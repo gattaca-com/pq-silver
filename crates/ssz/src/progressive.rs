@@ -108,11 +108,23 @@ pub trait ProgressiveContainer {
 /// mask of a ProgressiveContainer whose fields are all active (every EIP-7688
 /// type at its first fork).
 pub const fn packed_active_fields(n: usize) -> B256 {
+    active_fields(n, &[])
+}
+
+/// Spec `active_fields(width, gaps)`: the first `width` fields, less the
+/// removed ones in `gaps`.
+pub const fn active_fields(width: usize, gaps: &[usize]) -> B256 {
     let mut chunk = [0u8; 32];
     let mut i = 0;
-    while i < n {
+    while i < width {
         chunk[i / 8] |= 1 << (i % 8);
         i += 1;
+    }
+    let mut g = 0;
+    while g < gaps.len() {
+        assert!(gaps[g] < width, "a gap lies inside the width");
+        chunk[gaps[g] / 8] &= !(1 << (gaps[g] % 8));
+        g += 1;
     }
     chunk
 }

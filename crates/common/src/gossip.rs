@@ -7,21 +7,26 @@ use silver_beacon_state_data::{ForkName, SLOTS_PER_EPOCH};
 use crate::{
     Error, SlotSubnets,
     ssz_view::{
-        ATTESTER_SLASHING_MAX, ATTESTER_SLASHING_MIN, AttesterSlashingView,
-        DATA_COLUMN_SIDECAR_GLOAS_MIN, DATA_COLUMN_SIDECAR_MAX, DataColumnSidecarFuluView,
-        LIGHT_CLIENT_FINALITY_UPDATE_MAX, LIGHT_CLIENT_FINALITY_UPDATE_MIN,
-        LIGHT_CLIENT_OPTIMISTIC_UPDATE_MAX, LIGHT_CLIENT_OPTIMISTIC_UPDATE_MIN,
-        LightClientFinalityUpdateView, LightClientOptimisticUpdateView, MAX_PAYLOAD_SIZE,
-        PAYLOAD_ATTESTATION_MESSAGE_SIZE, PROPOSER_SLASHING_SIZE, PayloadAttestationMessageView,
-        ProposerSlashingView, SIGNED_AGG_PROOF_MAX, SIGNED_AGG_PROOF_MIN, SIGNED_BEACON_BLOCK_MIN,
-        SIGNED_BLS_CHANGE_SIZE, SIGNED_CONTRIBUTION_AND_PROOF_SIZE,
-        SIGNED_EXECUTION_PAYLOAD_BID_MAX, SIGNED_EXECUTION_PAYLOAD_BID_MIN,
-        SIGNED_EXECUTION_PAYLOAD_ENVELOPE_MIN, SIGNED_PROPOSER_PREFERENCES_SIZE,
-        SIGNED_VOLUNTARY_EXIT_SIZE, SINGLE_ATT_SIZE, SYNC_COMMITTEE_MSG_SIZE,
-        SignedAggregateAndProofView, SignedBeaconBlockView, SignedBlsToExecutionChangeView,
-        SignedExecutionPayloadBidView, SignedExecutionPayloadEnvelopeView,
-        SignedProposerPreferencesView, SignedSyncCommitteeProofView, SignedVoluntaryExitView,
-        SingleAttestationView, SszView, SyncCommitteeView,
+        ATTESTER_SLASHING_MAX, ATTESTER_SLASHING_MIN, ATTESTER_SLASHING_PQ_MAX,
+        ATTESTER_SLASHING_PQ_MIN, AttesterSlashingView, DATA_COLUMN_SIDECAR_GLOAS_MIN,
+        DATA_COLUMN_SIDECAR_MAX, DataColumnSidecarFuluView, LIGHT_CLIENT_FINALITY_UPDATE_MAX,
+        LIGHT_CLIENT_FINALITY_UPDATE_MIN, LIGHT_CLIENT_OPTIMISTIC_UPDATE_MAX,
+        LIGHT_CLIENT_OPTIMISTIC_UPDATE_MIN, LightClientFinalityUpdateView,
+        LightClientOptimisticUpdateView, MAX_PAYLOAD_SIZE, PAYLOAD_ATTESTATION_MESSAGE_PQ_SIZE,
+        PAYLOAD_ATTESTATION_MESSAGE_SIZE, PROPOSER_SLASHING_PQ_SIZE, PROPOSER_SLASHING_SIZE,
+        PayloadAttestationMessageView, ProposerSlashingView, SIGNED_AGG_PROOF_MAX,
+        SIGNED_AGG_PROOF_MIN, SIGNED_AGG_PROOF_PQ_MAX, SIGNED_AGG_PROOF_PQ_MIN,
+        SIGNED_BEACON_BLOCK_MIN, SIGNED_BEACON_BLOCK_PQ_MIN, SIGNED_BLS_CHANGE_SIZE,
+        SIGNED_CONTRIBUTION_AND_PROOF_SIZE, SIGNED_EXECUTION_PAYLOAD_BID_MAX,
+        SIGNED_EXECUTION_PAYLOAD_BID_MIN, SIGNED_EXECUTION_PAYLOAD_BID_PQ_MAX,
+        SIGNED_EXECUTION_PAYLOAD_BID_PQ_MIN, SIGNED_EXECUTION_PAYLOAD_ENVELOPE_MIN,
+        SIGNED_EXECUTION_PAYLOAD_ENVELOPE_PQ_MIN, SIGNED_PROPOSER_PREFERENCES_PQ_SIZE,
+        SIGNED_PROPOSER_PREFERENCES_SIZE, SIGNED_VOLUNTARY_EXIT_SIZE, SINGLE_ATT_PQ_SIZE,
+        SINGLE_ATT_SIZE, SYNC_COMMITTEE_MSG_SIZE, SignedAggregateAndProofView,
+        SignedBeaconBlockView, SignedBlsToExecutionChangeView, SignedExecutionPayloadBidView,
+        SignedExecutionPayloadEnvelopeView, SignedProposerPreferencesView,
+        SignedSyncCommitteeProofView, SignedVoluntaryExitView, SingleAttestationView, SszView,
+        SyncCommitteeView,
     },
 };
 
@@ -139,7 +144,8 @@ impl GossipTopic {
     pub const fn is_removed_in_pq(self) -> bool {
         matches!(
             self,
-            Self::SyncCommitteeContributionAndProof |
+            Self::VoluntaryExit |
+                Self::SyncCommitteeContributionAndProof |
                 Self::SyncCommittee(_) |
                 Self::LightClientFinalityUpdate |
                 Self::LightClientOptimisticUpdate |
@@ -157,6 +163,7 @@ impl GossipTopic {
 }
 
 pub const ATTESTATION_SUBNETS: usize = 64;
+pub const ATTESTATION_SUBNETS_PQ: usize = 16;
 
 pub struct SubnetsBySlot {
     slots: [SlotSubnets; Self::SLOTS],
@@ -292,7 +299,19 @@ impl GossipTopic {
         }
     }
 
-    pub fn max_uncompressed_size(self) -> usize {
+    pub fn max_uncompressed_size(self, format: ForkName) -> usize {
+        if format == ForkName::Pq {
+            match self {
+                Self::BeaconAggregateAndProof => return SIGNED_AGG_PROOF_PQ_MAX,
+                Self::BeaconAttestation(_) => return SINGLE_ATT_PQ_SIZE,
+                Self::ProposerSlashing => return PROPOSER_SLASHING_PQ_SIZE,
+                Self::AttesterSlashing => return ATTESTER_SLASHING_PQ_MAX,
+                Self::ExecutionPayloadBid => return SIGNED_EXECUTION_PAYLOAD_BID_PQ_MAX,
+                Self::PayloadAttestationMessage => return PAYLOAD_ATTESTATION_MESSAGE_PQ_SIZE,
+                Self::ProposerPreferences => return SIGNED_PROPOSER_PREFERENCES_PQ_SIZE,
+                _ => {}
+            }
+        }
         match self {
             Self::BeaconBlock | Self::ExecutionPayload => MAX_GOSSIP_UNCOMPRESSED_PAYLOAD_SIZE,
             Self::BeaconAggregateAndProof => SIGNED_AGG_PROOF_MAX,
@@ -312,7 +331,21 @@ impl GossipTopic {
         }
     }
 
-    pub fn min_uncompressed_size(self) -> usize {
+    pub fn min_uncompressed_size(self, format: ForkName) -> usize {
+        if format == ForkName::Pq {
+            match self {
+                Self::BeaconBlock => return SIGNED_BEACON_BLOCK_PQ_MIN,
+                Self::ExecutionPayload => return SIGNED_EXECUTION_PAYLOAD_ENVELOPE_PQ_MIN,
+                Self::BeaconAggregateAndProof => return SIGNED_AGG_PROOF_PQ_MIN,
+                Self::BeaconAttestation(_) => return SINGLE_ATT_PQ_SIZE,
+                Self::ProposerSlashing => return PROPOSER_SLASHING_PQ_SIZE,
+                Self::AttesterSlashing => return ATTESTER_SLASHING_PQ_MIN,
+                Self::ExecutionPayloadBid => return SIGNED_EXECUTION_PAYLOAD_BID_PQ_MIN,
+                Self::PayloadAttestationMessage => return PAYLOAD_ATTESTATION_MESSAGE_PQ_SIZE,
+                Self::ProposerPreferences => return SIGNED_PROPOSER_PREFERENCES_PQ_SIZE,
+                _ => {}
+            }
+        }
         match self {
             Self::BeaconBlock => SIGNED_BEACON_BLOCK_MIN,
             Self::ExecutionPayload => SIGNED_EXECUTION_PAYLOAD_ENVELOPE_MIN,
@@ -462,13 +495,14 @@ mod tests {
     }
 
     #[test]
-    fn pq_drops_sync_committee_light_client_and_bls_change_topics() {
+    fn pq_drops_removed_topics() {
         for topic in [
             GossipTopic::SyncCommitteeContributionAndProof,
             GossipTopic::SyncCommittee(0),
             GossipTopic::LightClientFinalityUpdate,
             GossipTopic::LightClientOptimisticUpdate,
             GossipTopic::BlsToExecutionChange,
+            GossipTopic::VoluntaryExit,
         ] {
             assert!(topic.supports_format(ForkName::Gloas), "{topic}");
             assert!(!topic.supports_format(ForkName::Pq), "{topic}");
@@ -585,10 +619,30 @@ mod tests {
         assert_eq!(MAX_GOSSIP_COMPRESSED_PAYLOAD_SIZE, 12_233_418);
         assert_eq!(MAX_GOSSIP_FRAME_SIZE, 12_234_442);
 
-        assert_eq!(GossipTopic::BeaconBlock.max_uncompressed_size(), 10_485_760);
-        assert_eq!(GossipTopic::BeaconAggregateAndProof.max_uncompressed_size(), 16_829);
-        assert_eq!(GossipTopic::BeaconAttestation(0).max_uncompressed_size(), 240);
-        assert_eq!(GossipTopic::AttesterSlashing.max_uncompressed_size(), 2_097_616);
-        assert_eq!(GossipTopic::DataColumnSidecar(0).max_uncompressed_size(), 8_782_180);
+        let max = |topic: GossipTopic| topic.max_uncompressed_size(ForkName::Gloas);
+        assert_eq!(max(GossipTopic::BeaconBlock), 10_485_760);
+        assert_eq!(max(GossipTopic::BeaconAggregateAndProof), 16_829);
+        assert_eq!(max(GossipTopic::BeaconAttestation(0)), 240);
+        assert_eq!(max(GossipTopic::AttesterSlashing), 2_097_616);
+        assert_eq!(max(GossipTopic::DataColumnSidecar(0)), 8_782_180);
+    }
+
+    /// The PQ p2p spec's type-specific SSZ bounds.
+    #[test]
+    fn pq_gossip_size_limits() {
+        let max = |topic: GossipTopic| topic.max_uncompressed_size(ForkName::Pq);
+        let min = |topic: GossipTopic| topic.min_uncompressed_size(ForkName::Pq);
+        assert_eq!(max(GossipTopic::BeaconBlock), 10_485_760);
+        assert_eq!(max(GossipTopic::BeaconAggregateAndProof), 1_068_549);
+        assert_eq!(max(GossipTopic::AttesterSlashing), 4_194_584);
+        assert_eq!(max(GossipTopic::ExecutionPayloadBid), 199_240);
+        assert_eq!(max(GossipTopic::BeaconAttestation(0)), 2_548);
+        assert_eq!(min(GossipTopic::BeaconAttestation(0)), 2_548);
+        assert_eq!(max(GossipTopic::ProposerSlashing), 5_032);
+        assert_eq!(max(GossipTopic::PayloadAttestationMessage), 2_454);
+        assert_eq!(max(GossipTopic::ProposerPreferences), 2_480);
+        assert_eq!(min(GossipTopic::BeaconBlock), 2_492);
+        assert_eq!(min(GossipTopic::BeaconAggregateAndProof), 3_588);
+        assert_eq!(min(GossipTopic::AttesterSlashing), 280);
     }
 }

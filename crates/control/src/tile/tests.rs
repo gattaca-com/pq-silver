@@ -515,7 +515,7 @@ fn assert_column_publication(origin: ColumnOrigin) {
     let topic = GossipTopic::DataColumnSidecar(5);
     // Transport decoding checks payload size; consensus validation is outside this
     // fixture.
-    let bytes = vec![0x42; topic.min_uncompressed_size()];
+    let bytes = vec![0x42; topic.min_uncompressed_size(ForkName::Fulu)];
     let mut capture = GossipPublications::new(topic, &[]);
     capture.observer.consume(|_: PeerEvent, _| {});
     capture.controller.peer_manager.set_sync_target(SyncUpdate::Following);
@@ -602,7 +602,7 @@ fn a_syncing_node_republishes_no_columns() {
 
 fn assert_no_syncing_publication(origin: ColumnOrigin) {
     let topic = GossipTopic::DataColumnSidecar(5);
-    let bytes = vec![0x42; topic.min_uncompressed_size()];
+    let bytes = vec![0x42; topic.min_uncompressed_size(ForkName::Fulu)];
     let mut capture = GossipPublications::new(topic, &[]);
     capture
         .controller

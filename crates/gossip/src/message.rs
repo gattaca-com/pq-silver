@@ -6,10 +6,10 @@ use buffa::{
 };
 use flux::timing::Nanos;
 use silver_common::{
-    BroadcastValidation, Error, GossipDomain, GossipTopic, MAX_GOSSIP_COMPRESSED_PAYLOAD_SIZE,
-    MAX_GOSSIP_FRAME_SIZE, MessageId, NewGossipMsg, P2pStreamId, PeerEvent, SszCache,
-    TCacheProducer, TCacheRead, TProducer, TReservation, msg_id_invalid_snappy,
-    msg_id_valid_snappy,
+    BroadcastValidation, Error, ForkName, GossipDomain, GossipTopic,
+    MAX_GOSSIP_COMPRESSED_PAYLOAD_SIZE, MAX_GOSSIP_FRAME_SIZE, MessageId, NewGossipMsg,
+    P2pStreamId, PeerEvent, SszCache, TCacheProducer, TCacheRead, TProducer, TReservation,
+    msg_id_invalid_snappy, msg_id_valid_snappy,
 };
 
 use crate::{GossipHandlerEvent, control::copy_idontwants_to_protobuf_output, dedup::DedupCache};
@@ -55,7 +55,7 @@ pub(super) fn handle_incoming(
     silver_log::trace!(?stream_id, ?topic, "Gossip message received");
 
     // Decompress: block snappy.
-    let len = read_message_length(snappy_data, &topic).inspect_err(|e| {
+    let len = read_message_length(snappy_data, &topic, domain.format()).inspect_err(|e| {
         let hash = msg_id_invalid_snappy(topic_string, snappy_data);
         if dedup_cache.insert(fast_id, hash) {
             silver_log::warn!(?stream_id, ?topic, ?e, "gossip rejected: bad snappy length");
@@ -249,12 +249,16 @@ fn validate_compressed_payload_size(len: usize) -> Result<(), Error> {
     Ok(())
 }
 
-fn read_message_length(msg: &[u8], gossip_topic: &GossipTopic) -> Result<usize, Error> {
+fn read_message_length(
+    msg: &[u8],
+    gossip_topic: &GossipTopic,
+    format: ForkName,
+) -> Result<usize, Error> {
     let len = snap::raw::decompress_len(msg).map_err(|_| Error::InvalidSnappy)?;
-    if len > gossip_topic.max_uncompressed_size() {
+    if len > gossip_topic.max_uncompressed_size(format) {
         return Err(Error::GossipPayloadTooLarge);
     }
-    if len < gossip_topic.min_uncompressed_size() {
+    if len < gossip_topic.min_uncompressed_size(format) {
         return Err(Error::GossipPayloadTooSmall);
     }
     Ok(len)
@@ -287,31 +291,27 @@ mod tests {
     #[test]
     fn uncompressed_payload_uses_topic_bound() {
         let topic = GossipTopic::BeaconAttestation(0);
-        assert_eq!(read_message_length(&snappy_length_prefix(240), &topic).unwrap(), 240);
-        assert!(matches!(
-            read_message_length(&snappy_length_prefix(241), &topic),
-            Err(Error::GossipPayloadTooLarge)
-        ));
+        let read = |len, format| read_message_length(&snappy_length_prefix(len), &topic, format);
+        assert_eq!(read(240, ForkName::Gloas).unwrap(), 240);
+        assert!(matches!(read(241, ForkName::Gloas), Err(Error::GossipPayloadTooLarge)));
+        assert_eq!(read(2548, ForkName::Pq).unwrap(), 2548);
+        assert!(matches!(read(2549, ForkName::Pq), Err(Error::GossipPayloadTooLarge)));
+        assert!(matches!(read(240, ForkName::Pq), Err(Error::GossipPayloadTooSmall)));
     }
 
     #[test]
     fn uncompressed_payload_uses_global_bound() {
         let topic = GossipTopic::BeaconBlock;
-        assert_eq!(
-            read_message_length(&snappy_length_prefix(topic.max_uncompressed_size()), &topic)
-                .unwrap(),
-            topic.max_uncompressed_size()
-        );
-        assert!(matches!(
-            read_message_length(&snappy_length_prefix(topic.max_uncompressed_size() + 1), &topic),
-            Err(Error::GossipPayloadTooLarge)
-        ));
+        let max = topic.max_uncompressed_size(ForkName::Fulu);
+        let read = |len| read_message_length(&snappy_length_prefix(len), &topic, ForkName::Fulu);
+        assert_eq!(read(max).unwrap(), max);
+        assert!(matches!(read(max + 1), Err(Error::GossipPayloadTooLarge)));
     }
 
     #[test]
     fn corrupt_snappy_body_is_penalised_once_then_deduped() {
         let topic = GossipTopic::BeaconBlock;
-        let mut corrupt = snappy_length_prefix(topic.min_uncompressed_size() + 64);
+        let mut corrupt = snappy_length_prefix(topic.min_uncompressed_size(ForkName::Fulu) + 64);
         corrupt.extend_from_slice(&[0xFF; 16]);
         let mut ssz = TCache::producer(TCacheId::NetworkIngress, 1 << 16);
         let mut protobuf = TCache::producer(TCacheId::NetworkIngress, 1 << 16);
@@ -359,7 +359,7 @@ mod tests {
         let mut ssz = TCache::producer(TCacheId::NetworkIngress, 1 << 16);
         let mut protobuf = TCache::producer(TCacheId::NetworkIngress, 1 << 16);
         let topic = GossipTopic::DataColumnSidecar(0);
-        let bytes = vec![0x33; topic.min_uncompressed_size() + 2048 + 96];
+        let bytes = vec![0x33; topic.min_uncompressed_size(ForkName::Fulu) + 2048 + 96];
         let compressed = snap::raw::Encoder::new().compress_vec(&bytes).unwrap();
         let stream = P2pStreamId::new(1, 3, StreamProtocol::GossipSubV13, true);
         let domains = ActiveDomains::new(Some(GossipDomain::new([0; 4], ForkName::Fulu)));
@@ -405,7 +405,7 @@ mod tests {
         let topic = GossipTopic::DataColumnSidecar(0);
         // Incompressible, so the frame is past the IDONTWANT threshold.
         let mut seed = 0x9E37_79B9_u32;
-        let bytes: Vec<u8> = (0..topic.min_uncompressed_size() + 2048)
+        let bytes: Vec<u8> = (0..topic.min_uncompressed_size(ForkName::Fulu) + 2048)
             .map(|_| {
                 seed ^= seed << 13;
                 seed ^= seed >> 17;

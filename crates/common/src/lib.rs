@@ -50,7 +50,8 @@ pub use silver_beacon_state_data::{
     EPOCHS_PER_SYNC_COMMITTEE_PERIOD, FAR_FUTURE_EPOCH, ForkName, SLOTS_PER_EPOCH,
 };
 pub use silver_ssz::{
-    block_contents, envelope_contents, merkle, progressive, ssz_hash, ssz_hash_gloas, ssz_view,
+    block_contents, envelope_contents, merkle, progressive, ssz_hash, ssz_hash_gloas, ssz_hash_pq,
+    ssz_view,
 };
 pub use tape_scratch::{FrameOut, TapeError, TapeScratch};
 #[cfg(feature = "test-util")]

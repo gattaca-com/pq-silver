@@ -1,0 +1,702 @@
+use super::{
+    ATTESTATION_DATA_SIZE, AttestationDataView, BEACON_BLOCK_FIXED, BEACON_BLOCK_HEADER_SIZE,
+    BYTES_PER_KZG_COMMITMENT, DEPOSIT_SIZE, ETH1_DATA_SIZE, EXECUTION_PAYLOAD_BID_MAX,
+    EXECUTION_PAYLOAD_BID_MIN, EXECUTION_PAYLOAD_ENVELOPE_MIN, ExecutionPayloadBidView,
+    ExecutionPayloadEnvelopeView, ExecutionPayloadView, MAX_ATTESTER_SLASHINGS_ELECTRA,
+    MAX_ATTESTING_INDICES, MAX_BLOB_COMMITMENTS_PER_BLOCK, MAX_PAYLOAD_SIZE,
+    MAX_PROPOSER_SLASHINGS, PAYLOAD_ATTESTATION_DATA_SIZE, PROPOSER_PREFERENCES_SIZE, bitlist_ok,
+    fixed, fixed_list_ok, offsets_ok, u32_le, u64_le, variable_field, variable_list_ok,
+};
+use crate::{
+    body_offsets::{BlockBodyError, OperationKind},
+    merkle::variable_containers,
+    ssz_hash_pq::ExecutionRequestsPqView,
+};
+
+pub const XMSS_SIGNATURE_SIZE: usize = 2404;
+pub const XMSS_PUBKEY_SIZE: usize = 32;
+pub const VRF_TREE_DEPTH: usize = 31;
+pub const VRF_PROOF_SIZE: usize = (VRF_TREE_DEPTH + 1) * 32;
+pub const MAX_STARK_PROOF_SIZE: usize = 1 << 20;
+
+pub const MAX_ATTESTATIONS_PQ: usize = 16;
+pub const MAX_VALIDATOR_PREREGISTRATION_REQUESTS_PER_PAYLOAD: usize = 64;
+pub const MAX_BUILDER_PREREGISTRATION_REQUESTS_PER_PAYLOAD: usize = 4;
+pub const MAX_VOLUNTARY_EXIT_REQUESTS_PER_PAYLOAD: usize = 16;
+
+pub type XMSSSignature = [u8; XMSS_SIGNATURE_SIZE];
+pub type XMSSPubkey = [u8; XMSS_PUBKEY_SIZE];
+/// The leaf for a slot followed by its Merkle branch to the VRF root.
+pub type VRFProof = [u8; VRF_PROOF_SIZE];
+
+/// Fixed part of `{ message: <variable>, signature: XMSSSignature }`.
+pub const SIGNED_PQ_FIXED: usize = 4 + XMSS_SIGNATURE_SIZE;
+
+// -- SingleAttestation (beacon_attestation_{subnet_id}) ---------------
+//
+// All fixed, 2548B.
+//   [0..8)      committee_index
+//   [8..16)     attester_index
+//   [16..144)   data (AttestationData 128B)
+//   [144..2548) signature
+
+pub const SINGLE_ATT_PQ_SIZE: usize = 16 + ATTESTATION_DATA_SIZE + XMSS_SIGNATURE_SIZE;
+
+#[derive(Clone, Copy, Debug, Hash, PartialEq, Eq)]
+#[repr(C)]
+pub struct SingleAttestationPqView;
+
+impl SingleAttestationPqView {
+    #[inline]
+    pub fn committee_index(buf: &[u8; SINGLE_ATT_PQ_SIZE]) -> u64 {
+        u64_le(buf, 0)
+    }
+    #[inline]
+    pub fn attester_index(buf: &[u8; SINGLE_ATT_PQ_SIZE]) -> u64 {
+        u64_le(buf, 8)
+    }
+    #[inline]
+    pub fn data(buf: &[u8; SINGLE_ATT_PQ_SIZE]) -> AttestationDataView<'_> {
+        AttestationDataView(fixed(buf, 16))
+    }
+    #[inline]
+    pub fn signature(buf: &[u8; SINGLE_ATT_PQ_SIZE]) -> &XMSSSignature {
+        fixed(buf, 16 + ATTESTATION_DATA_SIZE)
+    }
+}
+
+// -- Attestation (block-body element, aggregate) -----------------------
+//
+// Variable, fixed part 140B. `signature` is gone.
+//   [0..4)     offset: aggregation_bits (== 140)
+//   [4..132)   data (AttestationData 128B)
+//   [132..140) committee_bits (Bitvector[64])
+//   [140..)    aggregation_bits (Bitlist)
+
+pub const ATTESTATION_PQ_FIXED: usize = 4 + ATTESTATION_DATA_SIZE + 8;
+
+#[derive(Clone, Copy, Debug, Hash, PartialEq, Eq)]
+#[repr(C)]
+pub struct AttestationPqView;
+
+impl AttestationPqView {
+    #[inline]
+    pub fn data(buf: &[u8]) -> AttestationDataView<'_> {
+        AttestationDataView(fixed(buf, 4))
+    }
+    #[inline]
+    pub fn committee_bits(buf: &[u8]) -> &[u8; 8] {
+        fixed(buf, 132)
+    }
+    #[inline]
+    pub fn aggregation_bits(buf: &[u8]) -> &[u8] {
+        &buf[ATTESTATION_PQ_FIXED..]
+    }
+
+    pub fn check_canonical(buf: &[u8]) -> bool {
+        buf.len() >= ATTESTATION_PQ_FIXED &&
+            u32_le(buf, 0) as usize == ATTESTATION_PQ_FIXED &&
+            bitlist_ok(&buf[ATTESTATION_PQ_FIXED..], MAX_ATTESTING_INDICES)
+    }
+}
+
+// -- IndexedAttestation (inside AttesterSlashing) ---------------------
+//
+// Variable, fixed part 136B. `proof` takes `signature`'s place.
+//   [0..4)     offset: attesting_indices (== 136)
+//   [4..132)   data (AttestationData 128B)
+//   [132..136) offset: proof
+//   [136..)    attesting_indices (8B each) | proof
+
+pub const INDEXED_ATTESTATION_PQ_FIXED: usize = 4 + ATTESTATION_DATA_SIZE + 4;
+pub const INDEXED_ATTESTATION_PQ_MAX: usize =
+    INDEXED_ATTESTATION_PQ_FIXED + MAX_ATTESTING_INDICES * 8 + MAX_STARK_PROOF_SIZE;
+
+#[derive(Clone, Copy, Debug, Hash, PartialEq, Eq)]
+#[repr(C)]
+pub struct IndexedAttestationPqView;
+
+impl IndexedAttestationPqView {
+    const VARIABLE_OFFSETS: [usize; 2] = [0, 132];
+
+    #[inline]
+    pub fn data(buf: &[u8]) -> AttestationDataView<'_> {
+        AttestationDataView(fixed(buf, 4))
+    }
+    #[inline]
+    pub fn attesting_indices(buf: &[u8]) -> &[u8] {
+        variable_field(buf, &Self::VARIABLE_OFFSETS, 0)
+    }
+    #[inline]
+    pub fn proof(buf: &[u8]) -> &[u8] {
+        variable_field(buf, &Self::VARIABLE_OFFSETS, 1)
+    }
+
+    pub fn check_size(buf: &[u8]) -> bool {
+        if buf.len() < INDEXED_ATTESTATION_PQ_FIXED ||
+            buf.len() > INDEXED_ATTESTATION_PQ_MAX ||
+            !offsets_ok(buf, &Self::VARIABLE_OFFSETS, INDEXED_ATTESTATION_PQ_FIXED)
+        {
+            return false;
+        }
+        fixed_list_ok(Self::attesting_indices(buf), 8, MAX_ATTESTING_INDICES) &&
+            Self::proof(buf).len() <= MAX_STARK_PROOF_SIZE
+    }
+}
+
+// -- AttesterSlashing (attester_slashing) -----------------------------
+//
+// Variable. Two PQ IndexedAttestations.
+//   [0..4)  offset: attestation_1 (== 8)
+//   [4..8)  offset: attestation_2
+
+pub const ATTESTER_SLASHING_PQ_MIN: usize = 8 + 2 * INDEXED_ATTESTATION_PQ_FIXED;
+pub const ATTESTER_SLASHING_PQ_MAX: usize = 8 + 2 * INDEXED_ATTESTATION_PQ_MAX;
+const _: () = assert!(ATTESTER_SLASHING_PQ_MAX == 4_194_584, "MAX_ATTESTER_SLASHING_SIZE_PQ");
+
+#[derive(Clone, Copy, Debug, Hash, PartialEq, Eq)]
+#[repr(C)]
+pub struct AttesterSlashingPqView;
+
+impl AttesterSlashingPqView {
+    const VARIABLE_OFFSETS: [usize; 2] = [0, 4];
+
+    #[inline]
+    pub fn attestation_1(buf: &[u8]) -> &[u8] {
+        variable_field(buf, &Self::VARIABLE_OFFSETS, 0)
+    }
+    #[inline]
+    pub fn attestation_2(buf: &[u8]) -> &[u8] {
+        variable_field(buf, &Self::VARIABLE_OFFSETS, 1)
+    }
+
+    pub fn check_size(buf: &[u8]) -> bool {
+        buf.len() >= ATTESTER_SLASHING_PQ_MIN &&
+            buf.len() <= ATTESTER_SLASHING_PQ_MAX &&
+            offsets_ok(buf, &Self::VARIABLE_OFFSETS, 8) &&
+            IndexedAttestationPqView::check_size(Self::attestation_1(buf)) &&
+            IndexedAttestationPqView::check_size(Self::attestation_2(buf))
+    }
+}
+
+// -- ProposerSlashing (proposer_slashing) -----------------------------
+//
+// All fixed, 5032B. Two SignedBeaconBlockHeaders of 2516B each.
+//   [0..112)     signed_header_1.message
+//   [112..2516)  signed_header_1.signature
+//   [2516..2628) signed_header_2.message
+//   [2628..5032) signed_header_2.signature
+
+pub const SIGNED_BEACON_BLOCK_HEADER_PQ_SIZE: usize =
+    BEACON_BLOCK_HEADER_SIZE + XMSS_SIGNATURE_SIZE;
+pub const PROPOSER_SLASHING_PQ_SIZE: usize = 2 * SIGNED_BEACON_BLOCK_HEADER_PQ_SIZE;
+
+#[derive(Clone, Copy, Debug, Hash, PartialEq, Eq)]
+#[repr(C)]
+pub struct ProposerSlashingPqView;
+
+impl ProposerSlashingPqView {
+    #[inline]
+    pub fn header_1(buf: &[u8; PROPOSER_SLASHING_PQ_SIZE]) -> &[u8; BEACON_BLOCK_HEADER_SIZE] {
+        fixed(buf, 0)
+    }
+    #[inline]
+    pub fn signature_1(buf: &[u8; PROPOSER_SLASHING_PQ_SIZE]) -> &XMSSSignature {
+        fixed(buf, BEACON_BLOCK_HEADER_SIZE)
+    }
+    #[inline]
+    pub fn header_2(buf: &[u8; PROPOSER_SLASHING_PQ_SIZE]) -> &[u8; BEACON_BLOCK_HEADER_SIZE] {
+        fixed(buf, SIGNED_BEACON_BLOCK_HEADER_PQ_SIZE)
+    }
+    #[inline]
+    pub fn signature_2(buf: &[u8; PROPOSER_SLASHING_PQ_SIZE]) -> &XMSSSignature {
+        fixed(buf, SIGNED_BEACON_BLOCK_HEADER_PQ_SIZE + BEACON_BLOCK_HEADER_SIZE)
+    }
+}
+
+// -- SignedBeaconBlock (beacon_block) ---------------------------------
+//
+//   [0..4)       offset: message (== 2408)
+//   [4..2408)    signature
+//   [2408..2416) slot
+//   [2416..2424) proposer_index
+//   [2424..2456) parent_root
+//   [2456..2488) state_root
+//   [2488..2492) offset: body (relative to 2408, == 84)
+//   [2492..)     body
+
+pub const SIGNED_BEACON_BLOCK_PQ_MIN: usize = SIGNED_PQ_FIXED + BEACON_BLOCK_FIXED;
+
+#[derive(Clone, Copy, Debug, Hash, PartialEq, Eq)]
+#[repr(C)]
+pub struct SignedBeaconBlockPqView;
+
+impl SignedBeaconBlockPqView {
+    #[inline]
+    pub fn signature(buf: &[u8]) -> &XMSSSignature {
+        fixed(buf, 4)
+    }
+    /// Serialized `BeaconBlock`.
+    #[inline]
+    pub fn message(buf: &[u8]) -> &[u8] {
+        &buf[SIGNED_PQ_FIXED..]
+    }
+    #[inline]
+    pub fn slot(buf: &[u8]) -> u64 {
+        u64_le(buf, SIGNED_PQ_FIXED)
+    }
+    #[inline]
+    pub fn proposer_index(buf: &[u8]) -> u64 {
+        u64_le(buf, SIGNED_PQ_FIXED + 8)
+    }
+    #[inline]
+    pub fn parent_root(buf: &[u8]) -> &[u8; 32] {
+        fixed(buf, SIGNED_PQ_FIXED + 16)
+    }
+    #[inline]
+    pub fn state_root(buf: &[u8]) -> &[u8; 32] {
+        fixed(buf, SIGNED_PQ_FIXED + 48)
+    }
+    #[inline]
+    pub fn body(buf: &[u8]) -> &[u8] {
+        &buf[SIGNED_BEACON_BLOCK_PQ_MIN..]
+    }
+
+    /// Pins the two offsets the accessors hardcode. The body is checked on
+    /// its own by [`BeaconBlockBodyPqView::check_canonical`].
+    pub fn check_size(buf: &[u8]) -> bool {
+        buf.len() >= SIGNED_BEACON_BLOCK_PQ_MIN &&
+            buf.len() <= MAX_PAYLOAD_SIZE &&
+            u32_le(buf, 0) as usize == SIGNED_PQ_FIXED &&
+            u32_le(buf, SIGNED_PQ_FIXED + 80) as usize == BEACON_BLOCK_FIXED
+    }
+}
+
+// -- BeaconBlockBody --------------------------------------------------
+//
+// ProgressiveContainer of width 14; the inactive `voluntary_exits`,
+// `sync_aggregate`, `bls_to_execution_changes` and `payload_attestations`
+// are not serialized. Fixed part 1156B.
+//   [0..1024)    randao_reveal (VRFProof)
+//   [1024..1096) eth1_data (72B)
+//   [1096..1128) graffiti
+//   [1128..1132) offset: proposer_slashings
+//   [1132..1136) offset: attester_slashings
+//   [1136..1140) offset: attestations
+//   [1140..1144) offset: deposits
+//   [1144..1148) offset: signed_execution_payload_bid
+//   [1148..1152) offset: parent_execution_requests
+//   [1152..1156) offset: proof
+//   [1156..)     variable region
+
+pub const BEACON_BLOCK_BODY_PQ_FIXED: usize = VRF_PROOF_SIZE + ETH1_DATA_SIZE + 32 + 7 * 4;
+
+#[derive(Clone, Copy, Debug, Hash, PartialEq, Eq)]
+#[repr(C)]
+pub struct BeaconBlockBodyPqView;
+
+impl BeaconBlockBodyPqView {
+    pub const VARIABLE_OFFSETS: [usize; 7] = [1128, 1132, 1136, 1140, 1144, 1148, 1152];
+
+    #[inline]
+    pub fn randao_reveal(buf: &[u8]) -> &VRFProof {
+        fixed(buf, 0)
+    }
+    #[inline]
+    pub fn eth1_data(buf: &[u8]) -> &[u8; ETH1_DATA_SIZE] {
+        fixed(buf, VRF_PROOF_SIZE)
+    }
+    #[inline]
+    pub fn graffiti(buf: &[u8]) -> &[u8; 32] {
+        fixed(buf, VRF_PROOF_SIZE + ETH1_DATA_SIZE)
+    }
+    #[inline]
+    pub fn proposer_slashings(buf: &[u8]) -> &[u8] {
+        Self::field(buf, 0)
+    }
+    #[inline]
+    pub fn attester_slashings(buf: &[u8]) -> &[u8] {
+        Self::field(buf, 1)
+    }
+    #[inline]
+    pub fn attestations(buf: &[u8]) -> &[u8] {
+        Self::field(buf, 2)
+    }
+    #[inline]
+    pub fn deposits(buf: &[u8]) -> &[u8] {
+        Self::field(buf, 3)
+    }
+    #[inline]
+    pub fn signed_execution_payload_bid(buf: &[u8]) -> &[u8] {
+        Self::field(buf, 4)
+    }
+    #[inline]
+    pub fn parent_execution_requests(buf: &[u8]) -> &[u8] {
+        Self::field(buf, 5)
+    }
+    #[inline]
+    pub fn proof(buf: &[u8]) -> &[u8] {
+        Self::field(buf, 6)
+    }
+
+    #[inline]
+    fn field(buf: &[u8], i: usize) -> &[u8] {
+        debug_assert!(offsets_ok(buf, &Self::VARIABLE_OFFSETS, BEACON_BLOCK_BODY_PQ_FIXED));
+        variable_field(buf, &Self::VARIABLE_OFFSETS, i)
+    }
+
+    /// Progressive lists carry no type-level bound, so counts are left to
+    /// [`Self::check_operation_limits`].
+    pub fn check_canonical(body: &[u8]) -> bool {
+        const UNCAPPED: usize = usize::MAX;
+        body.len() >= BEACON_BLOCK_BODY_PQ_FIXED &&
+            offsets_ok(body, &Self::VARIABLE_OFFSETS, BEACON_BLOCK_BODY_PQ_FIXED) &&
+            fixed_list_ok(Self::proposer_slashings(body), PROPOSER_SLASHING_PQ_SIZE, UNCAPPED) &&
+            variable_list_ok(
+                Self::attester_slashings(body),
+                UNCAPPED,
+                AttesterSlashingPqView::check_size,
+            ) &&
+            variable_list_ok(
+                Self::attestations(body),
+                UNCAPPED,
+                AttestationPqView::check_canonical,
+            ) &&
+            fixed_list_ok(Self::deposits(body), DEPOSIT_SIZE, UNCAPPED) &&
+            SignedExecutionPayloadBidPqView::check_canonical(Self::signed_execution_payload_bid(
+                body,
+            )) &&
+            ExecutionRequestsPqView::check_canonical(Self::parent_execution_requests(body)) &&
+            Self::proof(body).len() <= MAX_STARK_PROOF_SIZE
+    }
+
+    /// Spec `verify_block_body_operation_limits`, plus
+    /// `verify_execution_requests_limits` on the parent requests.
+    pub fn check_operation_limits(body: &[u8]) -> Result<(), BlockBodyError> {
+        debug_assert!(Self::check_canonical(body));
+        let check = |op, count, max| {
+            if count > max {
+                Err(BlockBodyError::OperationCountOutOfBounds { op, count, max })
+            } else {
+                Ok(())
+            }
+        };
+        check(
+            OperationKind::ProposerSlashings,
+            Self::proposer_slashings(body).len() / PROPOSER_SLASHING_PQ_SIZE,
+            MAX_PROPOSER_SLASHINGS,
+        )?;
+        check(
+            OperationKind::AttesterSlashings,
+            variable_containers(Self::attester_slashings(body)).count(),
+            MAX_ATTESTER_SLASHINGS_ELECTRA,
+        )?;
+        check(
+            OperationKind::Attestations,
+            variable_containers(Self::attestations(body)).count(),
+            MAX_ATTESTATIONS_PQ,
+        )?;
+        check(OperationKind::Deposits, Self::deposits(body).len() / DEPOSIT_SIZE, 0)?;
+        ExecutionRequestsPqView::check_counts(Self::parent_execution_requests(body))?;
+        Ok(())
+    }
+}
+
+// -- SignedAggregateAndProof (beacon_aggregate_and_proof) -------------
+//
+// AggregateAndProof gains a trailing variable `proof`, so the aggregate's
+// end is read from the proof offset.
+//   [0..4)       offset: message (== 2408)
+//   [4..2408)    signature
+//   [2408..2416) aggregator_index
+//   [2416..2420) offset: aggregate (relative to 2408, == 1040)
+//   [2420..3444) selection_proof (VRFProof)
+//   [3444..3448) offset: proof (relative to 2408)
+//   [3448..3452) aggregate offset: aggregation_bits (relative to 3448, == 140)
+//   [3452..3580) aggregate.data
+//   [3580..3588) aggregate.committee_bits
+//   [3588..)     aggregate.aggregation_bits | proof
+
+const AGGREGATE_AND_PROOF_PQ_FIXED: usize = 8 + 4 + VRF_PROOF_SIZE + 4;
+const AGGREGATE_PQ_START: usize = SIGNED_PQ_FIXED + AGGREGATE_AND_PROOF_PQ_FIXED;
+
+pub const SIGNED_AGG_PROOF_PQ_MIN: usize = AGGREGATE_PQ_START + ATTESTATION_PQ_FIXED;
+pub const SIGNED_AGG_PROOF_PQ_MAX: usize =
+    SIGNED_AGG_PROOF_PQ_MIN + MAX_ATTESTING_INDICES / 8 + 1 + MAX_STARK_PROOF_SIZE;
+const _: () =
+    assert!(SIGNED_AGG_PROOF_PQ_MAX == 1_068_549, "MAX_SIGNED_AGGREGATE_AND_PROOF_SIZE_PQ");
+
+#[derive(Clone, Copy, Debug, Hash, PartialEq, Eq)]
+#[repr(C)]
+pub struct SignedAggregateAndProofPqView;
+
+impl SignedAggregateAndProofPqView {
+    #[inline]
+    pub fn signature(buf: &[u8]) -> &XMSSSignature {
+        fixed(buf, 4)
+    }
+    /// Serialized `AggregateAndProof`.
+    #[inline]
+    pub fn message(buf: &[u8]) -> &[u8] {
+        &buf[SIGNED_PQ_FIXED..]
+    }
+    #[inline]
+    pub fn aggregator_index(buf: &[u8]) -> u64 {
+        u64_le(buf, SIGNED_PQ_FIXED)
+    }
+    #[inline]
+    pub fn selection_proof(buf: &[u8]) -> &VRFProof {
+        fixed(buf, SIGNED_PQ_FIXED + 12)
+    }
+    /// Serialized `Attestation`.
+    #[inline]
+    pub fn aggregate(buf: &[u8]) -> &[u8] {
+        &buf[AGGREGATE_PQ_START..Self::proof_start(buf)]
+    }
+    #[inline]
+    pub fn agg_data(buf: &[u8]) -> AttestationDataView<'_> {
+        AttestationDataView(fixed(buf, AGGREGATE_PQ_START + 4))
+    }
+    #[inline]
+    pub fn agg_committee_bits(buf: &[u8]) -> &[u8; 8] {
+        fixed(buf, AGGREGATE_PQ_START + 132)
+    }
+    #[inline]
+    pub fn agg_aggregation_bits(buf: &[u8]) -> &[u8] {
+        &buf[SIGNED_AGG_PROOF_PQ_MIN..Self::proof_start(buf)]
+    }
+    #[inline]
+    pub fn proof(buf: &[u8]) -> &[u8] {
+        &buf[Self::proof_start(buf)..]
+    }
+
+    #[inline]
+    fn proof_start(buf: &[u8]) -> usize {
+        SIGNED_PQ_FIXED + u32_le(buf, SIGNED_PQ_FIXED + 12 + VRF_PROOF_SIZE) as usize
+    }
+
+    /// Pins every offset the accessors hardcode and checks the aggregate is
+    /// canonical.
+    pub fn check_size(buf: &[u8]) -> bool {
+        if buf.len() < SIGNED_AGG_PROOF_PQ_MIN ||
+            buf.len() > SIGNED_AGG_PROOF_PQ_MAX ||
+            u32_le(buf, 0) as usize != SIGNED_PQ_FIXED ||
+            u32_le(buf, SIGNED_PQ_FIXED + 8) as usize != AGGREGATE_AND_PROOF_PQ_FIXED
+        {
+            return false;
+        }
+        let proof_start = Self::proof_start(buf);
+        proof_start >= AGGREGATE_PQ_START &&
+            proof_start <= buf.len() &&
+            buf.len() - proof_start <= MAX_STARK_PROOF_SIZE &&
+            AttestationPqView::check_canonical(&buf[AGGREGATE_PQ_START..proof_start])
+    }
+}
+
+// -- SignedExecutionPayloadBid (execution_payload_bid) ----------------
+//
+//   [0..4)    offset: message (== 2408)
+//   [4..2408) signature
+//   [2408..)  message (ExecutionPayloadBid)
+
+pub const SIGNED_EXECUTION_PAYLOAD_BID_PQ_MIN: usize = SIGNED_PQ_FIXED + EXECUTION_PAYLOAD_BID_MIN;
+pub const SIGNED_EXECUTION_PAYLOAD_BID_PQ_MAX: usize = SIGNED_PQ_FIXED + EXECUTION_PAYLOAD_BID_MAX;
+const _: () = assert!(
+    SIGNED_EXECUTION_PAYLOAD_BID_PQ_MAX == 199_240,
+    "MAX_SIGNED_EXECUTION_PAYLOAD_BID_SIZE_PQ"
+);
+
+#[derive(Clone, Copy, Debug, Hash, PartialEq, Eq)]
+#[repr(C)]
+pub struct SignedExecutionPayloadBidPqView;
+
+impl SignedExecutionPayloadBidPqView {
+    #[inline]
+    pub fn signature(buf: &[u8]) -> &XMSSSignature {
+        fixed(buf, 4)
+    }
+    /// Serialized `ExecutionPayloadBid`.
+    #[inline]
+    pub fn message(buf: &[u8]) -> &[u8] {
+        &buf[SIGNED_PQ_FIXED..]
+    }
+    #[inline]
+    pub fn check_size(buf: &[u8]) -> bool {
+        buf.len() >= SIGNED_EXECUTION_PAYLOAD_BID_PQ_MIN &&
+            buf.len() <= SIGNED_EXECUTION_PAYLOAD_BID_PQ_MAX &&
+            u32_le(buf, 0) as usize == SIGNED_PQ_FIXED
+    }
+
+    pub fn check_canonical(buf: &[u8]) -> bool {
+        Self::check_size(buf) &&
+            ExecutionPayloadBidView::check_size(Self::message(buf)) &&
+            fixed_list_ok(
+                ExecutionPayloadBidView::blob_kzg_commitments(Self::message(buf)),
+                BYTES_PER_KZG_COMMITMENT,
+                MAX_BLOB_COMMITMENTS_PER_BLOCK,
+            )
+    }
+}
+
+// -- SignedExecutionPayloadEnvelope (execution_payload) ---------------
+//
+//   [0..4)    offset: message (== 2408)
+//   [4..2408) signature
+//   [2408..)  message (ExecutionPayloadEnvelope, PQ ExecutionRequests)
+
+pub const SIGNED_EXECUTION_PAYLOAD_ENVELOPE_PQ_MIN: usize =
+    SIGNED_PQ_FIXED + EXECUTION_PAYLOAD_ENVELOPE_MIN;
+
+#[derive(Clone, Copy, Debug, Hash, PartialEq, Eq)]
+#[repr(C)]
+pub struct SignedExecutionPayloadEnvelopePqView;
+
+impl SignedExecutionPayloadEnvelopePqView {
+    #[inline]
+    pub fn signature(buf: &[u8]) -> &XMSSSignature {
+        fixed(buf, 4)
+    }
+    /// Serialized `ExecutionPayloadEnvelope`.
+    #[inline]
+    pub fn message(buf: &[u8]) -> &[u8] {
+        &buf[SIGNED_PQ_FIXED..]
+    }
+    #[inline]
+    pub fn check_size(buf: &[u8]) -> bool {
+        buf.len() >= SIGNED_EXECUTION_PAYLOAD_ENVELOPE_PQ_MIN &&
+            buf.len() <= MAX_PAYLOAD_SIZE &&
+            u32_le(buf, 0) as usize == SIGNED_PQ_FIXED
+    }
+
+    pub fn check_canonical(buf: &[u8]) -> bool {
+        if !Self::check_size(buf) {
+            return false;
+        }
+        let message = Self::message(buf);
+        ExecutionPayloadEnvelopeView::check_size(message) &&
+            ExecutionPayloadView::check_canonical_gloas(ExecutionPayloadEnvelopeView::payload(
+                message,
+            )) &&
+            ExecutionRequestsPqView::check_canonical(
+                ExecutionPayloadEnvelopeView::execution_requests(message),
+            )
+    }
+}
+
+// -- PayloadAttestationMessage (payload_attestation_message) ----------
+//
+// All fixed, 2454B.
+//   [0..8)     validator_index
+//   [8..50)    data (PayloadAttestationData 42B)
+//   [50..2454) signature
+
+pub const PAYLOAD_ATTESTATION_MESSAGE_PQ_SIZE: usize =
+    8 + PAYLOAD_ATTESTATION_DATA_SIZE + XMSS_SIGNATURE_SIZE;
+
+#[derive(Clone, Copy, Debug, Hash, PartialEq, Eq)]
+#[repr(C)]
+pub struct PayloadAttestationMessagePqView;
+
+impl PayloadAttestationMessagePqView {
+    #[inline]
+    pub fn validator_index(buf: &[u8; PAYLOAD_ATTESTATION_MESSAGE_PQ_SIZE]) -> u64 {
+        u64_le(buf, 0)
+    }
+    #[inline]
+    pub fn data(
+        buf: &[u8; PAYLOAD_ATTESTATION_MESSAGE_PQ_SIZE],
+    ) -> &[u8; PAYLOAD_ATTESTATION_DATA_SIZE] {
+        fixed(buf, 8)
+    }
+    #[inline]
+    pub fn signature(buf: &[u8; PAYLOAD_ATTESTATION_MESSAGE_PQ_SIZE]) -> &XMSSSignature {
+        fixed(buf, 8 + PAYLOAD_ATTESTATION_DATA_SIZE)
+    }
+}
+
+// -- SignedProposerPreferences (proposer_preferences) -----------------
+//
+// All fixed, 2480B: message(76) + signature(2404).
+
+pub const SIGNED_PROPOSER_PREFERENCES_PQ_SIZE: usize =
+    PROPOSER_PREFERENCES_SIZE + XMSS_SIGNATURE_SIZE;
+
+#[derive(Clone, Copy, Debug, Hash, PartialEq, Eq)]
+#[repr(C)]
+pub struct SignedProposerPreferencesPqView;
+
+impl SignedProposerPreferencesPqView {
+    #[inline]
+    pub fn message(
+        buf: &[u8; SIGNED_PROPOSER_PREFERENCES_PQ_SIZE],
+    ) -> &[u8; PROPOSER_PREFERENCES_SIZE] {
+        fixed(buf, 0)
+    }
+    #[inline]
+    pub fn signature(buf: &[u8; SIGNED_PROPOSER_PREFERENCES_PQ_SIZE]) -> &XMSSSignature {
+        fixed(buf, PROPOSER_PREFERENCES_SIZE)
+    }
+}
+
+// -- ValidatorPreregistrationRequest (ExecutionRequests element) ------
+//   [0..32)  pubkey
+//   [32..64) withdrawal_credentials
+//   [64..96) vrf_root
+
+pub const VALIDATOR_PREREGISTRATION_REQUEST_SIZE: usize = XMSS_PUBKEY_SIZE + 32 + 32;
+
+#[derive(Clone, Copy, Debug, Hash, PartialEq, Eq)]
+#[repr(C)]
+pub struct ValidatorPreregistrationRequestView;
+
+impl ValidatorPreregistrationRequestView {
+    #[inline]
+    pub fn pubkey(buf: &[u8; VALIDATOR_PREREGISTRATION_REQUEST_SIZE]) -> &XMSSPubkey {
+        fixed(buf, 0)
+    }
+    #[inline]
+    pub fn withdrawal_credentials(buf: &[u8; VALIDATOR_PREREGISTRATION_REQUEST_SIZE]) -> &[u8; 32] {
+        fixed(buf, XMSS_PUBKEY_SIZE)
+    }
+    #[inline]
+    pub fn vrf_root(buf: &[u8; VALIDATOR_PREREGISTRATION_REQUEST_SIZE]) -> &[u8; 32] {
+        fixed(buf, XMSS_PUBKEY_SIZE + 32)
+    }
+}
+
+// -- BuilderPreregistrationRequest (ExecutionRequests element) --------
+//   [0..32)  pubkey
+//   [32..64) withdrawal_credentials
+
+pub const BUILDER_PREREGISTRATION_REQUEST_SIZE: usize = XMSS_PUBKEY_SIZE + 32;
+
+#[derive(Clone, Copy, Debug, Hash, PartialEq, Eq)]
+#[repr(C)]
+pub struct BuilderPreregistrationRequestView;
+
+impl BuilderPreregistrationRequestView {
+    #[inline]
+    pub fn pubkey(buf: &[u8; BUILDER_PREREGISTRATION_REQUEST_SIZE]) -> &XMSSPubkey {
+        fixed(buf, 0)
+    }
+    #[inline]
+    pub fn withdrawal_credentials(buf: &[u8; BUILDER_PREREGISTRATION_REQUEST_SIZE]) -> &[u8; 32] {
+        fixed(buf, XMSS_PUBKEY_SIZE)
+    }
+}
+
+// -- VoluntaryExitRequest (ExecutionRequests element) -----------------
+//   [0..32) pubkey
+
+pub const VOLUNTARY_EXIT_REQUEST_SIZE: usize = XMSS_PUBKEY_SIZE;
+
+#[derive(Clone, Copy, Debug, Hash, PartialEq, Eq)]
+#[repr(C)]
+pub struct VoluntaryExitRequestView;
+
+impl VoluntaryExitRequestView {
+    #[inline]
+    pub fn pubkey(buf: &[u8; VOLUNTARY_EXIT_REQUEST_SIZE]) -> &XMSSPubkey {
+        buf
+    }
+}

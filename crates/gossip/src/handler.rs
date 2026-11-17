@@ -157,7 +157,7 @@ impl GossipHandler {
             str::from_utf8(&encoded).expect("hex is ASCII")
         };
         let wire = topic.to_wire(digest);
-        if ssz.len() > topic.max_uncompressed_size() {
+        if ssz.len() > topic.max_uncompressed_size(domain.format()) {
             silver_log::error!(?topic, len = ssz.len(), "outgoing gossip payload too large");
             return None;
         }
@@ -203,7 +203,7 @@ impl GossipHandler {
         let Some((domain, wire)) = self.domains.current_wire(topic) else {
             return Ok(None);
         };
-        if ssz.len() > topic.max_uncompressed_size() {
+        if ssz.len() > topic.max_uncompressed_size(domain.format()) {
             return Err(Error::GossipPayloadTooLarge);
         }
 

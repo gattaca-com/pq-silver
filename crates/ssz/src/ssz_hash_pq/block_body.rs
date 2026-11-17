@@ -32,12 +32,12 @@ impl BeaconBlockBodyPqView {
             hash_variable_list(
                 ProgressiveHasher::new(),
                 Self::attester_slashings(body),
-                AttesterSlashingPqView::hash_tree_root,
+                AttesterSlashingPqView::root_of_canonical,
             ),
             hash_variable_list(
                 ProgressiveHasher::new(),
                 Self::attestations(body),
-                AttestationPqView::hash_tree_root,
+                AttestationPqView::root_of_canonical,
             ),
             DepositView::hash_list(ProgressiveHasher::new(), Self::deposits(body)),
             ZERO_HASH,

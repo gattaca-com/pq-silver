@@ -1,7 +1,7 @@
 use super::RequestCountOutOfBounds;
 use crate::{
-    merkle::{B256, FixedContainer},
-    progressive::ProgressiveHasher,
+    merkle::{B256, FixedContainer, ZERO_HASH},
+    progressive::{ProgressiveContainer, ProgressiveHasher},
     ssz_view::{fixed_list_ok, offsets_ok, variable_field},
 };
 
@@ -74,8 +74,21 @@ impl<const N: usize> RequestLists<N> {
         Ok(())
     }
 
-    pub(crate) fn roots(&self, data: &[u8]) -> [B256; N] {
-        let sections = self.sections(data);
-        std::array::from_fn(|i| (self.0[i].root)(sections[i]))
+    /// The `W` field roots of container `C`: each list's root at its active
+    /// field, zero in the gaps.
+    pub(crate) fn field_roots<C: ProgressiveContainer, const W: usize>(
+        &self,
+        data: &[u8],
+    ) -> [B256; W] {
+        let mut lists = self.0.iter().zip(self.sections(data));
+        let mut roots = [ZERO_HASH; W];
+        for (i, root) in roots.iter_mut().enumerate() {
+            if C::ACTIVE_FIELDS[i / 8] >> (i % 8) & 1 == 1 {
+                let (list, section) = lists.next().expect("a list per active field");
+                *root = (list.root)(section);
+            }
+        }
+        debug_assert!(lists.next().is_none(), "an active field per list");
+        roots
     }
 }

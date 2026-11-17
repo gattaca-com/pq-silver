@@ -5,11 +5,11 @@ use super::{
     ExecutionPayloadEnvelopeView, ExecutionPayloadView, MAX_ATTESTER_SLASHINGS_ELECTRA,
     MAX_ATTESTING_INDICES, MAX_BLOB_COMMITMENTS_PER_BLOCK, MAX_PAYLOAD_SIZE,
     MAX_PROPOSER_SLASHINGS, PAYLOAD_ATTESTATION_DATA_SIZE, PROPOSER_PREFERENCES_SIZE, bitlist_ok,
-    fixed, fixed_list_ok, offsets_ok, u32_le, u64_le, variable_field, variable_list_ok,
+    fixed, fixed_list_ok, offsets_ok, u32_le, u64_le, variable_field, variable_list_len,
+    variable_list_ok,
 };
 use crate::{
     body_offsets::{BlockBodyError, OperationKind},
-    merkle::variable_containers,
     ssz_hash_pq::ExecutionRequestsPqView,
 };
 
@@ -379,13 +379,11 @@ impl BeaconBlockBodyPqView {
             MAX_PROPOSER_SLASHINGS,
         )?;
         OperationKind::AttesterSlashings.check_count(
-            variable_containers(Self::attester_slashings(body)).count(),
+            variable_list_len(Self::attester_slashings(body)),
             MAX_ATTESTER_SLASHINGS_ELECTRA,
         )?;
-        OperationKind::Attestations.check_count(
-            variable_containers(Self::attestations(body)).count(),
-            MAX_ATTESTATIONS_PQ,
-        )?;
+        OperationKind::Attestations
+            .check_count(variable_list_len(Self::attestations(body)), MAX_ATTESTATIONS_PQ)?;
         OperationKind::Deposits.check_count(Self::deposits(body).len() / DEPOSIT_SIZE, 0)?;
         ExecutionRequestsPqView::check_counts(Self::parent_execution_requests(body))?;
         Ok(())

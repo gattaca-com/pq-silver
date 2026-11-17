@@ -1,7 +1,7 @@
 use flux_profiler::timed;
 
 use crate::{
-    merkle::{B256, FixedContainer, ZERO_HASH, merkleize},
+    merkle::{B256, FixedContainer, merkleize},
     progressive::{ProgressiveContainer, active_fields},
     ssz_hash_gloas::{
         RequestCountOutOfBounds,
@@ -76,41 +76,29 @@ impl ExecutionRequestsPqView {
 
     #[timed]
     pub fn hash_tree_root(data: &[u8]) -> B256 {
-        let [deposits, withdrawals, consolidations, builder_deposits, builder_exits, rest @ ..] =
-            Self::LISTS.roots(data);
-        let [validator_preregistrations, builder_preregistrations, voluntary_exits] = rest;
-        Self::progressive_root(&[
-            deposits,
-            withdrawals,
-            consolidations,
-            builder_deposits,
-            builder_exits,
-            ZERO_HASH,
-            ZERO_HASH,
-            validator_preregistrations,
-            builder_preregistrations,
-            voluntary_exits,
-        ])
+        Self::progressive_root(&Self::LISTS.field_roots::<Self, 10>(data))
     }
 }
 
 impl FixedContainer for ValidatorPreregistrationRequestView {
     const SSZ_SIZE: usize = VALIDATOR_PREREGISTRATION_REQUEST_SIZE;
 
+    /// Every field is a `Bytes32`, so the serialization is the field chunks.
     #[timed]
     fn hash_tree_root(bytes: &[u8]) -> B256 {
-        let d: &[u8; VALIDATOR_PREREGISTRATION_REQUEST_SIZE] = bytes.try_into().unwrap();
-        merkleize(&[*Self::pubkey(d), *Self::withdrawal_credentials(d), *Self::vrf_root(d)])
+        let (fields, []) = bytes.as_chunks() else { unreachable!("whole chunks") };
+        merkleize(fields)
     }
 }
 
 impl FixedContainer for BuilderPreregistrationRequestView {
     const SSZ_SIZE: usize = BUILDER_PREREGISTRATION_REQUEST_SIZE;
 
+    /// Every field is a `Bytes32`, so the serialization is the field chunks.
     #[timed]
     fn hash_tree_root(bytes: &[u8]) -> B256 {
-        let d: &[u8; BUILDER_PREREGISTRATION_REQUEST_SIZE] = bytes.try_into().unwrap();
-        merkleize(&[*Self::pubkey(d), *Self::withdrawal_credentials(d)])
+        let (fields, []) = bytes.as_chunks() else { unreachable!("whole chunks") };
+        merkleize(fields)
     }
 }
 

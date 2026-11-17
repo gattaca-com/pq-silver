@@ -6,6 +6,7 @@ use crate::{
         MAX_ATTESTER_SLASHINGS_ELECTRA, MAX_BLS_TO_EXECUTION_CHANGES, MAX_PAYLOAD_ATTESTATIONS,
         MAX_PROPOSER_SLASHINGS, MAX_VOLUNTARY_EXITS, PAYLOAD_ATTESTATION_SIZE,
         PROPOSER_SLASHING_SIZE, SIGNED_BLS_CHANGE_SIZE, SIGNED_VOLUNTARY_EXIT_SIZE,
+        variable_list_len,
     },
 };
 
@@ -326,16 +327,7 @@ impl<'a> BodyOffsets<'a> {
         }
 
         let fixed_count = |s: Option<&[u8]>, elem: usize| s.map_or(0, |s| s.len() / elem);
-        // Variable-size list count read from its offset table: first entry / 4.
-        let var_count = |s: Option<&[u8]>| {
-            s.map_or(0, |s| {
-                if s.len() < 4 {
-                    return 0;
-                }
-                let first = u32::from_le_bytes(s[..4].try_into().unwrap()) as usize;
-                if first > 0 && first.is_multiple_of(4) { first / 4 } else { 0 }
-            })
-        };
+        let var_count = |s: Option<&[u8]>| s.map_or(0, variable_list_len);
 
         OperationKind::ProposerSlashings.check_count(
             fixed_count(self.proposer_slashings(), PROPOSER_SLASHING_SIZE),

@@ -99,6 +99,16 @@ pub(crate) fn variable_list_ok(data: &[u8], max: usize, elem_ok: impl Fn(&[u8]) 
     true
 }
 
+/// Element count of a `List` of variable-size elements, read off its offset
+/// table's first entry.
+pub(crate) fn variable_list_len(data: &[u8]) -> usize {
+    if data.len() < 4 {
+        return 0;
+    }
+    let first = u32_le(data, 0) as usize;
+    if first > 0 && first.is_multiple_of(4) { first / 4 } else { 0 }
+}
+
 /// A container's variable-field offsets, read at `positions` in field order:
 /// the first equals the fixed part's length, they never decrease, and none
 /// points past `buf`.

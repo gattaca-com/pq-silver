@@ -28,6 +28,11 @@ impl AttestationPqView {
         if !Self::check_canonical(d) {
             return ZERO_HASH;
         }
+        Self::root_of_canonical(d)
+    }
+
+    pub(crate) fn root_of_canonical(d: &[u8]) -> B256 {
+        debug_assert!(Self::check_canonical(d));
         let aggregation_bits = Self::aggregation_bits(d);
         let aggregation_bits_root =
             hash_bitlist(ProgressiveHasher::new(), aggregation_bits, bitlist_len(aggregation_bits));
@@ -48,6 +53,11 @@ impl IndexedAttestationPqView {
         if !Self::check_size(d) {
             return ZERO_HASH;
         }
+        Self::root_of_canonical(d)
+    }
+
+    fn root_of_canonical(d: &[u8]) -> B256 {
+        debug_assert!(Self::check_size(d));
         let indices = Self::attesting_indices(d);
         Self::progressive_root(&[
             hash_uint64_list(ProgressiveHasher::new(), indices, indices.len() / 8),
@@ -63,9 +73,14 @@ impl AttesterSlashingPqView {
         if !Self::check_size(d) {
             return ZERO_HASH;
         }
+        Self::root_of_canonical(d)
+    }
+
+    pub(crate) fn root_of_canonical(d: &[u8]) -> B256 {
+        debug_assert!(Self::check_size(d));
         hash_concat(
-            &IndexedAttestationPqView::hash_tree_root(Self::attestation_1(d)),
-            &IndexedAttestationPqView::hash_tree_root(Self::attestation_2(d)),
+            &IndexedAttestationPqView::root_of_canonical(Self::attestation_1(d)),
+            &IndexedAttestationPqView::root_of_canonical(Self::attestation_2(d)),
         )
     }
 }
@@ -79,7 +94,7 @@ impl SignedAggregateAndProofPqView {
         }
         merkleize(&[
             uint64_chunk(Self::aggregator_index(d)),
-            AttestationPqView::hash_tree_root(Self::aggregate(d)),
+            AttestationPqView::root_of_canonical(Self::aggregate(d)),
             hash_fixed_bytes(Self::selection_proof(d)),
             attestation_proof_root(Self::proof(d)),
         ])

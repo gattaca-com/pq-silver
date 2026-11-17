@@ -84,7 +84,7 @@ impl ExecutionRequestsView {
 
     #[timed]
     pub fn hash_tree_root(data: &[u8]) -> B256 {
-        Self::progressive_root(&Self::LISTS.roots(data))
+        Self::progressive_root(&Self::LISTS.field_roots::<Self, 5>(data))
     }
 }
 

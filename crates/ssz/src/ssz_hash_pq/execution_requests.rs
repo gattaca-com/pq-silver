@@ -2,19 +2,20 @@ use flux_profiler::timed;
 
 use crate::{
     merkle::{B256, FixedContainer, ZERO_HASH, merkleize},
-    progressive::{ProgressiveContainer, ProgressiveHasher, active_fields},
-    ssz_hash_gloas::RequestCountOutOfBounds,
+    progressive::{ProgressiveContainer, active_fields},
+    ssz_hash_gloas::{
+        RequestCountOutOfBounds,
+        request_lists::{RequestList, RequestLists},
+    },
     ssz_view::{
-        BUILDER_DEPOSIT_REQUEST_SIZE, BUILDER_EXIT_REQUEST_SIZE,
         BUILDER_PREREGISTRATION_REQUEST_SIZE, BuilderDepositRequestView, BuilderExitRequestView,
-        BuilderPreregistrationRequestView, CONSOLIDATION_REQUEST_SIZE, ConsolidationRequestView,
-        DEPOSIT_REQUEST_SIZE, DepositRequestView, MAX_BUILDER_DEPOSIT_REQUESTS_PER_PAYLOAD,
-        MAX_BUILDER_EXIT_REQUESTS_PER_PAYLOAD, MAX_BUILDER_PREREGISTRATION_REQUESTS_PER_PAYLOAD,
-        MAX_CONSOLIDATION_REQUESTS_PER_PAYLOAD, MAX_VALIDATOR_PREREGISTRATION_REQUESTS_PER_PAYLOAD,
+        BuilderPreregistrationRequestView, ConsolidationRequestView, DepositRequestView,
+        MAX_BUILDER_DEPOSIT_REQUESTS_PER_PAYLOAD, MAX_BUILDER_EXIT_REQUESTS_PER_PAYLOAD,
+        MAX_BUILDER_PREREGISTRATION_REQUESTS_PER_PAYLOAD, MAX_CONSOLIDATION_REQUESTS_PER_PAYLOAD,
+        MAX_VALIDATOR_PREREGISTRATION_REQUESTS_PER_PAYLOAD,
         MAX_VOLUNTARY_EXIT_REQUESTS_PER_PAYLOAD, MAX_WITHDRAWAL_REQUESTS_PER_PAYLOAD,
         VALIDATOR_PREREGISTRATION_REQUEST_SIZE, VOLUNTARY_EXIT_REQUEST_SIZE,
-        ValidatorPreregistrationRequestView, VoluntaryExitRequestView, WITHDRAWAL_REQUEST_SIZE,
-        WithdrawalRequestView, fixed_list_ok, offsets_ok, variable_field,
+        ValidatorPreregistrationRequestView, VoluntaryExitRequestView, WithdrawalRequestView,
     },
 };
 
@@ -26,119 +27,69 @@ impl ProgressiveContainer for ExecutionRequestsPqView {
     const ACTIVE_FIELDS: B256 = active_fields(10, &[5, 6]);
 }
 
-#[derive(Clone, Copy)]
-struct RequestList {
-    kind: &'static str,
-    element_size: usize,
-    max: usize,
-}
-
 impl ExecutionRequestsPqView {
-    const FIXED: usize = 8 * 4;
-    const OFFSETS: [usize; 8] = [0, 4, 8, 12, 16, 20, 24, 28];
     /// Deposits are unbounded per consensus-specs #5436.
-    const LISTS: [RequestList; 8] = [
-        RequestList { kind: "deposit", element_size: DEPOSIT_REQUEST_SIZE, max: usize::MAX },
-        RequestList {
-            kind: "withdrawal",
-            element_size: WITHDRAWAL_REQUEST_SIZE,
-            max: MAX_WITHDRAWAL_REQUESTS_PER_PAYLOAD,
-        },
-        RequestList {
-            kind: "consolidation",
-            element_size: CONSOLIDATION_REQUEST_SIZE,
-            max: MAX_CONSOLIDATION_REQUESTS_PER_PAYLOAD,
-        },
-        RequestList {
-            kind: "builder_deposit",
-            element_size: BUILDER_DEPOSIT_REQUEST_SIZE,
-            max: MAX_BUILDER_DEPOSIT_REQUESTS_PER_PAYLOAD,
-        },
-        RequestList {
-            kind: "builder_exit",
-            element_size: BUILDER_EXIT_REQUEST_SIZE,
-            max: MAX_BUILDER_EXIT_REQUESTS_PER_PAYLOAD,
-        },
-        RequestList {
-            kind: "validator_preregistration",
-            element_size: VALIDATOR_PREREGISTRATION_REQUEST_SIZE,
-            max: MAX_VALIDATOR_PREREGISTRATION_REQUESTS_PER_PAYLOAD,
-        },
-        RequestList {
-            kind: "builder_preregistration",
-            element_size: BUILDER_PREREGISTRATION_REQUEST_SIZE,
-            max: MAX_BUILDER_PREREGISTRATION_REQUESTS_PER_PAYLOAD,
-        },
-        RequestList {
-            kind: "voluntary_exit",
-            element_size: VOLUNTARY_EXIT_REQUEST_SIZE,
-            max: MAX_VOLUNTARY_EXIT_REQUESTS_PER_PAYLOAD,
-        },
-    ];
+    const LISTS: RequestLists<8> = RequestLists([
+        RequestList::of::<DepositRequestView>("deposit", usize::MAX),
+        RequestList::of::<WithdrawalRequestView>("withdrawal", MAX_WITHDRAWAL_REQUESTS_PER_PAYLOAD),
+        RequestList::of::<ConsolidationRequestView>(
+            "consolidation",
+            MAX_CONSOLIDATION_REQUESTS_PER_PAYLOAD,
+        ),
+        RequestList::of::<BuilderDepositRequestView>(
+            "builder_deposit",
+            MAX_BUILDER_DEPOSIT_REQUESTS_PER_PAYLOAD,
+        ),
+        RequestList::of::<BuilderExitRequestView>(
+            "builder_exit",
+            MAX_BUILDER_EXIT_REQUESTS_PER_PAYLOAD,
+        ),
+        RequestList::of::<ValidatorPreregistrationRequestView>(
+            "validator_preregistration",
+            MAX_VALIDATOR_PREREGISTRATION_REQUESTS_PER_PAYLOAD,
+        ),
+        RequestList::of::<BuilderPreregistrationRequestView>(
+            "builder_preregistration",
+            MAX_BUILDER_PREREGISTRATION_REQUESTS_PER_PAYLOAD,
+        ),
+        RequestList::of::<VoluntaryExitRequestView>(
+            "voluntary_exit",
+            MAX_VOLUNTARY_EXIT_REQUESTS_PER_PAYLOAD,
+        ),
+    ]);
 
     /// The eight list bodies in serialization order: deposits, withdrawals,
     /// consolidations, builder deposits, builder exits, validator
-    /// preregistrations, builder preregistrations, voluntary exits. Empty on
-    /// a malformed offset table.
+    /// preregistrations, builder preregistrations, voluntary exits.
     pub fn sections(data: &[u8]) -> [&[u8]; 8] {
-        if data.len() < Self::FIXED || !offsets_ok(data, &Self::OFFSETS, Self::FIXED) {
-            return [&[]; 8];
-        }
-        std::array::from_fn(|i| variable_field(data, &Self::OFFSETS, i))
+        Self::LISTS.sections(data)
     }
 
     pub fn check_canonical(data: &[u8]) -> bool {
-        data.len() >= Self::FIXED &&
-            offsets_ok(data, &Self::OFFSETS, Self::FIXED) &&
-            Self::LISTS.iter().enumerate().all(|(i, list)| {
-                fixed_list_ok(
-                    variable_field(data, &Self::OFFSETS, i),
-                    list.element_size,
-                    usize::MAX,
-                )
-            })
+        Self::LISTS.check_canonical(data)
     }
 
     /// Spec `verify_execution_requests_limits`.
     pub fn check_counts(data: &[u8]) -> Result<(), RequestCountOutOfBounds> {
-        for (list, section) in Self::LISTS.iter().zip(Self::sections(data)) {
-            let count = section.len() / list.element_size;
-            if count > list.max {
-                return Err(RequestCountOutOfBounds { kind: list.kind, count, max: list.max });
-            }
-        }
-        Ok(())
+        Self::LISTS.check_counts(data)
     }
 
     #[timed]
     pub fn hash_tree_root(data: &[u8]) -> B256 {
-        let [
+        let [deposits, withdrawals, consolidations, builder_deposits, builder_exits, rest @ ..] =
+            Self::LISTS.roots(data);
+        let [validator_preregistrations, builder_preregistrations, voluntary_exits] = rest;
+        Self::progressive_root(&[
             deposits,
             withdrawals,
             consolidations,
             builder_deposits,
             builder_exits,
+            ZERO_HASH,
+            ZERO_HASH,
             validator_preregistrations,
             builder_preregistrations,
             voluntary_exits,
-        ] = Self::sections(data);
-        Self::progressive_root(&[
-            DepositRequestView::hash_list(ProgressiveHasher::new(), deposits),
-            WithdrawalRequestView::hash_list(ProgressiveHasher::new(), withdrawals),
-            ConsolidationRequestView::hash_list(ProgressiveHasher::new(), consolidations),
-            BuilderDepositRequestView::hash_list(ProgressiveHasher::new(), builder_deposits),
-            BuilderExitRequestView::hash_list(ProgressiveHasher::new(), builder_exits),
-            ZERO_HASH,
-            ZERO_HASH,
-            ValidatorPreregistrationRequestView::hash_list(
-                ProgressiveHasher::new(),
-                validator_preregistrations,
-            ),
-            BuilderPreregistrationRequestView::hash_list(
-                ProgressiveHasher::new(),
-                builder_preregistrations,
-            ),
-            VoluntaryExitRequestView::hash_list(ProgressiveHasher::new(), voluntary_exits),
         ])
     }
 }

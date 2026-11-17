@@ -86,12 +86,18 @@ impl ProgressiveContainer for ExecutionPayloadEnvelopeView {
 
 impl ExecutionPayloadEnvelopeView {
     pub fn hash_tree_root(d: &[u8]) -> B256 {
+        Self::hash_tree_root_with(d, ExecutionRequestsView::hash_tree_root)
+    }
+
+    /// The envelope over whichever fork's `ExecutionRequests` layout
+    /// `hash_requests` reads.
+    pub(crate) fn hash_tree_root_with(d: &[u8], hash_requests: fn(&[u8]) -> B256) -> B256 {
         if !Self::check_size(d) {
             return ZERO_HASH;
         }
         let fields = [
             ExecutionPayloadView::hash_tree_root_gloas(Self::payload(d)),
-            ExecutionRequestsView::hash_tree_root(Self::execution_requests(d)),
+            hash_requests(Self::execution_requests(d)),
             uint64_chunk(Self::builder_index(d)),
             *Self::beacon_block_root(d),
             *Self::parent_beacon_block_root(d),

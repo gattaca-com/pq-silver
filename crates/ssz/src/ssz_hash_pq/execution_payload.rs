@@ -2,11 +2,10 @@ use flux_profiler::timed;
 
 use super::ExecutionRequestsPqView;
 use crate::{
-    merkle::{B256, ZERO_HASH, hash_fixed_bytes, merkleize, uint64_chunk},
-    progressive::ProgressiveContainer,
+    merkle::{B256, ZERO_HASH, hash_fixed_bytes, merkleize},
     ssz_view::{
-        ExecutionPayloadBidView, ExecutionPayloadEnvelopeView, ExecutionPayloadView,
-        SignedExecutionPayloadBidPqView, SignedExecutionPayloadEnvelopePqView,
+        ExecutionPayloadBidView, ExecutionPayloadEnvelopeView, SignedExecutionPayloadBidPqView,
+        SignedExecutionPayloadEnvelopePqView,
     },
 };
 
@@ -24,19 +23,9 @@ impl SignedExecutionPayloadBidPqView {
 }
 
 impl ExecutionPayloadEnvelopeView {
-    /// The Gloas envelope over PQ `ExecutionRequests`.
     #[timed]
     pub fn hash_tree_root_pq(d: &[u8]) -> B256 {
-        if !Self::check_size(d) {
-            return ZERO_HASH;
-        }
-        Self::progressive_root(&[
-            ExecutionPayloadView::hash_tree_root_gloas(Self::payload(d)),
-            ExecutionRequestsPqView::hash_tree_root(Self::execution_requests(d)),
-            uint64_chunk(Self::builder_index(d)),
-            *Self::beacon_block_root(d),
-            *Self::parent_beacon_block_root(d),
-        ])
+        Self::hash_tree_root_with(d, ExecutionRequestsPqView::hash_tree_root)
     }
 }
 

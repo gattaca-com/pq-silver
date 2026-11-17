@@ -374,29 +374,19 @@ impl BeaconBlockBodyPqView {
     /// `verify_execution_requests_limits` on the parent requests.
     pub fn check_operation_limits(body: &[u8]) -> Result<(), BlockBodyError> {
         debug_assert!(Self::check_canonical(body));
-        let check = |op, count, max| {
-            if count > max {
-                Err(BlockBodyError::OperationCountOutOfBounds { op, count, max })
-            } else {
-                Ok(())
-            }
-        };
-        check(
-            OperationKind::ProposerSlashings,
+        OperationKind::ProposerSlashings.check_count(
             Self::proposer_slashings(body).len() / PROPOSER_SLASHING_PQ_SIZE,
             MAX_PROPOSER_SLASHINGS,
         )?;
-        check(
-            OperationKind::AttesterSlashings,
+        OperationKind::AttesterSlashings.check_count(
             variable_containers(Self::attester_slashings(body)).count(),
             MAX_ATTESTER_SLASHINGS_ELECTRA,
         )?;
-        check(
-            OperationKind::Attestations,
+        OperationKind::Attestations.check_count(
             variable_containers(Self::attestations(body)).count(),
             MAX_ATTESTATIONS_PQ,
         )?;
-        check(OperationKind::Deposits, Self::deposits(body).len() / DEPOSIT_SIZE, 0)?;
+        OperationKind::Deposits.check_count(Self::deposits(body).len() / DEPOSIT_SIZE, 0)?;
         ExecutionRequestsPqView::check_counts(Self::parent_execution_requests(body))?;
         Ok(())
     }

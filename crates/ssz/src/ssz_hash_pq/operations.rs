@@ -1,26 +1,22 @@
 use flux_profiler::timed;
 
 use crate::{
-    merkle::{B256, FixedContainer, hash_concat, hash_fixed_bytes},
-    ssz_hash::hash_beacon_block_header_bytes,
+    merkle::{B256, FixedContainer, hash_concat},
+    ssz_hash::hash_signed_beacon_block_header,
     ssz_view::{
-        BEACON_BLOCK_HEADER_SIZE, PROPOSER_SLASHING_PQ_SIZE, ProposerSlashingPqView, XMSSSignature,
+        PROPOSER_SLASHING_PQ_SIZE, ProposerSlashingPqView, SIGNED_BEACON_BLOCK_HEADER_PQ_SIZE,
     },
 };
-
-fn signed_header_root(header: &[u8; BEACON_BLOCK_HEADER_SIZE], signature: &XMSSSignature) -> B256 {
-    hash_concat(&hash_beacon_block_header_bytes(header), &hash_fixed_bytes(signature))
-}
 
 impl FixedContainer for ProposerSlashingPqView {
     const SSZ_SIZE: usize = PROPOSER_SLASHING_PQ_SIZE;
 
     #[timed]
     fn hash_tree_root(bytes: &[u8]) -> B256 {
-        let d: &[u8; PROPOSER_SLASHING_PQ_SIZE] = bytes.try_into().unwrap();
+        let (header_1, header_2) = bytes.split_at(SIGNED_BEACON_BLOCK_HEADER_PQ_SIZE);
         hash_concat(
-            &signed_header_root(Self::header_1(d), Self::signature_1(d)),
-            &signed_header_root(Self::header_2(d), Self::signature_2(d)),
+            &hash_signed_beacon_block_header(header_1),
+            &hash_signed_beacon_block_header(header_2),
         )
     }
 }

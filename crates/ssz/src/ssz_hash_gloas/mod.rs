@@ -12,6 +12,7 @@ mod execution_payload_bid;
 mod execution_requests;
 mod payload_attestation;
 mod proposer_preferences;
+pub(crate) mod request_lists;
 
 pub use execution_requests::{
     EMPTY_EXECUTION_REQUESTS, EMPTY_EXECUTION_REQUESTS_ROOT, ExecutionRequestsView,

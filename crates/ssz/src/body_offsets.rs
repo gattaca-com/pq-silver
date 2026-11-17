@@ -20,6 +20,16 @@ pub enum OperationKind {
     PayloadAttestations,
 }
 
+impl OperationKind {
+    pub(crate) fn check_count(self, count: usize, max: usize) -> Result<(), BlockBodyError> {
+        if count > max {
+            Err(BlockBodyError::OperationCountOutOfBounds { op: self, count, max })
+        } else {
+            Ok(())
+        }
+    }
+}
+
 impl core::fmt::Display for OperationKind {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         let s = match self {
@@ -315,13 +325,6 @@ impl<'a> BodyOffsets<'a> {
             }
         }
 
-        let check = |op: OperationKind, count: usize, max: usize| -> Result<(), BlockBodyError> {
-            if count > max {
-                Err(BlockBodyError::OperationCountOutOfBounds { op, count, max })
-            } else {
-                Ok(())
-            }
-        };
         let fixed_count = |s: Option<&[u8]>, elem: usize| s.map_or(0, |s| s.len() / elem);
         // Variable-size list count read from its offset table: first entry / 4.
         let var_count = |s: Option<&[u8]>| {
@@ -334,28 +337,19 @@ impl<'a> BodyOffsets<'a> {
             })
         };
 
-        check(
-            OperationKind::ProposerSlashings,
+        OperationKind::ProposerSlashings.check_count(
             fixed_count(self.proposer_slashings(), PROPOSER_SLASHING_SIZE),
             MAX_PROPOSER_SLASHINGS,
         )?;
-        check(
-            OperationKind::AttesterSlashings,
-            var_count(self.attester_slashings()),
-            MAX_ATTESTER_SLASHINGS_ELECTRA,
-        )?;
-        check(
-            OperationKind::Attestations,
-            var_count(self.attestations()),
-            MAX_ATTESTATIONS_ELECTRA,
-        )?;
-        check(
-            OperationKind::VoluntaryExits,
+        OperationKind::AttesterSlashings
+            .check_count(var_count(self.attester_slashings()), MAX_ATTESTER_SLASHINGS_ELECTRA)?;
+        OperationKind::Attestations
+            .check_count(var_count(self.attestations()), MAX_ATTESTATIONS_ELECTRA)?;
+        OperationKind::VoluntaryExits.check_count(
             fixed_count(self.voluntary_exits(), SIGNED_VOLUNTARY_EXIT_SIZE),
             MAX_VOLUNTARY_EXITS,
         )?;
-        check(
-            OperationKind::BlsToExecutionChanges,
+        OperationKind::BlsToExecutionChanges.check_count(
             fixed_count(self.bls_changes(), SIGNED_BLS_CHANGE_SIZE),
             MAX_BLS_TO_EXECUTION_CHANGES,
         )?;
@@ -370,8 +364,7 @@ impl<'a> BodyOffsets<'a> {
         }
 
         if self.fork == BodyFork::Gloas {
-            check(
-                OperationKind::PayloadAttestations,
+            OperationKind::PayloadAttestations.check_count(
                 fixed_count(self.payload_attestations(), PAYLOAD_ATTESTATION_SIZE),
                 MAX_PAYLOAD_ATTESTATIONS,
             )?;

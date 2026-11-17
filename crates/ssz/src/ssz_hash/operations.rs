@@ -16,10 +16,11 @@ use crate::{
     },
 };
 
+/// The signature runs to the end of `d`, so this serves BLS and XMSS headers.
 #[timed]
 pub fn hash_signed_beacon_block_header(d: &[u8]) -> B256 {
     let msg = hash_beacon_block_header_bytes(&d[..112]);
-    let sig = hash_fixed_bytes(&d[112..208]);
+    let sig = hash_fixed_bytes(&d[112..]);
     hash_concat(&msg, &sig)
 }
 

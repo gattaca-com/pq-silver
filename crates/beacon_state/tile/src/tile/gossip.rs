@@ -1088,10 +1088,9 @@ impl BeaconStateTile {
             return Feedback::reject("proposer preferences wrong proposer");
         }
 
-        // `compute_fork_version(proposal_epoch)`: Gloas is the last scheduled fork.
         let domain = bls::compute_domain(
             bls::DOMAIN_PROPOSER_PREFERENCES,
-            view.imm.gloas_fork_version,
+            self.spec.fork_version_at(proposal_epoch),
             &view.imm.genesis_validators_root,
         );
         let signing_root = bls::compute_signing_root(&Prefs::hash_tree_root(prefs), &domain);

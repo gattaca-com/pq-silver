@@ -137,7 +137,7 @@ impl GossipTopic {
     }
 
     pub const fn supports_format(self, format: ForkName) -> bool {
-        !self.is_gloas_only() || matches!(format, ForkName::Gloas)
+        !self.is_gloas_only() || matches!(format, ForkName::Gloas | ForkName::Pq)
     }
 }
 

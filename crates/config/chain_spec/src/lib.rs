@@ -472,6 +472,16 @@ impl SpecConfig {
     }
 
     #[inline]
+    pub fn is_pq_at(&self, epoch: u64) -> bool {
+        epoch >= self.pq_fork_epoch
+    }
+
+    #[inline]
+    pub fn is_pq_at_slot(&self, slot: u64) -> bool {
+        self.is_pq_at(slot / SLOTS_PER_EPOCH)
+    }
+
+    #[inline]
     pub fn is_gloas_activation_epoch(&self, epoch: u64) -> bool {
         epoch == self.gloas_fork_epoch
     }

@@ -124,8 +124,6 @@ aes = "0.8"
 aes-gcm = "0.10"
 alloy-rlp = { version = "0.3.12", default-features = false, features = ["derive", "std"] }
 base64 = "0.22"
-# Upstream leanXMSS with EthLib vectors and support for the workspace's Rust 1.91.
-leanvm_signatures = { package = "signatures", git = "https://github.com/leanEthereum/leanVM", rev = "8ba3bd912a55c795eecc516aa9690d63da7ae2e8" }
 blst = {version = "0.3.16", features = ["no-threads"]}
 buffa = "0.2.0"
 buffa-build = "0.2.0"

@@ -1963,7 +1963,7 @@ impl BeaconStateTile {
                 }
                 let expected = silver_common::xmss::SlotDuty::BeaconProposer.leaf(Header::slot(a));
                 for sig in [Slashing::signature_1(slashing), Slashing::signature_2(slashing)] {
-                    if expected != Some(silver_common::xmss::leaf_index(sig)) {
+                    if expected != Some(silver_crypto_simd::xmss::leaf_index(sig)) {
                         return Feedback::reject("incorrect XMSS proposer slashing leaf");
                     }
                 }

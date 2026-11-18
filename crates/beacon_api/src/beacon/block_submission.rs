@@ -34,7 +34,7 @@ pub(crate) fn post_block_v2(req: &Request<'_>, ctx: &ApiCtx, resp: &mut Response
         }
         let signature = silver_common::ssz_view::SignedBeaconBlockPqView::signature(body);
         if silver_common::xmss::SlotDuty::BeaconProposer.leaf(slot) !=
-            Some(silver_common::xmss::leaf_index(signature))
+            Some(silver_crypto_simd::xmss::leaf_index(signature))
         {
             return resp.error(400, "incorrect XMSS proposer leaf");
         }

@@ -1,8 +1,6 @@
-//! leanXMSS verification for the PQ consensus fork. The public key is the
-//! 16-byte tree root followed by the 16-byte public parameter.
-use leanvm_signatures::lean_xmss::{self, LeanXmssPublicKey, LeanXmssSignature};
+//! XMSS leaf assignments for PQ consensus duties.
 
-use crate::ssz_view::{XMSSPubkey, XMSSSignature};
+use crate::ssz_view::XMSSSignature;
 
 const RESERVED: u64 = 1 << 15;
 const ATTESTATION_LEAVES: u64 = 1 << 29;
@@ -29,24 +27,8 @@ pub fn attestation_leaf(epoch: u64) -> Option<u32> {
 }
 
 pub fn builder_bid_leaf(signature: &XMSSSignature) -> Option<u32> {
-    let index = leaf_index(signature);
+    let index = silver_crypto_simd::xmss::leaf_index(signature);
     (BID_START..SLOT_START).contains(&u64::from(index)).then_some(index)
-}
-
-pub fn leaf_index(signature: &XMSSSignature) -> u32 {
-    u32::from_le_bytes(signature[..4].try_into().unwrap())
-}
-
-/// Verify an upstream leanXMSS signature at the leaf assigned to this duty.
-pub fn verify(
-    pubkey: &XMSSPubkey,
-    leaf: u32,
-    message: &[u8; 32],
-    signature: &XMSSSignature,
-) -> bool {
-    let signature = LeanXmssSignature::from_bytes(signature);
-    signature.leaf_index == leaf &&
-        lean_xmss::verify(&LeanXmssPublicKey::from_bytes(pubkey), message, &signature).is_ok()
 }
 
 #[cfg(test)]
@@ -79,15 +61,20 @@ mod tests {
             assert_eq!(duty.leaf(u64::MAX), None);
         }
     }
+
     #[test]
     fn consensus_spec_known_answer() {
+        use silver_crypto_simd::xmss::verify;
+
+        use crate::ssz_view::XMSSPubkey;
+
         let vector: serde_json::Value =
             serde_json::from_str(include_str!("../tests/fixtures/xmss_kat.json")).unwrap();
         let decode = |name: &str| hex::decode(vector[name].as_str().unwrap()).unwrap();
         let pk: XMSSPubkey = decode("pubkey").try_into().unwrap();
         let mut message: [u8; 32] = decode("message").try_into().unwrap();
         let mut signature: XMSSSignature = decode("signature").try_into().unwrap();
-        let leaf = vector["leaf_index"].as_u64().unwrap() as u32;
+        let leaf = vector["leaf_index"].as_u64().unwrap();
         assert!(verify(&pk, leaf, &message, &signature));
         assert!(!verify(&pk, leaf + 1, &message, &signature));
         assert!(!verify(&[0; 32], leaf, &message, &signature));

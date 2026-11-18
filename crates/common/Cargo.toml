@@ -10,7 +10,6 @@ alloy-rlp.workspace = true
 backtrace.workspace = true
 base64.workspace = true
 blst.workspace = true
-leanvm_signatures.workspace = true
 buffa.workspace = true
 bytes.workspace = true
 flux.workspace = true

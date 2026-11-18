@@ -81,7 +81,7 @@ impl SubmittedEntry for SubmittedAttestation {
         let signature = match (&self.signature, ctx.spec.fork_at_slot(self.data.slot)) {
             (AttesterSignature::Xmss(sig), ForkName::Pq) => {
                 if silver_common::xmss::attestation_leaf(self.data.target.epoch) !=
-                    Some(silver_common::xmss::leaf_index(sig))
+                    Some(silver_crypto_simd::xmss::leaf_index(sig))
                 {
                     return Err("incorrect XMSS attestation leaf");
                 }

@@ -9,6 +9,8 @@ use crate::xmss::{
 
 const TARGET_SUM: u32 = 106;
 pub(super) const LAST_POSITION: u8 = 3;
+/// Chain steps from any codeword to the chain ends.
+pub(super) const CHAIN_STEPS: usize = CHAINS * LAST_POSITION as usize - TARGET_SUM as usize;
 
 /// Digits of `digest`, two bits each little endian, when they form a codeword:
 /// digits past `CHAINS` zero and the rest summing to `TARGET_SUM`.

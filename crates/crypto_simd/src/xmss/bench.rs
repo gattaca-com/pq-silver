@@ -107,3 +107,56 @@ fn sign() {
     }
     report("sign, bottom tree built (mean of 64)", start.elapsed().as_nanos() as f64 / 64.0);
 }
+
+// Eight signers, one signature each, built on parallel threads (~2 s). Lanes
+// with distinct digits are the realistic case; identical lanes are the A/A.
+#[test]
+#[ignore]
+fn verify_distinct_signers() {
+    use crate::xmss::{HEIGHT, Item, SecretKey, verify, verify_batch};
+
+    let signed: Vec<_> = std::thread::scope(|s| {
+        let handles: Vec<_> = (0..LANES as u8)
+            .map(|k| {
+                s.spawn(move || {
+                    let key = SecretKey::new(&[k + 1; 32]);
+                    let idx = u32::from(k) << HEIGHT | 17 * u32::from(k);
+                    let message = [k ^ 0x5a; 32];
+                    let sig = key.sign(&key.bottom_tree(idx >> HEIGHT), &message, idx);
+                    (key.public_key(), u64::from(idx), message, sig)
+                })
+            })
+            .collect();
+        handles.into_iter().map(|h| h.join().unwrap()).collect()
+    });
+    let items: Vec<_> = signed
+        .iter()
+        .map(|(pk, idx, message, sig)| Item {
+            public_key: pk,
+            leaf_index: *idx,
+            message,
+            signature: sig,
+        })
+        .collect();
+
+    let mut ok = [false; LANES];
+    let mut tampered = *items[3].signature;
+    tampered[4 + 16] ^= 1;
+    let mut one_bad: Vec<_> = items.iter().map(|it| Item { ..*it }).collect();
+    one_bad[3].signature = &tampered;
+    verify_batch(&one_bad, &mut ok);
+    assert_eq!(ok, std::array::from_fn(|l| l != 3));
+
+    let same: Vec<_> = (0..LANES).map(|_| Item { ..items[0] }).collect();
+    for (what, group) in [("same signature x8", &same), ("8 distinct signers", &items)] {
+        let per_batch = min_ns(|| verify_batch(group, &mut ok));
+        assert!(ok.iter().all(|&ok| ok), "{what}");
+        report(&format!("verify_batch {what}, per sig"), per_batch / LANES as f64);
+    }
+    let it = &items[0];
+    assert!(verify(it.public_key, it.leaf_index, it.message, it.signature));
+    report(
+        "verify, scalar",
+        min_ns(|| verify(it.public_key, it.leaf_index, it.message, it.signature)),
+    );
+}

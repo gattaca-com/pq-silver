@@ -1,7 +1,7 @@
 //! Verification of up to `LANES` signatures in lockstep, each permutation
-//! 8-way. Chain steps run at every position on every lane; a lane takes a
-//! step's output only from the position its digit names on. A short group
-//! repeats its first item on the spare lanes.
+//! 8-way. Every codeword leaves `CHAIN_STEPS` chain steps, so each lane walks
+//! its own chains and none idles. A short group repeats its first item on the
+//! spare lanes.
 
 use crate::xmss::{
     BOTTOM_LAYER, CHAINS, Digest, HEIGHT, LAYER_SIG_LEN, MSG, NODE, PATH_AT, SIGNATURE_LEN,
@@ -9,7 +9,7 @@ use crate::xmss::{
     lanes::{LANES, absorb, digest, pad, permutation_lanes},
     leaf_index,
     ots_lanes::{chain_step, leaf_hashes, p_words},
-    wots::{LAST_POSITION, codeword},
+    wots::{CHAIN_STEPS, LAST_POSITION, codeword},
 };
 
 pub struct Item<'a> {
@@ -101,13 +101,22 @@ impl<'a> Group<'a> {
                 chain[l] = *value;
             }
         }
+        // A lane that is not a codeword walks a prefix of its all-zero digits.
+        let mut chain = [[0u8; LANES]; CHAIN_STEPS];
+        let mut position = [[0u8; LANES]; CHAIN_STEPS];
+        for (l, x) in x.iter().enumerate() {
+            let steps = (0..CHAINS).flat_map(|i| (x[i]..LAST_POSITION).map(move |mu| (i, mu)));
+            for (k, (i, mu)) in steps.take(CHAIN_STEPS).enumerate() {
+                chain[k][l] = i as u8;
+                position[k][l] = mu;
+            }
+        }
         let words = p_words(&self.p);
-        for (i, value) in values.iter_mut().enumerate() {
-            for mu in 0..LAST_POSITION {
-                let take: [bool; LANES] = std::array::from_fn(|l| x[l][i] <= mu);
-                if take.contains(&true) {
-                    chain_step(&words, layer, e, i, mu, value, &take);
-                }
+        for (chain, position) in chain.iter().zip(&position) {
+            let mut value = std::array::from_fn(|l| values[chain[l] as usize][l]);
+            chain_step(&words, layer, e, chain, position, &mut value);
+            for (l, value) in value.into_iter().enumerate() {
+                values[chain[l] as usize][l] = value;
             }
         }
 

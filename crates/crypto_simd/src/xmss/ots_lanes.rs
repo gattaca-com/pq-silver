@@ -16,33 +16,30 @@ pub(super) fn p_words(p: &[Digest; LANES]) -> PWords {
     [std::array::from_fn(|l| word(l, 0)), std::array::from_fn(|l| word(l, 8))]
 }
 
-/// Step `mu` of chain `i` on every lane; lanes with `take` keep the result. The
-/// block is `P ∥ A_chain ∥ value ∥ LE128(i)`, written as words, padded.
+/// Step `mu[l]` of chain `i[l]` on each lane. The block is
+/// `P ∥ A_chain ∥ value ∥ LE128(i)`, written as words, padded.
 pub(super) fn chain_step(
     p: &PWords,
     layer: u32,
     e: &[u32; LANES],
-    i: usize,
-    mu: u8,
+    i: &[u8; LANES],
+    mu: &[u8; LANES],
     values: &mut [Digest; LANES],
-    take: &[bool; LANES],
 ) {
     let mut lanes = [[0u64; LANES]; 25];
     lanes[0] = p[0];
     lanes[1] = p[1];
-    lanes[2] = std::array::from_fn(|l| address_word(CHAIN, mu, hi(layer, 0), e[l]));
+    lanes[2] = std::array::from_fn(|l| address_word(CHAIN, mu[l], hi(layer, 0), e[l]));
     for (l, value) in values.iter().enumerate() {
         lanes[4][l] = u64::from_le_bytes(value[..8].try_into().unwrap());
         lanes[5][l] = u64::from_le_bytes(value[8..].try_into().unwrap());
     }
-    lanes[6] = [i as u64; LANES];
+    lanes[6] = i.map(u64::from);
     lanes[8] = [0x01; LANES];
     lanes[RATE_WORDS - 1] = [0x80 << 56; LANES];
     permutation_lanes(&mut lanes);
     for (l, value) in values.iter_mut().enumerate() {
-        if take[l] {
-            *value = digest(&lanes, l, 0);
-        }
+        *value = digest(&lanes, l, 0);
     }
 }
 
@@ -106,7 +103,7 @@ pub(super) fn ots_leaves(secret: &Secret, layer: u32, e: &[u32; LANES]) -> [Dige
     let mut values = chain_starts(secret, layer, e);
     for (i, value) in values.iter_mut().enumerate() {
         for mu in 0..LAST_POSITION {
-            chain_step(&words, layer, e, i, mu, value, &[true; LANES]);
+            chain_step(&words, layer, e, &[i as u8; LANES], &[mu; LANES], value);
         }
     }
     leaf_hashes(&p, layer, e, &values)

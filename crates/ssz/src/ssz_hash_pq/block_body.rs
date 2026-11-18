@@ -21,7 +21,7 @@ impl BeaconBlockBodyPqView {
         if !Self::check_canonical(body) {
             return ZERO_HASH;
         }
-        Self::progressive_root(&[
+        Self::root_of_active_fields(&[
             hash_fixed_bytes(Self::randao_reveal(body)),
             hash_eth1_data_bytes(Self::eth1_data(body)),
             *Self::graffiti(body),
@@ -40,13 +40,9 @@ impl BeaconBlockBodyPqView {
                 AttestationPqView::root_of_canonical,
             ),
             DepositView::hash_list(ProgressiveHasher::new(), Self::deposits(body)),
-            ZERO_HASH,
-            ZERO_HASH,
-            ZERO_HASH,
             SignedExecutionPayloadBidPqView::hash_tree_root(Self::signed_execution_payload_bid(
                 body,
             )),
-            ZERO_HASH,
             ExecutionRequestsPqView::hash_tree_root(Self::parent_execution_requests(body)),
             attestation_proof_root(Self::proof(body)),
         ])

@@ -39,7 +39,7 @@ impl AttestationPqView {
         let data_root = hash_attestation_data(&d[4..132]);
         let mut committee_bits = ZERO_HASH;
         committee_bits[..8].copy_from_slice(Self::committee_bits(d));
-        Self::progressive_root(&[aggregation_bits_root, data_root, ZERO_HASH, committee_bits])
+        Self::root_of_active_fields(&[aggregation_bits_root, data_root, committee_bits])
     }
 }
 
@@ -59,7 +59,7 @@ impl IndexedAttestationPqView {
     fn root_of_canonical(d: &[u8]) -> B256 {
         debug_assert!(Self::check_size(d));
         let indices = Self::attesting_indices(d);
-        Self::progressive_root(&[
+        Self::root_of_active_fields(&[
             hash_uint64_list(ProgressiveHasher::new(), indices, indices.len() / 8),
             hash_attestation_data(&d[4..132]),
             attestation_proof_root(Self::proof(d)),

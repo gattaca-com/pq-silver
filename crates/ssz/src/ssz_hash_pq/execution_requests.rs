@@ -76,7 +76,7 @@ impl ExecutionRequestsPqView {
 
     #[timed]
     pub fn hash_tree_root(data: &[u8]) -> B256 {
-        Self::progressive_root(&Self::LISTS.field_roots::<Self, 10>(data))
+        Self::root_of_active_fields(&Self::LISTS.roots(data))
     }
 }
 

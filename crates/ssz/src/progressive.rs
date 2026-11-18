@@ -102,6 +102,40 @@ pub trait ProgressiveContainer {
         );
         mix_in_active_fields(&merkleize_progressive(field_roots), &Self::ACTIVE_FIELDS)
     }
+
+    /// Root over the roots of the active fields only, in field order: each
+    /// inactive field's zero chunk is placed from `ACTIVE_FIELDS`.
+    fn root_of_active_fields(active_roots: &[B256]) -> B256 {
+        let width = const {
+            let width = active_width(&Self::ACTIVE_FIELDS);
+            assert!(width <= MAX_SCATTERED_WIDTH);
+            width
+        };
+        let mut roots = active_roots.iter();
+        let mut field_roots = ArrayVec::<B256, MAX_SCATTERED_WIDTH>::new();
+        for i in 0..width {
+            let active = (Self::ACTIVE_FIELDS[i / 8] >> (i % 8)) & 1 == 1;
+            field_roots.push(if active {
+                *roots.next().expect("a root per active field")
+            } else {
+                ZERO_HASH
+            });
+        }
+        debug_assert!(roots.next().is_none(), "an active field per root");
+        Self::progressive_root(field_roots.as_slice())
+    }
+}
+
+/// Widest layout [`ProgressiveContainer::root_of_active_fields`] takes.
+const MAX_SCATTERED_WIDTH: usize = 64;
+
+/// Fields up to and including the last active one.
+const fn active_width(active_fields: &B256) -> usize {
+    let mut i = 256;
+    while i > 0 && (active_fields[(i - 1) / 8] >> ((i - 1) % 8)) & 1 == 0 {
+        i -= 1;
+    }
+    i
 }
 
 /// `pack_bits([1] * n)` as a `Bitvector[256]` chunk — the `active_fields`
@@ -167,6 +201,19 @@ mod tests {
             *byte = (n(b[i * 2]) << 4) | n(b[i * 2 + 1]);
         }
         out
+    }
+
+    #[test]
+    fn active_roots_fill_around_gaps() {
+        struct Gapped;
+        impl ProgressiveContainer for Gapped {
+            const ACTIVE_FIELDS: B256 = active_fields(6, &[1, 4]);
+        }
+        let [a, b, c, d] = [e(1), e(2), e(3), e(4)];
+        assert_eq!(
+            Gapped::root_of_active_fields(&[a, b, c, d]),
+            Gapped::progressive_root(&[a, ZERO_HASH, b, c, ZERO_HASH, d]),
+        );
     }
 
     #[test]

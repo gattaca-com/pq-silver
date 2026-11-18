@@ -421,6 +421,7 @@ impl PeerManager {
             }
         }
         self.sweep_work.drop_inactive_subscriptions = true;
+        self.on_subscriptions_changed(emit);
     }
 
     pub fn activate_topics(
@@ -530,8 +531,14 @@ impl PeerManager {
     fn on_subscriptions_changed(&mut self, emit: &mut impl FnMut(PeerControl)) {
         let (attnets, syncnets) = build_subnet_masks(&self.our_topics);
         let attnets = u64::from_le_bytes(attnets) | self.duty_attnets;
-        self.required_attnets = attnets.to_le_bytes();
-        self.required_syncnets = syncnets;
+        let mut active_mask = 0;
+        let mut has_sync = false;
+        for domain in self.active_gossip_domains.into_iter().flatten() {
+            active_mask |= silver_common::attestation_subnet_mask(domain.format());
+            has_sync |= GossipTopic::SyncCommittee(0).supports_format(domain.format());
+        }
+        self.required_attnets = (attnets & active_mask).to_le_bytes();
+        self.required_syncnets = if has_sync { syncnets } else { 0 };
         for (deficit, required) in self.deficit_attnets.iter_mut().zip(self.required_attnets) {
             *deficit &= required;
         }
@@ -539,8 +546,24 @@ impl PeerManager {
         self.advertise_syncnets(emit);
     }
 
+    pub fn advertise_attnets(&mut self, attnets: [u8; 8], emit: &mut impl FnMut(PeerControl)) {
+        if MetadataView::attnets(&self.metadata) == &attnets {
+            return;
+        }
+        let seq = MetadataView::seq_number(&self.metadata) + 1;
+        self.metadata[..8].copy_from_slice(&seq.to_le_bytes());
+        self.metadata[8..16].copy_from_slice(&attnets);
+        emit(PeerControl::UpdateEnrAttnets { attnets });
+    }
+
     fn advertise_syncnets(&mut self, emit: &mut impl FnMut(PeerControl)) {
-        let syncnets = self.long_lived_syncnets | self.required_syncnets;
+        let syncnets = if self.active_gossip_domains[0]
+            .is_some_and(|domain| domain.format() == silver_common::ForkName::Pq)
+        {
+            0
+        } else {
+            self.long_lived_syncnets | self.required_syncnets
+        };
         if syncnets == MetadataView::syncnets(&self.metadata) {
             return;
         }

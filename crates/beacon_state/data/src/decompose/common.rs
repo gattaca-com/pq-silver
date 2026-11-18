@@ -293,6 +293,7 @@ impl Immutable {
         self.capella_fork_version = cfg.capella_fork_version;
         self.gloas_fork_version = cfg.gloas_fork_version;
         self.pq_fork_version = cfg.pq_fork_version;
+        self.pq_fork_epoch = cfg.pq_fork_epoch;
     }
 
     #[timed]

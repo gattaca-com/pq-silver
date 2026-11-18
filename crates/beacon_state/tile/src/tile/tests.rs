@@ -2293,6 +2293,80 @@ fn backfill_block_response_is_not_parked() {
     assert_eq!(tile.held.orphans.parents(), 1, "live block parks on its missing parent");
 }
 
+#[test]
+fn pq_rpc_and_gossip_check_the_same_block_and_envelope_framing() {
+    use silver_common::{ForkName, GossipDomain, RpcOffence, ssz_view::*};
+    let spec = SpecConfig { pq_fork_epoch: 1, ..SpecConfig::mainnet() };
+    let digest = spec.fork_digest_at(1, &[0; 32]);
+    let (mut tile, mut gossip, mut rpc, _spine, mut adapter) =
+        tile_with_producers_on(32, BeaconState::empty_test(0), spec);
+    adapter.consume(|_: PeerEvent, _| {});
+
+    let mut block = vec![0; SIGNED_PQ_FIXED + BEACON_BLOCK_FIXED];
+    block[..4].copy_from_slice(&(SIGNED_PQ_FIXED as u32).to_le_bytes());
+    block[SIGNED_PQ_FIXED..][..8].copy_from_slice(&32u64.to_le_bytes());
+    block[SIGNED_PQ_FIXED + 80..].copy_from_slice(&(BEACON_BLOCK_FIXED as u32).to_le_bytes());
+    let vectors = include_str!("../../../../ssz/tests/fixtures/pq/reference_vectors.txt");
+    let body = vectors.lines().find_map(|line| line.strip_prefix("BeaconBlockBody ")).unwrap();
+    let hex = body.split_once(' ').unwrap().0;
+    block
+        .extend((0..hex.len()).step_by(2).map(|i| u8::from_str_radix(&hex[i..i + 2], 16).unwrap()));
+
+    let mut envelope =
+        vec![
+            0;
+            SIGNED_PQ_FIXED + EXECUTION_PAYLOAD_ENVELOPE_MIN + EXECUTION_PAYLOAD_FIXED_GLOAS + 32
+        ];
+    envelope[..4].copy_from_slice(&(SIGNED_PQ_FIXED as u32).to_le_bytes());
+    let message = &mut envelope[SIGNED_PQ_FIXED..];
+    let requests_start = EXECUTION_PAYLOAD_ENVELOPE_MIN + EXECUTION_PAYLOAD_FIXED_GLOAS;
+    message[..4].copy_from_slice(&(EXECUTION_PAYLOAD_ENVELOPE_MIN as u32).to_le_bytes());
+    message[4..8].copy_from_slice(&(requests_start as u32).to_le_bytes());
+    for pos in [436, 504, 508, 528] {
+        message[EXECUTION_PAYLOAD_ENVELOPE_MIN + pos..][..4]
+            .copy_from_slice(&(EXECUTION_PAYLOAD_FIXED_GLOAS as u32).to_le_bytes());
+    }
+    for offset in message[requests_start..].chunks_exact_mut(4) {
+        offset.copy_from_slice(&32u32.to_le_bytes());
+    }
+    for (topic, kind, mut bytes) in [
+        (GossipTopic::BeaconBlock, DataKind::Block, block),
+        (GossipTopic::ExecutionPayload, DataKind::Envelope, envelope),
+    ] {
+        for valid_framing in [true, false] {
+            if !valid_framing {
+                bytes[..4].copy_from_slice(&100u32.to_le_bytes());
+            }
+            let mut msg = gossip_msg(&mut gossip, &bytes, topic);
+            msg.domain = GossipDomain::new(digest, ForkName::Pq);
+            let ssz = tcache_write(&mut rpc, &bytes);
+            let response = match topic {
+                GossipTopic::BeaconBlock => RpcResponse::BeaconBlock { fork_digest: digest, ssz },
+                _ => RpcResponse::ExecutionPayloadEnvelope { fork_digest: digest, ssz },
+            };
+            tile.on_rpc_inbound(
+                RpcInbound::Response(RpcResponseInbound {
+                    application_id: RequestId { kind, origin: Origin::Live, seq: 0 }.into(),
+                    stream_id: msg.stream_id,
+                    response,
+                }),
+                &mut adapter.producers,
+            );
+            tile.on_gossip(msg, &mut adapter.producers);
+            let mut penalties = (0, 0);
+            adapter.consume(|event: PeerEvent, _| match event {
+                PeerEvent::RpcMisbehaviour { offence: RpcOffence::ChunkFraming, .. } => {
+                    penalties.0 += 1
+                }
+                PeerEvent::P2pGossipInvalidMsg { .. } => penalties.1 += 1,
+                PeerEvent::SendGossip { .. } => panic!("unverified message relayed"),
+                _ => {}
+            });
+            assert_eq!(penalties, if valid_framing { (0, 0) } else { (1, 1) });
+        }
+    }
+}
+
 /// Storage's historical envelopes ride the same response queue. Their block
 /// is long gone from fork choice, so handling one spends a signature check on
 /// traffic that is not ours.
@@ -6404,7 +6478,7 @@ fn answer_bid(
 #[test]
 fn a_gloas_block_commits_to_the_pooled_bid() {
     use silver_beacon_state_data::{BUILDER_INDEX_SELF_BUILD, BodyFork, BodyOffsets};
-    use silver_common::ssz_view::{BeaconBlockBodyGloasView, SignedExecutionPayloadBidView};
+    use silver_common::ssz_view::BeaconBlockBodyGloasView;
 
     let (pre_ssz, block_ssz, _) = sanity_fixture_of("gloas", "empty_block_transition");
     let spec = SpecConfig { fulu_fork_epoch: 0, gloas_fork_epoch: 0, ..SpecConfig::mainnet() };
@@ -6452,7 +6526,7 @@ fn a_gloas_block_commits_to_the_pooled_bid() {
     let empty = produce(&mut tile, unpooled).expect("built empty");
     assert!(is_empty_self_build(&produced_bid(&tile, empty)));
 
-    tile.payload_bids_pool.add(bid.clone(), *SignedExecutionPayloadBidView::signature(signed_bid));
+    tile.payload_bids_pool.add(bid.clone(), signed_bid);
     let block = produce(&mut tile, proposal(0)).expect("built on the pooled bid");
     assert!(block.payload.is_none());
     assert_eq!(produced_bid(&tile, block), signed_bid);
@@ -6472,7 +6546,7 @@ fn a_proposal_waits_on_its_builders_and_falls_back_to_the_pool() {
     use silver_beacon_state_data::{BodyFork, BodyOffsets};
     use silver_common::{
         BuilderBid, BuilderBidsRequest, BuilderBidsResponse, BuilderTerms,
-        ssz_view::{BeaconBlockBodyGloasView, SignedExecutionPayloadBidView},
+        ssz_view::BeaconBlockBodyGloasView,
     };
 
     use super::seen_proposer_preferences::ProposerPreferences;
@@ -6499,7 +6573,7 @@ fn a_proposal_waits_on_its_builders_and_falls_back_to_the_pool() {
         ProposerPreferences { fee_recipient: bid.fee_recipient, target_gas_limit: bid.gas_limit },
         false,
     );
-    tile.payload_bids_pool.add(bid.clone(), *SignedExecutionPayloadBidView::signature(signed_bid));
+    tile.payload_bids_pool.add(bid.clone(), signed_bid);
     let mut produce = |tile: &mut BeaconStateTile,
                        builder_config_hash,
                        builder_bid: Option<&[u8]>| {
@@ -6647,7 +6721,7 @@ fn concurrent_builder_configs_report_their_winning_bids_total_payment() {
             slot / SLOTS_PER_EPOCH,
         );
         let signature = test_signing::sign(0, &signing_root);
-        let checked = tile.check_bid_on_parent(&bid, &signature, |_| true);
+        let checked = tile.check_bid_on_parent(&bid, &signature, |_, _| true);
         assert!(checked.is_ok(), "{checked:?}");
         let mut signed_bid = 100u32.to_le_bytes().to_vec();
         signed_bid.extend_from_slice(&signature);

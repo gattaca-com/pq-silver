@@ -1,7 +1,5 @@
 use silver_chain_spec::{ForkName, SpecConfig};
-use silver_common::{
-    FAR_FUTURE_EPOCH, GossipDomain, GossipTopic, SLOTS_PER_EPOCH, ticker::SlotTicker,
-};
+use silver_common::{GossipDomain, GossipTopic, SLOTS_PER_EPOCH, ticker::SlotTicker};
 
 const ADVANCE_EPOCHS: u64 = 1;
 const RETAIN_EPOCHS: u64 = 2;
@@ -47,14 +45,7 @@ impl GossipSchedule {
         genesis_validators_root: &[u8; 32],
         ticker: SlotTicker,
     ) -> Self {
-        let mut epochs: Vec<_> = ForkName::ALL
-            .into_iter()
-            .map(|fork| spec.fork_epoch(fork))
-            .chain(spec.blob_schedule.iter().map(|entry| entry.epoch))
-            .filter(|epoch| *epoch != FAR_FUTURE_EPOCH)
-            .collect();
-        epochs.sort_unstable();
-        epochs.dedup();
+        let epochs = spec.digest_transition_epochs();
         let mut transitions: Vec<Transition> = Vec::with_capacity(epochs.len());
         for epoch in epochs {
             let domain = GossipDomain::new(

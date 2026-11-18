@@ -175,6 +175,9 @@ impl BeaconStateTile {
         }
         let block_root = *PayloadAttestationData::beacon_block_root(data);
         let slot = PayloadAttestationData::slot(data);
+        if self.spec.is_pq_at_slot(slot) {
+            return Err(Feedback::reject("BLS payload attestation for a PQ slot"));
+        }
         let present = PayloadAttestationData::payload_present(data);
         let da = PayloadAttestationData::blob_data_available(data);
 

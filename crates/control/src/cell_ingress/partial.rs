@@ -227,7 +227,9 @@ impl CellIngress {
 fn parse(format: ForkName, payload: &[u8]) -> Option<PartialColumnView<'_>> {
     match format {
         ForkName::Fulu => PartialDataColumnSidecarFuluView::parse(payload),
-        ForkName::Gloas | ForkName::Pq => PartialDataColumnSidecarGloasView::parse(payload),
+        ForkName::Gloas | ForkName::Eip8483 | ForkName::Pq => {
+            PartialDataColumnSidecarGloasView::parse(payload)
+        }
         _ => None,
     }
 }

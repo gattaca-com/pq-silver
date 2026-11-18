@@ -72,8 +72,12 @@ impl ShufflingEntry {
 
     fn shuffling(&self) -> stf::EpochShuffling<'_> {
         let aggs = (!self.committee_aggs.is_empty()).then_some(self.committee_aggs.as_slice());
-        stf::EpochShuffling::new(&self.shuffled_indices, self.required_validator_count)
-            .with_committee_aggs(aggs)
+        stf::EpochShuffling::new(
+            &self.shuffled_indices,
+            self.required_validator_count,
+            self.id.is_some_and(|id| id.is_pq),
+        )
+        .with_committee_aggs(aggs)
     }
 
     /// Invalid until the complete shuffled active set is ready.
@@ -96,7 +100,10 @@ impl ShufflingEntry {
         view: &StateReadView,
         aggregator: &mut bls::PubkeyAggregator,
     ) {
-        if self.committee_aggs.is_empty() && !self.shuffled_indices.is_empty() {
+        if !self.id.is_some_and(|id| id.is_pq) &&
+            self.committee_aggs.is_empty() &&
+            !self.shuffled_indices.is_empty()
+        {
             self.compute_committee_aggs(view, aggregator);
         }
     }
@@ -108,8 +115,11 @@ impl ShufflingEntry {
         view: &StateReadView,
         aggregator: &mut bls::PubkeyAggregator,
     ) {
-        let shuffling =
-            stf::EpochShuffling::new(&self.shuffled_indices, self.required_validator_count);
+        let shuffling = stf::EpochShuffling::new(
+            &self.shuffled_indices,
+            self.required_validator_count,
+            self.id.is_some_and(|id| id.is_pq),
+        );
         for slot_in_epoch in 0..SLOTS_PER_EPOCH {
             for ci in 0..shuffling.committees_per_slot {
                 self.committee_aggs.push(

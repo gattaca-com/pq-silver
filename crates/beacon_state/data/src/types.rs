@@ -233,6 +233,7 @@ pub struct Immutable {
     pub capella_fork_version: Version,
     pub gloas_fork_version: Version,
     pub pq_fork_version: Version,
+    pub pq_fork_epoch: Epoch,
 }
 
 impl Immutable {
@@ -260,6 +261,7 @@ impl Default for Immutable {
             capella_fork_version: Version::default(),
             gloas_fork_version: GLOAS_FORK_VERSION,
             pq_fork_version: PQ_FORK_VERSION,
+            pq_fork_epoch: FAR_FUTURE_EPOCH,
         }
     }
 }

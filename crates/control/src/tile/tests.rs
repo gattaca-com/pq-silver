@@ -330,6 +330,57 @@ fn status_published_before_the_first_loop_is_received() {
 }
 
 #[test]
+fn pq_cutover_rotates_advertised_attnets_with_configured_subnets() {
+    use silver_common::{NodeId, ssz_view::MetadataView};
+
+    let node = NodeId::new(&[7; 32]);
+    let mut capture = GossipPublications::new(GossipTopic::BeaconAttestation(16), b"attestation");
+    capture.observer.consume(|_: PeerControl, _| {});
+    capture.controller.spec = Arc::new(SpecConfig {
+        gloas_fork_epoch: 0,
+        pq_fork_epoch: 10,
+        blob_schedule: vec![],
+        ..SpecConfig::mainnet()
+    });
+    let configured = (1 << 16) | (1 << 15);
+    capture.controller.set_attestation_subnet_assignment(node, 2, configured);
+    let mut ticker = SlotTicker::new(0, &capture.controller.spec, Duration::from_secs(3));
+    ticker.set_current_slot(9 * SLOTS_PER_EPOCH);
+    capture.controller.set_gossip_clock(ticker, &[0; 32]);
+    let mut last = 0;
+    for (epoch, format) in
+        [(9, ForkName::Gloas), (10, ForkName::Pq), (12, ForkName::Pq), (249, ForkName::Pq)]
+    {
+        capture
+            .controller
+            .gossip_schedule
+            .as_mut()
+            .unwrap()
+            .ticker
+            .set_current_slot(epoch * SLOTS_PER_EPOCH);
+        capture.crank();
+        let expected = u64::from_le_bytes(node.attestation_subnets(format, epoch, 2)) |
+            configured & silver_common::attestation_subnet_mask(format);
+        assert_eq!(
+            *MetadataView::attnets(capture.controller.peer_manager.metadata()),
+            expected.to_le_bytes()
+        );
+        let mut updated = Vec::new();
+        capture.observer.consume(|event: PeerControl, _| {
+            if let PeerControl::UpdateEnrAttnets { attnets } = event {
+                updated.push(attnets);
+            }
+        });
+        if last != expected {
+            assert_eq!(updated, vec![expected.to_le_bytes()]);
+        } else {
+            assert!(updated.is_empty());
+        }
+        last = expected;
+    }
+}
+
+#[test]
 fn gossip_cutover_uses_clock_despite_delayed_status_and_keeps_old_routing_until_retirement() {
     let topic = GossipTopic::DataColumnSidecar(5);
     let bytes = b"validated gossip frame";

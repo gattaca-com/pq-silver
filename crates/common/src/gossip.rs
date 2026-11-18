@@ -31,6 +31,7 @@ use crate::{
 };
 
 mod hash;
+mod pq;
 mod traffic;
 
 pub use hash::{
@@ -154,9 +155,12 @@ impl GossipTopic {
     }
 
     pub const fn supports_format(self, format: ForkName) -> bool {
+        if let Self::BeaconAttestation(id) = self {
+            return id < attestation_subnet_count(format) as u64;
+        }
         match format {
             ForkName::Pq => !self.is_removed_in_pq(),
-            ForkName::Gloas => true,
+            ForkName::Gloas | ForkName::Eip8483 => true,
             _ => !self.is_gloas_only(),
         }
     }
@@ -164,6 +168,17 @@ impl GossipTopic {
 
 pub const ATTESTATION_SUBNETS: usize = 64;
 pub const ATTESTATION_SUBNETS_PQ: usize = 16;
+
+pub const fn attestation_subnet_count(format: ForkName) -> usize {
+    match format {
+        ForkName::Pq => ATTESTATION_SUBNETS_PQ,
+        _ => ATTESTATION_SUBNETS,
+    }
+}
+
+pub const fn attestation_subnet_mask(format: ForkName) -> u64 {
+    u64::MAX >> (64 - attestation_subnet_count(format))
+}
 
 pub struct SubnetsBySlot {
     slots: [SlotSubnets; Self::SLOTS],
@@ -217,12 +232,13 @@ impl SubnetsBySlot {
 }
 
 pub fn compute_subnet_for_attestation(
+    format: ForkName,
     committees_per_slot: u64,
     slot: u64,
     committee_index: u64,
 ) -> u64 {
     let committees_since_epoch_start = committees_per_slot * (slot % SLOTS_PER_EPOCH);
-    (committees_since_epoch_start + committee_index) % ATTESTATION_SUBNETS as u64
+    (committees_since_epoch_start + committee_index) % attestation_subnet_count(format) as u64
 }
 
 const ATTESTATION_BASE: usize = 2;
@@ -633,8 +649,8 @@ mod tests {
         let max = |topic: GossipTopic| topic.max_uncompressed_size(ForkName::Pq);
         let min = |topic: GossipTopic| topic.min_uncompressed_size(ForkName::Pq);
         assert_eq!(max(GossipTopic::BeaconBlock), 10_485_760);
-        assert_eq!(max(GossipTopic::BeaconAggregateAndProof), 1_068_549);
-        assert_eq!(max(GossipTopic::AttesterSlashing), 4_194_584);
+        assert_eq!(max(GossipTopic::BeaconAggregateAndProof), 1_055_231);
+        assert_eq!(max(GossipTopic::AttesterSlashing), 2_621_720);
         assert_eq!(max(GossipTopic::ExecutionPayloadBid), 199_240);
         assert_eq!(max(GossipTopic::BeaconAttestation(0)), 2_548);
         assert_eq!(min(GossipTopic::BeaconAttestation(0)), 2_548);
@@ -642,7 +658,7 @@ mod tests {
         assert_eq!(max(GossipTopic::PayloadAttestationMessage), 2_454);
         assert_eq!(max(GossipTopic::ProposerPreferences), 2_480);
         assert_eq!(min(GossipTopic::BeaconBlock), 2_492);
-        assert_eq!(min(GossipTopic::BeaconAggregateAndProof), 3_588);
+        assert_eq!(min(GossipTopic::BeaconAggregateAndProof), 2_559);
         assert_eq!(min(GossipTopic::AttesterSlashing), 280);
     }
 }

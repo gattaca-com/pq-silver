@@ -1,7 +1,7 @@
 use std::ops::Range;
 
 use flux::type_hash_derive::TypeHash;
-use silver_ssz::ssz_view::MAX_COMMITTEES_PER_SLOT;
+use silver_ssz::ssz_view::{MAX_COMMITTEES_PER_SLOT, MAX_COMMITTEES_PER_SLOT_PQ};
 
 use crate::{
     StateReadView,
@@ -15,6 +15,7 @@ use crate::{
 pub struct ShufflingId {
     pub epoch: Epoch,
     pub dependent_root: B256,
+    pub is_pq: bool,
 }
 
 impl ShufflingId {
@@ -28,7 +29,7 @@ impl ShufflingId {
             slot.latest_block_root,
             slot.slot,
         )?;
-        Some(Self { epoch, dependent_root })
+        Some(Self { epoch, dependent_root, is_pq: epoch >= view.imm.pq_fork_epoch })
     }
 
     pub fn decision_slot(&self) -> Slot {
@@ -56,9 +57,9 @@ pub fn committee_range(
     start..end
 }
 
-pub fn committees_per_slot(active_validator_count: usize) -> usize {
+pub fn committees_per_slot(active_validator_count: usize, is_pq: bool) -> usize {
     let per_slot = active_validator_count / SLOTS_PER_EPOCH as usize / TARGET_COMMITTEE_SIZE;
-    per_slot.clamp(1, MAX_COMMITTEES_PER_SLOT)
+    per_slot.clamp(1, if is_pq { MAX_COMMITTEES_PER_SLOT_PQ } else { MAX_COMMITTEES_PER_SLOT })
 }
 
 /// Where one position of the shuffled active set attests.

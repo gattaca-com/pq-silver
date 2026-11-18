@@ -176,20 +176,27 @@ fn main() -> Result<(), Box<dyn Error>> {
     let boot_wall_slot = ticker.current_slot();
     let boot_epoch = boot_wall_slot / SLOTS_PER_EPOCH;
     let attnet_count = config.attestation_subnet_count();
-    let subnets = local_enr.node_id().attestation_subnets(boot_epoch, attnet_count);
-    local_enr.set_attnets(subnets, keypair.secret_key())?;
+    let subnets =
+        local_enr.node_id().attestation_subnets(spec.fork_at(boot_epoch), boot_epoch, attnet_count);
+    let boot_format = spec.fork_at(boot_epoch);
     let mut gossip_topics = config.gossip_topics()?;
-    let mut long_lived_attnets = u64::from_le_bytes(subnets);
+    let mut configured_attnets = 0u64;
     let mut long_lived_syncnets = config.sync_committee_subnets().long_lived();
     // Configured subnet topics subscribe at boot, so duties never leave them.
     for topic in &gossip_topics {
         match *topic {
-            GossipTopic::BeaconAttestation(subnet) => long_lived_attnets |= 1 << subnet,
+            GossipTopic::BeaconAttestation(subnet) => configured_attnets |= 1 << subnet,
             GossipTopic::SyncCommittee(subnet) => long_lived_syncnets |= 1 << subnet,
             _ => {}
         }
     }
-    local_enr.set_syncnets(long_lived_syncnets, keypair.secret_key())?;
+    let long_lived_attnets = u64::from_le_bytes(subnets) | configured_attnets;
+    let advertised = long_lived_attnets & silver_common::attestation_subnet_mask(boot_format);
+    local_enr.set_attnets(advertised.to_le_bytes(), keypair.secret_key())?;
+    local_enr.set_syncnets(
+        if boot_format == silver_common::ForkName::Pq { 0 } else { long_lived_syncnets },
+        keypair.secret_key(),
+    )?;
 
     // Cluster configuration
     let data_dir = Path::new(&chain_config.data_dir);
@@ -316,6 +323,11 @@ fn main() -> Result<(), Box<dyn Error>> {
         long_lived_attnets,
         long_lived_syncnets,
     )?;
+    control_tile.set_attestation_subnet_assignment(
+        local_enr.node_id(),
+        attnet_count,
+        configured_attnets,
+    );
     control_tile = control_tile
         .with_data_columns_cache(
             cell_config.clone(),

@@ -84,7 +84,7 @@ impl Shuffling {
     }
 
     pub(crate) fn committees_per_slot(&self) -> usize {
-        committees_per_slot(self.order.len())
+        committees_per_slot(self.order.len(), self.id.is_some_and(|id| id.is_pq))
     }
 
     pub(crate) fn position(&self, validator_index: u64) -> Option<u32> {
@@ -109,7 +109,7 @@ mod tests {
     const ACTIVE: u32 = 8192;
 
     fn id(epoch: Epoch) -> ShufflingId {
-        ShufflingId { epoch, dependent_root: [0; 32] }
+        ShufflingId { epoch, dependent_root: [0; 32], is_pq: false }
     }
 
     /// The active set reversed and rotated by `epoch`, so epochs differ.

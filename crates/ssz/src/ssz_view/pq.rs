@@ -3,10 +3,10 @@ use super::{
     BYTES_PER_KZG_COMMITMENT, DEPOSIT_SIZE, ETH1_DATA_SIZE, EXECUTION_PAYLOAD_BID_MAX,
     EXECUTION_PAYLOAD_BID_MIN, EXECUTION_PAYLOAD_ENVELOPE_MIN, ExecutionPayloadBidView,
     ExecutionPayloadEnvelopeView, ExecutionPayloadView, MAX_ATTESTER_SLASHINGS_ELECTRA,
-    MAX_ATTESTING_INDICES, MAX_BLOB_COMMITMENTS_PER_BLOCK, MAX_PAYLOAD_SIZE,
-    MAX_PROPOSER_SLASHINGS, PAYLOAD_ATTESTATION_DATA_SIZE, PROPOSER_PREFERENCES_SIZE, bitlist_ok,
-    fixed, fixed_list_ok, offsets_ok, u32_le, u64_le, variable_field, variable_list_len,
-    variable_list_ok,
+    MAX_BLOB_COMMITMENTS_PER_BLOCK, MAX_PAYLOAD_SIZE, MAX_PROPOSER_SLASHINGS,
+    MAX_VALIDATORS_PER_COMMITTEE, PAYLOAD_ATTESTATION_DATA_SIZE, PROPOSER_PREFERENCES_SIZE,
+    bitlist_ok, fixed, fixed_list_ok, offsets_ok, u32_le, u64_le, variable_field,
+    variable_list_len, variable_list_ok,
 };
 use crate::{
     body_offsets::{BlockBodyError, OperationKind},
@@ -19,6 +19,10 @@ pub const VRF_TREE_DEPTH: usize = 31;
 pub const VRF_PROOF_SIZE: usize = (VRF_TREE_DEPTH + 1) * 32;
 pub const MAX_STARK_PROOF_SIZE: usize = 1 << 20;
 
+pub const MAX_COMMITTEES_PER_SLOT_PQ: usize = 16;
+pub const MAX_ATTESTING_INDICES_PQ: usize =
+    MAX_VALIDATORS_PER_COMMITTEE * MAX_COMMITTEES_PER_SLOT_PQ;
+const COMMITTEE_BYTES: usize = MAX_COMMITTEES_PER_SLOT_PQ / 8;
 pub const MAX_ATTESTATIONS_PQ: usize = 16;
 pub const MAX_VALIDATOR_PREREGISTRATION_REQUESTS_PER_PAYLOAD: usize = 64;
 pub const MAX_BUILDER_PREREGISTRATION_REQUESTS_PER_PAYLOAD: usize = 4;
@@ -67,13 +71,13 @@ impl SingleAttestationPqView {
 
 // -- Attestation (block-body element, aggregate) -----------------------
 //
-// Variable, fixed part 140B. `signature` is gone.
-//   [0..4)     offset: aggregation_bits (== 140)
+// Variable, fixed part 134B. `signature` is gone.
+//   [0..4)     offset: aggregation_bits (== 134)
 //   [4..132)   data (AttestationData 128B)
-//   [132..140) committee_bits (Bitvector[64])
-//   [140..)    aggregation_bits (Bitlist)
+//   [132..134) committee_bits (Bitvector[16])
+//   [134..)    aggregation_bits (Bitlist)
 
-pub const ATTESTATION_PQ_FIXED: usize = 4 + ATTESTATION_DATA_SIZE + 8;
+pub const ATTESTATION_PQ_FIXED: usize = 4 + ATTESTATION_DATA_SIZE + COMMITTEE_BYTES;
 
 #[derive(Clone, Copy, Debug, Hash, PartialEq, Eq)]
 #[repr(C)]
@@ -85,7 +89,7 @@ impl AttestationPqView {
         AttestationDataView(fixed(buf, 4))
     }
     #[inline]
-    pub fn committee_bits(buf: &[u8]) -> &[u8; 8] {
+    pub fn committee_bits(buf: &[u8]) -> &[u8; COMMITTEE_BYTES] {
         fixed(buf, 132)
     }
     #[inline]
@@ -96,7 +100,7 @@ impl AttestationPqView {
     pub fn check_canonical(buf: &[u8]) -> bool {
         buf.len() >= ATTESTATION_PQ_FIXED &&
             u32_le(buf, 0) as usize == ATTESTATION_PQ_FIXED &&
-            bitlist_ok(&buf[ATTESTATION_PQ_FIXED..], MAX_ATTESTING_INDICES)
+            bitlist_ok(&buf[ATTESTATION_PQ_FIXED..], MAX_ATTESTING_INDICES_PQ)
     }
 }
 
@@ -110,7 +114,7 @@ impl AttestationPqView {
 
 pub const INDEXED_ATTESTATION_PQ_FIXED: usize = 4 + ATTESTATION_DATA_SIZE + 4;
 pub const INDEXED_ATTESTATION_PQ_MAX: usize =
-    INDEXED_ATTESTATION_PQ_FIXED + MAX_ATTESTING_INDICES * 8 + MAX_STARK_PROOF_SIZE;
+    INDEXED_ATTESTATION_PQ_FIXED + MAX_ATTESTING_INDICES_PQ * 8 + MAX_STARK_PROOF_SIZE;
 
 #[derive(Clone, Copy, Debug, Hash, PartialEq, Eq)]
 #[repr(C)]
@@ -139,7 +143,7 @@ impl IndexedAttestationPqView {
         {
             return false;
         }
-        fixed_list_ok(Self::attesting_indices(buf), 8, MAX_ATTESTING_INDICES) &&
+        fixed_list_ok(Self::attesting_indices(buf), 8, MAX_ATTESTING_INDICES_PQ) &&
             Self::proof(buf).len() <= MAX_STARK_PROOF_SIZE
     }
 }
@@ -152,7 +156,7 @@ impl IndexedAttestationPqView {
 
 pub const ATTESTER_SLASHING_PQ_MIN: usize = 8 + 2 * INDEXED_ATTESTATION_PQ_FIXED;
 pub const ATTESTER_SLASHING_PQ_MAX: usize = 8 + 2 * INDEXED_ATTESTATION_PQ_MAX;
-const _: () = assert!(ATTESTER_SLASHING_PQ_MAX == 4_194_584, "MAX_ATTESTER_SLASHING_SIZE_PQ");
+const _: () = assert!(ATTESTER_SLASHING_PQ_MAX == 2_621_720, "MAX_ATTESTER_SLASHING_SIZE_PQ");
 
 #[derive(Clone, Copy, Debug, Hash, PartialEq, Eq)]
 #[repr(C)]
@@ -397,22 +401,20 @@ impl BeaconBlockBodyPqView {
 //   [0..4)       offset: message (== 2408)
 //   [4..2408)    signature
 //   [2408..2416) aggregator_index
-//   [2416..2420) offset: aggregate (relative to 2408, == 1040)
-//   [2420..3444) selection_proof (VRFProof)
-//   [3444..3448) offset: proof (relative to 2408)
-//   [3448..3452) aggregate offset: aggregation_bits (relative to 3448, == 140)
-//   [3452..3580) aggregate.data
-//   [3580..3588) aggregate.committee_bits
-//   [3588..)     aggregate.aggregation_bits | proof
+//   [2416..2420) offset: aggregate (relative to message, == 16)
+//   [2420..2424) offset: proof (relative to message)
+//   [2424..)     aggregate | proof
 
-const AGGREGATE_AND_PROOF_PQ_FIXED: usize = 8 + 4 + VRF_PROOF_SIZE + 4;
+const AGGREGATE_AND_PROOF_PQ_FIXED: usize = 8 + 4 + 4;
 const AGGREGATE_PQ_START: usize = SIGNED_PQ_FIXED + AGGREGATE_AND_PROOF_PQ_FIXED;
 
-pub const SIGNED_AGG_PROOF_PQ_MIN: usize = AGGREGATE_PQ_START + ATTESTATION_PQ_FIXED;
+const AGGREGATION_BITS_START: usize = AGGREGATE_PQ_START + ATTESTATION_PQ_FIXED;
+// Even an empty bitlist has a delimiter byte.
+pub const SIGNED_AGG_PROOF_PQ_MIN: usize = AGGREGATION_BITS_START + 1;
 pub const SIGNED_AGG_PROOF_PQ_MAX: usize =
-    SIGNED_AGG_PROOF_PQ_MIN + MAX_ATTESTING_INDICES / 8 + 1 + MAX_STARK_PROOF_SIZE;
+    SIGNED_AGG_PROOF_PQ_MIN + MAX_ATTESTING_INDICES_PQ / 8 + MAX_STARK_PROOF_SIZE;
 const _: () =
-    assert!(SIGNED_AGG_PROOF_PQ_MAX == 1_068_549, "MAX_SIGNED_AGGREGATE_AND_PROOF_SIZE_PQ");
+    assert!(SIGNED_AGG_PROOF_PQ_MAX == 1_055_231, "MAX_SIGNED_AGGREGATE_AND_PROOF_SIZE_PQ");
 
 #[derive(Clone, Copy, Debug, Hash, PartialEq, Eq)]
 #[repr(C)]
@@ -432,10 +434,6 @@ impl SignedAggregateAndProofPqView {
     pub fn aggregator_index(buf: &[u8]) -> u64 {
         u64_le(buf, SIGNED_PQ_FIXED)
     }
-    #[inline]
-    pub fn selection_proof(buf: &[u8]) -> &VRFProof {
-        fixed(buf, SIGNED_PQ_FIXED + 12)
-    }
     /// Serialized `Attestation`.
     #[inline]
     pub fn aggregate(buf: &[u8]) -> &[u8] {
@@ -446,12 +444,12 @@ impl SignedAggregateAndProofPqView {
         AttestationDataView(fixed(buf, AGGREGATE_PQ_START + 4))
     }
     #[inline]
-    pub fn agg_committee_bits(buf: &[u8]) -> &[u8; 8] {
+    pub fn agg_committee_bits(buf: &[u8]) -> &[u8; COMMITTEE_BYTES] {
         fixed(buf, AGGREGATE_PQ_START + 132)
     }
     #[inline]
     pub fn agg_aggregation_bits(buf: &[u8]) -> &[u8] {
-        &buf[SIGNED_AGG_PROOF_PQ_MIN..Self::proof_start(buf)]
+        &buf[AGGREGATION_BITS_START..Self::proof_start(buf)]
     }
     #[inline]
     pub fn proof(buf: &[u8]) -> &[u8] {
@@ -460,7 +458,7 @@ impl SignedAggregateAndProofPqView {
 
     #[inline]
     fn proof_start(buf: &[u8]) -> usize {
-        SIGNED_PQ_FIXED + u32_le(buf, SIGNED_PQ_FIXED + 12 + VRF_PROOF_SIZE) as usize
+        SIGNED_PQ_FIXED + u32_le(buf, SIGNED_PQ_FIXED + 12) as usize
     }
 
     /// Pins every offset the accessors hardcode and checks the aggregate is

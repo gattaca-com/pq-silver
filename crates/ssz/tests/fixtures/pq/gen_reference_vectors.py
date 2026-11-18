@@ -12,6 +12,7 @@ pyspec build. Regenerate against a consensus-specs checkout of the `pq` branch a
 `generate_specs` writes the git-ignored `tests/core/pyspec/eth_consensus_specs/<fork>/`.
 """
 
+import hashlib
 import random
 import sys
 
@@ -242,3 +243,18 @@ if __name__ == "__main__":
         for _ in range(4):
             value = gen()
             print(name, value.encode_bytes().hex(), value.hash_tree_root().hex())
+            if name == "AggregateAndProof":
+                version = bytes.fromhex("e0000000")
+                genesis_validators_root = bytes(range(32))
+                fork_root = hashlib.sha256(
+                    version.ljust(32, b"\x00") + genesis_validators_root
+                ).digest()
+                domain = bytes.fromhex("06000000") + fork_root[:28]
+                signing_data = spec.SigningData(
+                    object_root=value.hash_tree_root(), domain=spec.Domain(domain)
+                )
+                print(
+                    "AggregateSigningRoot",
+                    value.encode_bytes().hex(),
+                    signing_data.hash_tree_root().hex(),
+                )

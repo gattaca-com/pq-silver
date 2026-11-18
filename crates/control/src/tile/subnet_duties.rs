@@ -60,11 +60,21 @@ impl SubnetChanges {
 
 impl SubnetDuties {
     pub(super) fn new(long_lived: Subnets) -> Self {
-        Self { long_lived, ..Self::default() }
+        Self { long_lived, joined: long_lived, ..Self::default() }
     }
 
     pub(super) fn long_lived(&self) -> Subnets {
         self.long_lived
+    }
+
+    pub(super) fn set_long_lived_attnets(&mut self, attnets: u64, pending: bool) {
+        if self.long_lived.attnets != attnets {
+            self.long_lived.attnets = attnets;
+            if pending {
+                self.joined.attnets = attnets;
+            }
+            self.evaluated_at = None;
+        }
     }
 
     pub(super) fn set_rejoin_wait(&mut self, wait: Duration, slot_duration: Duration) {
@@ -125,12 +135,12 @@ impl SubnetDuties {
         // backoff.
         let due_before_rejoin =
             self.subnets_due(wall_slot, self.rejoin_guard_slots, |duty| duty.aggregating);
-        let attnets = (due | self.joined.attnets & due_before_rejoin) & !self.long_lived.attnets;
+        let attnets = due | self.joined.attnets & due_before_rejoin | self.long_lived.attnets;
         let wall_epoch = wall_slot / SLOTS_PER_EPOCH;
         let syncnets = (0..SYNC_COMMITTEE_SUBNETS)
             .filter(|&subnet| self.sync_epochs[subnet].contains(&wall_epoch))
-            .fold(0, |mask, subnet| mask | 1 << subnet) &
-            !self.long_lived.syncnets;
+            .fold(0, |mask, subnet| mask | 1 << subnet) |
+            self.long_lived.syncnets;
         Subnets { attnets, syncnets }
     }
 

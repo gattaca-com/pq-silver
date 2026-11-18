@@ -167,7 +167,7 @@ mod tests {
             assert_eq!(duties.len(), ACTIVE as usize);
 
             let order = posted_order(epoch);
-            let per_slot = committees_per_slot(order.len());
+            let per_slot = committees_per_slot(order.len(), false);
             let mut seen = vec![false; ACTIVE as usize];
             for duty in duties {
                 let index = field(duty, "validator_index");

@@ -1,11 +1,11 @@
-use serde::Deserialize;
+use serde::{Deserialize, Deserializer, de};
 use silver_beacon_state_data::{SLOTS_PER_EPOCH, bls};
 use silver_common::{
-    GossipTopic, compute_subnet_for_attestation,
-    json_fields::{bytes, uint64},
+    ForkName, GossipTopic, compute_subnet_for_attestation,
+    json_fields::{bytes, parse_hex, uint64},
     ssz_view::{
         ATTESTATION_DATA_SIZE, MAX_ATTESTING_INDICES, PROPOSER_SLASHING_SIZE,
-        SIGNED_BLS_CHANGE_SIZE, SIGNED_VOLUNTARY_EXIT_SIZE, SINGLE_ATT_SIZE,
+        SIGNED_BLS_CHANGE_SIZE, SIGNED_VOLUNTARY_EXIT_SIZE, XMSSSignature,
     },
 };
 
@@ -28,8 +28,35 @@ struct SubmittedAttestation {
     #[serde(deserialize_with = "uint64")]
     attester_index: u64,
     data: AttestationData,
-    #[serde(deserialize_with = "bytes")]
-    signature: [u8; 96],
+    signature: AttesterSignature,
+}
+
+enum AttesterSignature {
+    Bls([u8; 96]),
+    Xmss(Box<XMSSSignature>),
+}
+
+impl<'de> Deserialize<'de> for AttesterSignature {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let text = <&str>::deserialize(deserializer)?;
+        match text.len() {
+            194 => parse_hex(text).map(Self::Bls),
+            n if n == 2 + 2 * size_of::<XMSSSignature>() => {
+                parse_hex(text).map(|sig| Self::Xmss(Box::new(sig)))
+            }
+            _ => None,
+        }
+        .ok_or_else(|| de::Error::custom("invalid attester signature encoding"))
+    }
+}
+
+impl AttesterSignature {
+    fn bytes(&self) -> &[u8] {
+        match self {
+            Self::Bls(sig) => sig,
+            Self::Xmss(sig) => sig.as_slice(),
+        }
+    }
 }
 
 impl SubmittedEntry for SubmittedAttestation {
@@ -41,12 +68,30 @@ impl SubmittedEntry for SubmittedAttestation {
         if self.committee_index >= committees_per_slot {
             return Err("committee_index is past the epoch's committee count");
         }
-        let subnet =
-            compute_subnet_for_attestation(committees_per_slot, slot, self.committee_index);
+        let subnet = compute_subnet_for_attestation(
+            ctx.spec.fork_at_slot(slot),
+            committees_per_slot,
+            slot,
+            self.committee_index,
+        );
         Ok([GossipTopic::BeaconAttestation(subnet)])
     }
 
     fn signature_check(&self, ctx: &ApiCtx) -> Result<Option<SignatureCheck>, &'static str> {
+        let signature = match (&self.signature, ctx.spec.fork_at_slot(self.data.slot)) {
+            (AttesterSignature::Xmss(sig), ForkName::Pq) => {
+                if silver_common::xmss::attestation_leaf(self.data.target.epoch) !=
+                    Some(silver_common::xmss::leaf_index(sig))
+                {
+                    return Err("incorrect XMSS attestation leaf");
+                }
+                return Err("PQ validator state unavailable");
+            }
+            (AttesterSignature::Bls(_), ForkName::Pq) | (AttesterSignature::Xmss(_), _) => {
+                return Err("signature encoding does not match attestation fork")
+            }
+            (AttesterSignature::Bls(signature), _) => *signature,
+        };
         let pubkey = ctx
             .read_state(|view| signing_key(&view, self.attester_index))
             .ok_or("attester_index is past the validator count")?;
@@ -55,13 +100,13 @@ impl SubmittedEntry for SubmittedAttestation {
             validator: self.attester_index,
             epoch: self.data.target.epoch,
             pubkey,
-            signature: self.signature,
+            signature,
             signing_root: bls::compute_signing_root(&self.data.hash_tree_root(), &domain),
         }))
     }
 
     fn ssz_len(&self) -> usize {
-        SINGLE_ATT_SIZE
+        16 + ATTESTATION_DATA_SIZE + self.signature.bytes().len()
     }
 
     fn encode(&self, ssz: &mut [u8]) {
@@ -69,7 +114,7 @@ impl SubmittedEntry for SubmittedAttestation {
         ssz[0..8].copy_from_slice(&self.committee_index.to_le_bytes());
         ssz[8..16].copy_from_slice(&self.attester_index.to_le_bytes());
         self.data.encode((&mut ssz[16..144]).try_into().expect("128 bytes"));
-        ssz[144..240].copy_from_slice(&self.signature);
+        ssz[144..].copy_from_slice(self.signature.bytes());
     }
 }
 
@@ -290,8 +335,8 @@ pub(crate) mod tests {
         TCacheProducer,
         ssz_hash::hash_attestation_data,
         ssz_view::{
-            AttesterSlashingView, ProposerSlashingView, SignedBlsToExecutionChangeView,
-            SignedVoluntaryExitView, SingleAttestationView,
+            AttesterSlashingView, ProposerSlashingView, SINGLE_ATT_SIZE,
+            SignedBlsToExecutionChangeView, SignedVoluntaryExitView, SingleAttestationView,
         },
     };
     use silver_httpcore::ParsedRequest;
@@ -380,7 +425,12 @@ pub(crate) mod tests {
         let [attestation] = submission.accepted.as_slice() else { panic!("one accepted") };
 
         assert_eq!(attestation.body_index, 0);
-        let subnet = compute_subnet_for_attestation(posted_committees(&ctx), SLOT, 0);
+        let subnet = compute_subnet_for_attestation(
+            ctx.spec.fork_at_slot(SLOT),
+            posted_committees(&ctx),
+            SLOT,
+            0,
+        );
         assert_eq!(attestation.topic, GossipTopic::BeaconAttestation(subnet));
 
         let ssz: &[u8; SINGLE_ATT_SIZE] =
@@ -421,6 +471,26 @@ pub(crate) mod tests {
         let response = submit(&ctx, &body).1;
         let failures = json_failures(&response);
         assert_eq!(failures[0]["message"], "attester_index is past the validator count");
+    }
+
+    #[test]
+    fn pq_attestation_submission_checks_encoding_and_leaf_before_taking_a_lock() {
+        let mut ctx = ctx();
+        ctx.spec.pq_fork_epoch = TARGET_EPOCH;
+        let mut entry: serde_json::Value = serde_json::from_str(&entry(2, 0)).unwrap();
+        let mut xmss = [0u8; size_of::<XMSSSignature>()];
+        let mut check = |sig: &[u8], expected| {
+            entry["signature"] = serde_json::Value::String(format!("0x{}", hex::encode(sig)));
+            let (outcome, response) = submit(&ctx, &format!("[{entry}]"));
+            assert_eq!(outcome, Outcome::Response(None));
+            assert_eq!(json_failures(&response)[0]["message"], expected);
+        };
+        check(&[0u8; 96], "signature encoding does not match attestation fork");
+        check(&xmss, "incorrect XMSS attestation leaf");
+        xmss[..4].copy_from_slice(
+            &silver_common::xmss::attestation_leaf(TARGET_EPOCH).unwrap().to_le_bytes(),
+        );
+        check(&xmss, "PQ validator state unavailable");
     }
 
     #[test]

@@ -8,7 +8,7 @@ use secp256k1::{
 use serde::{Deserialize, Serialize};
 
 use super::{Enr, digest, keys};
-use crate::PeerId;
+use crate::{ForkName, PeerId, gossip::attestation_subnet_count};
 
 type RawNodeId = [u8; 32];
 
@@ -101,19 +101,21 @@ impl NodeId {
     /// subscription period, with period boundaries offset by
     /// `node_id % EPOCHS_PER_SUBNET_SUBSCRIPTION` so the network's
     /// rotations are staggered.
-    pub fn attestation_subnets(&self, epoch: u64, count: u8) -> [u8; 8] {
-        // node_id >> (256 - prefix_bits), prefix_bits = ceillog2(64) = 6.
-        let prefix = (self.raw[0] >> 2) as u64;
+    pub fn attestation_subnets(&self, format: ForkName, epoch: u64, count: u8) -> [u8; 8] {
+        // Both counts are powers of two. Mainnet ATTESTATION_SUBNET_EXTRA_BITS is zero.
+        let subnet_count = attestation_subnet_count(format) as u64;
+        let prefix = (self.raw[0] >> (8 - subnet_count.ilog2())) as u64;
         // node_id % EPOCHS_PER_SUBNET_SUBSCRIPTION (raw is big-endian).
         let node_offset = self.raw[31] as u64;
-        let period = (epoch + node_offset) / EPOCHS_PER_SUBNET_SUBSCRIPTION;
+        let period = epoch / EPOCHS_PER_SUBNET_SUBSCRIPTION +
+            (epoch % EPOCHS_PER_SUBNET_SUBSCRIPTION + node_offset) /
+                EPOCHS_PER_SUBNET_SUBSCRIPTION;
         let seed = sha256::Hash::hash(&period.to_le_bytes());
-        let shuffled =
-            compute_shuffled_index(prefix, ATTESTATION_SUBNET_COUNT, seed.as_byte_array());
+        let shuffled = compute_shuffled_index(prefix, subnet_count, seed.as_byte_array());
 
         let mut attnets = [0u8; 8];
         for i in 0..count as u64 {
-            let subnet = ((shuffled + i) % ATTESTATION_SUBNET_COUNT) as u8;
+            let subnet = ((shuffled + i) % subnet_count) as u8;
             attnets[(subnet / 8) as usize] |= 1 << (subnet % 8);
         }
         attnets
@@ -387,7 +389,7 @@ mod tests {
     fn attestation_subnets_in_range_and_consecutive() {
         for _ in 0..64 {
             let id = NodeId::random();
-            let subnets = set_subnets(id.attestation_subnets(12345, 2));
+            let subnets = set_subnets(id.attestation_subnets(ForkName::Gloas, 12345, 2));
             let [a, b] = subnets[..] else {
                 panic!("expected exactly 2 subnet bits, got {subnets:?}");
             };
@@ -405,16 +407,24 @@ mod tests {
         let period_start = (10_000 + node_offset) / EPOCHS_PER_SUBNET_SUBSCRIPTION *
             EPOCHS_PER_SUBNET_SUBSCRIPTION -
             node_offset;
-        let subnets = id.attestation_subnets(period_start, 2);
+        let subnets = id.attestation_subnets(ForkName::Gloas, period_start, 2);
         assert_eq!(
             subnets,
-            id.attestation_subnets(period_start + EPOCHS_PER_SUBNET_SUBSCRIPTION - 1, 2)
+            id.attestation_subnets(
+                ForkName::Gloas,
+                period_start + EPOCHS_PER_SUBNET_SUBSCRIPTION - 1,
+                2
+            )
         );
 
         // Rotation at the period boundary changes the pair for almost every
         // period; check across several periods to dodge the 1-in-64 repeat.
         let rotated = (1..4).any(|k| {
-            id.attestation_subnets(period_start + k * EPOCHS_PER_SUBNET_SUBSCRIPTION, 2) != subnets
+            id.attestation_subnets(
+                ForkName::Gloas,
+                period_start + k * EPOCHS_PER_SUBNET_SUBSCRIPTION,
+                2,
+            ) != subnets
         });
         assert!(rotated, "subnets never rotated across periods");
     }
@@ -430,7 +440,13 @@ mod tests {
         // At a's boundary, b is mid-period: b's pair at boundary-1 and
         // boundary must match (its own boundary is elsewhere).
         let boundary = 4 * EPOCHS_PER_SUBNET_SUBSCRIPTION;
-        assert_eq!(b.attestation_subnets(boundary - 1, 2), b.attestation_subnets(boundary, 2));
-        assert_eq!(a.attestation_subnets(boundary - 1, 2), a.attestation_subnets(boundary - 2, 2));
+        assert_eq!(
+            b.attestation_subnets(ForkName::Gloas, boundary - 1, 2),
+            b.attestation_subnets(ForkName::Gloas, boundary, 2)
+        );
+        assert_eq!(
+            a.attestation_subnets(ForkName::Gloas, boundary - 1, 2),
+            a.attestation_subnets(ForkName::Gloas, boundary - 2, 2)
+        );
     }
 }

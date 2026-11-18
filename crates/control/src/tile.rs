@@ -83,6 +83,7 @@ pub struct Controller {
     /// meshes would earn P3 deficit at peers since nothing validates or
     /// forwards until then.
     long_lived_pending: bool,
+    attestation_assignment: Option<(silver_common::NodeId, u8, u64)>,
     subnet_duties: SubnetDuties,
     cell_ingress: Option<CellIngress>,
     partial_exchange: Option<PartialExchange>,
@@ -132,6 +133,7 @@ impl Controller {
             announced_subscriptions: None,
             auto_ping: true,
             long_lived_pending: true,
+            attestation_assignment: None,
             subnet_duties: SubnetDuties::new(Subnets {
                 attnets: long_lived_attnets,
                 syncnets: long_lived_syncnets,
@@ -163,6 +165,19 @@ impl Controller {
             );
             return produce_response(producers, request_id, Err(LocalGossipFailure::Internal));
         };
+        if self
+            .gossip_handler
+            .current_domain()
+            .is_some_and(|domain| domain.format() == silver_common::ForkName::Pq)
+        {
+            // Do not commit a lock for a submission the API cannot authenticate.
+            let failure = if topic.check_pq_signed_message(ssz).is_err() {
+                LocalGossipFailure::Invalid
+            } else {
+                LocalGossipFailure::Unverifiable
+            };
+            return produce_response(producers, request_id, Err(failure));
+        }
         // `slot` only labels the logs.
         let (ssz_read, slot) = match topic {
             GossipTopic::ExecutionPayload => {
@@ -382,6 +397,15 @@ impl Controller {
         self.gossip_handler.set_subscriptions(self.peer_manager.our_subscriptions());
     }
 
+    pub fn set_attestation_subnet_assignment(
+        &mut self,
+        node: silver_common::NodeId,
+        count: u8,
+        configured: u64,
+    ) {
+        self.attestation_assignment = Some((node, count, configured));
+    }
+
     fn advance_gossip_domains(&mut self, now: Instant, producers: &mut SilverSpineProducers) {
         let Some(update) = self.gossip_schedule.as_mut().and_then(GossipSchedule::advance) else {
             return;
@@ -393,6 +417,33 @@ impl Controller {
         self.peer_manager.set_active_gossip_domains(update.current, update.other, &mut |event| {
             handle_peer_control(&mut self.gossip_handler, &mut self.rpc_producer, event, producers)
         });
+        if let Some((node, count, configured)) = self.attestation_assignment {
+            let format = update.current.format();
+            let assigned =
+                |format| u64::from_le_bytes(node.attestation_subnets(format, update.epoch, count));
+            let current = assigned(format);
+            let advertised =
+                (current | configured) & silver_common::attestation_subnet_mask(format);
+            self.peer_manager.advertise_attnets(advertised.to_le_bytes(), &mut |event| {
+                handle_peer_control(
+                    &mut self.gossip_handler,
+                    &mut self.rpc_producer,
+                    event,
+                    producers,
+                )
+            });
+            // Keep the draining fork's subnets subscribed while its digest is routable.
+            let other = update.other.filter(|domain| {
+                (domain.format() == silver_common::ForkName::Pq) !=
+                    (format == silver_common::ForkName::Pq)
+            });
+            let subscribed = advertised |
+                other.map_or(0, |domain| {
+                    (assigned(domain.format()) | configured) &
+                        silver_common::attestation_subnet_mask(domain.format())
+                });
+            self.subnet_duties.set_long_lived_attnets(subscribed, self.long_lived_pending);
+        }
         self.update_scheduled_gossip_topics(&update.topics, now, producers);
         producers.peer_control.produce(
             &PeerControl::UpdateEnrForkId { epoch: update.epoch, enr_fork_id: update.enr_fork_id }

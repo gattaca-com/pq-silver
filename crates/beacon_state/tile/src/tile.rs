@@ -240,6 +240,7 @@ pub struct BeaconStateTile {
 
     initial_status_emitted: bool,
     cached_fork_digest: Option<(Epoch, [u8; 4])>,
+    pq_rpc_digests: Vec<[u8; 4]>,
 
     stf_scratch: stf::StfScratch,
     /// Every BLS verification the tile runs, for blocks and for gossip alike.
@@ -301,6 +302,14 @@ impl BeaconStateTile {
         let mut owner = BeaconStateOwner::new(state);
         let val_cap = owner.state().validators.finalized().capacity();
         let (anchor, anchor_header) = Self::roll_anchor(&mut owner, expected_root);
+        let pq_rpc_digests = spec
+            .digest_transition_epochs()
+            .into_iter()
+            .filter(|epoch| spec.fork_at(*epoch) == silver_common::ForkName::Pq)
+            .map(|epoch| {
+                spec.fork_digest_at(epoch, &owner.state().immutable.genesis_validators_root)
+            })
+            .collect();
         let mut tile = Self {
             sync_target: SyncUpdate::default(),
             ticker,
@@ -338,6 +347,7 @@ impl BeaconStateTile {
             emitted_head: None,
             initial_status_emitted: false,
             cached_fork_digest: None,
+            pq_rpc_digests,
             stf_scratch: stf::StfScratch::new(val_cap),
             sig_batch: bls::SigBatch::new(),
             held: HeldBlocks::new(&syncing.pending),
@@ -941,6 +951,12 @@ impl BeaconStateTile {
         self.consume_shared(adapter);
 
         adapter.consume(|m: NewGossipMsg, producers| {
+            if m.topic == GossipTopic::BeaconBlock &&
+                m.domain.format() == silver_common::ForkName::Pq
+            {
+                self.handle_gossip(m.ssz, m, true, false, producers);
+                return;
+            }
             silver_log::trace!(
                 topic = ?m.topic,
                 p2p_peer = m.stream_id.peer(),
@@ -1061,12 +1077,14 @@ impl BeaconStateTile {
     /// flushes it first, so the queue order the batch reorders is restored
     /// here.
     fn on_gossip(&mut self, m: NewGossipMsg, producers: &mut Producers) {
-        if matches!(
-            m.topic,
-            GossipTopic::BeaconAttestation(_) |
-                GossipTopic::SyncCommittee(_) |
-                GossipTopic::PayloadAttestationMessage
-        ) {
+        if m.domain.format() != silver_common::ForkName::Pq &&
+            matches!(
+                m.topic,
+                GossipTopic::BeaconAttestation(_) |
+                    GossipTopic::SyncCommittee(_) |
+                    GossipTopic::PayloadAttestationMessage
+            )
+        {
             self.defer_vote(m, producers);
             return;
         }
@@ -1120,6 +1138,35 @@ impl BeaconStateTile {
         };
 
         let id = RequestId::from(application_id);
+
+        let pq = match response {
+            RpcResponse::BeaconBlock { fork_digest, ssz }
+                if id.is(DataKind::Block, Origin::Live) &&
+                    self.pq_rpc_digests.contains(&fork_digest) =>
+            {
+                Some((GossipTopic::BeaconBlock, ssz))
+            }
+            RpcResponse::ExecutionPayloadEnvelope { fork_digest, ssz }
+                if id.is(DataKind::Envelope, Origin::Live) &&
+                    self.pq_rpc_digests.contains(&fork_digest) =>
+            {
+                Some((GossipTopic::ExecutionPayload, ssz))
+            }
+            _ => None,
+        };
+        if let Some((topic, ssz)) = pq {
+            let acquired = self.reader.acquire(ssz);
+            if let Ok((data, _)) = acquired.buffer() &&
+                topic.check_pq_signed_message(data).is_err()
+            {
+                producers.produce(silver_common::PeerEvent::RpcMisbehaviour {
+                    p2p_peer: stream_id.peer(),
+                    severity: silver_common::RpcSeverity::LowTolerance,
+                    offence: silver_common::RpcOffence::ChunkFraming,
+                });
+            }
+            return;
+        }
 
         match response {
             RpcResponse::BeaconBlock { fork_digest: _, ssz }

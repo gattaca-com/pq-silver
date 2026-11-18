@@ -30,9 +30,10 @@ pub(crate) fn fill_epoch_ptc(
     validators: &ValidatorsView,
     randao: &RandaoMixesView,
     target_epoch: u64,
+    is_pq: bool,
     active: &mut Vec<u32>,
 ) {
-    let shuffling = EpochShuffling::from_views(validators, randao, target_epoch, active);
+    let shuffling = EpochShuffling::from_views(validators, randao, target_epoch, is_pq, active);
     let ptc_seed = Seed::from_randao(randao, target_epoch, DOMAIN_PTC_ATTESTER);
     for (i, dst) in out.iter_mut().enumerate() {
         *dst = compute_ptc(
@@ -97,6 +98,7 @@ pub fn process_ptc_window(view: &StateWriterView, epoch: &mut EpochWriteView, cu
         &view.validators.reader(),
         &view.randao_mixes.reader(),
         target_epoch,
+        target_epoch >= view.imm.pq_fork_epoch,
         &mut active,
     );
     epoch.rotate_ptc_window(&new_epoch);

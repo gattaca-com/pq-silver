@@ -90,7 +90,9 @@ impl ProductionRig {
     }
 
     fn pool_bid(&mut self) {
-        self.tile.payload_bids_pool.add(self.bid.clone(), self.signature);
+        let mut signed = Vec::new();
+        self.bid.write_signed_ssz(&self.signature, &mut signed);
+        self.tile.payload_bids_pool.add(self.bid.clone(), &signed);
     }
 
     fn start(&mut self, id: u64) -> EnginePreparePayloadReq {

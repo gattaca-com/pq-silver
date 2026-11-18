@@ -61,6 +61,7 @@ pub mod tracing;
 mod util;
 mod wheel;
 mod wither;
+pub mod xmss;
 
 pub use enr::{
     EPOCHS_PER_SUBNET_SUBSCRIPTION, Enr, NUMBER_OF_CUSTODY_GROUPS, NodeId, SAMPLES_PER_SLOT,

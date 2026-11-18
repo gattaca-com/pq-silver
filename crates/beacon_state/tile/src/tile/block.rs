@@ -685,6 +685,9 @@ impl BeaconStateTile {
 
         let block_slot = SignedBeaconBlockView::slot(data);
         let block_epoch = block_slot / SLOTS_PER_EPOCH;
+        if self.spec.is_pq_at(block_epoch) {
+            return Err(PrecheckError::SignatureForkMismatch { slot: block_slot });
+        }
         let proposer_index = SignedBeaconBlockView::proposer_index(data);
         let parent_root = *SignedBeaconBlockView::parent_root(data);
         let state_root = *SignedBeaconBlockView::state_root(data);

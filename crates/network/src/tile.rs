@@ -120,6 +120,9 @@ impl NetworkTile {
             PeerControl::UpdateEnrForkId { epoch, enr_fork_id } => {
                 self.update_enr_fork_id(epoch, enr_fork_id)
             }
+            PeerControl::UpdateEnrAttnets { attnets } => {
+                self.inner.discovery.update_enr_attnets(attnets)
+            }
             PeerControl::UpdateEnrSyncnets { syncnets } => {
                 self.inner.discovery.update_enr_syncnets(syncnets)
             }

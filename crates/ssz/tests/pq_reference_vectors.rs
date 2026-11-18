@@ -73,6 +73,20 @@ fn proposer_slashing() {
 }
 
 #[test]
+fn aggregate_signing_root() {
+    let genesis_root = std::array::from_fn(|i| i as u8);
+    let domain = silver_ssz::ssz_hash::compute_domain(6, [0xe0, 0, 0, 0], &genesis_root);
+    for (message, expected) in vectors("AggregateSigningRoot") {
+        let mut signed = (SIGNED_PQ_FIXED as u32).to_le_bytes().to_vec();
+        signed.resize(SIGNED_PQ_FIXED, 0);
+        signed.extend_from_slice(&message);
+        assert!(SignedAggregateAndProofPqView::check_size(&signed));
+        let root = SignedAggregateAndProofPqView::message_root(&signed);
+        assert_eq!(silver_ssz::ssz_hash::compute_signing_root(&root, &domain), expected);
+    }
+}
+
+#[test]
 fn signed_execution_payload_bid() {
     for (ssz, root) in vectors("SignedExecutionPayloadBid") {
         assert!(SignedExecutionPayloadBidPqView::check_canonical(&ssz));

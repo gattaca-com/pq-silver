@@ -104,7 +104,7 @@ fn attestation(bits: &[u8]) -> Vec<u8> {
     encode(&[
         Field::Variable(bits.to_vec()),
         Field::Fixed(pattern(128, 1)),
-        Field::Fixed(pattern(8, 2)),
+        Field::Fixed(pattern(2, 2)),
     ])
 }
 
@@ -176,7 +176,7 @@ fn attestation_drops_signature_slot() {
     assert_eq!(AttestationPqView::aggregation_bits(&att), bits);
 
     let mut committee_bits = ZERO_HASH;
-    committee_bits[..8].copy_from_slice(&pattern(8, 2));
+    committee_bits[..2].copy_from_slice(&pattern(2, 2));
     let mut bits_chunk = ZERO_HASH;
     bits_chunk[0] = 0xFF;
     let bits_root = mix_in_length(&merkleize_progressive_ref(&[bits_chunk], 1), 9);
@@ -233,11 +233,9 @@ fn attester_slashing_splits_indexed_attestations() {
 fn signed_aggregate_and_proof_reads_its_fields() {
     let att = attestation(&[0b1100_0001, 0b1]);
     let proof = pattern(40, 12);
-    let selection_proof = pattern(VRF_PROOF_SIZE, 13);
     let message = encode(&[
         Field::Fixed(42u64.to_le_bytes().to_vec()),
         Field::Variable(att.clone()),
-        Field::Fixed(selection_proof.clone()),
         Field::Variable(proof.clone()),
     ]);
     let signature = pattern(XMSS_SIGNATURE_SIZE, 14);
@@ -246,26 +244,64 @@ fn signed_aggregate_and_proof_reads_its_fields() {
     assert!(SignedAggregateAndProofPqView::check_size(&signed));
     assert_eq!(SignedAggregateAndProofPqView::signature(&signed)[..], signature);
     assert_eq!(SignedAggregateAndProofPqView::aggregator_index(&signed), 42);
-    assert_eq!(SignedAggregateAndProofPqView::selection_proof(&signed)[..], selection_proof);
     assert_eq!(SignedAggregateAndProofPqView::aggregate(&signed), att);
     assert_eq!(SignedAggregateAndProofPqView::agg_aggregation_bits(&signed), [0b1100_0001, 1]);
-    assert_eq!(SignedAggregateAndProofPqView::agg_committee_bits(&signed)[..], pattern(8, 2));
+    assert_eq!(SignedAggregateAndProofPqView::agg_committee_bits(&signed)[..], pattern(2, 2));
     assert_eq!(SignedAggregateAndProofPqView::proof(&signed), proof);
 
     let expected = merkleize_padded(
-        &[
-            uint64_chunk(42),
-            AttestationPqView::hash_tree_root(&att),
-            hash_fixed_bytes(&selection_proof),
-            proof_root_ref(&proof),
-        ],
+        &[uint64_chunk(42), AttestationPqView::hash_tree_root(&att), proof_root_ref(&proof)],
         4,
     );
     assert_eq!(SignedAggregateAndProofPqView::message_root(&signed), expected);
 
+    let obsolete = encode(&[
+        Field::Fixed(42u64.to_le_bytes().to_vec()),
+        Field::Variable(att),
+        Field::Fixed(pattern(VRF_PROOF_SIZE, 13)),
+        Field::Variable(proof),
+    ]);
+    let obsolete = encode(&[Field::Variable(obsolete), Field::Fixed(signature)]);
+    assert!(!SignedAggregateAndProofPqView::check_size(&obsolete));
+
     let mut bad_offset = signed.clone();
     bad_offset[0] += 1;
     assert!(!SignedAggregateAndProofPqView::check_size(&bad_offset));
+}
+
+#[test]
+fn canonical_network_maxima() {
+    use crate::ssz_view::{MAX_ATTESTING_INDICES_PQ, MAX_STARK_PROOF_SIZE};
+
+    let mut bits = vec![0xff; MAX_ATTESTING_INDICES_PQ / 8];
+    bits.push(1);
+    let proof = vec![0x42; MAX_STARK_PROOF_SIZE];
+    let message = encode(&[
+        Field::Fixed(vec![0; 8]),
+        Field::Variable(attestation(&bits)),
+        Field::Variable(proof.clone()),
+    ]);
+    let mut signed =
+        encode(&[Field::Variable(message), Field::Fixed(vec![0; XMSS_SIGNATURE_SIZE])]);
+    assert_eq!(signed.len(), 1_055_231);
+    assert!(SignedAggregateAndProofPqView::check_size(&signed));
+    signed.push(0);
+    assert!(!SignedAggregateAndProofPqView::check_size(&signed));
+    *bits.last_mut().unwrap() = 2;
+    assert!(!AttestationPqView::check_canonical(&attestation(&bits)));
+
+    let indexed = indexed_attestation(&vec![0; MAX_ATTESTING_INDICES_PQ], &proof);
+    let mut slashing = encode(&[Field::Variable(indexed.clone()), Field::Variable(indexed)]);
+    assert_eq!(slashing.len(), 2_621_720);
+    assert!(AttesterSlashingPqView::check_size(&slashing));
+    slashing.push(0);
+    assert!(!AttesterSlashingPqView::check_size(&slashing));
+
+    let mut bid = signed_bid();
+    bid.resize(199_240, 0);
+    assert!(SignedExecutionPayloadBidPqView::check_canonical(&bid));
+    bid.push(0);
+    assert!(!SignedExecutionPayloadBidPqView::check_canonical(&bid));
 }
 
 #[test]

@@ -24,6 +24,22 @@ pub(crate) fn post_block_v2(req: &Request<'_>, ctx: &ApiCtx, resp: &mut Response
         return resp.error(400, "invalid broadcast_validation");
     };
     let body = req.body;
+    if req.eth_consensus_version == Some(silver_common::ForkName::Pq.name()) {
+        if let Err(reason) = silver_common::GossipTopic::BeaconBlock.check_pq_signed_message(body) {
+            return resp.error(400, reason);
+        }
+        let slot = silver_common::ssz_view::SignedBeaconBlockPqView::slot(body);
+        if ctx.spec.fork_at_slot(slot) != silver_common::ForkName::Pq {
+            return resp.error(400, "PQ block slot precedes the PQ fork");
+        }
+        let signature = silver_common::ssz_view::SignedBeaconBlockPqView::signature(body);
+        if silver_common::xmss::SlotDuty::BeaconProposer.leaf(slot) !=
+            Some(silver_common::xmss::leaf_index(signature))
+        {
+            return resp.error(400, "incorrect XMSS proposer leaf");
+        }
+        return resp.error(503, "PQ validator state unavailable");
+    }
     // Gloas blocks are posted bare, Fulu blocks as `SignedBlockContents`; the
     // leading offset (100 or 12) tells the two apart.
     let (signed_block, body_fork) = if SignedBeaconBlockView::check_size(body) {

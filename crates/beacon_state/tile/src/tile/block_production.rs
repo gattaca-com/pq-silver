@@ -1201,10 +1201,8 @@ impl BeaconStateTile {
         let builder = builder.filter(|bid| p2p_weight.is_none_or(|weight| bid.weight > weight));
         let (signed_bid, value, weight, builder_entry) = match (builder, p2p) {
             (Some(bid), _) => (bid.signed_bid.to_vec(), bid.value, bid.weight, Some(bid.entry)),
-            (None, Some((bid, signature))) => {
-                let mut signed_bid = Vec::new();
-                bid.write_signed_ssz(signature, &mut signed_bid);
-                (signed_bid, u128::from(bid.value), p2p_weight.expect("pooled bid"), None)
+            (None, Some((bid, signed_bid))) => {
+                (signed_bid.to_vec(), u128::from(bid.value), p2p_weight.expect("pooled bid"), None)
             }
             (None, None) => {
                 silver_log::info!(slot = proposal.slot, full, "no admitted bid on the branch");
@@ -1254,7 +1252,8 @@ impl BeaconStateTile {
             return None;
         }
         let signature = SignedExecutionPayloadBidView::signature(bid.signed_bid);
-        if let Err(feedback) = self.check_bid_on_parent(&decoded, signature, |key| bid.accepts(key))
+        if let Err(feedback) =
+            self.check_bid_on_parent(&decoded, signature, |builder, _| bid.accepts(&builder.pubkey))
         {
             let reason = match feedback {
                 Feedback::Reject { reason, .. } => reason,

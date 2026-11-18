@@ -59,7 +59,9 @@ impl PartialGroup {
         }
         let slot = match domain.format() {
             ForkName::Fulu if group_id.len() == FULU_GROUP_ID_SIZE => None,
-            ForkName::Gloas | ForkName::Pq if group_id.len() == GLOAS_GROUP_ID_SIZE => {
+            ForkName::Gloas | ForkName::Eip8483 | ForkName::Pq
+                if group_id.len() == GLOAS_GROUP_ID_SIZE =>
+            {
                 Some(u64::from_le_bytes(group_id[33..].try_into().ok()?))
             }
             _ => return None,

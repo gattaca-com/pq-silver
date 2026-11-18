@@ -77,6 +77,7 @@ fn build_ptc_window(view: &StateWriterView) -> Box<[PtcCommittee; PTC_WINDOW_LEN
             &validators,
             &randao,
             current_epoch + e,
+            current_epoch + e >= view.imm.pq_fork_epoch,
             &mut active,
         );
     }

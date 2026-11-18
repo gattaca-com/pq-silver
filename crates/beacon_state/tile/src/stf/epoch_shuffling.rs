@@ -21,26 +21,33 @@ pub struct EpochShuffling<'a> {
 impl<'a> EpochShuffling<'a> {
     /// Attester shuffling for `epoch`, seeded from the state's randao ring.
     pub fn from_state(rv: &StateReadView, epoch: Epoch, buf: &'a mut Vec<u32>) -> Self {
-        Self::from_views(&rv.validators, &rv.randao_mixes, epoch, buf)
+        Self::from_views(
+            &rv.validators,
+            &rv.randao_mixes,
+            epoch,
+            epoch >= rv.imm.pq_fork_epoch,
+            buf,
+        )
     }
 
     pub(super) fn from_views(
         validators: &ValidatorsView,
         randao: &RandaoMixesView,
         epoch: Epoch,
+        is_pq: bool,
         buf: &'a mut Vec<u32>,
     ) -> Self {
         let seed = Seed::from_randao(randao, epoch, DOMAIN_BEACON_ATTESTER);
         validators.active_indices_into(epoch, buf);
         let required_validator_count = buf.last().map_or(0, |&i| i as usize + 1);
         seed.shuffle(buf);
-        Self::new(buf, required_validator_count)
+        Self::new(buf, required_validator_count, is_pq)
     }
 
-    pub(crate) fn new(shuffled: &'a [u32], required_validator_count: usize) -> Self {
+    pub(crate) fn new(shuffled: &'a [u32], required_validator_count: usize, is_pq: bool) -> Self {
         Self {
             shuffled,
-            committees_per_slot: committees_per_slot(shuffled.len()),
+            committees_per_slot: committees_per_slot(shuffled.len(), is_pq),
             required_validator_count,
             committee_aggs: None,
         }

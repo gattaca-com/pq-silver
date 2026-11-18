@@ -433,6 +433,7 @@ impl NewGossipMsg {
     /// API verifies its signature first.
     pub fn is_api_verified(&self) -> bool {
         self.stream_id == LOCAL_GOSSIP_STREAM_ID &&
+            self.domain.format() != crate::ForkName::Pq &&
             matches!(self.topic, GossipTopic::BeaconBlock | GossipTopic::BeaconAttestation(_))
     }
 }
@@ -1159,6 +1160,9 @@ pub enum PeerControl {
     UpdateEnrForkId {
         epoch: u64,
         enr_fork_id: [u8; 16],
+    },
+    UpdateEnrAttnets {
+        attnets: [u8; 8],
     },
     UpdateEnrSyncnets {
         syncnets: u8,

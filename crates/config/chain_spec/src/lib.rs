@@ -46,13 +46,14 @@ pub enum ForkName {
     Electra,
     Fulu,
     Gloas,
+    Eip8483,
     Pq,
 }
 
 impl ForkName {
     /// Activation order: every cascade over the fork table walks it from the
     /// end, and the beacon-API fork schedule is served in this order.
-    pub const ALL: [Self; 9] = [
+    pub const ALL: [Self; 10] = [
         Self::Phase0,
         Self::Altair,
         Self::Bellatrix,
@@ -61,6 +62,7 @@ impl ForkName {
         Self::Electra,
         Self::Fulu,
         Self::Gloas,
+        Self::Eip8483,
         Self::Pq,
     ];
 
@@ -77,6 +79,7 @@ impl ForkName {
             Self::Electra => "electra",
             Self::Fulu => "fulu",
             Self::Gloas => "gloas",
+            Self::Eip8483 => "eip8483",
             Self::Pq => "pq",
         }
     }
@@ -163,6 +166,10 @@ pub struct SpecConfig {
     /// Gloas activation epoch.
     #[serde(default = "unscheduled")]
     pub gloas_fork_epoch: u64,
+    #[serde(default = "default_fork_version::<0xe8483000>", with = "hex_0x")]
+    pub eip8483_fork_version: [u8; 4],
+    #[serde(default = "unscheduled")]
+    pub eip8483_fork_epoch: u64,
     #[serde(default = "default_fork_version::<0xe0000000>", with = "hex_0x")]
     pub pq_fork_version: [u8; 4],
     #[serde(default = "unscheduled")]
@@ -388,6 +395,19 @@ impl SpecConfig {
         self.default_blob_params()
     }
 
+    /// Epochs at which the wire format or its blob-parameter digest may change.
+    pub fn digest_transition_epochs(&self) -> Vec<u64> {
+        let mut epochs: Vec<_> = ForkName::ALL
+            .into_iter()
+            .map(|fork| self.fork_epoch(fork))
+            .chain(self.blob_schedule.iter().map(|entry| entry.epoch))
+            .filter(|epoch| *epoch != u64::MAX)
+            .collect();
+        epochs.sort_unstable();
+        epochs.dedup();
+        epochs
+    }
+
     /// Spec `compute_fork_digest`, including the Fulu EIP-7892 mix of the
     /// active `BLOB_SCHEDULE` entry.
     pub fn fork_digest_at(&self, epoch: u64, genesis_validators_root: &B256) -> [u8; 4] {
@@ -407,6 +427,8 @@ impl SpecConfig {
     pub fn fork_at(&self, epoch: u64) -> ForkName {
         if epoch >= self.pq_fork_epoch {
             ForkName::Pq
+        } else if epoch >= self.eip8483_fork_epoch {
+            ForkName::Eip8483
         } else if epoch >= self.gloas_fork_epoch {
             ForkName::Gloas
         } else if epoch >= self.fulu_fork_epoch {
@@ -441,6 +463,7 @@ impl SpecConfig {
             ForkName::Electra => self.electra_fork_version,
             ForkName::Fulu => self.fulu_fork_version,
             ForkName::Gloas => self.gloas_fork_version,
+            ForkName::Eip8483 => self.eip8483_fork_version,
             ForkName::Pq => self.pq_fork_version,
         }
     }
@@ -456,6 +479,7 @@ impl SpecConfig {
             ForkName::Electra => self.electra_fork_epoch,
             ForkName::Fulu => self.fulu_fork_epoch,
             ForkName::Gloas => self.gloas_fork_epoch,
+            ForkName::Eip8483 => self.eip8483_fork_epoch,
             ForkName::Pq => self.pq_fork_epoch,
         }
     }
@@ -602,6 +626,8 @@ impl SpecConfig {
             fulu_fork_epoch: 50688,
             gloas_fork_version: default_fork_version::<0x80000910>(),
             gloas_fork_epoch: unscheduled(),
+            eip8483_fork_version: default_fork_version::<0xe8483000>(),
+            eip8483_fork_epoch: unscheduled(),
             pq_fork_version: default_fork_version::<0xe0000000>(),
             pq_fork_epoch: unscheduled(),
             blob_schedule: vec![
@@ -670,6 +696,8 @@ impl SpecConfig {
             fulu_fork_epoch: 272640,
             gloas_fork_version: default_fork_version::<0x90000076>(),
             gloas_fork_epoch: 353024,
+            eip8483_fork_version: default_fork_version::<0xe8483000>(),
+            eip8483_fork_epoch: unscheduled(),
             pq_fork_version: default_fork_version::<0xe0000000>(),
             pq_fork_epoch: unscheduled(),
             blob_schedule: vec![
@@ -736,6 +764,8 @@ impl SpecConfig {
             fulu_fork_epoch: 411392,
             gloas_fork_version: default_fork_version::<0x07000000>(),
             gloas_fork_epoch: unscheduled(),
+            eip8483_fork_version: default_fork_version::<0xe8483000>(),
+            eip8483_fork_epoch: unscheduled(),
             pq_fork_version: default_fork_version::<0xe0000000>(),
             pq_fork_epoch: unscheduled(),
             blob_schedule: default_blob_schedule(),
@@ -958,6 +988,7 @@ mod tests {
             spec.electra_fork_version,
             spec.fulu_fork_version,
             spec.gloas_fork_version,
+            spec.eip8483_fork_version,
             spec.pq_fork_version,
         ]);
         assert_eq!(ForkName::ALL.map(|fork| spec.fork_epoch(fork)), [
@@ -968,6 +999,7 @@ mod tests {
             spec.deneb_fork_epoch,
             spec.electra_fork_epoch,
             spec.fulu_fork_epoch,
+            u64::MAX,
             u64::MAX,
             u64::MAX,
         ]);
@@ -1019,6 +1051,24 @@ mod tests {
         assert_eq!(spec.fork_version_at(600_000), [0xe0, 0x00, 0x00, 0x00]);
         assert_eq!(spec.next_fork(599_999), (spec.pq_fork_version, 600_000));
         assert_eq!(spec.next_fork(600_000), (spec.pq_fork_version, u64::MAX));
+    }
+
+    #[test]
+    fn scheduled_eip8483_has_its_own_digest_before_pq() {
+        let spec = SpecConfig {
+            gloas_fork_epoch: 500_000,
+            eip8483_fork_epoch: 500_010,
+            pq_fork_epoch: 500_020,
+            ..SpecConfig::mainnet()
+        };
+        assert_eq!(spec.fork_at(500_009), ForkName::Gloas);
+        assert_eq!(spec.fork_at(500_010), ForkName::Eip8483);
+        assert_eq!(spec.fork_at(500_020), ForkName::Pq);
+        assert_eq!(spec.next_fork(500_009), ([0xe8, 0x48, 0x30, 0], 500_010));
+        let digest = spec.fork_digest_at(500_010, &MAINNET_GVR);
+        assert_ne!(digest, spec.fork_digest_at(500_009, &MAINNET_GVR));
+        assert_ne!(digest, spec.fork_digest_at(500_020, &MAINNET_GVR));
+        assert_eq!(spec.next_fork(500_019), (spec.pq_fork_version, 500_020));
     }
 
     /// EIP-7892's blob mix carries on past Gloas.

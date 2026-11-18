@@ -2,9 +2,9 @@ use std::fmt::{self, Display};
 
 use flux::spine::SpineProducers;
 use silver_beacon_state_data::{
-    B256, BLSPubkey, BidBuilderError, BuilderRegistry, Epoch, ExecutionPayloadBid,
-    MIN_SEED_LOOKAHEAD, ParsedAggregateAndProof, SLOTS_PER_EPOCH, SYNC_SUBCOMMITTEE_MASK_WORDS,
-    SYNC_SUBCOMMITTEE_SIZE, ShufflingId, Slot, StateId, StateReadView, SyncSubcommittee,
+    B256, BidBuilderError, BuilderRegistry, Epoch, ExecutionPayloadBid, MIN_SEED_LOOKAHEAD,
+    ParsedAggregateAndProof, SLOTS_PER_EPOCH, SYNC_SUBCOMMITTEE_MASK_WORDS, SYNC_SUBCOMMITTEE_SIZE,
+    ShufflingId, Slot, StateId, StateReadView, SyncSubcommittee,
     bls::{self, CheckedSignature, PublicKey, Signature, VerifiedSingleAttestation},
     gloas::PTC_SIZE,
 };
@@ -241,6 +241,9 @@ impl BeaconStateTile {
         let block_root = *SingleAttestationView::beacon_block_root(buf);
         let target_epoch = SingleAttestationView::target_epoch(buf);
         let att_slot = SingleAttestationView::slot(buf);
+        if self.spec.is_pq_at_slot(att_slot) {
+            return Err(Feedback::reject("BLS attestation for a PQ slot"));
+        }
         let committee_index = SingleAttestationView::committee_index(buf) as usize;
 
         if !self.attestation_slot_is_open(att_slot) {
@@ -276,6 +279,7 @@ impl BeaconStateTile {
         }
         if subnet !=
             compute_subnet_for_attestation(
+                self.spec.fork_at_slot(att_slot),
                 shuffling.committees_per_slot as u64,
                 att_slot,
                 committee_index as u64,
@@ -837,6 +841,9 @@ impl BeaconStateTile {
             return Feedback::reject("bid malformed");
         };
         let signature = SignedExecutionPayloadBidView::signature(signed_bid);
+        if self.spec.is_pq_at_slot(bid.slot) {
+            return Feedback::reject("BLS bid for a PQ slot");
+        }
 
         if !self.payload_bids_pool.is_candidate(&bid) {
             return Feedback::Ignore;
@@ -852,10 +859,12 @@ impl BeaconStateTile {
         if bid.execution_payment != 0 {
             return Feedback::reject("bid has execution payment");
         }
-        if let Err(feedback) = self.check_bid_on_parent(&bid, signature, |_| true) {
+        if let Err(feedback) = self.check_bid_on_parent(&bid, signature, |builder, pool| {
+            pool.within_limit(&bid, builder.balance)
+        }) {
             return feedback;
         }
-        self.payload_bids_pool.add(bid, *signature);
+        self.payload_bids_pool.add(bid, signed_bid);
         Feedback::Accept
     }
 
@@ -865,7 +874,7 @@ impl BeaconStateTile {
         &mut self,
         bid: &ExecutionPayloadBid,
         signature: &[u8; 96],
-        accepts_builder: impl Fn(&BLSPubkey) -> bool,
+        accepts_builder: impl Fn(&silver_beacon_state_data::Builder, &super::BidPool) -> bool,
     ) -> Result<(), Feedback> {
         if bid.block_hash == bid.parent_block_hash {
             return Err(Feedback::reject("bid block hash equals parent"));
@@ -927,7 +936,7 @@ impl BeaconStateTile {
                 return Err(Feedback::Ignore);
             }
         }
-        if !accepts_builder(&builder.pubkey) {
+        if !accepts_builder(builder, &self.payload_bids_pool) {
             return Err(Feedback::Ignore);
         }
 
@@ -1048,6 +1057,9 @@ impl BeaconStateTile {
         };
         let prefs = SignedProposerPreferencesView::message(signed);
         let proposal_slot = Prefs::proposal_slot(prefs);
+        if self.spec.is_pq_at_slot(proposal_slot) {
+            return Feedback::reject("BLS preferences for a PQ slot");
+        }
         let dependent_root = *Prefs::dependent_root(prefs);
 
         let seen = self.seen_proposer_preferences.contains(proposal_slot, &dependent_root);
@@ -1171,6 +1183,9 @@ impl BeaconStateTile {
         let Some(parsed) = ParsedAggregateAndProof::try_from(data) else {
             return Feedback::reject("aggregate malformed");
         };
+        if self.spec.is_pq_at_slot(parsed.agg_slot) {
+            return Feedback::reject("BLS aggregate for a PQ slot");
+        }
 
         // Gossip-rule checks (no state access). Pre-Gloas requires index 0;
         // Gloas widens it to the payload-status bit (`index < 2`).
@@ -1312,6 +1327,9 @@ impl BeaconStateTile {
             return EnvelopeCheck::AwaitBlock(block_root);
         };
         let node = self.fork_choice.node(idx);
+        if self.spec.is_pq_at_slot(node.slot) {
+            return EnvelopeCheck::Reject;
+        }
         if node.slot < self.fork_choice.finalized_checkpoint().epoch * SLOTS_PER_EPOCH {
             return EnvelopeCheck::Ignore;
         }
@@ -1894,6 +1912,69 @@ impl BeaconStateTile {
         Feedback::Accept
     }
 
+    fn precheck_pq_gossip(&self, topic: GossipTopic, bytes: &[u8]) -> Feedback {
+        use silver_common::ssz_view::{
+            BeaconBlockHeaderView as Header, ProposerSlashingPqView as Slashing,
+            SignedAggregateAndProofPqView as Aggregate, SignedBeaconBlockPqView as Block,
+            SingleAttestationPqView as Attestation,
+        };
+
+        if topic == GossipTopic::BeaconBlock && Block::check_size(bytes) {
+            let slot = Block::slot(bytes);
+            let finalized_slot =
+                self.fork_choice.finalized_checkpoint().epoch.saturating_mul(SLOTS_PER_EPOCH);
+            if self.ticker.is_future_slot(slot, MAXIMUM_GOSSIP_CLOCK_DISPARITY) ||
+                slot <= finalized_slot
+            {
+                return Feedback::Ignore;
+            }
+            if !self.spec.is_pq_at_slot(slot) {
+                return Feedback::reject("PQ block precedes fork");
+            }
+        }
+        if let Err(reason) = topic.check_pq_signed_message(bytes) {
+            return Feedback::reject(reason);
+        }
+        match topic {
+            GossipTopic::BeaconAttestation(_) => {
+                let attestation = bytes.try_into().expect("checked PQ attestation size");
+                let data = Attestation::data(attestation);
+                if data.index() > 1 {
+                    return Feedback::reject("attestation data index");
+                }
+            }
+            GossipTopic::BeaconAggregateAndProof => {
+                if Aggregate::agg_data(bytes).index() > 1 {
+                    return Feedback::reject("aggregate data index");
+                }
+                if u16::from_le_bytes(*Aggregate::agg_committee_bits(bytes)).count_ones() != 1 {
+                    return Feedback::reject("aggregate committee bits");
+                }
+            }
+            GossipTopic::ProposerSlashing => {
+                let slashing = bytes.try_into().expect("checked PQ slashing size");
+                let a = Slashing::header_1(slashing);
+                let b = Slashing::header_2(slashing);
+                if a == b ||
+                    Header::slot(a) != Header::slot(b) ||
+                    Header::proposer_index(a) != Header::proposer_index(b)
+                {
+                    return Feedback::reject("proposer slashing headers do not conflict");
+                }
+                let expected = silver_common::xmss::SlotDuty::BeaconProposer.leaf(Header::slot(a));
+                for sig in [Slashing::signature_1(slashing), Slashing::signature_2(slashing)] {
+                    if expected != Some(silver_common::xmss::leaf_index(sig)) {
+                        return Feedback::reject("incorrect XMSS proposer slashing leaf");
+                    }
+                }
+            }
+            _ => {}
+        }
+        // The local registry currently exposes only BLS keys. These messages
+        // must stay out of the valid-message caches until authenticated.
+        Feedback::Ignore
+    }
+
     /// False when the ring lapped `read` before it could be handled.
     pub(super) fn handle_gossip(
         &mut self,
@@ -1903,8 +1984,19 @@ impl BeaconStateTile {
         pre_verified: bool,
         producers: &mut Producers,
     ) -> bool {
+        if matches!(m.topic, GossipTopic::DataColumnSidecar(_)) {
+            return true;
+        }
         let acquired = self.reader.acquire(read);
         let Some(data) = acquired.buffer().ok().map(|(d, _)| d) else { return false };
+        if m.domain.format() == silver_common::ForkName::Pq {
+            let feedback = self.precheck_pq_gossip(m.topic, data);
+            match feedback {
+                Feedback::Reject { reason, .. } => self.reject_gossip(&m, data, reason, producers),
+                other => Self::local_verdict(&m, other, producers),
+            }
+            return true;
+        }
         let pre_verified = pre_verified || m.is_api_verified();
 
         let feedback = match m.topic {
@@ -2085,7 +2177,7 @@ impl BeaconStateTile {
             p2p_peer = m.stream_id.peer(),
             topic = ?m.topic,
             reason,
-            message = %GossipFields { topic: m.topic, data },
+            message = %GossipFields { topic: m.topic, format: m.domain.format(), data },
             head_slot = self.head_state_slot(),
             wall_slot = self.ticker.current_slot(),
             time_into_slot = ?self.ticker.slot_time_elapsed(),
@@ -2194,6 +2286,7 @@ impl BeaconStateTile {
 
 /// A rejected message's identifying fields, decoded only when logged.
 struct GossipFields<'a> {
+    format: silver_common::ForkName,
     topic: GossipTopic,
     data: &'a [u8],
 }
@@ -2201,6 +2294,9 @@ struct GossipFields<'a> {
 impl Display for GossipFields<'_> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         let data = self.data;
+        if self.format == silver_common::ForkName::Pq {
+            return write!(f, "PQ len={}", data.len());
+        }
         match self.topic {
             GossipTopic::BeaconAttestation(_) if data.len() == SINGLE_ATT_SIZE => {
                 let buf = data[..SINGLE_ATT_SIZE].try_into().unwrap();

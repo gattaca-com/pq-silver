@@ -42,6 +42,8 @@ pub trait Discovery {
 
     fn update_enr_fork_id(&mut self, _eth2: [u8; 16]) {}
 
+    fn update_enr_attnets(&mut self, _attnets: [u8; 8]) {}
+
     fn update_enr_syncnets(&mut self, _syncnets: u8) {}
 
     fn teardown(&self);

@@ -3,7 +3,7 @@ use flux_profiler::timed;
 use crate::{
     merkle::{
         B256, MerkleStack, ZERO_HASH, bitlist_len, hash_bitlist, hash_bytelist, hash_concat,
-        hash_fixed_bytes, hash_uint64_list, merkleize, uint64_chunk,
+        hash_uint64_list, merkleize, uint64_chunk,
     },
     progressive::{ProgressiveContainer, ProgressiveHasher, active_fields},
     ssz_hash::hash_attestation_data,
@@ -38,7 +38,7 @@ impl AttestationPqView {
             hash_bitlist(ProgressiveHasher::new(), aggregation_bits, bitlist_len(aggregation_bits));
         let data_root = hash_attestation_data(&d[4..132]);
         let mut committee_bits = ZERO_HASH;
-        committee_bits[..8].copy_from_slice(Self::committee_bits(d));
+        committee_bits[..Self::committee_bits(d).len()].copy_from_slice(Self::committee_bits(d));
         Self::root_of_active_fields(&[aggregation_bits_root, data_root, committee_bits])
     }
 }
@@ -95,7 +95,6 @@ impl SignedAggregateAndProofPqView {
         merkleize(&[
             uint64_chunk(Self::aggregator_index(d)),
             AttestationPqView::root_of_canonical(Self::aggregate(d)),
-            hash_fixed_bytes(Self::selection_proof(d)),
             attestation_proof_root(Self::proof(d)),
         ])
     }

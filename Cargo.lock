@@ -4570,6 +4570,14 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "04744f49eae99ab78e0d5c0b603ab218f515ea8cfe5a456d7629ad883a3b6e7d"
 
 [[package]]
+name = "parallel"
+version = "0.1.0"
+source = "git+https://github.com/leanEthereum/leanVM?rev=8ba3bd912a55c795eecc516aa9690d63da7ae2e8#8ba3bd912a55c795eecc516aa9690d63da7ae2e8"
+dependencies = [
+ "libc",
+]
+
+[[package]]
 name = "parity-scale-codec"
 version = "3.7.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -4884,6 +4892,15 @@ dependencies = [
  "impl-rlp",
  "impl-serde",
  "uint",
+]
+
+[[package]]
+name = "primitives"
+version = "0.1.0"
+source = "git+https://github.com/leanEthereum/leanVM?rev=8ba3bd912a55c795eecc516aa9690d63da7ae2e8#8ba3bd912a55c795eecc516aa9690d63da7ae2e8"
+dependencies = [
+ "parallel",
+ "serde",
 ]
 
 [[package]]
@@ -6025,6 +6042,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "signatures"
+version = "0.1.0"
+source = "git+https://github.com/leanEthereum/leanVM?rev=8ba3bd912a55c795eecc516aa9690d63da7ae2e8#8ba3bd912a55c795eecc516aa9690d63da7ae2e8"
+dependencies = [
+ "parallel",
+ "primitives",
+ "rand 0.9.4",
+ "serde",
+]
+
+[[package]]
 name = "silver"
 version = "0.1.0-alpha.17"
 dependencies = [
@@ -6209,6 +6237,7 @@ dependencies = [
  "serde_json",
  "sha3 0.10.9",
  "shared_memory",
+ "signatures",
  "silver_beacon_state_data",
  "silver_chain_spec",
  "silver_crypto_simd",

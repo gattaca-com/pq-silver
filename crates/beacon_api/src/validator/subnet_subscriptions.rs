@@ -25,7 +25,9 @@ pub(crate) fn post_beacon_committee_subscriptions(
     let window = SubnetsBySlot::window(ctx.node_status.wall_slot);
     let mut by_slot = SubnetsBySlot::default();
     let parsed = each_body_entry(req.body, |_, entry: CommitteeSubscription| {
-        if let Some(slot_subnets) = entry.slot_subnets().filter(|held| window.contains(&held.slot))
+        if let Some(slot_subnets) = entry
+            .slot_subnets(ctx.spec.fork_at_slot(entry.slot))
+            .filter(|held| window.contains(&held.slot))
         {
             by_slot.insert(slot_subnets);
         }
@@ -61,13 +63,20 @@ struct CommitteeSubscription {
 }
 
 impl CommitteeSubscription {
-    fn slot_subnets(&self) -> Option<SlotSubnets> {
+    fn slot_subnets(&self, format: silver_common::ForkName) -> Option<SlotSubnets> {
         let committees = self.committees_at_slot;
-        if self.committee_index >= committees || committees > MAX_COMMITTEES_PER_SLOT as u64 {
+        if self.committee_index >= committees ||
+            committees >
+                (if format == silver_common::ForkName::Pq {
+                    silver_common::ssz_view::MAX_COMMITTEES_PER_SLOT_PQ
+                } else {
+                    MAX_COMMITTEES_PER_SLOT
+                }) as u64
+        {
             return None;
         }
-        let subnet =
-            1 << compute_subnet_for_attestation(committees, self.slot, self.committee_index);
+        let subnet = 1 <<
+            compute_subnet_for_attestation(format, committees, self.slot, self.committee_index);
         Some(SlotSubnets {
             slot: self.slot,
             attesting: subnet,

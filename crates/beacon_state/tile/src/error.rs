@@ -18,6 +18,8 @@ pub enum RejectReason {
 pub enum PrecheckError {
     #[error("block size precheck failed: expected {expected_min}..={expected_max} got {got}")]
     SizeMismatch { expected_min: usize, expected_max: usize, got: usize },
+    #[error("BLS signed block at PQ slot {slot}")]
+    SignatureForkMismatch { slot: Slot },
     #[error(
         "block parent precheck failed: parent_root=0x{} last_applied_slot={last_applied_slot} \
          block_slot={block_slot}",
@@ -102,6 +104,7 @@ impl PrecheckError {
     pub fn feedback(self) -> Feedback {
         match self {
             Self::SizeMismatch { .. } => Feedback::reject("block size mismatch"),
+            Self::SignatureForkMismatch { .. } => Feedback::reject("BLS block for a PQ slot"),
             Self::NonCanonicalBody { .. } => Feedback::reject("block body not canonical"),
             Self::BodyOverLimits { .. } => Feedback::reject("block body over limits"),
             Self::ParentMissing { parent_root, block_root, .. } => {

@@ -149,6 +149,9 @@ impl GossipHandler {
         domain: GossipDomain,
         ssz: &[u8],
     ) -> Option<SelfBuiltGossip> {
+        if !topic.supports_format(domain.format()) {
+            return None;
+        }
         let mut encoded = [0; 8];
         let digest = if let Some((_, digest)) = self.domains.index_hex(domain) {
             digest
@@ -646,7 +649,9 @@ impl ActiveDomains {
     /// digests are ignored, never penalized.
     pub(crate) fn parse(&self, wire: &str) -> Result<(GossipTopic, GossipDomain), Error> {
         for state in self.states() {
-            if let Ok(topic) = GossipTopic::from_wire(wire, &state.hex) {
+            if let Ok(topic) = GossipTopic::from_wire(wire, &state.hex) &&
+                topic.supports_format(state.domain.format())
+            {
                 return Ok((topic, state.domain));
             }
         }
@@ -655,7 +660,10 @@ impl ActiveDomains {
 
     /// Local sends always use the current domain.
     fn current_wire(&self, topic: GossipTopic) -> Option<(GossipDomain, String)> {
-        self.current.as_ref().map(|s| (s.domain, topic.to_wire(&s.hex)))
+        self.current
+            .as_ref()
+            .filter(|s| topic.supports_format(s.domain.format()))
+            .map(|s| (s.domain, topic.to_wire(&s.hex)))
     }
 
     fn current_domain(&self) -> Option<GossipDomain> {
@@ -715,6 +723,30 @@ mod tests {
 
     fn v13_stream(peer: usize, stream: u64) -> P2pStreamId {
         P2pStreamId::new(peer, stream, StreamProtocol::GossipSubV13, true)
+    }
+
+    #[test]
+    fn pq_overlap_routes_each_topic_on_its_own_digest() {
+        let gloas = GossipDomain::new([1; 4], ForkName::Gloas);
+        let pq = GossipDomain::new([2; 4], ForkName::Pq);
+        let mut domains = ActiveDomains::default();
+        for (current, other) in [(gloas, pq), (pq, gloas)] {
+            domains.set(current, Some(other));
+            for topic in [
+                GossipTopic::BeaconAttestation(16),
+                GossipTopic::VoluntaryExit,
+                GossipTopic::SyncCommittee(0),
+            ] {
+                assert_eq!(domains.parse(&topic.to_wire("01010101")).unwrap(), (topic, gloas));
+                assert!(domains.parse(&topic.to_wire("02020202")).is_err());
+                assert_eq!(domains.current_wire(topic).is_some(), current == gloas);
+            }
+            let shared = GossipTopic::BeaconAttestation(15);
+            assert_eq!(domains.parse(&shared.to_wire("02020202")).unwrap(), (shared, pq));
+            assert_eq!(domains.current_wire(shared).unwrap().0, current);
+        }
+        domains.set(pq, None);
+        assert!(domains.parse(&GossipTopic::BeaconAttestation(15).to_wire("01010101")).is_err());
     }
 
     #[test]

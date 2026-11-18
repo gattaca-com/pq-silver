@@ -335,6 +335,19 @@ mod tests {
     }
 
     #[test]
+    fn pq_variable_size_gossip_bounds_before_decompression() {
+        for (topic, max) in [
+            (GossipTopic::BeaconAggregateAndProof, 1_055_231),
+            (GossipTopic::AttesterSlashing, 2_621_720),
+            (GossipTopic::ExecutionPayloadBid, 199_240),
+        ] {
+            let read = |n| read_message_length(&snappy_length_prefix(n), &topic, ForkName::Pq);
+            assert_eq!(read(max).unwrap(), max);
+            assert!(matches!(read(max + 1), Err(Error::GossipPayloadTooLarge)));
+        }
+    }
+
+    #[test]
     fn corrupt_snappy_body_is_penalised_once_then_deduped() {
         let topic = GossipTopic::BeaconBlock;
         let mut corrupt = snappy_length_prefix(topic.min_uncompressed_size(ForkName::Fulu) + 64);

@@ -92,7 +92,9 @@ impl<'a> ContextData<'a> {
                     commitments: &bytes[PARTIAL_HEADER_FIXED..],
                 })
             }
-            ForkName::Gloas | ForkName::Pq => Some(Self::Gloas { commitments: bytes }),
+            ForkName::Gloas | ForkName::Eip8483 | ForkName::Pq => {
+                Some(Self::Gloas { commitments: bytes })
+            }
             _ => None,
         }
     }

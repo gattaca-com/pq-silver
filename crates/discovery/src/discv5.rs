@@ -1120,6 +1120,17 @@ impl Discovery for DiscV5 {
         );
     }
 
+    fn update_enr_attnets(&mut self, attnets: [u8; 8]) {
+        if self.local_enr.attnets() == Some(attnets) {
+            return;
+        }
+        if let Err(e) = self.local_enr.set_attnets(attnets, &self.local_key) {
+            silver_log::error!(?e, "failed to update local ENR attnets field");
+            return;
+        }
+        self.reencode_local_enr();
+    }
+
     fn update_enr_syncnets(&mut self, syncnets: u8) {
         if self.local_enr.syncnets() == Some(syncnets) {
             return;
@@ -1779,6 +1790,20 @@ mod tests {
         let seq_after = d.local_enr.seq();
         d.update_enr_fork_id(new_eth2);
         assert_eq!(d.local_enr.seq(), seq_after);
+    }
+
+    #[test]
+    fn update_enr_attnets_preserves_width_and_signature() {
+        let sk = SecretKey::new(&mut rand::thread_rng());
+        let enr = Enr::builder().ip4(Ipv4Addr::LOCALHOST).udp4(20000u16).build(&sk).unwrap();
+        let mut d = DiscV5::new(DiscoveryConfig::default(), sk, enr, [0; 4]);
+        let attnets = 0x8001u64.to_le_bytes();
+        d.update_enr_attnets(attnets);
+        assert_eq!(d.local_enr.attnets(), Some(attnets));
+        assert!(d.local_enr.verify());
+        let seq = d.local_enr.seq();
+        d.update_enr_attnets(attnets);
+        assert_eq!(d.local_enr.seq(), seq);
     }
 
     #[test]

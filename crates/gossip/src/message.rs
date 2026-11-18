@@ -52,6 +52,9 @@ pub(super) fn handle_incoming(
     };
 
     let (topic, domain) = parsed?;
+    if !topic.supports_format(domain.format()) {
+        return Err(Error::TopicNotInFork);
+    }
     silver_log::trace!(?stream_id, ?topic, "Gossip message received");
 
     // Decompress: block snappy.
@@ -277,6 +280,29 @@ mod tests {
         let mut buf = [0; 10];
         let encoded = encode_varint(len as u64, &mut buf).unwrap();
         buf[..encoded].to_vec()
+    }
+
+    #[test]
+    fn topic_removed_from_the_domain_fork_is_dropped() {
+        let mut ssz = TCache::producer(TCacheId::NetworkIngress, 1 << 16);
+        let mut protobuf = TCache::producer(TCacheId::NetworkIngress, 1 << 16);
+        let stream = P2pStreamId::new(1, 3, StreamProtocol::GossipSubV13, true);
+        let domains = ActiveDomains::new(Some(GossipDomain::new([0; 4], ForkName::Pq)));
+        let wire = GossipTopic::VoluntaryExit.to_wire("00000000");
+        let compressed = snap::raw::Encoder::new().compress_vec(&[0; 112]).unwrap();
+        let result = handle_incoming(
+            &wire,
+            domains.parse(&wire),
+            &compressed,
+            &stream,
+            Nanos::now(),
+            &mut DedupCache::default(),
+            &mut ssz,
+            None,
+            &mut protobuf,
+            &mut |_| panic!("a dropped topic emits no event"),
+        );
+        assert!(matches!(result, Err(Error::TopicNotInFork)));
     }
 
     #[test]

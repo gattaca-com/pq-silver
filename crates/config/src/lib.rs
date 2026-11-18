@@ -727,6 +727,14 @@ mod tests {
     }
 
     #[test]
+    fn mainnet_is_refused_as_not_pq_from_genesis() {
+        let chain = Config::mainnet().unwrap().chain().unwrap();
+        let err = chain.require_pq_from_genesis().unwrap_err();
+        let text = format!("{err}");
+        assert!(text.contains("PQ_FORK_EPOCH"), "error should name the key: {text}");
+    }
+
+    #[test]
     fn mainnet_blob_schedule_fits_the_block_capacity() {
         let max_blobs = Network::Mainnet.spec().unwrap().max_scheduled_blobs_per_block();
         assert!(max_blobs <= MAX_BLOBS_PER_BLOCK as u64, "{max_blobs} > {MAX_BLOBS_PER_BLOCK}");

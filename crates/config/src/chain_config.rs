@@ -99,6 +99,20 @@ impl ChainConfig {
         Ok(self.spec.fork_digest_at(epoch, &genesis.validators_root))
     }
 
+    /// This build has no fork-transition logic into PQ, so it runs only
+    /// chains that are PQ from genesis.
+    pub fn require_pq_from_genesis(&self) -> Result<(), Error> {
+        if self.spec.pq_fork_epoch != 0 {
+            return Err(Error::ConfigError(format!(
+                "{} sets PQ_FORK_EPOCH {}; this build runs only chains that are PQ from \
+                 genesis (PQ_FORK_EPOCH 0)",
+                self.spec.network_name(),
+                self.spec.pq_fork_epoch
+            )));
+        }
+        Ok(())
+    }
+
     pub fn node_chain(&self, genesis: &Genesis) -> NodeChain {
         NodeChain {
             genesis_unix_secs: genesis.unix_secs,

@@ -22,6 +22,7 @@ pub enum Error {
     GossipPayloadTooLarge,
     GossipPayloadTooSmall,
     ParseTopicError,
+    TopicNotInFork,
     InvalidSnappy,
     IoError(#[from] std::io::Error),
     JsonError(#[from] serde_json::Error),

@@ -691,6 +691,9 @@ impl BeaconStateTile {
 
         let body = SignedBeaconBlockView::body(data);
 
+        if self.spec.is_pq_at(block_epoch) {
+            return Err(PrecheckError::PqBlockUnimplemented { block_slot });
+        }
         let is_gloas = self.spec.is_gloas_at(block_epoch);
 
         let canonical = if is_gloas {

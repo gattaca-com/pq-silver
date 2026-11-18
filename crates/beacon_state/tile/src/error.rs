@@ -34,6 +34,8 @@ pub enum PrecheckError {
     PreFinalized { block_slot: Slot, finalized_slot: Slot },
     #[error("block body is not canonical SSZ: block_slot={block_slot} body_len={body_len}")]
     NonCanonicalBody { block_slot: Slot, body_len: usize },
+    #[error("PQ block processing is not implemented: block_slot={block_slot}")]
+    PqBlockUnimplemented { block_slot: Slot },
     #[error("block body over its limits: block_slot={block_slot}: {kind}")]
     BodyOverLimits { block_slot: Slot, kind: BlockBodyError },
     #[error("block past-slot precheck failed: block_slot={block_slot} parent_slot={parent_slot}")]
@@ -106,6 +108,7 @@ impl PrecheckError {
                 Feedback::RequestParent { parent_root, block_root }
             }
             Self::PreFinalized { .. } |
+            Self::PqBlockUnimplemented { .. } |
             Self::FutureSlot { .. } |
             Self::UnconfirmedProposer { .. } |
             Self::AwaitingData { .. } |
@@ -307,6 +310,8 @@ pub enum BlockError {
     ParentRootMismatch { expected: B256, got: B256 },
     #[error("post-state root mismatch: expected=0x{} got=0x{}", b256_hex(expected), b256_hex(got))]
     PostStateRootMismatch { expected: B256, got: B256 },
+    #[error("PQ block processing is not implemented: slot={slot}")]
+    PqUnimplemented { slot: u64 },
     #[error(transparent)]
     Body(#[from] BlockBodyError),
 }
@@ -422,8 +427,6 @@ pub enum BlsToExecutionChangeError {
     PubkeyHashMismatch { from_pubkey: BLSPubkey, expected: B256, got: B256 },
     #[error("from_pubkey failed to decompress: 0x{}", pubkey_hex(from_pubkey))]
     BadPubkey { from_pubkey: BLSPubkey },
-    #[error("bls_to_execution_changes are disabled from PQ")]
-    DisabledInPq,
 }
 
 #[derive(Debug, Error)]

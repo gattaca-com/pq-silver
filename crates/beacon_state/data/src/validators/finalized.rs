@@ -11,9 +11,11 @@ use rustc_hash::FxHashMap;
 use silver_crypto_simd::bls::{G1Point, uncompress_in_g1};
 use silver_state_memory::RetainedVec;
 
+use super::scheme::{SchemeColumn, SchemeKey};
 use crate::{
     Withdrawals,
     merkle::{merkleize_each, uint64_chunk},
+    pq::{KeyScheme, xmss_pubkey, xmss_pubkey_padded},
     slot_state::{EpochBalances, EpochBalancesRow},
     types::{B256, BLSPubkey, Epoch, FAR_FUTURE_EPOCH, validator_capacity},
 };
@@ -51,7 +53,7 @@ impl Default for ValSeed {
 /// leaner — its mutable fields are always spec-defaults at append time.
 pub(super) struct ValidatorInit {
     pub pubkey: BLSPubkey,
-    pub pubkey_decompressed: PublicKey,
+    pub scheme_key: SchemeKey,
     pub credentials: Withdrawals,
     pub effective_balance: u64,
     pub slashed: bool,
@@ -61,29 +63,28 @@ pub(super) struct ValidatorInit {
     pub withdrawable_epoch: Epoch,
 }
 
-/// SSZ-serialised size of a single `Validator` container (Fulu).
-const VALIDATOR_SSZ_SIZE: usize = 121;
-
-/// Byte offset of each field within a 121-byte SSZ `Validator` record. Fixed
-/// layout, packed contiguously: `pubkey[48] | withdrawal_credentials[32] |
-/// effective_balance:u64 | slashed:bool | 4 × epoch:u64`, ending at
-/// [`VALIDATOR_SSZ_SIZE`]. Shared by the decode (`try_new`) and encode
-/// (`write_ssz_range`) paths so the layout lives in one place.
+/// Byte offset of each SSZ `Validator` field after the key fields, packed
+/// contiguously: `withdrawal_credentials[32] | effective_balance:u64 |
+/// slashed:bool | 4 × epoch:u64`. The key fields are `pubkey[48]` before
+/// PQ, and `pubkey[32] | vrf_root[32]` in PQ.
 mod offset {
-    pub const PUBKEY: usize = 0;
-    pub const CREDENTIALS: usize = 48;
-    pub const EFFECTIVE_BALANCE: usize = 80;
-    pub const SLASHED: usize = 88;
-    pub const ACTIVATION_ELIGIBILITY_EPOCH: usize = 89;
-    pub const ACTIVATION_EPOCH: usize = 97;
-    pub const EXIT_EPOCH: usize = 105;
-    pub const WITHDRAWABLE_EPOCH: usize = 113;
+    pub const CREDENTIALS: usize = 0;
+    pub const EFFECTIVE_BALANCE: usize = 32;
+    pub const SLASHED: usize = 40;
+    pub const ACTIVATION_ELIGIBILITY_EPOCH: usize = 41;
+    pub const ACTIVATION_EPOCH: usize = 49;
+    pub const EXIT_EPOCH: usize = 57;
+    pub const WITHDRAWABLE_EPOCH: usize = 65;
+    pub const END: usize = 73;
 }
+
+const VALIDATOR_SSZ_SIZE: usize = 48 + offset::END;
+const VALIDATOR_PQ_SSZ_SIZE: usize = 32 + 32 + offset::END;
 
 #[derive(Debug, thiserror::Error)]
 pub enum ValidatorsDecodeError {
-    #[error("validators bytes {len} not a multiple of {VALIDATOR_SSZ_SIZE}")]
-    LenNotMultiple { len: usize },
+    #[error("validators bytes {len} not a multiple of {size}")]
+    LenNotMultiple { len: usize, size: usize },
     #[error("validator {idx} pubkey failed BLS decompression")]
     InvalidPubkey { idx: usize },
     #[error("pubkey sidecar count {sidecar} != validator count {validators}")]
@@ -92,6 +93,35 @@ pub enum ValidatorsDecodeError {
     PubkeyMismatch { idx: usize },
     #[error("validator count {n} exceeds the u32 index space")]
     TooMany { n: usize },
+}
+
+fn record_count(val_bytes: &[u8], size: usize) -> Result<usize, ValidatorsDecodeError> {
+    if !val_bytes.len().is_multiple_of(size) {
+        return Err(ValidatorsDecodeError::LenNotMultiple { len: val_bytes.len(), size });
+    }
+    let n = val_bytes.len() / size;
+    if u32::try_from(n).is_err() {
+        return Err(ValidatorsDecodeError::TooMany { n });
+    }
+    Ok(n)
+}
+
+impl ValidatorInit {
+    fn from_shared_fields(pubkey: BLSPubkey, scheme_key: SchemeKey, shared: &[u8]) -> Self {
+        Self {
+            pubkey,
+            scheme_key,
+            credentials: Withdrawals(
+                shared[offset::CREDENTIALS..offset::EFFECTIVE_BALANCE].try_into().unwrap(),
+            ),
+            effective_balance: u64_at(shared, offset::EFFECTIVE_BALANCE),
+            slashed: shared[offset::SLASHED] != 0,
+            activation_eligibility_epoch: u64_at(shared, offset::ACTIVATION_ELIGIBILITY_EPOCH),
+            activation_epoch: u64_at(shared, offset::ACTIVATION_EPOCH),
+            exit_epoch: u64_at(shared, offset::EXIT_EPOCH),
+            withdrawable_epoch: u64_at(shared, offset::WITHDRAWABLE_EPOCH),
+        }
+    }
 }
 
 #[inline]
@@ -144,7 +174,7 @@ impl<'a> RecordKeys<'a> {
         self.compressed.extend(
             records
                 .chunks_exact(VALIDATOR_SSZ_SIZE)
-                .map(|v| BLSPubkey::try_from(&v[offset::PUBKEY..offset::CREDENTIALS]).unwrap()),
+                .map(|v| BLSPubkey::try_from(&v[..48]).unwrap()),
         );
         self.start = start;
         uncompress_in_g1(&self.compressed, &mut self.decoded[..self.compressed.len()]);
@@ -162,8 +192,9 @@ fn put(buf: &mut [u8], off: usize, src: &[u8]) {
 }
 
 pub struct FinalizedValidators {
+    /// The 48-byte form of each pubkey, whichever the scheme.
     pub(super) val_pubkey: RetainedVec<BLSPubkey>,
-    pub(super) val_pubkey_decompressed: RetainedVec<PublicKey>,
+    pub(super) scheme_keys: SchemeColumn,
     pub(super) val_withdrawal_credentials: RetainedVec<Withdrawals>,
     pub(super) effective_balance: RetainedVec<u64>,
     /// Bitset: validator `i` is slashed iff
@@ -178,6 +209,7 @@ pub struct FinalizedValidators {
 
 impl FinalizedValidators {
     fn build<E>(
+        scheme: KeyScheme,
         capacity: usize,
         n: usize,
         mut field_at: impl FnMut(usize) -> Result<ValidatorInit, E>,
@@ -185,7 +217,7 @@ impl FinalizedValidators {
         debug_assert!(n <= capacity);
         let mut this = Self {
             val_pubkey: RetainedVec::with_capacity(capacity),
-            val_pubkey_decompressed: RetainedVec::with_capacity(capacity),
+            scheme_keys: SchemeColumn::with_capacity(scheme, capacity),
             val_withdrawal_credentials: RetainedVec::with_capacity(capacity),
             effective_balance: RetainedVec::with_capacity(capacity),
             slashed: RetainedVec::with_capacity(capacity.div_ceil(8)),
@@ -201,7 +233,7 @@ impl FinalizedValidators {
         for i in 0..n {
             let f = field_at(i)?;
             this.val_pubkey[i] = f.pubkey;
-            this.val_pubkey_decompressed[i] = f.pubkey_decompressed;
+            this.scheme_keys.set(i, f.scheme_key);
             this.val_withdrawal_credentials[i] = f.credentials;
             this.effective_balance[i] = f.effective_balance;
             if f.slashed {
@@ -224,7 +256,7 @@ impl FinalizedValidators {
             self.grow(count);
         }
         self.val_pubkey.resize(count, [0u8; 48]);
-        self.val_pubkey_decompressed.resize(count, PublicKey::default());
+        self.scheme_keys.resize(count);
         self.val_withdrawal_credentials.resize(count, Withdrawals::default());
         self.effective_balance.resize(count, 0);
         self.slashed.resize(count.div_ceil(8), 0);
@@ -239,7 +271,7 @@ impl FinalizedValidators {
     fn grow(&mut self, needed: usize) {
         let capacity = validator_capacity(needed);
         self.val_pubkey.grow_to(capacity);
-        self.val_pubkey_decompressed.grow_to(capacity);
+        self.scheme_keys.grow_to(capacity);
         self.val_withdrawal_credentials.grow_to(capacity);
         self.effective_balance.grow_to(capacity);
         self.slashed.grow_to(capacity.div_ceil(8));
@@ -266,13 +298,7 @@ impl FinalizedValidators {
         val_bytes: &[u8],
         decompressed: Option<&[PublicKey]>,
     ) -> Result<Self, ValidatorsDecodeError> {
-        if !val_bytes.len().is_multiple_of(VALIDATOR_SSZ_SIZE) {
-            return Err(ValidatorsDecodeError::LenNotMultiple { len: val_bytes.len() });
-        }
-        let n = val_bytes.len() / VALIDATOR_SSZ_SIZE;
-        if u32::try_from(n).is_err() {
-            return Err(ValidatorsDecodeError::TooMany { n });
-        }
+        let n = record_count(val_bytes, VALIDATOR_SSZ_SIZE)?;
         if let Some(d) = decompressed {
             if d.len() != n {
                 return Err(ValidatorsDecodeError::PubkeyCountMismatch {
@@ -283,9 +309,9 @@ impl FinalizedValidators {
         }
 
         let mut record_keys = RecordKeys::new(val_bytes);
-        Self::build(validator_capacity(n), n, |i| {
-            let v = &val_bytes[i * VALIDATOR_SSZ_SIZE..];
-            let pubkey: BLSPubkey = v[offset::PUBKEY..offset::CREDENTIALS].try_into().unwrap();
+        Self::build(KeyScheme::Bls, validator_capacity(n), n, |i| {
+            let (pubkey, shared) = val_bytes[i * VALIDATOR_SSZ_SIZE..].split_at(48);
+            let pubkey: BLSPubkey = pubkey.try_into().unwrap();
             let pubkey_decompressed = match decompressed {
                 Some(d) if d[i].compress() != pubkey => {
                     return Err(ValidatorsDecodeError::PubkeyMismatch { idx: i });
@@ -293,45 +319,77 @@ impl FinalizedValidators {
                 Some(d) => d[i],
                 None => record_keys.key(i)?,
             };
-            Ok(ValidatorInit {
+            Ok(ValidatorInit::from_shared_fields(
                 pubkey,
-                pubkey_decompressed,
-                credentials: Withdrawals(
-                    v[offset::CREDENTIALS..offset::EFFECTIVE_BALANCE].try_into().unwrap(),
-                ),
-                effective_balance: u64_at(v, offset::EFFECTIVE_BALANCE),
-                slashed: v[offset::SLASHED] != 0,
-                activation_eligibility_epoch: u64_at(v, offset::ACTIVATION_ELIGIBILITY_EPOCH),
-                activation_epoch: u64_at(v, offset::ACTIVATION_EPOCH),
-                exit_epoch: u64_at(v, offset::EXIT_EPOCH),
-                withdrawable_epoch: u64_at(v, offset::WITHDRAWABLE_EPOCH),
-            })
+                SchemeKey::Bls(pubkey_decompressed),
+                shared,
+            ))
         })
     }
 
+    /// Decode the PQ SSZ `validators` byte range. XMSS keys need no
+    /// validation: any 32 bytes are a key.
+    #[timed]
+    pub fn try_new_xmss(val_bytes: &[u8]) -> Result<Self, ValidatorsDecodeError> {
+        let n = record_count(val_bytes, VALIDATOR_PQ_SSZ_SIZE)?;
+        Self::build(KeyScheme::Xmss, validator_capacity(n), n, |i| {
+            let v = &val_bytes[i * VALIDATOR_PQ_SSZ_SIZE..];
+            Ok::<_, Infallible>(ValidatorInit::from_shared_fields(
+                xmss_pubkey_padded(v[..32].try_into().unwrap()),
+                SchemeKey::Xmss { vrf_root: v[32..64].try_into().unwrap() },
+                &v[64..],
+            ))
+        })
+        .map_err(|e| match e {})
+    }
+
     #[inline]
-    /// SSZ-encode validators `[start, end)` (one 121-B record each) — the
-    /// checkpoint persist's section body, called in bounded slices.
+    /// SSZ-encode validators `[start, end)` — the checkpoint persist's
+    /// section body, called in bounded slices.
     pub(crate) fn write_ssz_range<W: Write>(
         &self,
         start: usize,
         end: usize,
         w: &mut W,
     ) -> io::Result<()> {
-        let mut buf = [0u8; VALIDATOR_SSZ_SIZE];
+        let mut buf = [0u8; VALIDATOR_PQ_SSZ_SIZE];
+        let record = &mut buf[..self.ssz_record_size()];
         for i in start..end {
-            put(&mut buf, offset::PUBKEY, &self.val_pubkey[i]);
-            put(&mut buf, offset::CREDENTIALS, &self.val_withdrawal_credentials[i].0);
-            put(&mut buf, offset::EFFECTIVE_BALANCE, &self.effective_balance[i].to_le_bytes());
-            buf[offset::SLASHED] = self.is_slashed(i) as u8;
-            let elig = self.activation_eligibility_epoch[i].to_le_bytes();
-            put(&mut buf, offset::ACTIVATION_ELIGIBILITY_EPOCH, &elig);
-            put(&mut buf, offset::ACTIVATION_EPOCH, &self.activation_epoch[i].to_le_bytes());
-            put(&mut buf, offset::EXIT_EPOCH, &self.exit_epoch[i].to_le_bytes());
-            put(&mut buf, offset::WITHDRAWABLE_EPOCH, &self.withdrawable_epoch[i].to_le_bytes());
-            w.write_all(&buf)?;
+            let (keys, shared) = record.split_at_mut(record.len() - offset::END);
+            match &self.scheme_keys {
+                SchemeColumn::Bls(_) => keys.copy_from_slice(&self.val_pubkey[i]),
+                SchemeColumn::Xmss(vrf_roots) => {
+                    keys[..32].copy_from_slice(xmss_pubkey(&self.val_pubkey[i]));
+                    keys[32..].copy_from_slice(&vrf_roots[i]);
+                }
+            }
+            self.put_shared_fields(i, shared);
+            w.write_all(record)?;
         }
         Ok(())
+    }
+
+    fn put_shared_fields(&self, i: usize, shared: &mut [u8]) {
+        put(shared, offset::CREDENTIALS, &self.val_withdrawal_credentials[i].0);
+        put(shared, offset::EFFECTIVE_BALANCE, &self.effective_balance[i].to_le_bytes());
+        shared[offset::SLASHED] = self.is_slashed(i) as u8;
+        let elig = self.activation_eligibility_epoch[i].to_le_bytes();
+        put(shared, offset::ACTIVATION_ELIGIBILITY_EPOCH, &elig);
+        put(shared, offset::ACTIVATION_EPOCH, &self.activation_epoch[i].to_le_bytes());
+        put(shared, offset::EXIT_EPOCH, &self.exit_epoch[i].to_le_bytes());
+        put(shared, offset::WITHDRAWABLE_EPOCH, &self.withdrawable_epoch[i].to_le_bytes());
+    }
+
+    pub(crate) fn ssz_record_size(&self) -> usize {
+        match self.scheme() {
+            KeyScheme::Bls => VALIDATOR_SSZ_SIZE,
+            KeyScheme::Xmss => VALIDATOR_PQ_SSZ_SIZE,
+        }
+    }
+
+    #[inline]
+    pub fn scheme(&self) -> KeyScheme {
+        self.scheme_keys.scheme()
     }
 
     /// Write the decompressed (96-B serialized) pubkeys `[start, end)` — the
@@ -342,8 +400,9 @@ impl FinalizedValidators {
         end: usize,
         w: &mut W,
     ) -> io::Result<()> {
+        assert_eq!(self.scheme(), KeyScheme::Bls, "only BLS keys are decompressed");
         for i in start..end {
-            w.write_all(&self.val_pubkey_decompressed[i].serialize())?;
+            w.write_all(&self.scheme_keys.bls(i).serialize())?;
         }
         Ok(())
     }
@@ -404,17 +463,10 @@ impl FinalizedValidators {
     }
 
     pub(super) fn leaf_hashes(&self, range: Range<usize>) -> Vec<B256> {
-        let pubkey_chunks = range.clone().flat_map(|i| {
-            let mut tail = [0u8; 32];
-            tail[..16].copy_from_slice(&self.val_pubkey[i][32..]);
-            [self.val_pubkey[i][..32].try_into().unwrap(), tail]
-        });
-        let pubkey_roots = merkleize_each(pubkey_chunks.collect(), 2);
-        let fields = range.zip(pubkey_roots).flat_map(|(i, pubkey_root)| {
+        let shared_fields = |i: usize| {
             let mut slashed = [0u8; 32];
             slashed[0] = u8::from(self.is_slashed(i));
             [
-                pubkey_root,
                 self.val_withdrawal_credentials[i].0,
                 uint64_chunk(self.effective_balance[i]),
                 slashed,
@@ -423,8 +475,31 @@ impl FinalizedValidators {
                 uint64_chunk(self.exit_epoch[i]),
                 uint64_chunk(self.withdrawable_epoch[i]),
             ]
-        });
-        merkleize_each(fields.collect(), 8)
+        };
+        match &self.scheme_keys {
+            SchemeColumn::Bls(_) => {
+                let pubkey_chunks = range.clone().flat_map(|i| {
+                    let mut tail = [0u8; 32];
+                    tail[..16].copy_from_slice(&self.val_pubkey[i][32..]);
+                    [self.val_pubkey[i][..32].try_into().unwrap(), tail]
+                });
+                let pubkey_roots = merkleize_each(pubkey_chunks.collect(), 2);
+                let fields = range.zip(pubkey_roots).flat_map(|(i, pubkey_root)| {
+                    std::iter::once(pubkey_root).chain(shared_fields(i))
+                });
+                merkleize_each(fields.collect(), 8)
+            }
+            // Nine fields pad to a 16-leaf tree.
+            SchemeColumn::Xmss(vrf_roots) => {
+                let fields = range.flat_map(|i| {
+                    [*xmss_pubkey(&self.val_pubkey[i]), vrf_roots[i]]
+                        .into_iter()
+                        .chain(shared_fields(i))
+                        .chain([B256::default(); 16 - 9])
+                });
+                merkleize_each(fields.collect(), 16)
+            }
+        }
     }
 
     /// Harness-seeding constructor: builds a registry from `ValSeed`s whose
@@ -433,11 +508,11 @@ impl FinalizedValidators {
     /// the one bridge from test seeds to the private `build`; reached from
     /// other crates' tests only through `for_test`.
     pub(crate) fn with_validators(seeds: &[ValSeed]) -> Self {
-        Self::build(validator_capacity(seeds.len()), seeds.len(), |i| {
+        Self::build(KeyScheme::Bls, validator_capacity(seeds.len()), seeds.len(), |i| {
             let s = &seeds[i];
             Ok::<_, Infallible>(ValidatorInit {
                 pubkey: s.pubkey,
-                pubkey_decompressed: PublicKey::from_bytes(&s.pubkey).unwrap_or_default(),
+                scheme_key: SchemeKey::Bls(PublicKey::from_bytes(&s.pubkey).unwrap_or_default()),
                 credentials: s.withdrawal_credentials,
                 effective_balance: s.effective_balance,
                 slashed: false,

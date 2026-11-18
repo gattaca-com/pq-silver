@@ -472,15 +472,15 @@ impl BeaconStateTile {
     ) {
         let slot = self.state.state().slot_states.finalized_view().slot_number();
 
-        let (anchor_is_gloas, block_root, execution_block_hash) = {
+        let (anchor_post_gloas, block_root, execution_block_hash) = {
             let rv = self.state.read_view(anchor);
             let slot_state = rv.slot.state();
-            let execution_block_hash = if rv.is_gloas() {
+            let execution_block_hash = if rv.post_gloas() {
                 slot_state.latest_execution_payload_bid.block_hash
             } else {
                 slot_state.latest_execution_payload_header.block_hash
             };
-            (rv.is_gloas(), slot_state.latest_block_root, execution_block_hash)
+            (rv.post_gloas(), slot_state.latest_block_root, execution_block_hash)
         };
 
         let trusted = Checkpoint { epoch: slot.div_ceil(SLOTS_PER_EPOCH), root: block_root };
@@ -495,7 +495,7 @@ impl BeaconStateTile {
             block_root,
             header.state_root,
             execution_block_hash,
-            anchor_is_gloas,
+            anchor_post_gloas,
             anchor,
             validators_capacity,
         );
@@ -541,7 +541,7 @@ impl BeaconStateTile {
 
         let ws_period = {
             let view = self.state.read_view(self.last_applied);
-            if view.is_gloas() {
+            if view.post_gloas() {
                 weak_subjectivity_period_gloas(&self.spec, &view, &mut self.stf_scratch.active)
             } else {
                 weak_subjectivity_period_fulu(&view, &mut self.stf_scratch.active)

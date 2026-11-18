@@ -12,7 +12,8 @@ use blst::min_pk::PublicKey;
 
 use crate::{
     BeaconState,
-    decompose::{FULU_FIXED_PART, gloas::GLOAS_FIXED_PART},
+    decompose::{FULU_FIXED_PART, gloas::GloasLayout},
+    pq::KeyScheme,
     types::{B256, Checkpoint, Eth1Data, SyncCommittee},
 };
 
@@ -42,6 +43,11 @@ pub(crate) const GLOAS_VAR_LEN_SECTIONS: usize = 15;
 /// Number of checkpoint sections for Gloas: the fixed part + the 15 var bodies.
 pub const GLOAS_CHECKPOINT_SECTIONS: usize = 1 + GLOAS_VAR_LEN_SECTIONS;
 
+/// Gloas's variable fields plus the two preregistration lists.
+pub(crate) const PQ_VAR_LEN_SECTIONS: usize = GLOAS_VAR_LEN_SECTIONS + 2;
+
+pub const PQ_CHECKPOINT_SECTIONS: usize = 1 + PQ_VAR_LEN_SECTIONS;
+
 const BUILDER_PENDING_WITHDRAWAL_SSZ: usize = 36;
 const WITHDRAWAL_SSZ: usize = 44;
 
@@ -64,6 +70,8 @@ pub(crate) enum Section {
     BuilderPendingWithdrawals,
     LatestExecutionPayloadBid,
     PayloadExpectedWithdrawals,
+    ValidatorPreregistrations,
+    BuilderPreregistrations,
 }
 
 impl Section {
@@ -83,7 +91,7 @@ impl Section {
         Section::PendingConsolidations,
     ];
 
-    pub(crate) const GLOAS: [Section; GLOAS_CHECKPOINT_SECTIONS] = [
+    pub(crate) const PQ: [Section; PQ_CHECKPOINT_SECTIONS] = [
         Section::FixedPart,
         Section::HistoricalRoots,
         Section::Eth1Votes,
@@ -100,6 +108,8 @@ impl Section {
         Section::BuilderPendingWithdrawals,
         Section::LatestExecutionPayloadBid,
         Section::PayloadExpectedWithdrawals,
+        Section::ValidatorPreregistrations,
+        Section::BuilderPreregistrations,
     ];
 }
 
@@ -152,21 +162,26 @@ impl BeaconState {
         ]
     }
 
-    /// Byte lengths of the 15 Gloas variable-length fields, in SSZ-declared
-    /// order (offset-slot order): the 11 Fulu-shared bodies (no
-    /// `execution_payload_header`) then the four Gloas-only bodies.
-    pub(crate) fn var_len_section_lens_gloas(&self) -> [usize; GLOAS_VAR_LEN_SECTIONS] {
-        let n = self.validators.finalized().validator_count();
+    /// Byte lengths of the Gloas-shaped variable-length fields, in
+    /// SSZ-declared order (offset-slot order): the 11 Fulu-shared bodies (no
+    /// `execution_payload_header`), the four Gloas-only bodies, then PQ's two
+    /// preregistration lists, which are empty before PQ.
+    pub(crate) fn var_len_section_lens_gloas(&self) -> [usize; PQ_VAR_LEN_SECTIONS] {
+        let validators = self.validators.finalized();
+        let n = validators.validator_count();
         let dep = self.pending.deposits.with_finalized_locked(|q| q.len());
         let wdr = self.pending.partial_withdrawals.with_finalized_locked(|q| q.len());
         let con = self.pending.consolidations.with_finalized_locked(|q| q.len());
         let bpw = self.pending.builder_withdrawals.with_finalized_locked(|q| q.len());
         let summaries = self.longtail.with_finalized_locked(|lt| lt.historical_summaries_len());
+        let [validator_preregistrations, builder_preregistrations] = self
+            .preregistrations
+            .with_finalized_locked(|p| [p.validators_ssz_len(), p.builders_ssz_len()]);
         let sl = self.slot_states.finalized().state();
         [
             self.immutable.historical_roots.len() * 32,
             self.eth1.finalized().len() * ETH1_DATA_SSZ,
-            n * VALIDATOR_SSZ,
+            n * validators.ssz_record_size(),
             n * 8,
             n,
             n,
@@ -179,7 +194,19 @@ impl BeaconState {
             bpw * BUILDER_PENDING_WITHDRAWAL_SSZ,
             sl.latest_execution_payload_bid.ssz_len(),
             sl.payload_expected_withdrawals.len() * WITHDRAWAL_SSZ,
+            validator_preregistrations,
+            builder_preregistrations,
         ]
+    }
+
+    /// `None` before Gloas.
+    fn gloas_layout(&self) -> Option<GloasLayout> {
+        let current_version = self.epoch.finalized().state().fork.current_version;
+        if self.immutable.is_pq(current_version) {
+            Some(GloasLayout::PQ)
+        } else {
+            self.is_finalized_post_gloas().then_some(GloasLayout::GLOAS)
+        }
     }
 
     /// Absolute byte offsets of the variable bodies (the values written into
@@ -188,12 +215,6 @@ impl BeaconState {
         lens: &[usize; FULU_VAR_LEN_SECTIONS],
     ) -> [u32; FULU_VAR_LEN_SECTIONS] {
         Self::offsets_with_base(lens, FULU_FIXED_PART)
-    }
-
-    fn offsets_from_lens_gloas(
-        lens: &[usize; GLOAS_VAR_LEN_SECTIONS],
-    ) -> [u32; GLOAS_VAR_LEN_SECTIONS] {
-        Self::offsets_with_base(lens, GLOAS_FIXED_PART)
     }
 
     fn offsets_with_base<const N: usize>(lens: &[usize; N], base: usize) -> [u32; N] {
@@ -208,27 +229,36 @@ impl BeaconState {
 
     /// Total SSZ length of the encoded state.
     pub fn ssz_len(&self) -> usize {
-        if self.is_finalized_post_gloas() {
-            GLOAS_FIXED_PART + self.var_len_section_lens_gloas().iter().sum::<usize>()
-        } else {
-            FULU_FIXED_PART + self.var_len_section_lens_fulu().iter().sum::<usize>()
+        match self.gloas_layout() {
+            Some(layout) => {
+                layout.fixed_part() + self.var_len_section_lens_gloas().iter().sum::<usize>()
+            }
+            None => FULU_FIXED_PART + self.var_len_section_lens_fulu().iter().sum::<usize>(),
         }
     }
 
     /// Fork-selected checkpoint section list for the streaming cursor.
     pub(crate) fn checkpoint_sections(&self) -> &'static [Section] {
-        if self.is_finalized_post_gloas() { &Section::GLOAS } else { &Section::FULU }
+        match self.gloas_layout() {
+            Some(GloasLayout::PQ) => &Section::PQ,
+            Some(_) => &Section::PQ[..GLOAS_CHECKPOINT_SECTIONS],
+            None => &Section::FULU,
+        }
     }
 
     /// Variable-body offsets for the streaming checkpoint cursor, widened to
-    /// the Gloas array; Fulu fills only the leading [`VAR_LEN_SECTIONS`].
-    pub(crate) fn checkpoint_offsets(&self) -> [u32; GLOAS_VAR_LEN_SECTIONS] {
-        let mut out = [0u32; GLOAS_VAR_LEN_SECTIONS];
-        if self.is_finalized_post_gloas() {
-            out = Self::offsets_from_lens_gloas(&self.var_len_section_lens_gloas());
-        } else {
-            out[..FULU_VAR_LEN_SECTIONS]
-                .copy_from_slice(&Self::offsets_from_lens_fulu(&self.var_len_section_lens_fulu()));
+    /// the PQ array; earlier forks fill a leading prefix.
+    pub(crate) fn checkpoint_offsets(&self) -> [u32; PQ_VAR_LEN_SECTIONS] {
+        let mut out = [0u32; PQ_VAR_LEN_SECTIONS];
+        match self.gloas_layout() {
+            Some(layout) => {
+                out = Self::offsets_with_base(
+                    &self.var_len_section_lens_gloas(),
+                    layout.fixed_part(),
+                );
+            }
+            None => out[..FULU_VAR_LEN_SECTIONS]
+                .copy_from_slice(&Self::offsets_from_lens_fulu(&self.var_len_section_lens_fulu())),
         }
         out
     }
@@ -239,10 +269,9 @@ impl BeaconState {
     }
 
     pub fn encode_ssz(&self, w: &mut Vec<u8>) -> io::Result<()> {
-        if self.is_finalized_post_gloas() {
-            self.encode_ssz_gloas(w)
-        } else {
-            self.encode_ssz_fulu(w)
+        match self.gloas_layout() {
+            Some(layout) => self.encode_ssz_gloas(w, layout),
+            None => self.encode_ssz_fulu(w),
         }
     }
 
@@ -256,11 +285,11 @@ impl BeaconState {
         Ok(())
     }
 
-    fn encode_ssz_gloas(&self, w: &mut Vec<u8>) -> io::Result<()> {
+    fn encode_ssz_gloas(&self, w: &mut Vec<u8>, layout: GloasLayout) -> io::Result<()> {
         let lens = self.var_len_section_lens_gloas();
-        w.reserve(GLOAS_FIXED_PART + lens.iter().sum::<usize>());
-        let offsets = Self::offsets_from_lens_gloas(&lens);
-        for section in Section::GLOAS {
+        w.reserve(layout.fixed_part() + lens.iter().sum::<usize>());
+        let offsets = Self::offsets_with_base(&lens, layout.fixed_part());
+        for &section in self.checkpoint_sections() {
             self.write_section(section, &offsets, w)?;
         }
         Ok(())
@@ -273,13 +302,10 @@ impl BeaconState {
         w: &mut W,
     ) -> io::Result<()> {
         match section {
-            Section::FixedPart => {
-                if self.is_finalized_post_gloas() {
-                    self.write_fixed_part_gloas(w, offsets)
-                } else {
-                    self.write_fixed_part_fulu(w, offsets)
-                }
-            }
+            Section::FixedPart => match self.gloas_layout() {
+                Some(layout) => self.write_fixed_part_gloas(w, offsets, layout),
+                None => self.write_fixed_part_fulu(w, offsets),
+            },
             Section::HistoricalRoots => write_b256_slice(w, &self.immutable.historical_roots),
             Section::Eth1Votes => self.eth1.finalized().write_ssz(w),
             Section::Validators => {
@@ -316,6 +342,12 @@ impl BeaconState {
                 }
                 Ok(())
             }
+            Section::ValidatorPreregistrations => {
+                self.preregistrations.with_finalized_locked(|p| p.write_validators_ssz(w))
+            }
+            Section::BuilderPreregistrations => {
+                self.preregistrations.with_finalized_locked(|p| p.write_builders_ssz(w))
+            }
         }
     }
 
@@ -345,15 +377,14 @@ impl BeaconState {
         }
     }
 
-    /// Fixed-part fields F0..F23 (genesis_time through next_sync_committee),
-    /// byte-identical across Fulu and Gloas. `off[0..=6]` are the seven leading
-    /// variable offsets (historical_roots..inactivity_scores).
+    /// Fixed-part fields F0..F21 (genesis_time through inactivity_scores),
+    /// byte-identical across Fulu, Gloas and PQ. `off[0..=6]` are the seven
+    /// leading variable offsets (historical_roots..inactivity_scores).
     fn write_fixed_prefix<W: Write>(&self, w: &mut W, off: &[u32]) -> io::Result<()> {
         let imm = &self.immutable;
         let sl = self.slot_states.finalized().state();
         let epoch_base = self.epoch.finalized();
         let est = epoch_base.state();
-        let lt = self.longtail.finalized();
 
         // F0..F4
         w_u64(w, imm.genesis_time)?;
@@ -400,10 +431,14 @@ impl BeaconState {
         write_checkpoint(w, &est.current_justified_checkpoint)?;
         write_checkpoint(w, &est.finalized_checkpoint)?;
         // F21_OFF inactivity_scores
-        w_u32(w, off[6])?;
-        // F22/F23 sync committees
-        write_sync_committee(w, lt.sync_committees().current())?;
-        write_sync_committee(w, lt.sync_committees().next())
+        w_u32(w, off[6])
+    }
+
+    /// F22/F23, which PQ drops.
+    fn write_sync_committees<W: Write>(&self, w: &mut W) -> io::Result<()> {
+        let committees = self.longtail.finalized().sync_committees();
+        write_sync_committee(w, committees.current())?;
+        write_sync_committee(w, committees.next())
     }
 
     /// Fixed-part fields shared by both forks' tails.
@@ -438,6 +473,7 @@ impl BeaconState {
 
     fn write_fixed_part_fulu<W: Write>(&self, w: &mut W, offs: &[u32]) -> io::Result<()> {
         self.write_fixed_prefix(w, offs)?;
+        self.write_sync_committees(w)?;
         // F24_OFF execution_payload_header
         w_u32(w, offs[7])?;
         // F25/F26 withdrawal indices, F27_OFF historical_summaries, F28..F33
@@ -445,8 +481,16 @@ impl BeaconState {
         self.write_summaries_scalars_pending(w, offs[8], offs[9], offs[10], offs[11])
     }
 
-    fn write_fixed_part_gloas<W: Write>(&self, w: &mut W, offs: &[u32]) -> io::Result<()> {
+    fn write_fixed_part_gloas<W: Write>(
+        &self,
+        w: &mut W,
+        offs: &[u32],
+        layout: GloasLayout,
+    ) -> io::Result<()> {
         self.write_fixed_prefix(w, offs)?;
+        if !layout.is_pq() {
+            self.write_sync_committees(w)?;
+        }
         let epoch_base = self.epoch.finalized();
         let sl = self.slot_states.finalized().state();
 
@@ -475,6 +519,11 @@ impl BeaconState {
             for v in committee.iter() {
                 w_u64(w, *v)?;
             }
+        }
+        if layout.is_pq() {
+            // validator_preregistrations / builder_preregistrations offsets
+            w_u32(w, offs[15])?;
+            w_u32(w, offs[16])?;
         }
         Ok(())
     }
@@ -513,7 +562,11 @@ impl BeaconState {
         w: &mut W,
     ) -> io::Result<bool> {
         let v = self.validators.finalized();
-        let n = v.validator_count();
+        // XMSS keys need no decompression, so their sidecar is header-only.
+        let n = match v.scheme() {
+            KeyScheme::Bls => v.validator_count(),
+            KeyScheme::Xmss => 0,
+        };
         if chunk == 0 {
             w.write_all(&PUBKEYS_MAGIC)?;
             w_u32(w, PUBKEYS_VERSION)?;
@@ -666,7 +719,7 @@ mod tests {
 
         let offsets = bs.checkpoint_offsets();
         let mut streamed = Vec::with_capacity(bs.ssz_len());
-        for section in Section::GLOAS {
+        for &section in bs.checkpoint_sections() {
             let mut chunk = 0;
             while !bs.write_section_chunk(section, chunk, &offsets, &mut streamed).expect("chunk") {
                 chunk += 1;

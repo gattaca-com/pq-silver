@@ -6103,6 +6103,7 @@ dependencies = [
  "criterion",
  "flux",
  "flux-profiler",
+ "hex",
  "rand 0.8.6",
  "ring",
  "rustc-hash",

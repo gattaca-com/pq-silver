@@ -1,5 +1,6 @@
 use common::F3;
 use flux_profiler::timed;
+use gloas::GloasLayout;
 
 use crate::{BeaconState, SpecConfig, decode_checkpoint_pubkeys};
 
@@ -38,8 +39,12 @@ impl BeaconState {
         pubkeys: Option<&[blst::min_pk::PublicKey]>,
     ) -> Result<Self, DecomposeError> {
         // `fork.current_version` sits at F3 + 4 (after `previous_version`).
-        if ssz.get(F3 + 4..F3 + 8) == Some(cfg.gloas_fork_version.as_slice()) {
-            return gloas::decompose(ssz, cfg, pubkeys);
+        let current_version = ssz.get(F3 + 4..F3 + 8);
+        if current_version == Some(cfg.pq_fork_version.as_slice()) {
+            return gloas::decompose(ssz, cfg, None, GloasLayout::PQ);
+        }
+        if current_version == Some(cfg.gloas_fork_version.as_slice()) {
+            return gloas::decompose(ssz, cfg, pubkeys, GloasLayout::GLOAS);
         }
         Self::decompose_fulu(ssz, cfg, pubkeys)
     }
@@ -51,7 +56,7 @@ impl BeaconState {
         cfg: &SpecConfig,
         pubkeys: Option<&[blst::min_pk::PublicKey]>,
     ) -> Result<Self, DecomposeError> {
-        gloas::decompose(ssz, cfg, pubkeys)
+        gloas::decompose(ssz, cfg, pubkeys, GloasLayout::GLOAS)
     }
 }
 

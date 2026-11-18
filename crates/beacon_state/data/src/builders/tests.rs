@@ -1,7 +1,7 @@
 use silver_ssz::{merkle::hash_list, progressive::ProgressiveHasher};
 
 use super::{BuildersGroup, BuildersView, FinalizedBuilders, builder_hash};
-use crate::{B256, gloas::Builder};
+use crate::{B256, gloas::Builder, pq::KeyScheme};
 
 fn builder(seed: u8) -> Builder {
     Builder {
@@ -17,7 +17,7 @@ fn builder(seed: u8) -> Builder {
 /// Independent full-recompute over the same effective builders — the gloas
 /// `ProgressiveList` shape (the registry is gloas-born, never fulu).
 fn naive_root(view: &BuildersView) -> B256 {
-    hash_list(ProgressiveHasher::new(), view.iter().map(|b| builder_hash(&b)))
+    hash_list(ProgressiveHasher::new(), view.iter().map(|b| builder_hash(&b, KeyScheme::Bls)))
 }
 
 fn ssz_bytes(builders: &[Builder]) -> Vec<u8> {
@@ -34,7 +34,7 @@ fn ssz_bytes(builders: &[Builder]) -> Vec<u8> {
 }
 
 fn base_with(builders: &[Builder]) -> FinalizedBuilders {
-    FinalizedBuilders::from_ssz(&ssz_bytes(builders)).unwrap()
+    FinalizedBuilders::from_ssz(&ssz_bytes(builders), KeyScheme::Bls).unwrap()
 }
 
 #[test]

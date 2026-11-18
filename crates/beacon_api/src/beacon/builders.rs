@@ -21,7 +21,7 @@ pub(crate) fn post_state_builders(req: &Request<'_>, ctx: &ApiCtx, resp: &mut Re
         Err(message) => return resp.error(400, message),
     };
     ctx.try_state_response(req, resp, |view, json| {
-        if !view.is_gloas() {
+        if !view.post_gloas() {
             return Err((400, "state is prior to Gloas"));
         }
         filter.render(view, json);

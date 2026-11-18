@@ -6,6 +6,7 @@ mod fork_choice;
 pub mod shuffling;
 pub mod ssz_hash;
 pub mod ssz_hash_gloas;
+mod ssz_hash_pq;
 pub mod stf;
 pub mod tile;
 mod validate;

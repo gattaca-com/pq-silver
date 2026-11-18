@@ -169,11 +169,7 @@ pub fn apply_signed_block_debug(
     // epoch view, so a block at the fork boundary uses the upgraded fork (Gloas
     // body layout / signing version), not the parent's.
     let block_epoch = block_slot / SLOTS_PER_EPOCH;
-    let body_fork = if epoch_view.is_gloas(view.imm.gloas_fork_version) {
-        BodyFork::Gloas
-    } else {
-        BodyFork::Fulu
-    };
+    let body_fork = if epoch_view.post_gloas(view.imm) { BodyFork::Gloas } else { BodyFork::Fulu };
     let offsets = BodyOffsets::validated(body, body_fork).map_err(|e| wrap(e.into()))?;
     let HashedBody { root: body_root, fork: block_fork } = HashedBody::of(&offsets);
     if !verify_block_sig(
@@ -344,9 +340,7 @@ fn maybe_upgrade_to_gloas(
     epoch: &mut EpochWriteView,
 ) {
     let current_epoch = view.slot.state().slot / SLOTS_PER_EPOCH;
-    if cfg.is_gloas_activation_epoch(current_epoch) &&
-        !epoch.reader().is_gloas(view.imm.gloas_fork_version)
-    {
+    if cfg.is_gloas_activation_epoch(current_epoch) && !epoch.reader().post_gloas(view.imm) {
         silver_log::info!(epoch = current_epoch, "state upgraded to gloas");
         upgrade_to_gloas(view, epoch);
     }
@@ -371,7 +365,7 @@ pub fn process_slot(
     let header = view.slot.state().latest_block_header;
     view.block_roots.set(bucket, hash_tree_root_block_header(&header));
 
-    if epoch.is_gloas(view.imm.gloas_fork_version) {
+    if epoch.post_gloas(view.imm) {
         view.slot.unset_next_payload_availability();
     }
 }
@@ -458,7 +452,7 @@ pub fn process_block_body(
 ) -> Result<()> {
     debug_assert_eq!(
         input.fork.is_gloas(),
-        fork.epoch_view().is_gloas(fork.view.imm.gloas_fork_version),
+        fork.epoch_view().post_gloas(fork.view.imm),
         "body parsed for one fork, state on another",
     );
     let offsets = &input.body;

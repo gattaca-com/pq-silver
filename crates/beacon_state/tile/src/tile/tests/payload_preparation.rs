@@ -510,7 +510,7 @@ fn first_gloas_slot_prepares_on_the_last_fulu_payload() {
     let mut rig = PreparationRig::new(state, spec, slot);
     let before = rig.state_root();
     let head = rig.tile.state.read_view(rig.tile.last_applied);
-    assert!(!head.is_gloas());
+    assert!(!head.post_gloas());
     let parent = head.slot.state().latest_execution_payload_header.clone();
     rig.register(slot);
     rig.tile.payload_attributes.wanted = true;
@@ -524,6 +524,6 @@ fn first_gloas_slot_prepares_on_the_last_fulu_payload() {
     assert!(request.attrs_withdrawals.is_empty());
     assert!(attributes.withdrawals.is_none());
     let advanced = rig.tile.epoch_start_state(rig.tile.last_applied, slot);
-    assert!(rig.tile.state.read_view(advanced).is_gloas());
+    assert!(rig.tile.state.read_view(advanced).post_gloas());
     assert_eq!(rig.state_root(), before);
 }

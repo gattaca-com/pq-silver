@@ -477,7 +477,8 @@ GENERATORS = {
     "BeaconBlockBody": beacon_block_body,
 }
 
-for name, gen in GENERATORS.items():
-    for _ in range(4):
-        value = gen()
-        print(name, value.encode_bytes().hex(), bytes(hash_tree_root(value)).hex())
+if __name__ == "__main__":
+    for name, gen in GENERATORS.items():
+        for _ in range(4):
+            value = gen()
+            print(name, value.encode_bytes().hex(), bytes(hash_tree_root(value)).hex())

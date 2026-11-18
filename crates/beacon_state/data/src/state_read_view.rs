@@ -74,7 +74,12 @@ pub struct StateReadView<'a> {
 
 impl StateReadView<'_> {
     #[inline]
-    pub fn is_gloas(&self) -> bool {
-        self.epoch.is_gloas(self.imm.gloas_fork_version)
+    pub fn post_gloas(&self) -> bool {
+        self.epoch.post_gloas(self.imm)
+    }
+
+    #[inline]
+    pub fn is_pq(&self) -> bool {
+        self.epoch.is_pq(self.imm)
     }
 }

@@ -4,10 +4,10 @@ use crate::{
     BalancesGroup, BeaconState, BlockRootsGroup, BuildersGroup, CurrentParticipationGroup,
     EPOCHS_PER_HISTORICAL_VECTOR, EPOCHS_PER_SLASHINGS_VECTOR, EpochGroup, EpochStateFinalized,
     Eth1Group, Eth1Votes, FinalizedBuilders, FinalizedValidators, InactivityScoresGroup,
-    LongtailGroup, LongtailState, PendingGroup, PreviousParticipationGroup, QueueItem,
-    RandaoMixesGroup, SLOTS_PER_HISTORICAL_ROOT, SlashingsGroup, SlotStateFinalized,
-    SlotStateGroup, SpecConfig, StateRootsGroup, TreeLenMismatch, ValidatorsDecodeError,
-    ValidatorsGroup,
+    LongtailGroup, LongtailState, PendingGroup, Preregistrations, PreregistrationsGroup,
+    PreviousParticipationGroup, QueueItem, RandaoMixesGroup, SLOTS_PER_HISTORICAL_ROOT,
+    SlashingsGroup, SlotStateFinalized, SlotStateGroup, SpecConfig, StateRootsGroup,
+    TreeLenMismatch, ValidatorsDecodeError, ValidatorsGroup,
     gloas::BuilderPendingWithdrawal,
     merkle,
     types::{
@@ -193,16 +193,27 @@ impl BeaconState {
         epoch: EpochStateFinalized,
         slot: SlotStateFinalized,
         builders: FinalizedBuilders,
+        preregistrations: Preregistrations,
         cfg: &SpecConfig,
     ) -> Result<Self, DecomposeError> {
-        let is_gloas = epoch.state().fork.current_version == cfg.gloas_fork_version;
-        let format = if is_gloas { HashFormat::Progressive } else { HashFormat::Fixed };
+        let mut immutable = Immutable::default();
+        immutable.fill_from_ssz(ssz, cfg);
+        immutable.fill_historical_roots_hash(ssz, offsets)?;
+
+        let current_version = epoch.state().fork.current_version;
+        let is_pq = immutable.is_pq(current_version);
+        let post_gloas = immutable.is_post_gloas(current_version);
+        let format = if post_gloas { HashFormat::Progressive } else { HashFormat::Fixed };
 
         let eth1 = Eth1Group::new(Eth1Votes::from_ssz(ssz, offsets)?);
 
         let val_bytes = &ssz[offsets.validators..offsets.balances];
-        let validators =
-            ValidatorsGroup::new(FinalizedValidators::try_new(val_bytes, pubkeys)?, format);
+        let finalized_validators = if is_pq {
+            FinalizedValidators::try_new_xmss(val_bytes)?
+        } else {
+            FinalizedValidators::try_new(val_bytes, pubkeys)?
+        };
+        let validators = ValidatorsGroup::new(finalized_validators, format);
 
         // Per-validator columns size to the validators' capacity/count; each
         // constructor length-checks against the count (construction =
@@ -222,17 +233,17 @@ impl BeaconState {
         let inactivity =
             InactivityScoresGroup::new(cap, n, &ssz[offsets.inactivity..offsets.eph], format)?;
 
-        let mut immutable = Immutable::default();
-        immutable.fill_from_ssz(ssz, cfg);
-        immutable.fill_historical_roots_hash(ssz, offsets)?;
-
         // Longtail's sync-committee → validator-index resolution reads the
         // registry.
-        let longtail =
-            LongtailGroup::new(LongtailState::from_ssz(ssz, offsets, validators.finalized())?);
+        let longtail = LongtailGroup::new(LongtailState::from_ssz(
+            ssz,
+            offsets,
+            validators.finalized(),
+            !is_pq,
+        )?);
 
         let mut pending = decode_pending(ssz, offsets, consolidations_end, builder_withdrawals)?;
-        if is_gloas {
+        if post_gloas {
             pending.mark_gloas_base();
         }
 
@@ -264,8 +275,9 @@ impl BeaconState {
             epoch: EpochGroup::new(epoch),
             longtail,
             builders: BuildersGroup::new(builders),
+            preregistrations: PreregistrationsGroup::new(preregistrations),
         };
-        debug_assert_eq!(state.is_finalized_post_gloas(), is_gloas);
+        debug_assert_eq!(state.is_finalized_post_gloas(), post_gloas);
         Ok(state)
     }
 }
@@ -278,6 +290,7 @@ impl Immutable {
         self.genesis_fork_version = cfg.genesis_fork_version;
         self.capella_fork_version = cfg.capella_fork_version;
         self.gloas_fork_version = cfg.gloas_fork_version;
+        self.pq_fork_version = cfg.pq_fork_version;
     }
 
     #[timed]
@@ -359,4 +372,21 @@ fn validate_queue<Q: QueueItem>(
         return Err(many_err(n, Q::SSZ_LIMIT));
     }
     Ok(bytes)
+}
+
+/// List length / cap check shared by the Gloas variable-list readers.
+pub(crate) fn checked_count(
+    bytes: usize,
+    size: usize,
+    field: &'static str,
+    limit: usize,
+) -> Result<usize, DecomposeError> {
+    if !bytes.is_multiple_of(size) {
+        return Err(DecomposeError::GloasFieldLen { field, len: bytes, size });
+    }
+    let n = bytes / size;
+    if n > limit {
+        return Err(DecomposeError::GloasTooMany { field, n, max: limit });
+    }
+    Ok(n)
 }

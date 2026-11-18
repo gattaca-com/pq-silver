@@ -5,9 +5,9 @@ use blst::min_pk::PublicKey;
 use crate::{
     BalancesWriteView, BlockRoots, BuildersWriteView, Current, EpochId, EpochView, Eth1View,
     Eth1WriteView, InactivityWriteView, LongtailId, LongtailView, ParticipationWriteView,
-    PendingView, PendingWriteView, Previous, RandaoMixesWriteView, RootsWriteView,
-    SlashingsWriteView, SlotStateWriteView, StateReadView, StateRoots, ValidatorsWriteView,
-    Withdrawals,
+    PendingView, PendingWriteView, Preregistrations, PreregistrationsWriteView, Previous,
+    RandaoMixesWriteView, RootsWriteView, SlashingsWriteView, SlotStateWriteView, StateReadView,
+    StateRoots, ValidatorsWriteView, Withdrawals,
     types::{BLSPubkey, Immutable, StateId},
 };
 
@@ -19,6 +19,7 @@ pub struct StateView<'a> {
     pub epoch: EpochView<'a>,
     pub longtail: LongtailView<'a>,
     pub pending: PendingView<'a>,
+    pub preregistrations: &'a Preregistrations,
 }
 
 impl<'a> Deref for StateView<'a> {
@@ -49,6 +50,7 @@ pub struct StateWriterView<'a> {
     pub slot: SlotStateWriteView<'a>,
     pub validators: ValidatorsWriteView<'a>,
     pub builders: BuildersWriteView<'a>,
+    pub preregistrations: PreregistrationsWriteView<'a>,
 }
 
 impl<'a> StateWriterView<'a> {
@@ -103,6 +105,7 @@ impl<'a> StateWriterView<'a> {
             randao_mixes_idx: self.randao_mixes.commit(),
             slot_idx: self.slot.commit(),
             builders_idx: self.builders.commit(),
+            preregistrations_idx: self.preregistrations.commit(),
         }
     }
 
@@ -137,6 +140,7 @@ impl<'a> StateWriterView<'a> {
             epoch,
             longtail,
             pending: self.pending.reader(),
+            preregistrations: self.preregistrations.reader(),
         }
     }
 }

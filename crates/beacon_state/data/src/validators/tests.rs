@@ -1,12 +1,13 @@
 use blst::min_pk::{PublicKey, SecretKey};
 
 use super::{
-    FinalizedValidators, ValSeed, ValidatorsDecodeError, ValidatorsGroup, finalized::DECODE_CHUNK,
-    validator_hash,
+    FinalizedValidators, ValSeed, ValidatorsDecodeError, ValidatorsGroup, ValidatorsWriteView,
+    finalized::DECODE_CHUNK, validator_hash,
 };
 use crate::{
     B256, Withdrawals,
     merkle::{MerkleStack, hash_concat, hash_fixed_bytes, hash_list, merkleize, uint64_chunk},
+    pq::{KeyScheme, xmss_pubkey_padded},
     progressive::ProgressiveHasher,
     types::{BLSPubkey, FAR_FUTURE_EPOCH, HashFormat, VALIDATOR_REGISTRY_LIMIT},
 };
@@ -556,4 +557,89 @@ fn leaf_hashes_match_validator_hash() {
             assert_eq!(root, expected, "validator {i}");
         }
     }
+}
+
+/// PQ `Validator` records: pubkey, vrf_root, then the shared fields.
+fn xmss_record(i: u8, effective_balance: u64, epoch: u64) -> Vec<u8> {
+    let mut record = Vec::with_capacity(137);
+    record.extend_from_slice(&[i; 32]);
+    record.extend_from_slice(&[i.wrapping_add(100); 32]);
+    record.extend_from_slice(&creds(i).0);
+    record.extend_from_slice(&effective_balance.to_le_bytes());
+    record.push(i % 2);
+    for _ in 0..4 {
+        record.extend_from_slice(&epoch.to_le_bytes());
+    }
+    record
+}
+
+#[test]
+fn xmss_registry_round_trips_its_ssz() {
+    let ssz: Vec<u8> = (1..=5).flat_map(|i| xmss_record(i, u64::from(i) * 7, 9)).collect();
+    let f = FinalizedValidators::try_new_xmss(&ssz).unwrap();
+    assert_eq!(f.scheme(), KeyScheme::Xmss);
+    assert_eq!(f.validator_count(), 5);
+    assert_eq!(f.find_by_pubkey(&xmss_pubkey_padded(&[3; 32])), Some(2));
+    assert_eq!(f.scheme_keys.vrf_root(2), Some(&[103; 32]));
+
+    let mut encoded = Vec::new();
+    f.write_ssz_range(0, 5, &mut encoded).unwrap();
+    assert_eq!(encoded, ssz);
+    assert!(matches!(
+        FinalizedValidators::try_new_xmss(&ssz[1..]),
+        Err(ValidatorsDecodeError::LenNotMultiple { size: 137, .. })
+    ));
+}
+
+#[test]
+fn xmss_leaf_hashes_match_validator_hash() {
+    let ssz: Vec<u8> = (1..=9).flat_map(|i| xmss_record(i, u64::from(i), 4)).collect();
+    let f = FinalizedValidators::try_new_xmss(&ssz).unwrap();
+    for (i, root) in f.leaf_hashes(0..9).into_iter().enumerate() {
+        let mut slashed = [0u8; 32];
+        slashed[0] = (i as u8 + 1) % 2;
+        let fields = [
+            [i as u8 + 1; 32],
+            [i as u8 + 101; 32],
+            creds(i as u8 + 1).0,
+            uint64_chunk(i as u64 + 1),
+            slashed,
+            uint64_chunk(4),
+            uint64_chunk(4),
+            uint64_chunk(4),
+            uint64_chunk(4),
+        ];
+        assert_eq!(root, merkleize(&fields), "validator {i}");
+    }
+}
+
+#[test]
+fn appended_xmss_validator_hashes_like_a_decoded_one() {
+    let base: Vec<u8> = (1..=2).flat_map(|i| xmss_record(i, 5, 6)).collect();
+    let mut g = ValidatorsGroup::new(
+        FinalizedValidators::try_new_xmss(&base).unwrap(),
+        HashFormat::Progressive,
+    );
+    let mut wv = g.roll_fresh();
+    let idx = wv.append_xmss(&[3; 32], [103; 32], creds(3));
+    wv.set_effective_balance(idx, 5);
+    wv.set_slashed(idx, true);
+    for set in [
+        ValidatorsWriteView::set_activation_eligibility_epoch,
+        ValidatorsWriteView::set_activation_epoch,
+        ValidatorsWriteView::set_exit_epoch,
+        ValidatorsWriteView::set_withdrawable_epoch,
+    ] {
+        set(&mut wv, idx, 6);
+    }
+    assert_eq!(wv.reader().vrf_root(idx as usize), Some(&[103; 32]));
+    assert_eq!(wv.find_by_pubkey(&xmss_pubkey_padded(&[3; 32])), Some(idx));
+
+    let all: Vec<u8> = (1..=3).flat_map(|i| xmss_record(i, 5, 6)).collect();
+    let decoded = ValidatorsGroup::new(
+        FinalizedValidators::try_new_xmss(&all).unwrap(),
+        HashFormat::Progressive,
+    );
+    let mut fresh = decoded;
+    assert_eq!(wv.hash_root(), fresh.roll_fresh().hash_root());
 }

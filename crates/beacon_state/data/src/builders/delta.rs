@@ -146,7 +146,7 @@ impl<'a> BuildersView<'a> {
 
     #[inline]
     fn recompute_leaf(&self, i: usize) -> B256 {
-        builder_hash(self.get(i).unwrap())
+        builder_hash(self.get(i).unwrap(), self.base.scheme())
     }
 }
 

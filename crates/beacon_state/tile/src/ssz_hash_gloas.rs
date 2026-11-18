@@ -36,25 +36,30 @@ impl BeaconStateGloas {
 
         let mut fields = [[0u8; 32]; 46];
         fields[..38].copy_from_slice(&common);
-        fields[38..].copy_from_slice(&[
-            rv.builders_hash.hash_root(),
-            uint64_chunk(slot.next_withdrawal_builder_index),
-            hash_fixed_bytes(&slot.execution_payload_availability),
-            hash_vector(
-                MerkleStack::new(BUILDER_PENDING_PAYMENTS_LEN),
-                slot.builder_pending_payments.iter().map(hash_builder_pending_payment),
-            ),
-            rv.pending.builder_withdrawals.hash_root(),
-            hash_execution_payload_bid(&slot.latest_execution_payload_bid),
-            hash_list(
-                ProgressiveHasher::new(),
-                slot.payload_expected_withdrawals.iter().map(hash_withdrawal),
-            ),
-            rv.epoch.ptc_window().hash_root(),
-        ]);
+        fields[38..].copy_from_slice(&gloas_fields(rv));
 
         Self::progressive_root(&fields)
     }
+}
+
+pub(crate) fn gloas_fields(rv: &StateView) -> [B256; 8] {
+    let slot = rv.slot.state();
+    [
+        rv.builders_hash.hash_root(),
+        uint64_chunk(slot.next_withdrawal_builder_index),
+        hash_fixed_bytes(&slot.execution_payload_availability),
+        hash_vector(
+            MerkleStack::new(BUILDER_PENDING_PAYMENTS_LEN),
+            slot.builder_pending_payments.iter().map(hash_builder_pending_payment),
+        ),
+        rv.pending.builder_withdrawals.hash_root(),
+        hash_execution_payload_bid(&slot.latest_execution_payload_bid),
+        hash_list(
+            ProgressiveHasher::new(),
+            slot.payload_expected_withdrawals.iter().map(hash_withdrawal),
+        ),
+        rv.epoch.ptc_window().hash_root(),
+    ]
 }
 
 /// `ExecutionAddress` (20 B) right-padded into a 32-B chunk.

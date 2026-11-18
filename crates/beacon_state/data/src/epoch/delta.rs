@@ -7,7 +7,7 @@ use super::{
 use crate::{
     gloas::{PTC_WINDOW_LEN, PtcCommittee},
     ring::{Reset, Slot as RingSlot},
-    types::{Epoch, EpochState, Fork, Version},
+    types::{Epoch, EpochState, Fork, Immutable, Version},
 };
 
 #[derive(Clone, Default)]
@@ -92,8 +92,13 @@ impl<'a> EpochReadView<'a> {
     }
 
     #[inline]
-    pub fn is_gloas(&self, gloas_fork_version: Version) -> bool {
-        self.state().fork.current_version == gloas_fork_version
+    pub fn post_gloas(&self, imm: &Immutable) -> bool {
+        imm.is_post_gloas(self.state().fork.current_version)
+    }
+
+    #[inline]
+    pub fn is_pq(&self, imm: &Immutable) -> bool {
+        imm.is_pq(self.state().fork.current_version)
     }
 
     #[inline]

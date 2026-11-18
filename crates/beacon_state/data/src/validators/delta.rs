@@ -1,12 +1,15 @@
 use blst::min_pk::PublicKey;
 use flux_profiler::timed;
+use silver_ssz::ssz_view::XMSSPubkey;
 use silver_state_memory::RetainedVec;
 
 use super::{
-    FinalizedValidators, ValidatorsGroup, ValidatorsId, finalized::slashed_bit, validator_hash,
+    FinalizedValidators, ValidatorsGroup, ValidatorsId, finalized::slashed_bit, scheme::SchemeKey,
+    validator_hash, validator_hash_xmss,
 };
 use crate::{
     B256, Withdrawals,
+    pq::{KeyScheme, xmss_pubkey, xmss_pubkey_padded},
     ring::{Reset, Slot as RingSlot},
     sparse::Edits,
     tree::{TreeView, TreeWriteView, ValidatorsHash},
@@ -20,7 +23,7 @@ use crate::{
 #[derive(Clone, Copy, PartialEq)]
 struct AppendedValidator {
     pubkey: BLSPubkey,
-    pubkey_decompressed: PublicKey,
+    scheme_key: SchemeKey,
     credentials: Withdrawals,
 }
 
@@ -86,7 +89,7 @@ impl ValidatorsDelta {
             for (p, a) in self.appended.iter().enumerate() {
                 let idx = start + p;
                 base.val_pubkey[idx] = a.pubkey;
-                base.val_pubkey_decompressed[idx] = a.pubkey_decompressed;
+                base.scheme_keys.set(idx, a.scheme_key);
                 base.val_withdrawal_credentials[idx] = a.credentials;
                 index.insert(a.pubkey, idx as u32);
             }
@@ -246,9 +249,19 @@ impl<'a> ValidatorsView<'a> {
     #[inline]
     pub fn pubkey_decompressed(&self, ix: usize) -> &'a PublicKey {
         if ix < self.delta.base_count {
-            &self.base.val_pubkey_decompressed[ix]
+            self.base.scheme_keys.bls(ix)
         } else {
-            &self.delta.appended[ix - self.delta.base_count].pubkey_decompressed
+            self.delta.appended[ix - self.delta.base_count].scheme_key.bls()
+        }
+    }
+
+    /// `None` in a BLS registry.
+    #[inline]
+    pub fn vrf_root(&self, ix: usize) -> Option<&'a B256> {
+        if ix < self.delta.base_count {
+            self.base.scheme_keys.vrf_root(ix)
+        } else {
+            self.delta.appended[ix - self.delta.base_count].scheme_key.vrf_root()
         }
     }
 
@@ -362,16 +375,29 @@ impl<'a> ValidatorsView<'a> {
     /// edit to keep the overlay consistent with the field edits.
     fn recompute_leaf(&self, idx: u32) -> B256 {
         let ix = idx as usize;
-        validator_hash(
-            self.pubkey(ix),
-            self.credentials(ix),
-            self.effective_balance(ix),
-            self.is_slashed(ix),
-            self.activation_eligibility_epoch(ix),
-            self.activation_epoch(ix),
-            self.exit_epoch(ix),
-            self.withdrawable_epoch(ix),
-        )
+        match self.vrf_root(ix) {
+            None => validator_hash(
+                self.pubkey(ix),
+                self.credentials(ix),
+                self.effective_balance(ix),
+                self.is_slashed(ix),
+                self.activation_eligibility_epoch(ix),
+                self.activation_epoch(ix),
+                self.exit_epoch(ix),
+                self.withdrawable_epoch(ix),
+            ),
+            Some(vrf_root) => validator_hash_xmss(
+                xmss_pubkey(self.pubkey(ix)),
+                vrf_root,
+                self.credentials(ix),
+                self.effective_balance(ix),
+                self.is_slashed(ix),
+                self.activation_eligibility_epoch(ix),
+                self.activation_epoch(ix),
+                self.exit_epoch(ix),
+                self.withdrawable_epoch(ix),
+            ),
+        }
     }
 
     /// The finalized base (for callers that must read the pre-fork registry).
@@ -695,12 +721,28 @@ impl<'a> ValidatorsWriteView<'a> {
     /// Returns the absolute index of the new validator.
     #[inline]
     pub fn append(&mut self, pk: BLSPubkey, pk_decompressed: PublicKey, creds: Withdrawals) -> u32 {
+        self.append_scheme(pk, SchemeKey::Bls(pk_decompressed), creds)
+    }
+
+    /// [`Self::append`] for a PQ registry.
+    #[inline]
+    pub fn append_xmss(&mut self, pk: &XMSSPubkey, vrf_root: B256, creds: Withdrawals) -> u32 {
+        self.append_scheme(xmss_pubkey_padded(pk), SchemeKey::Xmss { vrf_root }, creds)
+    }
+
+    fn append_scheme(
+        &mut self,
+        pubkey: BLSPubkey,
+        scheme_key: SchemeKey,
+        credentials: Withdrawals,
+    ) -> u32 {
+        debug_assert_eq!(
+            matches!(scheme_key, SchemeKey::Xmss { .. }),
+            self.base.scheme() == KeyScheme::Xmss,
+            "appended key must match the registry's scheme",
+        );
         let idx = (self.fork.base_count + self.fork.appended.len()) as u32;
-        self.fork.appended.push(AppendedValidator {
-            pubkey: pk,
-            pubkey_decompressed: pk_decompressed,
-            credentials: creds,
-        });
+        self.fork.appended.push(AppendedValidator { pubkey, scheme_key, credentials });
         let appended = self.hash.append_empty();
         debug_assert_eq!(appended, idx, "hash column count out of step with registry");
         self.refresh_leaf(idx);

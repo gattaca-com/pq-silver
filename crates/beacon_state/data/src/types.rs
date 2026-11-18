@@ -5,8 +5,8 @@ pub use silver_state_hashing::HashFormat;
 
 use crate::{
     BalancesId, BlockRootsId, BuildersId, CurrentParticipationId, DecomposeError, EpochId, Eth1Id,
-    InactivityId, LongtailId, PayloadWithdrawals, PendingId, PreviousParticipationId,
-    RandaoMixesId, SlashingsId, SlotStateId, StateRootsId, ValidatorsId,
+    InactivityId, LongtailId, PayloadWithdrawals, PendingId, PreregistrationsId,
+    PreviousParticipationId, RandaoMixesId, SlashingsId, SlotStateId, StateRootsId, ValidatorsId,
     decompose::common::{b256, u32_le, u64_le},
     gloas::{
         BUILDER_PENDING_PAYMENTS_LEN, BuilderPendingPayment, EXECUTION_PAYLOAD_AVAILABILITY_BYTES,
@@ -16,6 +16,7 @@ use crate::{
         MerkleStack, ZERO_HASHES, const_hash_concat, hash_concat, hash_fixed_bytes, hash_vector,
         merkleize, uint64_chunk,
     },
+    pq::PQ_FORK_VERSION,
 };
 
 const EPH_FIXED_PART: usize = 584;
@@ -104,6 +105,8 @@ pub struct StateId {
     pub slot_idx: SlotStateId,
     /// Empty until the Gloas fork.
     pub builders_idx: BuildersId,
+    /// Empty until the PQ fork.
+    pub preregistrations_idx: PreregistrationsId,
 }
 
 // size: ~5.5 KB of plain data — the vote list lives in its own tier
@@ -229,6 +232,21 @@ pub struct Immutable {
     pub genesis_fork_version: Version,
     pub capella_fork_version: Version,
     pub gloas_fork_version: Version,
+    pub pq_fork_version: Version,
+}
+
+impl Immutable {
+    /// Whether a state at `current_version` carries the Gloas tiers, which PQ
+    /// keeps.
+    #[inline]
+    pub fn is_post_gloas(&self, current_version: Version) -> bool {
+        current_version == self.gloas_fork_version || self.is_pq(current_version)
+    }
+
+    #[inline]
+    pub fn is_pq(&self, current_version: Version) -> bool {
+        current_version == self.pq_fork_version
+    }
 }
 
 impl Default for Immutable {
@@ -241,6 +259,7 @@ impl Default for Immutable {
             genesis_fork_version: Version::default(),
             capella_fork_version: Version::default(),
             gloas_fork_version: GLOAS_FORK_VERSION,
+            pq_fork_version: PQ_FORK_VERSION,
         }
     }
 }

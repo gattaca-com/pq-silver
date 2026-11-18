@@ -6,7 +6,7 @@ use super::{
 use crate::{
     decompose::{
         common::{F17, F18, F19, F20, F29, F37, read_checkpoint, read_fork, u64_le},
-        gloas::{G_DEPOSIT_BALANCE_TO_CONSUME, G_PROPOSER_LOOKAHEAD, G_PTC_WINDOW},
+        gloas::{G_DEPOSIT_BALANCE_TO_CONSUME, G_PROPOSER_LOOKAHEAD, G_PTC_WINDOW, GloasLayout},
     },
     gloas::{PTC_SIZE, zeroed_ptc_window},
     types::EpochState,
@@ -50,16 +50,20 @@ impl EpochStateFinalized {
         Self { state: read_epoch_state(ssz, F37, F29), ..Default::default() }
     }
 
-    pub(crate) fn from_ssz_gloas(ssz: &[u8]) -> Self {
+    pub(crate) fn from_ssz_gloas(ssz: &[u8], layout: GloasLayout) -> Self {
         let mut ptc_window = zeroed_ptc_window();
         for (c, committee) in ptc_window.iter_mut().enumerate() {
             for (j, v) in committee.iter_mut().enumerate() {
-                *v = u64_le(ssz, G_PTC_WINDOW + (c * PTC_SIZE + j) * 8);
+                *v = u64_le(ssz, layout.at(G_PTC_WINDOW) + (c * PTC_SIZE + j) * 8);
             }
         }
 
         Self {
-            state: read_epoch_state(ssz, G_PROPOSER_LOOKAHEAD, G_DEPOSIT_BALANCE_TO_CONSUME),
+            state: read_epoch_state(
+                ssz,
+                layout.at(G_PROPOSER_LOOKAHEAD),
+                layout.at(G_DEPOSIT_BALANCE_TO_CONSUME),
+            ),
             ptc_window: PtcWindow::new(ptc_window),
             increments: EffectiveIncrements::default(),
         }

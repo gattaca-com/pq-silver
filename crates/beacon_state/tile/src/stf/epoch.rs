@@ -61,7 +61,7 @@ pub fn process_epoch(
     scratch: &mut StfScratch,
 ) {
     let current_epoch = view.slot.state().slot / SLOTS_PER_EPOCH;
-    let is_gloas = epoch.reader().is_gloas(view.imm.gloas_fork_version);
+    let post_gloas = epoch.reader().post_gloas(view.imm);
 
     // Longtail boundary roll: once iff either rotation gate fires, derived
     // from the inherited entry (fresh off the base when no ancestor rotated).
@@ -80,7 +80,7 @@ pub fn process_epoch(
     process_eth1_data_reset(&mut view.eth1, current_epoch);
     process_pending_deposits(cfg, view, epoch, &mut scratch.postponed);
     process_pending_consolidations(view);
-    if is_gloas {
+    if post_gloas {
         process_builder_pending_payments(view, current_epoch);
     }
     process_effective_balance_updates(view, &mut scratch.replace_u64);
@@ -103,7 +103,7 @@ pub fn process_epoch(
         );
     }
     process_proposer_lookahead(view, epoch, current_epoch, &mut scratch.active, &mut scratch.eff);
-    if is_gloas {
+    if post_gloas {
         process_ptc_window(view, epoch, current_epoch);
     }
 
@@ -804,7 +804,7 @@ pub fn process_proposer_lookahead(
         DOMAIN_BEACON_PROPOSER,
     );
     view.validators.reader().active_indices_into(target_epoch, active_scratch);
-    if epoch.reader().is_gloas(view.imm.gloas_fork_version) {
+    if epoch.reader().post_gloas(view.imm) {
         retain_unslashed(active_scratch, &view.validators.reader());
     }
     eff_scratch.clear();

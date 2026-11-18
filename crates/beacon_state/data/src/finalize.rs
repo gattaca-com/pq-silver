@@ -68,6 +68,10 @@ impl BeaconState {
         survivors.rebase(|s| &mut s.pending_idx, |w, ids| self.pending.finalize(w, ids));
         survivors.rebase(|s| &mut s.slot_idx, |w, ids| self.slot_states.finalize(w, ids));
         survivors.rebase(|s| &mut s.builders_idx, |w, ids| self.builders.finalize(w, ids));
+        survivors.rebase(
+            |s| &mut s.preregistrations_idx,
+            |w, ids| self.preregistrations.finalize(w, ids),
+        );
 
         survivors.rebase_lazy(|s| &mut s.epoch_idx, |w, ids| self.epoch.finalize(w, ids));
         survivors.rebase_lazy(|s| &mut s.longtail_idx, |w, ids| self.longtail.finalize(w, ids));

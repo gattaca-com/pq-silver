@@ -9,7 +9,7 @@ use flux::communication::Seqlock;
 use flux_profiler::timed;
 
 use crate::{
-    BeaconState, ForkWriter, StateId, StateReadView, StateView, encode::GLOAS_VAR_LEN_SECTIONS,
+    BeaconState, ForkWriter, StateId, StateReadView, StateView, encode::PQ_VAR_LEN_SECTIONS,
 };
 
 /// The shared `BeaconState` allocation. Lifetime rides the `Arc` (a reader
@@ -367,7 +367,7 @@ pub enum CheckpointChunk {
 pub struct CheckpointCursor {
     version: u64,
     slot: u64,
-    offsets: [u32; GLOAS_VAR_LEN_SECTIONS],
+    offsets: [u32; PQ_VAR_LEN_SECTIONS],
     section_count: usize,
     // Section index; pubkeys stage once past `section_count`.
     section: usize,

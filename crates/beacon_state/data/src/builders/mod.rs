@@ -12,6 +12,7 @@ use flux_profiler::timed;
 use crate::{
     gloas::Builder,
     merkle::{hash_fixed_bytes, merkleize, uint64_chunk},
+    pq::KeyScheme,
     reanchor::reanchor_survivors,
     ring::{Id, Ring, RingGroup},
     tree::{BuildersHash, TreeGroup, TreeView},
@@ -43,7 +44,7 @@ impl BuildersGroup {
         let hash = TreeGroup::from_leaves(
             finalized.capacity(),
             builders.len(),
-            builders.iter().map(builder_hash),
+            builders.iter().map(|b| builder_hash(b, finalized.scheme())),
             HashFormat::Progressive,
         );
         Self { finalized, deltas: Ring::new(SLOTS_RING_N), hash }
@@ -113,9 +114,9 @@ impl BuildersGroup {
 }
 
 #[inline]
-pub(crate) fn builder_hash(b: &Builder) -> B256 {
+pub(crate) fn builder_hash(b: &Builder, scheme: KeyScheme) -> B256 {
     merkleize(&[
-        hash_fixed_bytes(&b.pubkey),
+        scheme.pubkey_root(&b.pubkey),
         uint64_chunk(b.version as u64),
         hash_fixed_bytes(&b.execution_address),
         uint64_chunk(b.balance),

@@ -4,7 +4,10 @@ use super::common::{
     DecomposeError, F7_OFF, F9_OFF, F11_OFF, F12_OFF, F15_OFF, F16_OFF, F21_OFF, F24_OFF, F27_OFF,
     F34_OFF, F35_OFF, F36_OFF, FULU_FIXED_PART, Offsets, u32_le,
 };
-use crate::{BeaconState, EpochStateFinalized, FinalizedBuilders, SlotStateFinalized, SpecConfig};
+use crate::{
+    BeaconState, EpochStateFinalized, FinalizedBuilders, Preregistrations, SlotStateFinalized,
+    SpecConfig,
+};
 
 impl Offsets {
     fn read_and_validate(ssz: &[u8]) -> Result<Self, DecomposeError> {
@@ -83,6 +86,7 @@ impl BeaconState {
             epoch,
             slot,
             FinalizedBuilders::default(),
+            Preregistrations::default(),
             cfg,
         )
     }

@@ -29,6 +29,10 @@ pub use parsed::ParsedAggregateAndProof;
 pub use pending::{
     PendingGroup, PendingId, PendingView, PendingWriteView, QueueItem, QueueView, QueueWriteView,
 };
+pub use preregistrations::{
+    BuilderPreregistration, PREREGISTRATIONS_LIMIT, Preregistrations, PreregistrationsGroup,
+    PreregistrationsId, PreregistrationsWriteView, ValidatorPreregistration,
+};
 pub use silver_chain_spec::{BlobParameters, ForkName, SpecConfig};
 pub use silver_ssz::body_offsets::{BlockBodyError, BodyFork, BodyOffsets, OperationKind, Payload};
 pub(crate) use silver_ssz::{merkle, progressive};
@@ -65,6 +69,8 @@ pub mod gloas;
 mod longtail;
 mod parsed;
 mod pending;
+pub mod pq;
+mod preregistrations;
 mod reanchor;
 pub mod ring;
 mod slot_state;
@@ -115,11 +121,14 @@ pub struct BeaconState {
     pub longtail: LongtailGroup,
     /// Gloas builder registry — own ring, rolled every slot.
     pub builders: BuildersGroup,
+    /// Empty before PQ.
+    pub preregistrations: PreregistrationsGroup,
 }
 
 impl BeaconState {
+    /// Gloas or a later fork: every Gloas tier is live.
     pub fn is_finalized_post_gloas(&self) -> bool {
-        self.epoch.finalized().state().fork.current_version == self.immutable.gloas_fork_version
+        self.immutable.is_post_gloas(self.epoch.finalized().state().fork.current_version)
     }
 
     /// Anchor a fresh per-fork delta on every always-rolled tier (epoch/
@@ -145,6 +154,7 @@ impl BeaconState {
             slot: self.slot_states.roll_fresh(),
             validators: self.validators.roll_fresh(),
             builders: self.builders.roll_fresh(),
+            preregistrations: self.preregistrations.roll_fresh(),
         };
         (view, &mut self.epoch, &mut self.longtail)
     }
@@ -175,6 +185,7 @@ impl BeaconState {
             slot: self.slot_states.roll_from(parent.slot_idx),
             validators: self.validators.roll_from(parent.validators_idx),
             builders: self.builders.roll_from(parent.builders_idx),
+            preregistrations: self.preregistrations.roll_from(parent.preregistrations_idx),
         };
         (view, &mut self.epoch, &mut self.longtail)
     }
@@ -187,6 +198,7 @@ impl BeaconState {
             read,
             eth1: self.eth1.view(state_id.eth1_idx),
             pending: self.pending.view(state_id.pending_idx),
+            preregistrations: self.preregistrations.view(state_id.preregistrations_idx),
         }
     }
 
@@ -267,6 +279,7 @@ impl BeaconState {
             epoch: EpochGroup::new(epoch_base),
             longtail: LongtailGroup::new(LongtailState::default()),
             builders: BuildersGroup::new(FinalizedBuilders::default()),
+            preregistrations: PreregistrationsGroup::new(Preregistrations::default()),
         }
     }
 

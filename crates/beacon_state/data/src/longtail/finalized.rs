@@ -72,18 +72,23 @@ impl LongtailState {
 
 // `validators` resolves the sync-committee → validator indices.
 impl LongtailState {
+    /// A PQ state has no sync committees, so `has_sync_committees` is false
+    /// and they stay empty.
     #[timed]
     pub(crate) fn from_ssz(
         ssz: &[u8],
         o: &Offsets,
         validators: &FinalizedValidators,
+        has_sync_committees: bool,
     ) -> Result<Self, DecomposeError> {
         let mut lt = Self::default();
 
-        lt.committees.fill_rehashing(|current, next| {
-            read_sync_committee(ssz, F22, "current", current)?;
-            read_sync_committee(ssz, F23, "next", next)
-        })?;
+        if has_sync_committees {
+            lt.committees.fill_rehashing(|current, next| {
+                read_sync_committee(ssz, F22, "current", current)?;
+                read_sync_committee(ssz, F23, "next", next)
+            })?;
+        }
 
         let hs_bytes = &ssz[o.hist_summaries..o.pending_deposits];
         if !hs_bytes.len().is_multiple_of(HISTORICAL_SUMMARY_SSZ_SIZE) {
@@ -107,10 +112,12 @@ impl LongtailState {
 
         lt.historical_summaries_root = hash_summaries(&lt.historical_summaries);
 
-        lt.committees.set_indices(std::array::from_fn(|i| {
-            let pk = &lt.committees.current().pubkeys[i];
-            validators.find_by_pubkey(pk).map_or(SyncCommittees::unresolved(), |i| i as u32)
-        }));
+        if has_sync_committees {
+            lt.committees.set_indices(std::array::from_fn(|i| {
+                let pk = &lt.committees.current().pubkeys[i];
+                validators.find_by_pubkey(pk).map_or(SyncCommittees::unresolved(), |i| i as u32)
+            }));
+        }
 
         Ok(lt)
     }

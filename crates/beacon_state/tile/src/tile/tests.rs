@@ -5564,6 +5564,7 @@ fn finalize_promotes_every_tier_into_checkpoint_encode() {
             state_roots_idx: set1(&mut bs.state_roots, a.state_roots_idx, 1, [0x51; 32]),
             randao_mixes_idx: set1(&mut bs.randao_mixes, a.randao_mixes_idx, 0, [0xAA; 32]),
             builders_idx: a.builders_idx,
+            preregistrations_idx: a.preregistrations_idx,
         }
     };
 

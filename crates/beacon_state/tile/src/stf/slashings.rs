@@ -86,7 +86,7 @@ pub fn process_proposer_slashings(
     cfg: &SpecConfig,
     data: &[u8],
 ) -> Result<u64, ProposerSlashingError> {
-    let is_gloas = epoch.is_gloas(view.imm.gloas_fork_version);
+    let post_gloas = epoch.post_gloas(view.imm);
     let count = data.len() / PROPOSER_SLASHING_SIZE;
     let n = view.validators.count();
     let proposer_index = get_beacon_proposer_index(&view.slot, epoch);
@@ -108,7 +108,7 @@ pub fn process_proposer_slashings(
                 epoch: current_epoch,
             });
         }
-        proposer_reward += slash_validator(cfg, view, is_gloas, vi, proposer_index);
+        proposer_reward += slash_validator(cfg, view, post_gloas, vi, proposer_index);
     }
     Ok(proposer_reward)
 }
@@ -231,7 +231,7 @@ pub fn process_attester_slashings(
     if data.is_empty() {
         return Ok(0);
     }
-    let is_gloas = epoch.is_gloas(view.imm.gloas_fork_version);
+    let post_gloas = epoch.post_gloas(view.imm);
     let proposer_index = get_beacon_proposer_index(&view.slot, epoch);
     let n = view.validators.count();
     let current_epoch = view.slot.state().slot / SLOTS_PER_EPOCH;
@@ -267,7 +267,7 @@ pub fn process_attester_slashings(
                 return Err(AttesterSlashingError::NoSlashedIntersection);
             }
             for &vi in &slashed_sink[start..] {
-                proposer_reward += slash_validator(cfg, view, is_gloas, vi, proposer_index);
+                proposer_reward += slash_validator(cfg, view, post_gloas, vi, proposer_index);
             }
             Ok(())
         },

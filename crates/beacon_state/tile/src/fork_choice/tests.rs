@@ -27,6 +27,7 @@ fn test_state_id() -> StateId {
         randao_mixes_idx: Default::default(),
         slot_idx: Default::default(),
         builders_idx: Default::default(),
+        preregistrations_idx: Default::default(),
     }
 }
 

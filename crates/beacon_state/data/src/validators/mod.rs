@@ -1,5 +1,6 @@
 mod delta;
 mod finalized;
+mod scheme;
 
 #[cfg(test)]
 mod tests;
@@ -8,6 +9,7 @@ use delta::ValidatorsDelta;
 pub use delta::{ValidatorsView, ValidatorsWriteView};
 pub use finalized::{FinalizedValidators, ValSeed, ValidatorsDecodeError};
 use flux_profiler::timed;
+use silver_ssz::ssz_view::XMSSPubkey;
 
 use crate::{
     Withdrawals,
@@ -152,6 +154,37 @@ pub fn validator_hash(
 
     let chunks = [
         hash_fixed_bytes(pubkey),
+        credentials.0,
+        uint64_chunk(effective_balance),
+        slashed_chunk,
+        uint64_chunk(activation_eligibility_epoch),
+        uint64_chunk(activation_epoch),
+        uint64_chunk(exit_epoch),
+        uint64_chunk(withdrawable_epoch),
+    ];
+    merkleize(&chunks)
+}
+
+/// The PQ `Validator`: an XMSS key and its `vrf_root` take the BLS key's place.
+#[allow(clippy::too_many_arguments)]
+#[inline]
+pub fn validator_hash_xmss(
+    pubkey: &XMSSPubkey,
+    vrf_root: &B256,
+    credentials: &Withdrawals,
+    effective_balance: u64,
+    slashed: bool,
+    activation_eligibility_epoch: Epoch,
+    activation_epoch: Epoch,
+    exit_epoch: Epoch,
+    withdrawable_epoch: Epoch,
+) -> B256 {
+    let mut slashed_chunk = [0u8; 32];
+    slashed_chunk[0] = u8::from(slashed);
+
+    let chunks = [
+        *pubkey,
+        *vrf_root,
         credentials.0,
         uint64_chunk(effective_balance),
         slashed_chunk,

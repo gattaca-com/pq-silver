@@ -6,7 +6,7 @@ use silver_beacon_state_data::{
 use silver_common::merkle::*;
 pub use silver_common::ssz_hash::*;
 
-use crate::ssz_hash_gloas::BeaconStateGloas;
+use crate::{ssz_hash_gloas::BeaconStateGloas, ssz_hash_pq::BeaconStatePq};
 
 pub fn hash_tree_root_sync_contribution(
     slot: u64,
@@ -49,7 +49,13 @@ pub fn hash_checkpoint(cp: &Checkpoint) -> B256 {
 #[inline]
 #[timed]
 pub fn hash_tree_root_state(rv: &StateView) -> B256 {
-    if rv.is_gloas() { BeaconStateGloas::hash_tree_root(rv) } else { hash_tree_root_state_fulu(rv) }
+    if rv.is_pq() {
+        BeaconStatePq::hash_tree_root(rv)
+    } else if rv.post_gloas() {
+        BeaconStateGloas::hash_tree_root(rv)
+    } else {
+        hash_tree_root_state_fulu(rv)
+    }
 }
 
 /// State fields 0..=37, shared by the Fulu and Gloas layouts. Field 24 is the

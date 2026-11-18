@@ -34,6 +34,7 @@ silver_common = { workspace = true, features = ["test-util"] }
 # (lives in storage; storage only depends on beacon_state_data, so no cycle).
 silver_storage.workspace = true
 criterion.workspace = true
+hex.workspace = true
 rand.workspace = true
 serde = { version = "1", features = ["derive"] }
 serde_yml.workspace = true

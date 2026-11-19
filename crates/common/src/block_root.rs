@@ -1,7 +1,10 @@
 use silver_common::{
     merkle::{B256, merkleize, uint64_chunk},
     ssz_hash::hash_tree_root_body_fulu,
-    ssz_view::{BeaconBlockBodyGloasView, SignedBeaconBlockView},
+    ssz_view::{
+        BeaconBlockBodyGloasView, BeaconBlockBodyPqView, SignedBeaconBlockPqView,
+        SignedBeaconBlockView,
+    },
 };
 
 /// SSZ `body_root` of a `BeaconBlockBody` given its raw SSZ bytes.
@@ -35,16 +38,42 @@ pub fn block_root_gloas(signed_block: &[u8]) -> B256 {
     )
 }
 
+pub fn block_root_pq(signed_block: &[u8]) -> B256 {
+    header_root(
+        SignedBeaconBlockPqView::slot(signed_block),
+        SignedBeaconBlockPqView::proposer_index(signed_block),
+        SignedBeaconBlockPqView::parent_root(signed_block),
+        SignedBeaconBlockPqView::state_root(signed_block),
+        BeaconBlockBodyPqView::hash_tree_root(SignedBeaconBlockPqView::body(signed_block)),
+    )
+}
+
 pub fn block_root(signed_block: &[u8], is_gloas: bool) -> B256 {
     if is_gloas { block_root_gloas(signed_block) } else { block_root_fulu(signed_block) }
 }
 
 fn block_root_from_body(signed_block: &[u8], body_root: B256) -> B256 {
+    header_root(
+        SignedBeaconBlockView::slot(signed_block),
+        SignedBeaconBlockView::proposer_index(signed_block),
+        SignedBeaconBlockView::parent_root(signed_block),
+        SignedBeaconBlockView::state_root(signed_block),
+        body_root,
+    )
+}
+
+fn header_root(
+    slot: u64,
+    proposer_index: u64,
+    parent_root: &B256,
+    state_root: &B256,
+    body_root: B256,
+) -> B256 {
     merkleize(&[
-        uint64_chunk(SignedBeaconBlockView::slot(signed_block)),
-        uint64_chunk(SignedBeaconBlockView::proposer_index(signed_block)),
-        *SignedBeaconBlockView::parent_root(signed_block),
-        *SignedBeaconBlockView::state_root(signed_block),
+        uint64_chunk(slot),
+        uint64_chunk(proposer_index),
+        *parent_root,
+        *state_root,
         body_root,
     ])
 }

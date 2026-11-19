@@ -509,6 +509,18 @@ impl SpecConfig {
         self.fork_version(self.fork_at(epoch))
     }
 
+    /// The first adjacent pair of forks from Fulu on whose activation epochs
+    /// decrease. Forks are cumulative, so code may test a fork's epoch alone to
+    /// mean "this fork or later", which only holds when this is `None`. Earlier
+    /// forks are not checked: silver runs from Fulu.
+    pub fn misordered_forks(&self) -> Option<(ForkName, ForkName)> {
+        ForkName::ALL
+            .windows(2)
+            .filter(|pair| pair[0] >= ForkName::Fulu)
+            .find(|pair| self.fork_epoch(pair[0]) > self.fork_epoch(pair[1]))
+            .map(|pair| (pair[0], pair[1]))
+    }
+
     /// `(next_fork_version, next_fork_epoch)` for the ENR `eth2` field at
     /// `epoch`. BPO forks count as forks, so the version can stay the current
     /// one while a later fork is planned.
@@ -972,6 +984,15 @@ mod tests {
             u64::MAX,
         ]);
         assert!(ForkName::ALL.is_sorted(), "ALL is in activation order");
+    }
+
+    #[test]
+    fn a_fork_scheduled_before_its_predecessor_is_misordered() {
+        assert_eq!(SpecConfig::mainnet().misordered_forks(), None);
+        let pq_without_gloas = SpecConfig { pq_fork_epoch: 0, ..SpecConfig::mainnet() };
+        assert_eq!(pq_without_gloas.misordered_forks(), Some((ForkName::Gloas, ForkName::Pq)));
+        let fulu_without_deneb = SpecConfig { fulu_fork_epoch: 0, ..SpecConfig::mainnet() };
+        assert_eq!(fulu_without_deneb.misordered_forks(), None);
     }
 
     #[test]

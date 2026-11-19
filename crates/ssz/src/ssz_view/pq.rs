@@ -270,6 +270,41 @@ impl SignedBeaconBlockPqView {
             u32_le(buf, 0) as usize == SIGNED_PQ_FIXED &&
             u32_le(buf, SIGNED_PQ_FIXED + 80) as usize == BEACON_BLOCK_FIXED
     }
+    /// [`Self::check_size`], plus bounds for the bid accessors below.
+    pub fn check_bid_size(buf: &[u8]) -> bool {
+        if !Self::check_size(buf) {
+            return false;
+        }
+        let body = Self::body(buf);
+        if body.len() < BEACON_BLOCK_BODY_PQ_FIXED ||
+            !offsets_ok(
+                body,
+                &BeaconBlockBodyPqView::VARIABLE_OFFSETS,
+                BEACON_BLOCK_BODY_PQ_FIXED,
+            )
+        {
+            return false;
+        }
+        let signed_bid = BeaconBlockBodyPqView::signed_execution_payload_bid(body);
+        SignedExecutionPayloadBidPqView::check_size(signed_bid) &&
+            ExecutionPayloadBidView::check_size(SignedExecutionPayloadBidPqView::message(
+                signed_bid,
+            ))
+    }
+
+    /// Serialized `ExecutionPayloadBid`.
+    #[inline]
+    pub fn bid(buf: &[u8]) -> &[u8] {
+        let body = Self::body(buf);
+        SignedExecutionPayloadBidPqView::message(
+            BeaconBlockBodyPqView::signed_execution_payload_bid(body),
+        )
+    }
+
+    #[inline]
+    pub fn block_commitments(buf: &[u8]) -> &[u8] {
+        ExecutionPayloadBidView::blob_kzg_commitments(Self::bid(buf))
+    }
 }
 
 // -- BeaconBlockBody --------------------------------------------------

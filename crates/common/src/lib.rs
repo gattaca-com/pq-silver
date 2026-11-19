@@ -30,6 +30,7 @@ mod error;
 mod payload_frame;
 mod request;
 pub mod rpc_rate_limit;
+mod signed_block_layout;
 mod tape_scratch;
 pub use silver_metrics::{self as metrics, declare_counters, profiler};
 #[path = "generated/protobuf.identify.rs"]
@@ -42,10 +43,13 @@ mod identity;
 pub mod json_fields;
 mod node_chain;
 mod spine;
-pub use block_root::{block_root, block_root_fulu, block_root_gloas, body_root, body_root_at};
+pub use block_root::{
+    block_root, block_root_fulu, block_root_gloas, block_root_pq, body_root, body_root_at,
+};
 pub use builder_bid::{BuilderBid, BuilderTerms};
 pub use node_chain::NodeChain;
 pub use payload_frame::PayloadFrame;
+pub use signed_block_layout::SignedBlockLayout;
 pub use silver_beacon_state_data::{
     EPOCHS_PER_SYNC_COMMITTEE_PERIOD, FAR_FUTURE_EPOCH, ForkName, SLOTS_PER_EPOCH,
 };

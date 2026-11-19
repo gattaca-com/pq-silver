@@ -298,6 +298,18 @@ impl Config {
             );
         }
 
+        if let Some((earlier, later)) = spec.misordered_forks() {
+            return Err(Error::ConfigError(format!(
+                "{} activates {} at epoch {} but {} at epoch {}; forks must not activate \
+                 before the one they build on",
+                spec.network_name(),
+                later.name(),
+                spec.fork_epoch(later),
+                earlier.name(),
+                spec.fork_epoch(earlier),
+            )));
+        }
+
         let max_blobs = spec.max_scheduled_blobs_per_block();
         if max_blobs > MAX_BLOBS_PER_BLOCK as u64 {
             return Err(Error::ConfigError(format!(

@@ -13,7 +13,9 @@ use std::{
 
 use flux_profiler::timed;
 use silver_beacon_state_data::SLOTS_PER_EPOCH;
-use silver_common::{DataKind, Enr, PeerEvent, TCacheProducer, TCacheRead, TProducer, hex32};
+use silver_common::{
+    DataKind, Enr, PeerEvent, SignedBlockLayout, TCacheProducer, TCacheRead, TProducer, hex32,
+};
 
 use super::{
     Payload, PendingWrite, QueryUnit, Store, backfill::BlockFacts, block_path, column_path,
@@ -121,7 +123,8 @@ impl Store {
                         open_file_write(&path, false)?.write_all(buffer)?;
                         self.finalized.landed(dir, block)?;
                     }
-                    self.history.seed_pending(slot, buffer, &self.finalized);
+                    let layout = SignedBlockLayout::at_slot(&self.spec, slot);
+                    self.history.seed_pending(slot, buffer, layout, &self.finalized);
                     let parent_slot = self.finalized.slot_of(&parent_root);
                     emit(IoEvent::Need(self.finalized.persisted(
                         DataKind::Block,

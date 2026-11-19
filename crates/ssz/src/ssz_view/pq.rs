@@ -270,6 +270,7 @@ impl SignedBeaconBlockPqView {
             u32_le(buf, 0) as usize == SIGNED_PQ_FIXED &&
             u32_le(buf, SIGNED_PQ_FIXED + 80) as usize == BEACON_BLOCK_FIXED
     }
+
     /// [`Self::check_size`], plus bounds for the bid accessors below.
     pub fn check_bid_size(buf: &[u8]) -> bool {
         if !Self::check_size(buf) {
@@ -299,11 +300,6 @@ impl SignedBeaconBlockPqView {
         SignedExecutionPayloadBidPqView::message(
             BeaconBlockBodyPqView::signed_execution_payload_bid(body),
         )
-    }
-
-    #[inline]
-    pub fn block_commitments(buf: &[u8]) -> &[u8] {
-        ExecutionPayloadBidView::blob_kzg_commitments(Self::bid(buf))
     }
 }
 

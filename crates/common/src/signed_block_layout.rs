@@ -5,7 +5,7 @@ use crate::{
     merkle::B256,
     ssz_view::{
         BeaconBlockBodyFuluView, BeaconBlockBodyGloasView, BeaconBlockBodyPqView,
-        ExecutionPayloadEnvelopeView, SIGNED_PQ_FIXED, SignedBeaconBlockPqView,
+        ExecutionPayloadEnvelopeView, SIGNED_BLS_FIXED, SIGNED_PQ_FIXED, SignedBeaconBlockPqView,
         SignedBeaconBlockView, SignedExecutionPayloadEnvelopePqView,
         SignedExecutionPayloadEnvelopeView,
     },
@@ -54,10 +54,11 @@ impl SignedBlockLayout {
     #[inline]
     pub const fn parent_root_end(self) -> usize {
         let message_at = match self {
-            Self::Fulu | Self::Gloas => 100,
+            Self::Fulu | Self::Gloas => SIGNED_BLS_FIXED,
             Self::Pq => SIGNED_PQ_FIXED,
         };
-        message_at + 16 + 32
+        let (slot, proposer_index) = (size_of::<u64>(), size_of::<u64>());
+        message_at + slot + proposer_index + size_of::<B256>()
     }
 
     #[inline]
@@ -121,14 +122,13 @@ mod tests {
     use super::*;
     use crate::{
         merkle::{merkleize, uint64_chunk},
-        ssz_view::{
-            BEACON_BLOCK_BODY_FIXED, BEACON_BLOCK_BODY_PQ_FIXED, BEACON_BLOCK_FIXED,
-            SIGNED_PQ_FIXED,
-        },
+        ssz_view::BEACON_BLOCK_FIXED,
+        test_util::{SynthBid, SynthBlock},
     };
 
     const GLOAS_EPOCH: u64 = 5;
     const PQ_EPOCH: u64 = 10;
+    const PARENT_ROOT: B256 = [0xAB; 32];
 
     fn spec() -> SpecConfig {
         SpecConfig {
@@ -138,25 +138,12 @@ mod tests {
         }
     }
 
-    /// A signed block whose message starts after `signature_len` bytes.
-    fn block(signature_len: usize, body_len: usize, slot: u64) -> Vec<u8> {
-        let message_at = 4 + signature_len;
-        let mut block = vec![0; message_at + BEACON_BLOCK_FIXED + body_len];
-        block[..4].copy_from_slice(&(message_at as u32).to_le_bytes());
-        block[message_at..message_at + 8].copy_from_slice(&slot.to_le_bytes());
-        block[message_at + 16..message_at + 48].fill(0xAB);
-        let body_offset = message_at + BEACON_BLOCK_FIXED - 4;
-        block[body_offset..body_offset + 4]
-            .copy_from_slice(&(BEACON_BLOCK_FIXED as u32).to_le_bytes());
-        block
-    }
-
     fn bls_block(slot: u64) -> Vec<u8> {
-        block(96, BEACON_BLOCK_BODY_FIXED, slot)
+        SynthBlock::gloas(slot, SynthBid::new(&[])).parent_root(PARENT_ROOT).into_bytes()
     }
 
     fn pq_block(slot: u64) -> Vec<u8> {
-        block(SIGNED_PQ_FIXED - 4, BEACON_BLOCK_BODY_PQ_FIXED, slot)
+        SynthBlock::pq(slot, SynthBid::new(&[])).parent_root(PARENT_ROOT).into_bytes()
     }
 
     #[test]
@@ -169,7 +156,8 @@ mod tests {
         ] {
             assert_eq!(SignedBlockLayout::of(&spec(), &block), Some(layout));
             assert_eq!(layout.slot(&block), slot);
-            assert_eq!(layout.parent_root(&block), [0xAB; 32]);
+            assert_eq!(layout.parent_root(&block), PARENT_ROOT);
+            assert_eq!(layout.parent_root(&block[..layout.parent_root_end()]), PARENT_ROOT);
         }
     }
 
@@ -198,7 +186,7 @@ mod tests {
             let header_root = merkleize(&[
                 uint64_chunk(slot),
                 uint64_chunk(0),
-                [0xAB; 32],
+                PARENT_ROOT,
                 [0; 32],
                 body_root.try_into().unwrap(),
             ]);

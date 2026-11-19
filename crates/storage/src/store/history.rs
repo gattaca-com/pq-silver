@@ -187,20 +187,25 @@ impl History {
                 continue;
             }
             let slot = prefill.start + offset;
-            if coverage::read_block(store_dir, slot, &mut block, &self.spec).is_none() {
+            let Some(layout) = coverage::read_block(store_dir, slot, &mut block, &self.spec) else {
                 silver_log::error!(slot, "held block unreadable; its columns stay missing");
                 continue;
-            }
-            self.seed_pending(slot, &block, finalized);
+            };
+            self.seed_pending(slot, &block, layout, finalized);
         }
         self.block_scratch = block;
     }
-    /// `block` is one whose layout was checked when it was read or received.
-    pub(super) fn seed_pending(&mut self, slot: u64, block: &[u8], finalized: &Finalized) {
+
+    pub(super) fn seed_pending(
+        &mut self,
+        slot: u64,
+        block: &[u8],
+        layout: SignedBlockLayout,
+        finalized: &Finalized,
+    ) {
         let is_gloas = self.spec.is_gloas_at_slot(slot);
         let missing = finalized.coverage().columns_missing(slot);
         let envelope = is_gloas && finalized.coverage().envelope_missing(slot);
-        let layout = SignedBlockLayout::at_slot(&self.spec, slot);
         self.pending.seed_block(slot, block, layout, missing, envelope);
     }
 

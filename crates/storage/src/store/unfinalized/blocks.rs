@@ -32,10 +32,9 @@ impl UnfinalizedBlocks {
         read_unfinalized_dir(&dir, |name| {
             if let Some((block_root, slot, parent_root)) = io::parse_unfinalized_name(name) {
                 let ssz = std::fs::read(dir.join(name)).unwrap_or_default();
-                let facts = match SignedBlockLayout::of(spec, &ssz) {
-                    Some(layout) => PayloadFacts::of(&ssz, layout),
-                    None => PayloadFacts::default(),
-                };
+                let facts = SignedBlockLayout::of(spec, &ssz)
+                    .map(|layout| PayloadFacts::of(&ssz, layout))
+                    .unwrap_or_default();
                 map.insert(block_root, UnfinalizedBlock {
                     slot,
                     parent_root,

@@ -565,13 +565,14 @@ impl Store {
         if slot <= self.head.finalized_slot || self.has_block(&block_root) {
             return;
         }
-        let facts = match block_ssz.buffer() {
-            Ok((buffer, _)) => match SignedBlockLayout::of(&self.spec, buffer) {
-                Some(layout) => PayloadFacts::of(buffer, layout),
-                None => PayloadFacts::default(),
-            },
-            Err(_) => PayloadFacts::default(),
-        };
+        let facts = block_ssz
+            .buffer()
+            .ok()
+            .and_then(|(buffer, _)| {
+                SignedBlockLayout::of(&self.spec, buffer)
+                    .map(|layout| PayloadFacts::of(buffer, layout))
+            })
+            .unwrap_or_default();
         self.unfinalized.insert(block_root, slot, parent_root, facts);
         self.write_queue.push_back(PendingWrite::WriteUnfinalized {
             slot,

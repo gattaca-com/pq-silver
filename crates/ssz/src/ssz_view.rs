@@ -620,6 +620,8 @@ impl SignedBlsToExecutionChangeView {
 //   [184..)    body data
 
 pub const SIGNED_BEACON_BLOCK_MIN: usize = 184;
+/// Fixed part of `{ message: <variable>, signature: BLSSignature }`.
+pub const SIGNED_BLS_FIXED: usize = 4 + 96;
 /// `slot`, `proposer_index`, `parent_root`, `state_root` and the body offset.
 pub const BEACON_BLOCK_FIXED: usize = 8 + 8 + 32 + 32 + 4;
 

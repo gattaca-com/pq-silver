@@ -620,7 +620,8 @@ mod tests {
             env!("CARGO_MANIFEST_DIR"),
             "/../beacon_state/tile/tests/fixtures/pq/state.ssz_snappy"
         );
-        let ssz = snap::Decoder::new().decompress_vec(&std::fs::read(fixture).unwrap()).unwrap();
+        let ssz =
+            snap::raw::Decoder::new().decompress_vec(&std::fs::read(fixture).unwrap()).unwrap();
         let bs = BeaconState::decompose(&ssz, &SpecConfig::mainnet(), None).unwrap();
         let slot = bs.slot_states.finalized_view().slot_number();
         let owner = published_owner(bs);

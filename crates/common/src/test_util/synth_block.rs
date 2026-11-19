@@ -4,22 +4,20 @@ use crate::{
     ssz_view::{
         BEACON_BLOCK_BODY_FIXED, BEACON_BLOCK_BODY_PQ_FIXED, BEACON_BLOCK_FIXED,
         BeaconBlockBodyPqView, EXECUTION_PAYLOAD_BID_MIN, EXECUTION_PAYLOAD_FIXED,
-        SIGNED_EXECUTION_PAYLOAD_BID_MIN, SIGNED_PQ_FIXED,
+        SIGNED_BLS_FIXED, SIGNED_PQ_FIXED,
     },
 };
 
-/// Where a BLS-signed container's message starts.
-const BLS_MESSAGE_AT: usize = SIGNED_EXECUTION_PAYLOAD_BID_MIN - EXECUTION_PAYLOAD_BID_MIN;
 const EMPTY_FULU_EXECUTION_REQUESTS: [u8; 12] = [12, 0, 0, 0, 12, 0, 0, 0, 12, 0, 0, 0];
 /// Eight empty lists: every offset is the table's own length.
 const EMPTY_PQ_EXECUTION_REQUESTS: [u8; 8 * 4] = {
-    let mut requests = [0; 8 * 4];
-    let mut i = 0;
-    while i < requests.len() {
-        requests[i] = if i % 4 == 0 { 8 * 4 } else { 0 };
-        i += 1;
+    let mut ssz = [0; 8 * 4];
+    let mut at = 0;
+    while at < ssz.len() {
+        ssz[at] = ssz.len() as u8;
+        at += 4;
     }
-    requests
+    ssz
 };
 
 fn write_offset(buf: &mut [u8], at: usize, offset: usize) {
@@ -82,11 +80,11 @@ pub struct SynthBlock {
 
 impl SynthBlock {
     pub fn fulu(slot: u64, commitments: &[u8]) -> Self {
-        Self::around(slot, &fulu_body(commitments), BLS_MESSAGE_AT)
+        Self::around(slot, &fulu_body(commitments), SIGNED_BLS_FIXED)
     }
 
     pub fn gloas(slot: u64, bid: SynthBid) -> Self {
-        Self::around(slot, &gloas_body(bid), BLS_MESSAGE_AT)
+        Self::around(slot, &gloas_body(bid), SIGNED_BLS_FIXED)
     }
 
     /// XMSS-signed, so the message starts after the longer signature.
@@ -148,7 +146,7 @@ fn fulu_body(commitments: &[u8]) -> Vec<u8> {
 /// Empty operation lists, the signed bid, then empty parent execution requests.
 fn gloas_body(bid: SynthBid) -> Vec<u8> {
     const FIXED: usize = BEACON_BLOCK_BODY_FIXED;
-    let signed_bid = bid.signed(BLS_MESSAGE_AT);
+    let signed_bid = bid.signed(SIGNED_BLS_FIXED);
     let mut body = vec![0u8; FIXED + signed_bid.len()];
     let bid_end = body.len();
     for at in [200usize, 204, 208, 212, 216, 380, 384] {

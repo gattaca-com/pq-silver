@@ -6,7 +6,7 @@ use serde::{
 };
 use silver_common::json_fields::uint64;
 use silver_httpcore::ClientResponse;
-use silver_ssz::ssz_view::EXECUTION_PAYLOAD_BID_MIN;
+use silver_ssz::ssz_view::{EXECUTION_PAYLOAD_BID_MIN, SIGNED_BLS_FIXED};
 
 use crate::json_bid::{Bytes, Envelope, List};
 
@@ -35,7 +35,7 @@ enum Field {
 }
 
 /// The `message` offset, then the signature.
-const MESSAGE_AT: usize = 4 + 96;
+const MESSAGE_AT: usize = SIGNED_BLS_FIXED;
 
 /// Re-encodes a JSON `SignedExecutionPayloadBid` (Gloas) as SSZ, for a
 /// builder that answers JSON whatever `Accept` says. The buffer is reused

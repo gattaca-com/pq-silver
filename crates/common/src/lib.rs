@@ -58,7 +58,7 @@ pub use silver_ssz::{
     ssz_view,
 };
 pub use tape_scratch::{FrameOut, TapeError, TapeScratch};
-#[cfg(feature = "test-util")]
+#[cfg(any(test, feature = "test-util"))]
 pub mod test_util;
 pub mod ticker;
 pub mod tracing;

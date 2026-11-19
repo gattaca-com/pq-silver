@@ -104,7 +104,9 @@ pub(in crate::store) mod fixtures {
         TCache, TCacheProducer, TRead, body_root, column_util,
         merkle::B256,
         ssz_hash::kzg_commitments_inclusion_proof,
-        ssz_view::{EXECUTION_PAYLOAD_FIXED_GLOAS, NUMBER_OF_COLUMNS, SIGNED_PQ_FIXED},
+        ssz_view::{
+            EXECUTION_PAYLOAD_FIXED_GLOAS, NUMBER_OF_COLUMNS, SIGNED_BLS_FIXED, SIGNED_PQ_FIXED,
+        },
         test_util::{SynthBid, SynthBlock},
     };
 
@@ -255,7 +257,7 @@ pub(in crate::store) mod fixtures {
     pub(in crate::store) fn xmss_signed(signed: &[u8]) -> Vec<u8> {
         let mut xmss_signed = vec![0; SIGNED_PQ_FIXED];
         xmss_signed[..4].copy_from_slice(&(SIGNED_PQ_FIXED as u32).to_le_bytes());
-        xmss_signed.extend_from_slice(&signed[100..]);
+        xmss_signed.extend_from_slice(&signed[SIGNED_BLS_FIXED..]);
         xmss_signed
     }
 

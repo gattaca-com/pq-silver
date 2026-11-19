@@ -1,4 +1,4 @@
-use silver_crypto_simd::xmss::{Item, leaf_index, verify, verify_batch};
+use silver_crypto_simd::xmss::{Item, LANES, leaf_index, verify, verify_batch};
 use silver_ssz::{
     ssz_hash::{compute_signing_root, hash_beacon_block_header_bytes},
     ssz_view::{
@@ -7,7 +7,8 @@ use silver_ssz::{
         PayloadAttestationMessagePqView, ProposerPreferencesView, ProposerSlashingPqView,
         SIGNED_PROPOSER_PREFERENCES_PQ_SIZE, SINGLE_ATT_PQ_SIZE, SignedBeaconBlockPqView,
         SignedExecutionPayloadBidPqView, SignedExecutionPayloadEnvelopePqView,
-        SignedProposerPreferencesPqView, SingleAttestationPqView, XMSSPubkey, XMSSSignature,
+        SignedProposerPreferencesPqView, SingleAttestationPqView, XMSS_PUBKEY_SIZE,
+        XMSS_SIGNATURE_SIZE, XMSSPubkey, XMSSSignature,
     },
 };
 
@@ -52,6 +53,7 @@ pub fn is_builder_bid_leaf_index(leaf_index: u64) -> bool {
     (FIRST_BUILDER_BID_LEAF..FIRST_SLOT_LEAF).contains(&leaf_index)
 }
 
+#[derive(Clone, Copy)]
 pub struct SignatureCheck<'a> {
     pub public_key: &'a XMSSPubkey,
     pub leaf_index: u64,
@@ -60,6 +62,13 @@ pub struct SignatureCheck<'a> {
 }
 
 impl<'a> SignatureCheck<'a> {
+    const NEVER_VALID: Self = Self {
+        public_key: &[0; XMSS_PUBKEY_SIZE],
+        leaf_index: u64::MAX,
+        signing_root: [0; 32],
+        signature: &[0; XMSS_SIGNATURE_SIZE],
+    };
+
     pub fn single_attestation(
         attestation: &'a [u8; SINGLE_ATT_PQ_SIZE],
         attester_pubkey: &'a XMSSPubkey,
@@ -215,16 +224,20 @@ impl<'a> SignatureCheck<'a> {
         verify(self.public_key, self.leaf_index, &self.signing_root, self.signature)
     }
 
-    pub fn verify_batch(checks: &[Self], valid: &mut [bool]) {
-        let items: Vec<_> = checks
-            .iter()
-            .map(|check| Item {
-                public_key: check.public_key,
-                leaf_index: check.leaf_index,
-                message: &check.signing_root,
-                signature: check.signature,
-            })
-            .collect();
-        verify_batch(&items, valid);
+    pub fn verify_batch(checks: impl IntoIterator<Item = Self>, valid: &mut [bool]) {
+        let mut checks = checks.into_iter();
+        for valid in valid.chunks_mut(LANES) {
+            let group: [Self; LANES] = std::array::from_fn(|lane| {
+                checks.next().filter(|_| lane < valid.len()).unwrap_or(Self::NEVER_VALID)
+            });
+            let items: [Item; LANES] = std::array::from_fn(|lane| Item {
+                public_key: group[lane].public_key,
+                leaf_index: group[lane].leaf_index,
+                message: &group[lane].signing_root,
+                signature: group[lane].signature,
+            });
+            verify_batch(&items[..valid.len()], valid);
+        }
+        debug_assert!(checks.next().is_none());
     }
 }

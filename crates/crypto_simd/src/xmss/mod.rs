@@ -6,10 +6,12 @@
 //! caller decides which bottom trees to keep. A leaf index must sign one
 //! message only.
 
-pub use crate::xmss::batch::{Item, verify_batch};
+pub use crate::xmss::{
+    batch::{Item, verify_batch},
+    lanes::LANES,
+};
 use crate::xmss::{
     keccak::keccak256,
-    lanes::LANES,
     ots_lanes::ots_leaves,
     tree::{Tree, fold},
     wots::{ots_recover, ots_sign},

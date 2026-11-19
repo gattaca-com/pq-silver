@@ -50,7 +50,7 @@ fn signature_at_another_message_types_leaf_is_rejected() {
     let checks = [&at_own_leaf, &at_ptc_leaf]
         .map(|signed| SignatureCheck::proposer_preferences(signed, &pubkey, &DOMAIN));
     let mut valid = [false; 2];
-    SignatureCheck::verify_batch(&checks, &mut valid);
+    SignatureCheck::verify_batch(checks, &mut valid);
     assert_eq!(valid, [true, false]);
     assert_eq!(checks.map(|check| check.verify()), valid);
 }

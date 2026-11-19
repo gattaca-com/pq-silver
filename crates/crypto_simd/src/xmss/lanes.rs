@@ -4,7 +4,7 @@
 
 use crate::xmss::keccak::permutation;
 
-pub(crate) const LANES: usize = 8;
+pub const LANES: usize = 8;
 
 pub(crate) type Lanes = [[u64; LANES]; 25];
 

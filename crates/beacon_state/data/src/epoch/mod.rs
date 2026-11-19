@@ -1,3 +1,4 @@
+mod aggregation_committee_window;
 mod delta;
 mod effective_increments;
 mod finalized;
@@ -5,6 +6,9 @@ mod ptc_window;
 #[cfg(test)]
 mod tests;
 
+pub use aggregation_committee_window::{
+    AGGREGATION_COMMITTEE_WINDOW_LEN, AggregationCommitteeWindow,
+};
 pub(crate) use delta::EpochStateDelta;
 pub use delta::{EpochReadView, EpochView, EpochWriteView};
 pub use effective_increments::EffectiveIncrements;

@@ -5,7 +5,7 @@ use blst::min_pk::PublicKey;
 use crate::{
     BalancesWriteView, BlockRoots, BuildersWriteView, Current, EpochId, EpochView, Eth1View,
     Eth1WriteView, InactivityWriteView, LongtailId, LongtailView, ParticipationWriteView,
-    PendingView, PendingWriteView, Preregistrations, PreregistrationsWriteView, Previous,
+    PendingView, PendingWriteView, PreregistrationsView, PreregistrationsWriteView, Previous,
     RandaoMixesWriteView, RootsWriteView, SlashingsWriteView, SlotStateWriteView, StateReadView,
     StateRoots, ValidatorsWriteView, Withdrawals,
     types::{BLSPubkey, Immutable, StateId},
@@ -19,7 +19,7 @@ pub struct StateView<'a> {
     pub epoch: EpochView<'a>,
     pub longtail: LongtailView<'a>,
     pub pending: PendingView<'a>,
-    pub preregistrations: &'a Preregistrations,
+    pub preregistrations: PreregistrationsView<'a>,
 }
 
 impl<'a> Deref for StateView<'a> {

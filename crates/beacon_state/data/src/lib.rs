@@ -12,8 +12,8 @@ pub use decompose::DecomposeError;
 pub use delta_view::{StateView, StateWriterView};
 pub use encode::{FULU_CHECKPOINT_SECTIONS, PubkeysDecodeError, decode_checkpoint_pubkeys};
 pub use epoch::{
-    EffectiveIncrements, EpochGroup, EpochId, EpochReadView, EpochStateFinalized, EpochView,
-    EpochWriteView, PtcWindow,
+    AGGREGATION_COMMITTEE_WINDOW_LEN, AggregationCommitteeWindow, EffectiveIncrements, EpochGroup,
+    EpochId, EpochReadView, EpochStateFinalized, EpochView, EpochWriteView, PtcWindow,
 };
 pub use eth1::{Eth1Group, Eth1Id, Eth1View, Eth1Votes, Eth1WriteView};
 pub use fork_writer::ForkWriter;
@@ -30,8 +30,9 @@ pub use pending::{
     PendingGroup, PendingId, PendingView, PendingWriteView, QueueItem, QueueView, QueueWriteView,
 };
 pub use preregistrations::{
-    BuilderPreregistration, PREREGISTRATIONS_LIMIT, Preregistrations, PreregistrationsGroup,
-    PreregistrationsId, PreregistrationsWriteView, ValidatorPreregistration,
+    BuilderPreregistration, FinalizedList, ListView, ListWriter, PREREGISTRATIONS_LIMIT,
+    Preregistrations, PreregistrationsGroup, PreregistrationsId, PreregistrationsView,
+    PreregistrationsWriteView, Record, ValidatorPreregistration,
 };
 pub use silver_chain_spec::{BlobParameters, ForkName, SpecConfig};
 pub use silver_ssz::body_offsets::{BlockBodyError, BodyFork, BodyOffsets, OperationKind, Payload};

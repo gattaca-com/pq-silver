@@ -1,7 +1,8 @@
 use flux_profiler::timed;
 
 use super::{
-    delta::EpochStateDelta, effective_increments::EffectiveIncrements, ptc_window::PtcWindow,
+    aggregation_committee_window::AggregationCommitteeWindow, delta::EpochStateDelta,
+    effective_increments::EffectiveIncrements, ptc_window::PtcWindow,
 };
 use crate::{
     decompose::{
@@ -20,6 +21,8 @@ pub struct EpochStateFinalized {
     /// [New in Gloas]
     pub(crate) ptc_window: PtcWindow,
     pub(crate) increments: EffectiveIncrements,
+    /// [New in PQ]
+    pub(crate) aggregation_committee_window: AggregationCommitteeWindow,
 }
 
 impl EpochStateFinalized {
@@ -43,6 +46,7 @@ impl EpochStateFinalized {
         self.state = delta.state;
         self.ptc_window.clone_from(&delta.ptc_window);
         self.increments.clone_from(&delta.increments);
+        self.aggregation_committee_window.clone_from(&delta.aggregation_committee_window);
     }
 
     #[timed]
@@ -50,7 +54,11 @@ impl EpochStateFinalized {
         Self { state: read_epoch_state(ssz, F37, F29), ..Default::default() }
     }
 
-    pub(crate) fn from_ssz_gloas(ssz: &[u8], layout: GloasLayout) -> Self {
+    pub(crate) fn from_ssz_gloas(
+        ssz: &[u8],
+        layout: GloasLayout,
+        aggregation_committee_window: AggregationCommitteeWindow,
+    ) -> Self {
         let mut ptc_window = zeroed_ptc_window();
         for (c, committee) in ptc_window.iter_mut().enumerate() {
             for (j, v) in committee.iter_mut().enumerate() {
@@ -66,6 +74,7 @@ impl EpochStateFinalized {
             ),
             ptc_window: PtcWindow::new(ptc_window),
             increments: EffectiveIncrements::default(),
+            aggregation_committee_window,
         }
     }
 }

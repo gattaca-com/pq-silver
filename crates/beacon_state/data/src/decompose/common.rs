@@ -129,6 +129,8 @@ pub enum DecomposeError {
     GloasOffset { field: &'static str, off: usize, fixed: usize },
     #[error("too many gloas {field}: {n} > {max}")]
     GloasTooMany { field: &'static str, n: usize, max: usize },
+    #[error("aggregation_committee_window malformed: {0}")]
+    AggregationCommitteeWindow(&'static str),
     #[error("{field} {index} out of range: count {count}")]
     IndexOutOfRange { field: &'static str, index: u64, count: usize },
 }

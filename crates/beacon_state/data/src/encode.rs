@@ -43,8 +43,9 @@ pub(crate) const GLOAS_VAR_LEN_SECTIONS: usize = 15;
 /// Number of checkpoint sections for Gloas: the fixed part + the 15 var bodies.
 pub const GLOAS_CHECKPOINT_SECTIONS: usize = 1 + GLOAS_VAR_LEN_SECTIONS;
 
-/// Gloas's variable fields plus the two preregistration lists.
-pub(crate) const PQ_VAR_LEN_SECTIONS: usize = GLOAS_VAR_LEN_SECTIONS + 2;
+/// Gloas's variable fields plus the two preregistration lists and the
+/// aggregation committee window.
+pub(crate) const PQ_VAR_LEN_SECTIONS: usize = GLOAS_VAR_LEN_SECTIONS + 3;
 
 pub const PQ_CHECKPOINT_SECTIONS: usize = 1 + PQ_VAR_LEN_SECTIONS;
 
@@ -72,6 +73,7 @@ pub(crate) enum Section {
     PayloadExpectedWithdrawals,
     ValidatorPreregistrations,
     BuilderPreregistrations,
+    AggregationCommitteeWindow,
 }
 
 impl Section {
@@ -110,6 +112,7 @@ impl Section {
         Section::PayloadExpectedWithdrawals,
         Section::ValidatorPreregistrations,
         Section::BuilderPreregistrations,
+        Section::AggregationCommitteeWindow,
     ];
 }
 
@@ -164,8 +167,8 @@ impl BeaconState {
 
     /// Byte lengths of the Gloas-shaped variable-length fields, in
     /// SSZ-declared order (offset-slot order): the 11 Fulu-shared bodies (no
-    /// `execution_payload_header`), the four Gloas-only bodies, then PQ's two
-    /// preregistration lists, which are empty before PQ.
+    /// `execution_payload_header`), the four Gloas-only bodies, then PQ's
+    /// three, which are empty before PQ.
     pub(crate) fn var_len_section_lens_gloas(&self) -> [usize; PQ_VAR_LEN_SECTIONS] {
         let validators = self.validators.finalized();
         let n = validators.validator_count();
@@ -174,9 +177,11 @@ impl BeaconState {
         let con = self.pending.consolidations.with_finalized_locked(|q| q.len());
         let bpw = self.pending.builder_withdrawals.with_finalized_locked(|q| q.len());
         let summaries = self.longtail.with_finalized_locked(|lt| lt.historical_summaries_len());
-        let [validator_preregistrations, builder_preregistrations] = self
-            .preregistrations
-            .with_finalized_locked(|p| [p.validators_ssz_len(), p.builders_ssz_len()]);
+        let preregistrations = self.preregistrations.finalized();
+        let aggregation_committee_window = match self.gloas_layout() {
+            Some(GloasLayout::PQ) => self.epoch.finalized().aggregation_committee_window.ssz_len(),
+            _ => 0,
+        };
         let sl = self.slot_states.finalized().state();
         [
             self.immutable.historical_roots.len() * 32,
@@ -194,8 +199,9 @@ impl BeaconState {
             bpw * BUILDER_PENDING_WITHDRAWAL_SSZ,
             sl.latest_execution_payload_bid.ssz_len(),
             sl.payload_expected_withdrawals.len() * WITHDRAWAL_SSZ,
-            validator_preregistrations,
-            builder_preregistrations,
+            preregistrations.validators.ssz_len(),
+            preregistrations.builders.ssz_len(),
+            aggregation_committee_window,
         ]
     }
 
@@ -343,10 +349,13 @@ impl BeaconState {
                 Ok(())
             }
             Section::ValidatorPreregistrations => {
-                self.preregistrations.with_finalized_locked(|p| p.write_validators_ssz(w))
+                self.preregistrations.finalized().validators.write_ssz(w)
             }
             Section::BuilderPreregistrations => {
-                self.preregistrations.with_finalized_locked(|p| p.write_builders_ssz(w))
+                self.preregistrations.finalized().builders.write_ssz(w)
+            }
+            Section::AggregationCommitteeWindow => {
+                self.epoch.finalized().aggregation_committee_window.write_ssz(w)
             }
         }
     }
@@ -521,9 +530,11 @@ impl BeaconState {
             }
         }
         if layout.is_pq() {
-            // validator_preregistrations / builder_preregistrations offsets
+            // validator_preregistrations / builder_preregistrations /
+            // aggregation_committee_window offsets
             w_u32(w, offs[15])?;
             w_u32(w, offs[16])?;
+            w_u32(w, offs[17])?;
         }
         Ok(())
     }

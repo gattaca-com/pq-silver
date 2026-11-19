@@ -1,79 +1,108 @@
-mod lists;
+mod list;
+mod records;
 #[cfg(test)]
 mod tests;
 
-use std::sync::Arc;
-
 use flux_profiler::timed;
-pub use lists::{
-    BuilderPreregistration, PREREGISTRATIONS_LIMIT, Preregistrations, ValidatorPreregistration,
-};
-use parking_lot::Mutex;
+use list::ListDelta;
+pub use list::{FinalizedList, ListView, ListWriter, PREREGISTRATIONS_LIMIT, Record};
+pub use records::{BuilderPreregistration, ValidatorPreregistration};
 
 use crate::{
-    reanchor::finalize_full_copies,
+    DecomposeError,
+    reanchor::reanchor_survivors,
     ring::{Id, Reset, Ring, RingGroup, Slot},
     types::SLOTS_RING_N,
 };
 
 pub type PreregistrationsId = Id<PreregistrationsGroup>;
 
-/// Each fork holds the whole lists behind an `Arc`, so a roll is a refcount
-/// bump and a fork copies the lists only on its first write. Owner-only: a
-/// slot's reuse can drop the last reference, so lock-free readers must never
-/// see these lists.
-pub struct PreregistrationsGroup {
-    finalized: Arc<Preregistrations>,
-    deltas: Ring<Self>,
-    persist_lock: Mutex<()>,
+/// The two finalized PQ preregistration lists. Deposit requests append or
+/// overwrite records; deposits and the epoch sweep remove them.
+#[derive(Default)]
+pub struct Preregistrations {
+    pub validators: FinalizedList<ValidatorPreregistration>,
+    pub builders: FinalizedList<BuilderPreregistration>,
 }
 
-impl RingGroup for PreregistrationsGroup {
-    type Entry = Arc<Preregistrations>;
+impl Preregistrations {
+    pub(crate) fn from_ssz(validators: &[u8], builders: &[u8]) -> Result<Self, DecomposeError> {
+        Ok(Self {
+            validators: FinalizedList::from_ssz(validators, "validator_preregistrations")?,
+            builders: FinalizedList::from_ssz(builders, "builder_preregistrations")?,
+        })
+    }
 }
 
-impl Reset for Arc<Preregistrations> {
+#[derive(Clone, Default)]
+pub(crate) struct PreregistrationsDelta {
+    validators: ListDelta<ValidatorPreregistration>,
+    builders: ListDelta<BuilderPreregistration>,
+}
+
+impl Reset for PreregistrationsDelta {
     fn reset(&mut self) {
-        *self = Arc::default();
+        // Every roll overwrites both lists: `fresh` from the base, `reset_from`
+        // from the parent.
     }
 
     fn reset_from(&mut self, other: &Self) {
-        self.clone_from(other);
+        self.validators.reset_from(&other.validators);
+        self.builders.reset_from(&other.builders);
     }
+}
+
+pub struct PreregistrationsGroup {
+    finalized: Preregistrations,
+    deltas: Ring<Self>,
+}
+
+impl RingGroup for PreregistrationsGroup {
+    type Entry = PreregistrationsDelta;
 }
 
 impl PreregistrationsGroup {
     pub fn new(finalized: Preregistrations) -> Self {
-        Self {
-            finalized: Arc::new(finalized),
-            deltas: Ring::new(SLOTS_RING_N),
-            persist_lock: Mutex::new(()),
-        }
-    }
-
-    /// The checkpoint encoder's only way in. Keep `f` to a bounded memcpy.
-    #[inline]
-    pub(crate) fn with_finalized_locked<R>(&self, f: impl FnOnce(&Preregistrations) -> R) -> R {
-        let _g = self.persist_lock.lock();
-        f(&self.finalized)
+        Self { finalized, deltas: Ring::new(SLOTS_RING_N) }
     }
 
     #[inline]
-    pub fn view(&self, id: PreregistrationsId) -> &Preregistrations {
-        self.deltas.get(id)
+    pub fn finalized(&self) -> &Preregistrations {
+        &self.finalized
+    }
+
+    #[inline]
+    pub fn view(&self, id: PreregistrationsId) -> PreregistrationsView<'_> {
+        PreregistrationsView::new(&self.finalized, self.deltas.get(id))
     }
 
     #[inline]
     pub fn roll_fresh(&mut self) -> PreregistrationsWriteView<'_> {
-        let Self { finalized, deltas, .. } = self;
+        let Self { finalized, deltas } = self;
         let mut fork = deltas.roll_fresh();
-        fork.clone_from(finalized);
-        PreregistrationsWriteView { fork }
+        fork.validators.reset_onto(&finalized.validators);
+        fork.builders.reset_onto(&finalized.builders);
+        PreregistrationsWriteView { base: finalized, fork }
     }
 
     #[inline]
     pub fn roll_from(&mut self, parent: PreregistrationsId) -> PreregistrationsWriteView<'_> {
-        PreregistrationsWriteView { fork: self.deltas.roll_from(parent) }
+        let Self { finalized, deltas } = self;
+        PreregistrationsWriteView { base: finalized, fork: deltas.roll_from(parent) }
+    }
+
+    /// Copy a survivor into a fresh slot and rebase it against the
+    /// pre-promotion `winner`.
+    fn reanchor(
+        &mut self,
+        survivor: PreregistrationsId,
+        winner: PreregistrationsId,
+    ) -> PreregistrationsId {
+        let (mut fork, old, winner_delta) = self.deltas.roll_fresh_deriving(survivor, winner);
+        fork.reset_from(old);
+        fork.validators.rebase(&winner_delta.validators);
+        fork.builders.rebase(&winner_delta.builders);
+        fork.commit()
     }
 
     #[timed]
@@ -82,15 +111,38 @@ impl PreregistrationsGroup {
         winner: PreregistrationsId,
         survivors: &[PreregistrationsId],
     ) -> Vec<PreregistrationsId> {
-        let Self { finalized, deltas, persist_lock } = self;
-        finalize_full_copies(deltas, winner, survivors, |w| {
-            let _g = persist_lock.lock();
-            finalized.clone_from(w);
-        })
+        debug_assert!(survivors.contains(&winner), "winner must be among the survivors");
+        self.deltas.free_outdated(survivors);
+
+        let fresh = reanchor_survivors(survivors, |s| self.reanchor(s, winner));
+
+        let Self { finalized, deltas } = self;
+        let winner_delta = deltas.get(winner);
+        finalized.validators.promote(&winner_delta.validators);
+        finalized.builders.promote(&winner_delta.builders);
+
+        deltas.free_outdated(&fresh);
+        fresh
+    }
+}
+
+#[derive(Clone, Copy)]
+pub struct PreregistrationsView<'a> {
+    pub validators: ListView<'a, ValidatorPreregistration>,
+    pub builders: ListView<'a, BuilderPreregistration>,
+}
+
+impl<'a> PreregistrationsView<'a> {
+    fn new(base: &'a Preregistrations, delta: &'a PreregistrationsDelta) -> Self {
+        Self {
+            validators: ListView::new(&base.validators, &delta.validators),
+            builders: ListView::new(&base.builders, &delta.builders),
+        }
     }
 }
 
 pub struct PreregistrationsWriteView<'a> {
+    base: &'a Preregistrations,
     fork: Slot<'a, PreregistrationsGroup>,
 }
 
@@ -101,13 +153,17 @@ impl PreregistrationsWriteView<'_> {
     }
 
     #[inline]
-    pub fn reader(&self) -> &Preregistrations {
-        &self.fork
+    pub fn reader(&self) -> PreregistrationsView<'_> {
+        PreregistrationsView::new(self.base, &self.fork)
     }
 
-    /// The first call in a fork copies the lists it shares with its parent.
     #[inline]
-    pub fn lists_mut(&mut self) -> &mut Preregistrations {
-        Arc::make_mut(&mut self.fork)
+    pub fn validators(&mut self) -> ListWriter<'_, ValidatorPreregistration> {
+        ListWriter::new(&self.base.validators, &mut self.fork.validators)
+    }
+
+    #[inline]
+    pub fn builders(&mut self) -> ListWriter<'_, BuilderPreregistration> {
+        ListWriter::new(&self.base.builders, &mut self.fork.builders)
     }
 }

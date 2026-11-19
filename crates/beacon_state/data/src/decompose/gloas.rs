@@ -5,8 +5,8 @@ use super::common::{
     Offsets, u32_le,
 };
 use crate::{
-    BeaconState, EpochStateFinalized, FinalizedBuilders, Preregistrations, SlotStateFinalized,
-    SpecConfig,
+    AggregationCommitteeWindow, BeaconState, EpochStateFinalized, FinalizedBuilders,
+    Preregistrations, SlotStateFinalized, SpecConfig,
     gloas::{PTC_SIZE, PTC_WINDOW_LEN},
     pq::KeyScheme,
 };
@@ -40,7 +40,7 @@ pub(crate) const GLOAS_FIXED_PART: usize = 3_134_845;
 const _: () = assert!(G_PTC_WINDOW + PTC_WINDOW_LEN * PTC_SIZE * 8 == GLOAS_FIXED_PART);
 
 /// A Gloas-shaped fixed part, addressed by Gloas positions. PQ drops both sync
-/// committees, which precede every `G_*` field, and appends two list offsets.
+/// committees, which precede every `G_*` field, and appends three offsets.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct GloasLayout {
     removed: usize,
@@ -61,7 +61,7 @@ impl GloasLayout {
     }
 
     pub(crate) const fn fixed_part(self) -> usize {
-        if self.is_pq() { self.at(GLOAS_FIXED_PART) + 2 * 4 } else { GLOAS_FIXED_PART }
+        if self.is_pq() { self.at(GLOAS_FIXED_PART) + 3 * 4 } else { GLOAS_FIXED_PART }
     }
 
     pub(crate) const fn key_scheme(self) -> KeyScheme {
@@ -78,9 +78,10 @@ pub(crate) struct GloasOffsets {
     pub(crate) builder_pending_withdrawals: usize,
     pub(crate) latest_execution_payload_bid: usize,
     pub(crate) payload_expected_withdrawals: usize,
-    /// Before PQ both sit at the end of the SSZ, so the lists read empty.
+    /// The PQ fields. Before PQ all three sit at the end of the SSZ.
     pub(crate) validator_preregistrations: usize,
     builder_preregistrations: usize,
+    aggregation_committee_window: usize,
     pub(crate) layout: GloasLayout,
 }
 
@@ -88,8 +89,18 @@ impl GloasOffsets {
     fn preregistrations(&self, ssz: &[u8]) -> Result<Preregistrations, DecomposeError> {
         Preregistrations::from_ssz(
             &ssz[self.validator_preregistrations..self.builder_preregistrations],
-            &ssz[self.builder_preregistrations..],
+            &ssz[self.builder_preregistrations..self.aggregation_committee_window],
         )
+    }
+
+    fn aggregation_committee_window(
+        &self,
+        ssz: &[u8],
+    ) -> Result<AggregationCommitteeWindow, DecomposeError> {
+        if !self.layout.is_pq() {
+            return Ok(AggregationCommitteeWindow::default());
+        }
+        AggregationCommitteeWindow::from_ssz(&ssz[self.aggregation_committee_window..])
     }
 }
 
@@ -104,7 +115,8 @@ pub(super) fn decompose(
         return Err(DecomposeError::TruncatedFixedPart { len: ssz.len(), need: fixed_part });
     }
     let off = read_offsets(ssz, layout)?;
-    let epoch = EpochStateFinalized::from_ssz_gloas(ssz, layout);
+    let epoch =
+        EpochStateFinalized::from_ssz_gloas(ssz, layout, off.aggregation_committee_window(ssz)?);
     let slot = SlotStateFinalized::from_ssz_gloas(ssz, &off)?;
     let builders = FinalizedBuilders::from_ssz(
         &ssz[off.builders..off.builder_pending_withdrawals],
@@ -146,11 +158,12 @@ fn read_offsets(ssz: &[u8], layout: GloasLayout) -> Result<GloasOffsets, Decompo
     let builder_pending_withdrawals = at(G_BUILDER_PENDING_WITHDRAWALS_OFF);
     let latest_execution_payload_bid = at(G_LATEST_EXECUTION_PAYLOAD_BID_OFF);
     let payload_expected_withdrawals = at(G_PAYLOAD_EXPECTED_WITHDRAWALS_OFF);
-    let [validator_preregistrations, builder_preregistrations] = if layout.is_pq() {
-        [at(GLOAS_FIXED_PART), at(GLOAS_FIXED_PART + 4)]
-    } else {
-        [ssz.len(); 2]
-    };
+    let [validator_preregistrations, builder_preregistrations, aggregation_committee_window] =
+        if layout.is_pq() {
+            [at(GLOAS_FIXED_PART), at(GLOAS_FIXED_PART + 4), at(GLOAS_FIXED_PART + 8)]
+        } else {
+            [ssz.len(); 3]
+        };
 
     let raw = [
         historical_roots,
@@ -170,6 +183,7 @@ fn read_offsets(ssz: &[u8], layout: GloasLayout) -> Result<GloasOffsets, Decompo
         payload_expected_withdrawals,
         validator_preregistrations,
         builder_preregistrations,
+        aggregation_committee_window,
     ];
     let fixed = layout.fixed_part();
     if raw[0] < fixed {
@@ -208,6 +222,7 @@ fn read_offsets(ssz: &[u8], layout: GloasLayout) -> Result<GloasOffsets, Decompo
         payload_expected_withdrawals,
         validator_preregistrations,
         builder_preregistrations,
+        aggregation_committee_window,
         layout,
     })
 }

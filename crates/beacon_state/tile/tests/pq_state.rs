@@ -11,7 +11,7 @@ use silver_beacon_state::ssz_hash::hash_tree_root_state;
 use silver_beacon_state_data::{BeaconState, SpecConfig, pq::KeyScheme};
 
 const FIXTURE: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/pq/state.ssz_snappy");
-const ROOT: &str = "80f64baa4663da9ed8f184d6cb546db72905acc2672362f74a7a5a01199cb3e7";
+const ROOT: &str = "bef140f4b21b68ed75ab5bb7f565b845a5f143988fcc5eaf1479a185f33d5b14";
 
 #[test]
 fn state_root_matches_reference() {

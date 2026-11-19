@@ -1,7 +1,8 @@
 use std::ops::Deref;
 
 use super::{
-    EpochGroup, EpochId, effective_increments::EffectiveIncrements, finalized::EpochStateFinalized,
+    EpochGroup, EpochId, aggregation_committee_window::AggregationCommitteeWindow,
+    effective_increments::EffectiveIncrements, finalized::EpochStateFinalized,
     ptc_window::PtcWindow,
 };
 use crate::{
@@ -16,12 +17,14 @@ pub(crate) struct EpochStateDelta {
     // [New in Gloas]
     pub(super) ptc_window: PtcWindow,
     pub(super) increments: EffectiveIncrements,
+    // [New in PQ]
+    pub(super) aggregation_committee_window: AggregationCommitteeWindow,
 }
 
 impl Reset for EpochStateDelta {
     fn reset(&mut self) {
         self.state = Default::default();
-        // `ptc_window` and `increments` are left as-is: every roll overwrites
+        // The windows and `increments` are left as-is: every roll overwrites
         // them (`fresh` copies the base's, `reset_from` the parent's), so
         // zeroing their buffers here would be redundant work.
     }
@@ -30,6 +33,7 @@ impl Reset for EpochStateDelta {
         self.state = other.state;
         self.ptc_window.clone_from(&other.ptc_window);
         self.increments.clone_from(&other.increments);
+        self.aggregation_committee_window.clone_from(&other.aggregation_committee_window);
     }
 }
 
@@ -76,6 +80,12 @@ impl<'a> EpochReadView<'a> {
     #[inline]
     pub fn ptc_window(&self) -> &'a PtcWindow {
         self.delta.map_or(&self.base.ptc_window, |d| &d.ptc_window)
+    }
+
+    #[inline]
+    pub fn aggregation_committee_window(&self) -> &'a AggregationCommitteeWindow {
+        self.delta
+            .map_or(&self.base.aggregation_committee_window, |d| &d.aggregation_committee_window)
     }
 
     /// Expected proposer at `lookahead_idx` (slots since the lookahead's
@@ -126,6 +136,7 @@ impl<'a> EpochWriteView<'a> {
         fork.state = base.state;
         fork.ptc_window.clone_from(&base.ptc_window);
         fork.increments.clone_from(&base.increments);
+        fork.aggregation_committee_window.clone_from(&base.aggregation_committee_window);
         Self { base, fork }
     }
 

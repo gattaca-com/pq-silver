@@ -2,17 +2,22 @@ use core::cmp::min;
 
 use blst::min_pk::PublicKey;
 use flux_profiler::timed;
+use rustc_hash::FxHashSet;
 use silver_beacon_state_data::{
     BalancesWriteView, Epoch, Immutable, PENDING_CONSOLIDATIONS_LIMIT,
-    PENDING_PARTIAL_WITHDRAWALS_LIMIT, PendingConsolidation, PendingDeposit,
-    PendingPartialWithdrawal, PendingWriteView, SLOTS_PER_EPOCH, SpecConfig, StateWriterView,
-    ValidatorsView, ValidatorsWriteView, Withdrawals,
+    PENDING_PARTIAL_WITHDRAWALS_LIMIT, PREREGISTRATION_EXPIRY_SLOTS, PendingConsolidation,
+    PendingDeposit, PendingPartialWithdrawal, PendingView, PendingWriteView, SLOTS_PER_EPOCH,
+    SpecConfig, StateWriterView, ValidatorPreregistration, ValidatorsView, ValidatorsWriteView,
+    Withdrawals,
     bls::{self, SigBatch},
+    pq::{KeyScheme, xmss_pubkey, xmss_pubkey_padded},
 };
 use silver_common::ssz_view::{
     CONSOLIDATION_REQUEST_SIZE, ConsolidationRequestView, DEPOSIT_REQUEST_SIZE, DepositRequestView,
     SIGNED_BLS_CHANGE_SIZE, SIGNED_VOLUNTARY_EXIT_SIZE, SignedBlsToExecutionChangeView,
-    SignedVoluntaryExitView, WITHDRAWAL_REQUEST_SIZE, WithdrawalRequestView,
+    SignedVoluntaryExitView, VALIDATOR_PREREGISTRATION_REQUEST_SIZE, VOLUNTARY_EXIT_REQUEST_SIZE,
+    ValidatorPreregistrationRequestView, VoluntaryExitRequestView, WITHDRAWAL_REQUEST_SIZE,
+    WithdrawalRequestView, XMSSPubkey,
 };
 
 use crate::{
@@ -139,10 +144,10 @@ pub(crate) fn process_execution_requests(
 
 #[timed]
 pub fn process_deposit_requests(view: &mut StateWriterView, data: &[u8]) {
-    let slot = &mut view.slot;
-    let pending = &mut view.pending;
     let count = data.len() / DEPOSIT_REQUEST_SIZE;
-    let cur_slot = slot.state().slot;
+    let state = view.slot.state();
+    let (cur_slot, parent_slot) = (state.slot, state.latest_execution_payload_bid.slot);
+    let scheme = view.validators.reader().scheme();
 
     for i in 0..count {
         let d: &[u8; DEPOSIT_REQUEST_SIZE] =
@@ -152,7 +157,19 @@ pub fn process_deposit_requests(view: &mut StateWriterView, data: &[u8]) {
         let amount = DepositRequestView::amount(d);
         let signature = *DepositRequestView::signature(d);
 
-        pending.deposits.push(PendingDeposit {
+        if scheme == KeyScheme::Xmss &&
+            !view.preregistrations.validators().admit_deposit(
+                xmss_pubkey(&scheme.deposit_pubkey(&pubkey)),
+                parent_slot,
+                |binding| {
+                    binding.withdrawal_credentials == credentials.0 &&
+                        binding.vrf_root == signature[..32]
+                },
+            )
+        {
+            continue;
+        }
+        view.pending.deposits.push(PendingDeposit {
             pubkey,
             withdrawal_credentials: credentials,
             amount,
@@ -160,6 +177,45 @@ pub fn process_deposit_requests(view: &mut StateWriterView, data: &[u8]) {
             slot: cur_slot,
         });
     }
+}
+
+#[timed]
+pub fn process_validator_preregistration_requests(view: &mut StateWriterView, data: &[u8]) {
+    if data.is_empty() {
+        return;
+    }
+    let pending_keys = pending_validator_keys(&view.pending.reader());
+    let state = view.slot.state();
+    let (expiry_slot, parent_slot) =
+        (state.slot + PREREGISTRATION_EXPIRY_SLOTS, state.latest_execution_payload_bid.slot);
+    for request in data.chunks_exact(VALIDATOR_PREREGISTRATION_REQUEST_SIZE) {
+        let request = request.try_into().unwrap();
+        let pubkey = *ValidatorPreregistrationRequestView::pubkey(request);
+        if view.validators.find_by_pubkey(&xmss_pubkey_padded(&pubkey)).is_some() ||
+            pending_keys.contains(&pubkey)
+        {
+            continue;
+        }
+        view.preregistrations.validators().admit(
+            ValidatorPreregistration {
+                pubkey,
+                withdrawal_credentials:
+                    *ValidatorPreregistrationRequestView::withdrawal_credentials(request),
+                vrf_root: *ValidatorPreregistrationRequestView::vrf_root(request),
+                expiry_slot,
+            },
+            parent_slot,
+        );
+    }
+}
+
+/// Spec `is_pending_validator` for every key at once. Deposits carry no
+/// signature, so any pending deposit for a key counts.
+fn pending_validator_keys(pending: &PendingView) -> FxHashSet<XMSSPubkey> {
+    let deposits = &pending.deposits;
+    (0..deposits.len())
+        .map(|i| *xmss_pubkey(&KeyScheme::Xmss.deposit_pubkey(&deposits.get(i).pubkey)))
+        .collect()
 }
 
 #[timed]
@@ -190,12 +246,17 @@ fn process_withdrawal_request(
     let amount = WithdrawalRequestView::amount(r);
     let is_full_exit = amount == FULL_EXIT_REQUEST_AMOUNT;
 
+    let scheme = view.validators.reader().scheme();
+    if scheme.is_legacy(validator_pubkey) {
+        return;
+    }
+
     let ppw_len = view.pending.partial_withdrawals.reader().len();
     if ppw_len >= PENDING_PARTIAL_WITHDRAWALS_LIMIT && !is_full_exit {
         return;
     }
 
-    let vi = match view.validators.find_by_pubkey(validator_pubkey) {
+    let vi = match view.validators.find_by_pubkey(&scheme.request_pubkey(validator_pubkey)) {
         Some(idx) => idx,
         None => return,
     };
@@ -277,8 +338,15 @@ fn process_consolidation_request(
     let source_pubkey = ConsolidationRequestView::source_pubkey(r);
     let target_pubkey = ConsolidationRequestView::target_pubkey(r);
 
+    let scheme = validators.reader().scheme();
+    if scheme.is_legacy(source_pubkey) || scheme.is_legacy(target_pubkey) {
+        return;
+    }
+    let (source_key, target_key) =
+        (scheme.request_pubkey(source_pubkey), scheme.request_pubkey(target_pubkey));
+
     if source_pubkey == target_pubkey {
-        if let Some(src) = validators.find_by_pubkey(source_pubkey) {
+        if let Some(src) = validators.find_by_pubkey(&source_key) {
             let creds = *validators.credentials(src as usize);
             if creds.execution_address() == source_address &&
                 creds.has_eth1_credential() &&
@@ -301,11 +369,11 @@ fn process_consolidation_request(
         return;
     }
 
-    let source_idx = match validators.find_by_pubkey(source_pubkey) {
+    let source_idx = match validators.find_by_pubkey(&source_key) {
         Some(idx) => idx,
         None => return,
     };
-    let target_idx = match validators.find_by_pubkey(target_pubkey) {
+    let target_idx = match validators.find_by_pubkey(&target_key) {
         Some(idx) => idx,
         None => return,
     };
@@ -348,6 +416,29 @@ fn process_consolidation_request(
         source_index: source_idx as u64,
         target_index: target_idx as u64,
     });
+}
+
+/// Spec `process_voluntary_exit_request`: the system contract verified each
+/// exit's signature, so a request that fails a check is dropped.
+#[timed]
+pub fn process_voluntary_exit_requests(view: &mut StateWriterView, cfg: &SpecConfig, data: &[u8]) {
+    let current_epoch = view.slot.state().slot / SLOTS_PER_EPOCH;
+    for request in data.chunks_exact(VOLUNTARY_EXIT_REQUEST_SIZE) {
+        let pubkey =
+            xmss_pubkey_padded(VoluntaryExitRequestView::pubkey(request.try_into().unwrap()));
+        let Some(vi) = view.validators.find_by_pubkey(&pubkey) else {
+            continue;
+        };
+        if !is_active(&view.validators.reader(), vi, current_epoch) ||
+            view.validators.exit_epoch(vi as usize) != u64::MAX ||
+            current_epoch <
+                view.validators.activation_epoch(vi as usize) + cfg.shard_committee_period ||
+            get_pending_balance_to_withdraw(&view.pending.reader(), vi) != 0
+        {
+            continue;
+        }
+        initiate_validator_exit(cfg, view, vi, current_epoch);
+    }
 }
 
 /// Pass 1 — push bls_to_execution_change sigs. Signer is the validator's
@@ -450,11 +541,16 @@ fn switch_to_compounding_validator(
         let excess = balance - MIN_ACTIVATION_BALANCE;
         balances.set(vi, MIN_ACTIVATION_BALANCE);
         let pubkey = *validators.pubkey(vi as usize);
+        // An empty signature marks the deposit as the validator's own excess.
+        let signature = match validators.reader().scheme() {
+            KeyScheme::Bls => G2_POINT_AT_INFINITY,
+            KeyScheme::Xmss => [0; 96],
+        };
         pending.deposits.push(PendingDeposit {
             pubkey,
             withdrawal_credentials: creds,
             amount: excess,
-            signature: G2_POINT_AT_INFINITY,
+            signature,
             slot: 0, // GENESIS_SLOT
         });
     }

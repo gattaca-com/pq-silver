@@ -355,6 +355,14 @@ pub struct ProposerSlashingView;
 
 impl ProposerSlashingView {
     #[inline]
+    pub fn header_1(buf: &[u8; PROPOSER_SLASHING_SIZE]) -> &[u8; BEACON_BLOCK_HEADER_SIZE] {
+        fixed(buf, 0)
+    }
+    #[inline]
+    pub fn header_2(buf: &[u8; PROPOSER_SLASHING_SIZE]) -> &[u8; BEACON_BLOCK_HEADER_SIZE] {
+        fixed(buf, 208)
+    }
+    #[inline]
     pub fn h1_slot(buf: &[u8; PROPOSER_SLASHING_SIZE]) -> u64 {
         u64_le(buf, 0)
     }

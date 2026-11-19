@@ -7,7 +7,7 @@ use silver_beacon_state_data::{
 use silver_common::ssz_view::AttestationDataView;
 
 use crate::{
-    stf::{EFFECTIVE_BALANCE_INCREMENT, ParsedAttestationData, ShufflingRef},
+    stf::{EFFECTIVE_BALANCE_INCREMENT, ParsedAttestationData, ShufflingRef, voted_block_slot},
     validate::validate_attestation_data_view,
 };
 
@@ -23,9 +23,11 @@ pub(super) struct AttestationRewards<'a> {
     current_epoch: Epoch,
     /// Indexed by whether the target is the current epoch.
     justified: [Checkpoint; 2],
-    /// Gloas: the parent slot's payload availability bit once the block has
-    /// applied its parent's payload; `None` before Gloas.
-    payload_index: Option<u64>,
+    /// Gloas: the parent's payload availability once the block has applied
+    /// its parent's payload; `None` before Gloas.
+    parent_payload_available: Option<bool>,
+    parent_slot: Slot,
+    min_inclusion_delay: Slot,
     /// Indexed by a participation flag mask.
     flags_weight: [u64; 8],
 }
@@ -39,10 +41,10 @@ impl<'a> AttestationRewards<'a> {
         builds_on_full_parent: bool,
     ) -> Self {
         let slot_state = pre_state.slot.state();
-        let payload_index = pre_state.post_gloas_fork().then(|| {
-            let parent_slot = slot_state.latest_block_header.slot;
-            (builds_on_full_parent || slot_state.payload_available(parent_slot)) as u64
-        });
+        let parent_slot = slot_state.latest_block_header.slot;
+        let parent_payload_available = pre_state
+            .post_gloas_fork()
+            .then(|| builds_on_full_parent || slot_state.payload_available(parent_slot));
         let epoch = pre_state.epoch.state();
         let justified = [epoch.previous_justified_checkpoint, epoch.current_justified_checkpoint];
         let flags_weight = array::from_fn(|mask| {
@@ -56,7 +58,9 @@ impl<'a> AttestationRewards<'a> {
             block_slot,
             current_epoch: block_slot / SLOTS_PER_EPOCH,
             justified,
-            payload_index,
+            parent_payload_available,
+            parent_slot,
+            min_inclusion_delay: pre_state.epoch.min_attestation_inclusion_delay(pre_state.imm),
             flags_weight,
         }
     }
@@ -69,22 +73,47 @@ impl<'a> AttestationRewards<'a> {
         }
     }
 
+    fn payload_index(&self, att_slot: Slot) -> Option<u64> {
+        let parent_payload_available = self.parent_payload_available?;
+        let block_slot = voted_block_slot(
+            &self.pre_state.block_roots,
+            att_slot,
+            self.parent_slot,
+            self.block_slot,
+            self.pre_state.is_pq(),
+        );
+        let available = if block_slot == self.parent_slot {
+            parent_payload_available
+        } else {
+            self.pre_state.slot.state().payload_available(block_slot)
+        };
+        Some(available as u64)
+    }
+
     /// `None` when the block may not include the vote candidate.
     fn earned_flags(&self, data: AttestationDataView) -> Option<u8> {
         let previous_epoch = self.current_epoch.saturating_sub(1);
+        let min_inclusion_delay = self.min_inclusion_delay;
         validate_attestation_data_view(
             data,
             self.block_slot,
             self.current_epoch,
             previous_epoch,
-            self.payload_index.is_some(),
+            self.parent_payload_available.is_some(),
+            min_inclusion_delay,
         )
         .ok()?;
         let vote = ParsedAttestationData::parse(data);
         let is_current = vote.target_epoch == self.current_epoch;
         vote.check_source(self.justified[is_current as usize]).ok()?;
-        let flags =
-            vote.flags(|slot| self.root_at(slot), self.block_slot, self.payload_index).ok()?;
+        let flags = vote
+            .flags(
+                |slot| self.root_at(slot),
+                self.block_slot,
+                self.payload_index(vote.att_slot),
+                min_inclusion_delay,
+            )
+            .ok()?;
         (flags & TIMELY_TARGET_FLAG != 0).then_some(flags)
     }
 
@@ -136,8 +165,9 @@ impl<'a> AttestationRewards<'a> {
 #[cfg(test)]
 mod tests {
     use silver_beacon_state_data::{
-        BeaconState, EpochState, EpochStateFinalized, Fork, StateId, TIMELY_HEAD_FLAG,
-        TIMELY_SOURCE_FLAG, ValSeed, gloas::GLOAS_FORK_VERSION,
+        BeaconState, EpochState, EpochStateFinalized, Fork, SLOTS_PER_HISTORICAL_ROOT, StateId,
+        TIMELY_HEAD_FLAG, TIMELY_SOURCE_FLAG, ValSeed, gloas::GLOAS_FORK_VERSION,
+        pq::PQ_FORK_VERSION,
     };
     use silver_common::ssz_view::ATTESTATION_DATA_SIZE;
 
@@ -352,5 +382,40 @@ mod tests {
         assert_eq!(weights_of(&state, &with_index(same_slot, 1), 0, true), [0, 0]);
         let target_only = increments(STATE_SLOT).map(|i| i * 26);
         assert_eq!(weights_of(&state, &same_slot, 0, true), target_only);
+    }
+
+    /// A PQ pre-state advanced to the block's slot. The parent sits one slot
+    /// back with its payload missing. The slots before it, back to the epoch
+    /// start, are empty after a block there whose payload arrived.
+    fn pq_state_over_a_skipped_slot() -> (BeaconState, StateId) {
+        let fork = Fork { current_version: PQ_FORK_VERSION, ..Fork::default() };
+        let (bs, state_id) = state_at_fork(&[], fork);
+        let StateId { epoch_idx, longtail_idx, .. } = state_id;
+        let mut st = TestState { bs, state_id };
+        let (mut view, _, _) = st.view();
+        let parent_slot = BLOCK_SLOT - 1;
+        for slot in STATE_SLOT..BLOCK_SLOT {
+            let root = if slot == parent_slot { [0xCC; 32] } else { PARENT_ROOT };
+            view.block_roots.set((slot % SLOTS_PER_HISTORICAL_ROOT as u64) as u32, root);
+        }
+        let slot_state = view.slot.state_mut();
+        slot_state.slot = BLOCK_SLOT;
+        slot_state.latest_block_header.slot = parent_slot;
+        slot_state.set_payload_available(STATE_SLOT, true);
+        let id = view.commit(epoch_idx, longtail_idx);
+        (st.bs, id)
+    }
+
+    /// Included two slots late, the vote heads the block before the parent,
+    /// so it is that block's payload status the vote must claim.
+    #[test]
+    fn pq_head_needs_the_payload_status_of_the_block_it_votes_for() {
+        let state = pq_state_over_a_skipped_slot();
+        let slot = BLOCK_SLOT - 2;
+        let paid =
+            |index| weights_of(&state, &with_index(vote(slot, PARENT_ROOT), index), 0, false);
+
+        assert_eq!(paid(1), increments(slot).map(|i| i * SOURCE_TARGET_HEAD));
+        assert_eq!(paid(0), increments(slot).map(|i| i * (14 + 26)));
     }
 }

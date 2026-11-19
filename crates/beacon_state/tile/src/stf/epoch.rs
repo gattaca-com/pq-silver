@@ -7,16 +7,19 @@ use silver_beacon_state_data::{
     EPOCHS_PER_SYNC_COMMITTEE_PERIOD, Epoch, EpochBalances, EpochView, EpochWriteView,
     Eth1WriteView, HistoricalSummary, LongtailGroup, LongtailId, LongtailWriteView,
     MIN_SEED_LOOKAHEAD, PARTICIPATION_FLAGS, PARTICIPATION_WEIGHTS, PROPOSER_LOOKAHEAD_SIZE,
-    SLOTS_PER_EPOCH, SLOTS_PER_HISTORICAL_ROOT, SYNC_COMMITTEE_SIZE, SlotStateWriteView,
-    SpecConfig, StateWriterView, SyncCommittees, TIMELY_TARGET_FLAG, ValidatorsView, bls,
+    Preregistration, SLOTS_PER_EPOCH, SLOTS_PER_HISTORICAL_ROOT, SYNC_COMMITTEE_SIZE,
+    SlotStateWriteView, SpecConfig, StateWriterView, SyncCommittees, TIMELY_TARGET_FLAG,
+    ValidatorsView, bls,
+    pq::{KeyScheme, deposit_vrf_root, xmss_pubkey},
 };
 
 use crate::{
     merkle,
     shuffling::{self, DOMAIN_BEACON_PROPOSER},
     stf::{
+        EpochShuffling,
         common::StfScratch,
-        process_builder_pending_payments, process_ptc_window,
+        process_aggregation_committee_window, process_builder_pending_payments, process_ptc_window,
         validator::{
             ActiveStatus, get_balance_churn_limit, initiate_validator_exit, is_active,
             sweep_epoch_balances,
@@ -67,8 +70,9 @@ pub fn process_epoch(
     // from the inherited entry (fresh off the base when no ancestor rotated).
     let next_epoch = current_epoch + 1;
     let rotates_summary = next_epoch.is_multiple_of(HISTORICAL_SUMMARY_PERIOD);
+    let is_pq = epoch.reader().is_pq(view.imm);
     let rotates_sync_committee =
-        !cfg.is_pq_at(current_epoch) && next_epoch.is_multiple_of(EPOCHS_PER_SYNC_COMMITTEE_PERIOD);
+        !is_pq && next_epoch.is_multiple_of(EPOCHS_PER_SYNC_COMMITTEE_PERIOD);
     let needs_longtail = rotates_sync_committee || rotates_summary;
     let mut longtail_w = needs_longtail.then(|| longtail.roll_inheriting(*longtail_idx));
 
@@ -104,7 +108,12 @@ pub fn process_epoch(
     }
     process_proposer_lookahead(view, epoch, current_epoch, &mut scratch.active, &mut scratch.eff);
     if post_gloas_fork {
-        process_ptc_window(view, epoch, current_epoch);
+        let lookahead = EpochShuffling::lookahead(view, current_epoch, &mut scratch.active);
+        process_ptc_window(view, epoch, current_epoch, &lookahead);
+        if is_pq {
+            process_aggregation_committee_window(view, epoch, current_epoch, &lookahead);
+            process_preregistration_expiry(view);
+        }
     }
 
     // Last: until this runs, `total_active_balance` still answers for
@@ -531,6 +540,12 @@ fn reseed_epoch_balances(view: &mut StateWriterView, next_epoch: Epoch) {
     *view.slot.epoch_balances_mut() = reseeded;
 }
 
+pub fn process_preregistration_expiry(view: &mut StateWriterView) {
+    let parent_slot = view.slot.state().latest_execution_payload_bid.slot;
+    view.preregistrations.validators().retain(|binding| binding.is_active(parent_slot));
+    view.preregistrations.builders().retain(|binding| binding.is_active(parent_slot));
+}
+
 pub fn process_eth1_data_reset(eth1: &mut Eth1WriteView, current_epoch: Epoch) {
     let next_epoch = current_epoch + 1;
     if next_epoch.is_multiple_of(EPOCHS_PER_ETH1_VOTING_PERIOD) {
@@ -557,6 +572,7 @@ pub fn process_pending_deposits(
     let mut next_deposit_index: usize = 0;
     let mut churn_limit_reached = false;
 
+    let scheme = view.validators.reader().scheme();
     let pending_len = view.pending.deposits.reader().len();
     for di in 0..pending_len {
         let deposit = *view.pending.deposits.reader().get(di);
@@ -568,13 +584,14 @@ pub fn process_pending_deposits(
             break;
         }
 
-        let vi = view.validators.find_by_pubkey(&deposit.pubkey);
+        let vi = view.validators.find_by_pubkey(&scheme.deposit_pubkey(&deposit.pubkey));
         let is_exited = vi.is_some_and(|v| view.validators.exit_epoch(v as usize) != u64::MAX);
         let is_withdrawn =
             vi.is_some_and(|v| view.validators.withdrawable_epoch(v as usize) < next_epoch);
 
-        if is_withdrawn {
-            apply_pending_deposit(view, &deposit);
+        // A legacy deposit's validator is never active, so it takes no churn.
+        if is_withdrawn || scheme.is_legacy(&deposit.pubkey) {
+            apply_pending_deposit(cfg, view, &deposit);
         } else if is_exited {
             postponed.push(deposit);
         } else {
@@ -583,7 +600,7 @@ pub fn process_pending_deposits(
                 break;
             }
             processed_amount += deposit.amount;
-            apply_pending_deposit(view, &deposit);
+            apply_pending_deposit(cfg, view, &deposit);
         }
         next_deposit_index += 1;
     }
@@ -596,30 +613,54 @@ pub fn process_pending_deposits(
 }
 
 #[timed]
-fn apply_pending_deposit(view: &mut StateWriterView, deposit: &common::PendingDeposit) {
-    if let Some(v) = view.validators.find_by_pubkey(&deposit.pubkey) {
+fn apply_pending_deposit(
+    cfg: &SpecConfig,
+    view: &mut StateWriterView,
+    deposit: &common::PendingDeposit,
+) {
+    let scheme = view.validators.reader().scheme();
+    let registry_pubkey = scheme.deposit_pubkey(&deposit.pubkey);
+    if let Some(v) = view.validators.find_by_pubkey(&registry_pubkey) {
         let balance = view.balances.get(v as usize);
         view.balances.set(v, balance.saturating_add(deposit.amount));
         return;
     }
-    if !is_valid_deposit_signature(
-        view.imm.genesis_fork_version,
-        &deposit.pubkey,
-        &deposit.withdrawal_credentials,
-        deposit.amount,
-        &deposit.signature,
-    ) {
-        return;
-    }
-    let pk_decompressed = blst::min_pk::PublicKey::from_bytes(&deposit.pubkey).unwrap_or_default();
-    let idx =
-        view.append_validator(deposit.pubkey, pk_decompressed, deposit.withdrawal_credentials);
+    let idx = match scheme {
+        KeyScheme::Bls => {
+            if !is_valid_deposit_signature(
+                view.imm.genesis_fork_version,
+                &deposit.pubkey,
+                &deposit.withdrawal_credentials,
+                deposit.amount,
+                &deposit.signature,
+            ) {
+                return;
+            }
+            let pk_decompressed =
+                blst::min_pk::PublicKey::from_bytes(&deposit.pubkey).unwrap_or_default();
+            view.append_validator(deposit.pubkey, pk_decompressed, deposit.withdrawal_credentials)
+        }
+        // A PQ deposit carries no signature to verify.
+        KeyScheme::Xmss => view.append_xmss_validator(
+            xmss_pubkey(&registry_pubkey),
+            deposit_vrf_root(&deposit.pubkey, &deposit.signature),
+            deposit.withdrawal_credentials,
+        ),
+    };
     let initial_eff = min(
         deposit.amount - deposit.amount % EFFECTIVE_BALANCE_INCREMENT,
         deposit.withdrawal_credentials.max_effective_balance(),
     );
     view.validators.set_effective_balance(idx, initial_eff);
     view.balances.set(idx, deposit.amount);
+
+    // Never active, so it exits without consuming exit churn.
+    if scheme.is_legacy(&deposit.pubkey) {
+        let current_epoch = view.slot.state().slot / SLOTS_PER_EPOCH;
+        view.validators.set_exit_epoch(idx, current_epoch);
+        view.validators
+            .set_withdrawable_epoch(idx, current_epoch + cfg.min_validator_withdrawability_delay);
+    }
 }
 
 #[timed]

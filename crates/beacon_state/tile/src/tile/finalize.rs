@@ -41,7 +41,9 @@ impl BeaconStateTile {
         // is now the finalized block) are exactly the deltas to re-base.
         self.fork_choice.prune();
         let fork_choice = &self.fork_choice;
-        self.held.drop_outdated(|parent| fork_choice.find_node_idx(parent).is_some());
+        let finalized_slot = fork_choice.finalized_checkpoint().epoch * SLOTS_PER_EPOCH;
+        self.held
+            .drop_outdated(finalized_slot, |parent| fork_choice.find_node_idx(parent).is_some());
         self.precomputed_epochs.drop_outdated(fork_choice);
         self.block_production.drop_outdated(|parent| fork_choice.find_node_idx(parent).is_some());
         self.payload_execution_requests

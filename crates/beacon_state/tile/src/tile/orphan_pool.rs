@@ -4,7 +4,7 @@ use silver_common::{
     BeaconStateEvent, BlockSource, BlockStage, P2pStreamId, PeerEvent, RpcOffence, RpcSeverity,
     SyncNeed, TCacheRead, hex32,
     metrics::timed,
-    ssz_view::{ExecutionPayloadBidView, SignedBeaconBlockView},
+    ssz_view::{ExecutionPayloadBidView, SignedBeaconBlockPqView, SignedBeaconBlockView},
 };
 
 use super::{
@@ -158,20 +158,14 @@ impl BeaconStateTile {
         producers: &mut Producers,
     ) {
         let block_source = msg.source();
+        let block_slot =
+            self.block_layout(data).expect("a parked block passed precheck").slot(data);
         let admitted = match feedback {
-            Feedback::RequestParent { parent_root, block_root } => {
-                let block_slot = SignedBeaconBlockView::slot(data);
-                self.buffer_orphan(parent_root, block_root, msg, block_slot, producers)
-                    .then_some(block_root)
-            }
+            Feedback::RequestParent { parent_root, block_root } => self
+                .buffer_orphan(parent_root, block_root, msg, block_slot, producers)
+                .then_some(block_root),
             Feedback::AwaitParentPayload { parent_root, block_root } => self
-                .buffer_awaiting_payload(
-                    parent_root,
-                    block_root,
-                    SignedBeaconBlockView::slot(data),
-                    msg,
-                    producers,
-                )
+                .buffer_awaiting_payload(parent_root, block_root, block_slot, msg, producers)
                 .then_some(block_root),
             _ => {
                 debug_assert!(false, "park_block: unexpected feedback {feedback:?}");
@@ -198,16 +192,18 @@ impl BeaconStateTile {
         source: BlockSource,
         producers: &mut Producers,
     ) {
-        let parent_root = *SignedBeaconBlockView::parent_root(data);
-        let slot = SignedBeaconBlockView::slot(data);
+        let Ok(layout) = self.block_layout(data) else {
+            debug_assert!(false, "emit_block_received: block without a layout");
+            return;
+        };
+        let parent_root = layout.parent_root(data);
+        let slot = layout.slot(data);
         let parent =
             self.fork_choice.find_node_idx(&parent_root).map(|idx| self.fork_choice.node(idx));
         let parent_empty = parent.is_some_and(|parent| {
-            self.spec.is_gloas_at_slot(slot) &&
-                SignedBeaconBlockView::check_gloas_size(data) &&
-                *ExecutionPayloadBidView::parent_block_hash(SignedBeaconBlockView::gloas_bid(
-                    data,
-                )) != parent.payload.bid_block_hash
+            layout.bid(data).is_some_and(|bid| {
+                *ExecutionPayloadBidView::parent_block_hash(bid) != parent.payload.bid_block_hash
+            })
         });
         producers.produce(BeaconStateEvent::BlockReceived {
             slot,
@@ -232,7 +228,7 @@ impl BeaconStateTile {
             return false;
         };
 
-        if !SignedBeaconBlockView::check_size(data) {
+        if !SignedBeaconBlockView::check_size(data) && !SignedBeaconBlockPqView::check_size(data) {
             producers.produce(PeerEvent::RpcMisbehaviour {
                 p2p_peer: sender.peer(),
                 severity: RpcSeverity::LowTolerance,
@@ -251,6 +247,7 @@ impl BeaconStateTile {
             }),
             Feedback::BlockImported(_) |
             Feedback::AwaitData(_) |
+            Feedback::AwaitVerify(_) |
             Feedback::BlockKnown(_) |
             Feedback::Ignore |
             Feedback::AlreadySeen |

@@ -58,6 +58,21 @@ impl RootsView<'_, BlockRoots> {
             .then(|| self.at_slot(decision_slot))
     }
 
+    pub fn latest_block_slot(&self, slot: Slot, parent_slot: Slot, state_slot: Slot) -> Slot {
+        if parent_slot <= slot {
+            return parent_slot;
+        }
+        let block_root = self.at_slot(slot);
+        let mut slot = slot;
+        while slot > 0 &&
+            slot + SLOTS_PER_HISTORICAL_ROOT as u64 > state_slot &&
+            self.at_slot(slot - 1) == block_root
+        {
+            slot -= 1;
+        }
+        slot
+    }
+
     /// Slot of the block with `root`, if the ring holds it at or below
     /// `from_slot`. Fork choice is what writes a root here, so a hit means
     /// "seen and validated".

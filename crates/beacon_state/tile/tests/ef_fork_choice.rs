@@ -207,3 +207,48 @@ fn gloas_fork_choice_on_block() {
 fn gloas_fork_choice_on_execution_payload_envelope() {
     run_handler("gloas", "on_execution_payload_envelope");
 }
+
+#[test]
+fn pq_fork_choice_ex_ante() {
+    run_handler("pq", "ex_ante");
+}
+
+#[test]
+fn pq_fork_choice_get_head() {
+    run_handler("pq", "get_head");
+}
+
+#[test]
+fn pq_fork_choice_get_parent_payload_status() {
+    run_handler("pq", "get_parent_payload_status");
+}
+
+#[test]
+fn pq_fork_choice_on_attestation() {
+    run_handler("pq", "on_attestation");
+}
+
+#[test]
+fn pq_fork_choice_on_block() {
+    run_handler("pq", "on_block");
+}
+
+#[test]
+fn pq_fork_choice_on_execution_payload_envelope() {
+    run_handler("pq", "on_execution_payload_envelope");
+}
+
+#[test]
+fn pq_fork_choice_on_payload_attestation_message() {
+    run_handler("pq", "on_payload_attestation_message");
+}
+
+#[test]
+fn pq_fork_choice_payload_data_availability() {
+    run_handler("pq", "payload_data_availability");
+}
+
+#[test]
+fn pq_fork_choice_payload_timeliness() {
+    run_handler("pq", "payload_timeliness");
+}

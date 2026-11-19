@@ -9,14 +9,15 @@ mod withdrawals;
 pub use bid::{
     collect_sigs_execution_payload_bid, decode_bid, decode_bid_message,
     is_gas_limit_target_compatible, process_execution_payload_bid,
-    verify_execution_payload_bid_signature,
+    verify_execution_payload_bid_signature, verify_execution_payload_bid_signature_pq,
 };
 pub use builders::{
     get_builder_payment_quorum_threshold, process_builder_deposit_request,
     process_builder_exit_request, process_builder_pending_payments,
+    process_builder_preregistration_requests,
 };
 pub use committee::process_ptc_window;
-pub(crate) use committee::{fill_epoch_ptc, get_ptc};
+pub(crate) use committee::{balance_weighted_draws, fill_epoch_ptc, get_ptc};
 pub(crate) use envelope::payload_withdrawals_match_expected;
 pub use envelope::{
     envelope_execution_requests, envelope_withdrawals_match_expected, verify_envelope_signature,

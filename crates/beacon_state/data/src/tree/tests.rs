@@ -470,6 +470,29 @@ fn block_roots_slot_of_scans_back_from_the_given_slot() {
     assert_eq!(reader.slot_of(&[0xCC; 32], 103), None);
 }
 
+/// Blocks at slots 100 and 103 with the parent at 103, processing the block at
+/// slot 105. A vote for an empty slot finds the block that fills it.
+#[test]
+fn latest_block_slot_walks_back_through_empty_slots() {
+    let mut g = BlockRootsGroup::zeroed_vector();
+    let id = {
+        let mut wv = g.roll_fresh();
+        for slot in 100..=102 {
+            wv.set(slot, [0xAA; 32]);
+        }
+        for slot in 103..=104 {
+            wv.set(slot, [0xBB; 32]);
+        }
+        wv.commit()
+    };
+    let reader = g.view(id);
+
+    assert_eq!(reader.latest_block_slot(102, 103, 105), 100, "empty slots before the parent");
+    assert_eq!(reader.latest_block_slot(100, 103, 105), 100);
+    assert_eq!(reader.latest_block_slot(103, 103, 105), 103, "the parent's own slot");
+    assert_eq!(reader.latest_block_slot(104, 103, 105), 103, "at or after the parent");
+}
+
 /// A head in epoch 2 uses decision slots 63 and 31.
 #[test]
 fn duty_dependent_roots_read_the_slots_below_the_two_epoch_starts() {

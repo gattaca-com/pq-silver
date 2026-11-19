@@ -2,12 +2,32 @@ use std::io::{self, Write};
 
 use silver_ssz::ssz_view::XMSSPubkey;
 
-use super::list::Record;
 use crate::{
     decompose::u64_le,
     merkle::{merkleize, uint64_chunk},
     types::{B256, Slot},
 };
+
+/// A binding of an XMSS key to the credentials its deposit must carry, held
+/// until `expiry_slot`, as the state stores it.
+pub trait Preregistration: Copy + Default + PartialEq {
+    const SSZ_SIZE: usize;
+
+    fn from_ssz(ssz: &[u8]) -> Self;
+
+    fn write_ssz<W: Write>(&self, w: &mut W) -> io::Result<()>;
+
+    fn hash_tree_root(&self) -> B256;
+
+    fn pubkey(&self) -> &XMSSPubkey;
+
+    fn expiry_slot(&self) -> Slot;
+
+    #[inline]
+    fn is_active(&self, parent_slot: Slot) -> bool {
+        parent_slot < self.expiry_slot()
+    }
+}
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct ValidatorPreregistration {
@@ -17,7 +37,7 @@ pub struct ValidatorPreregistration {
     pub expiry_slot: Slot,
 }
 
-impl Record for ValidatorPreregistration {
+impl Preregistration for ValidatorPreregistration {
     const SSZ_SIZE: usize = 32 + 32 + 32 + 8;
 
     fn from_ssz(s: &[u8]) -> Self {
@@ -44,6 +64,16 @@ impl Record for ValidatorPreregistration {
             uint64_chunk(self.expiry_slot),
         ])
     }
+
+    #[inline]
+    fn pubkey(&self) -> &XMSSPubkey {
+        &self.pubkey
+    }
+
+    #[inline]
+    fn expiry_slot(&self) -> Slot {
+        self.expiry_slot
+    }
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -53,7 +83,7 @@ pub struct BuilderPreregistration {
     pub expiry_slot: Slot,
 }
 
-impl Record for BuilderPreregistration {
+impl Preregistration for BuilderPreregistration {
     const SSZ_SIZE: usize = 32 + 32 + 8;
 
     fn from_ssz(s: &[u8]) -> Self {
@@ -72,5 +102,15 @@ impl Record for BuilderPreregistration {
 
     fn hash_tree_root(&self) -> B256 {
         merkleize(&[self.pubkey, self.withdrawal_credentials, uint64_chunk(self.expiry_slot)])
+    }
+
+    #[inline]
+    fn pubkey(&self) -> &XMSSPubkey {
+        &self.pubkey
+    }
+
+    #[inline]
+    fn expiry_slot(&self) -> Slot {
+        self.expiry_slot
     }
 }

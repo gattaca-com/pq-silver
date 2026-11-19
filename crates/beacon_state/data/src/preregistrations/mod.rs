@@ -5,20 +5,38 @@ mod tests;
 
 use flux_profiler::timed;
 use list::ListDelta;
-pub use list::{FinalizedList, ListView, ListWriter, PREREGISTRATIONS_LIMIT, Record};
-pub use records::{BuilderPreregistration, ValidatorPreregistration};
+pub use list::{
+    FinalizedList, ListView, ListWriter, PREREGISTRATION_EXPIRY_SLOTS, PREREGISTRATIONS_LIMIT,
+};
+pub use records::{BuilderPreregistration, Preregistration, ValidatorPreregistration};
 
 use crate::{
     DecomposeError,
     reanchor::reanchor_survivors,
     ring::{Id, Reset, Ring, RingGroup, Slot},
-    types::SLOTS_RING_N,
+    tree::{TreeGroup, TreeSpec, TreeWriteView},
+    types::{B256, HashFormat, SLOTS_RING_N},
 };
 
-pub type PreregistrationsId = Id<PreregistrationsGroup>;
+pub struct PreregistrationRoots;
+impl TreeSpec for PreregistrationRoots {
+    type Val = B256;
+    type Page = [B256; 32];
+}
 
-/// The two finalized PQ preregistration lists. Deposit requests append or
-/// overwrite records; deposits and the epoch sweep remove them.
+type RootsGroup = TreeGroup<PreregistrationRoots>;
+
+/// The data ring reanchors survivors at finalize while the paged roots keep
+/// their ids, so a fork's id is the triple.
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
+pub struct PreregistrationsId {
+    data: Id<PreregistrationsGroup>,
+    validator_roots: Id<RootsGroup>,
+    builder_roots: Id<RootsGroup>,
+}
+
+/// The two finalized PQ preregistration lists. Requests append or overwrite
+/// records; deposits and the epoch sweep remove them.
 #[derive(Default)]
 pub struct Preregistrations {
     pub validators: FinalizedList<ValidatorPreregistration>,
@@ -42,8 +60,8 @@ pub(crate) struct PreregistrationsDelta {
 
 impl Reset for PreregistrationsDelta {
     fn reset(&mut self) {
-        // Every roll overwrites both lists: `fresh` from the base, `reset_from`
-        // from the parent.
+        self.validators.clear();
+        self.builders.clear();
     }
 
     fn reset_from(&mut self, other: &Self) {
@@ -55,6 +73,8 @@ impl Reset for PreregistrationsDelta {
 pub struct PreregistrationsGroup {
     finalized: Preregistrations,
     deltas: Ring<Self>,
+    validator_roots: RootsGroup,
+    builder_roots: RootsGroup,
 }
 
 impl RingGroup for PreregistrationsGroup {
@@ -63,7 +83,12 @@ impl RingGroup for PreregistrationsGroup {
 
 impl PreregistrationsGroup {
     pub fn new(finalized: Preregistrations) -> Self {
-        Self { finalized, deltas: Ring::new(SLOTS_RING_N) }
+        Self {
+            validator_roots: roots_of(&finalized.validators),
+            builder_roots: roots_of(&finalized.builders),
+            finalized,
+            deltas: Ring::new(SLOTS_RING_N),
+        }
     }
 
     #[inline]
@@ -73,35 +98,51 @@ impl PreregistrationsGroup {
 
     #[inline]
     pub fn view(&self, id: PreregistrationsId) -> PreregistrationsView<'_> {
-        PreregistrationsView::new(&self.finalized, self.deltas.get(id))
+        let delta = self.deltas.get(id.data);
+        PreregistrationsView {
+            validators: ListView::new(
+                &self.finalized.validators,
+                &delta.validators,
+                self.validator_roots.view(id.validator_roots),
+            ),
+            builders: ListView::new(
+                &self.finalized.builders,
+                &delta.builders,
+                self.builder_roots.view(id.builder_roots),
+            ),
+        }
     }
 
     #[inline]
     pub fn roll_fresh(&mut self) -> PreregistrationsWriteView<'_> {
-        let Self { finalized, deltas } = self;
-        let mut fork = deltas.roll_fresh();
-        fork.validators.reset_onto(&finalized.validators);
-        fork.builders.reset_onto(&finalized.builders);
-        PreregistrationsWriteView { base: finalized, fork }
+        let Self { finalized, deltas, validator_roots, builder_roots } = self;
+        PreregistrationsWriteView {
+            base: finalized,
+            fork: deltas.roll_fresh(),
+            validator_roots: validator_roots.roll_fresh(),
+            builder_roots: builder_roots.roll_fresh(),
+        }
     }
 
     #[inline]
     pub fn roll_from(&mut self, parent: PreregistrationsId) -> PreregistrationsWriteView<'_> {
-        let Self { finalized, deltas } = self;
-        PreregistrationsWriteView { base: finalized, fork: deltas.roll_from(parent) }
+        let Self { finalized, deltas, validator_roots, builder_roots } = self;
+        PreregistrationsWriteView {
+            base: finalized,
+            fork: deltas.roll_from(parent.data),
+            validator_roots: validator_roots.roll_from(parent.validator_roots),
+            builder_roots: builder_roots.roll_from(parent.builder_roots),
+        }
     }
 
     /// Copy a survivor into a fresh slot and rebase it against the
     /// pre-promotion `winner`.
-    fn reanchor(
-        &mut self,
-        survivor: PreregistrationsId,
-        winner: PreregistrationsId,
-    ) -> PreregistrationsId {
-        let (mut fork, old, winner_delta) = self.deltas.roll_fresh_deriving(survivor, winner);
+    fn reanchor(&mut self, survivor: Id<Self>, winner: Id<Self>) -> Id<Self> {
+        let Self { finalized, deltas, .. } = self;
+        let (mut fork, old, winner_delta) = deltas.roll_fresh_deriving(survivor, winner);
         fork.reset_from(old);
-        fork.validators.rebase(&winner_delta.validators);
-        fork.builders.rebase(&winner_delta.builders);
+        fork.validators.rebase(&winner_delta.validators, &finalized.validators);
+        fork.builders.rebase(&winner_delta.builders, &finalized.builders);
         fork.commit()
     }
 
@@ -112,58 +153,73 @@ impl PreregistrationsGroup {
         survivors: &[PreregistrationsId],
     ) -> Vec<PreregistrationsId> {
         debug_assert!(survivors.contains(&winner), "winner must be among the survivors");
-        self.deltas.free_outdated(survivors);
+        let data_ids: Vec<_> = survivors.iter().map(|s| s.data).collect();
+        self.deltas.free_outdated(&data_ids);
 
-        let fresh = reanchor_survivors(survivors, |s| self.reanchor(s, winner));
+        let fresh = reanchor_survivors(survivors, |s| PreregistrationsId {
+            data: self.reanchor(s.data, winner.data),
+            ..s
+        });
 
-        let Self { finalized, deltas } = self;
-        let winner_delta = deltas.get(winner);
+        let Self { finalized, deltas, validator_roots, builder_roots } = self;
+        let winner_delta = deltas.get(winner.data);
         finalized.validators.promote(&winner_delta.validators);
         finalized.builders.promote(&winner_delta.builders);
+        validator_roots.finalize(winner.validator_roots, survivors, |s| s.validator_roots);
+        builder_roots.finalize(winner.builder_roots, survivors, |s| s.builder_roots);
 
-        deltas.free_outdated(&fresh);
+        let fresh_data: Vec<_> = fresh.iter().map(|f| f.data).collect();
+        deltas.free_outdated(&fresh_data);
         fresh
     }
 }
 
-#[derive(Clone, Copy)]
+fn roots_of<T: Preregistration>(list: &FinalizedList<T>) -> RootsGroup {
+    let count = list.as_slice().len();
+    TreeGroup::from_leaves(count, count, list.leaf_roots(), HashFormat::Progressive)
+}
+
 pub struct PreregistrationsView<'a> {
     pub validators: ListView<'a, ValidatorPreregistration>,
     pub builders: ListView<'a, BuilderPreregistration>,
 }
 
-impl<'a> PreregistrationsView<'a> {
-    fn new(base: &'a Preregistrations, delta: &'a PreregistrationsDelta) -> Self {
-        Self {
-            validators: ListView::new(&base.validators, &delta.validators),
-            builders: ListView::new(&base.builders, &delta.builders),
-        }
-    }
-}
-
 pub struct PreregistrationsWriteView<'a> {
     base: &'a Preregistrations,
     fork: Slot<'a, PreregistrationsGroup>,
+    validator_roots: TreeWriteView<'a, PreregistrationRoots>,
+    builder_roots: TreeWriteView<'a, PreregistrationRoots>,
 }
 
-impl PreregistrationsWriteView<'_> {
+impl<'a> PreregistrationsWriteView<'a> {
     #[inline]
     pub fn commit(self) -> PreregistrationsId {
-        self.fork.commit()
+        PreregistrationsId {
+            data: self.fork.commit(),
+            validator_roots: self.validator_roots.commit(),
+            builder_roots: self.builder_roots.commit(),
+        }
+    }
+
+    pub fn hashed_reader(&mut self) -> PreregistrationsView<'_> {
+        let Self { base, fork, validator_roots, builder_roots } = self;
+        PreregistrationsView {
+            validators: ListView::new(
+                &base.validators,
+                &fork.validators,
+                validator_roots.hashed_reader(),
+            ),
+            builders: ListView::new(&base.builders, &fork.builders, builder_roots.hashed_reader()),
+        }
     }
 
     #[inline]
-    pub fn reader(&self) -> PreregistrationsView<'_> {
-        PreregistrationsView::new(self.base, &self.fork)
+    pub fn validators(&mut self) -> ListWriter<'_, 'a, ValidatorPreregistration> {
+        ListWriter::new(&self.base.validators, &mut self.fork.validators, &mut self.validator_roots)
     }
 
     #[inline]
-    pub fn validators(&mut self) -> ListWriter<'_, ValidatorPreregistration> {
-        ListWriter::new(&self.base.validators, &mut self.fork.validators)
-    }
-
-    #[inline]
-    pub fn builders(&mut self) -> ListWriter<'_, BuilderPreregistration> {
-        ListWriter::new(&self.base.builders, &mut self.fork.builders)
+    pub fn builders(&mut self) -> ListWriter<'_, 'a, BuilderPreregistration> {
+        ListWriter::new(&self.base.builders, &mut self.fork.builders, &mut self.builder_roots)
     }
 }

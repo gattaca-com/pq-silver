@@ -1,20 +1,27 @@
+use std::ops::Range;
+
 use flux::spine::SpineProducers;
 use flux_profiler::timed;
 use silver_beacon_state_data::{
     B256, BeaconBlockHeader, BodyFork, BodyOffsets, Checkpoint, Epoch, ForkWriter, SLOTS_PER_EPOCH,
     Slot, StateId, StateReadView, StateView, bls, hash_tree_root_block_header,
+    pq::xmss_pubkey,
+    xmss::{LeafOffset, SignatureCheck, compute_xmss_leaf_index},
 };
 use silver_common::{
     BeaconStateEvent, BlockSource, BlockStage, EngineFcuReq, EngineNewPayloadReq, EngineReq,
-    SyncNeed, SyncUpdate, TCacheRead, TRead, hex32,
+    SignedBlockLayout, SyncNeed, SyncUpdate, TCacheRead, TRead, hex32,
     ssz_hash::{BlockFork, HashedBody},
-    ssz_view::{self, BeaconBlockBodyFuluView, BeaconBlockBodyGloasView, SignedBeaconBlockView},
+    ssz_view::{self, SignedBeaconBlockPqView, SignedBeaconBlockView},
 };
 
 use super::{
     BeaconStateTile, Feedback, MAXIMUM_GOSSIP_CLOCK_DISPARITY, Producers,
     gossip::EnvelopeCheck,
+    held_blocks::VerifyProgress,
+    leanvm_verifier::ProofVerdict,
     pending_envelopes::{ParkedEnvelope, ParkedKind},
+    pq_aggregation::claim,
 };
 use crate::{
     Error,
@@ -32,6 +39,7 @@ pub(super) fn lookahead_proposer(rv: &StateView<'_>, block_slot: Slot) -> Option
 }
 
 pub(super) struct ParsedBlock {
+    pub(super) layout: SignedBlockLayout,
     pub(super) header: BeaconBlockHeader,
     pub(super) block_root: B256,
     pub(super) has_data_columns: bool,
@@ -64,7 +72,7 @@ impl AppliedBlock {
         // its epoch boundary, read-only on the live view.
         let unrealized = stf::unrealized_checkpoints(&fork.view, es, header.slot / SLOTS_PER_EPOCH);
         let slot_state = fork.view.slot.state();
-        let execution_block_hash = if block_fork.is_gloas() {
+        let execution_block_hash = if block_fork.post_gloas_fork() {
             slot_state.latest_block_hash
         } else {
             slot_state.latest_execution_payload_header.block_hash
@@ -125,11 +133,44 @@ impl StagedBlock {
     }
 }
 
+/// What an applied block waits on before it enters fork choice. The pin keeps
+/// the bytes of a block that waits.
+pub(super) enum ImportGate {
+    Now,
+    DataColumns(TRead, BlockSource),
+    StarkVerdict(TRead, BlockSource),
+}
+
+/// The verify requests a PQ block's STARK proofs went out as: an empty range
+/// when no proof needed leanVM.
+enum StarkRequests {
+    Sent(Range<u64>),
+    ProofOfNoClaims,
+    /// A request did not fit in the tcache.
+    Unsent,
+}
+
+/// The root and stage of a block held back from import.
+fn held_stage(feedback: Feedback) -> Option<(B256, BlockStage)> {
+    match feedback {
+        Feedback::AwaitData(root) => Some((root, BlockStage::AwaitData)),
+        Feedback::AwaitVerify(root) => Some((root, BlockStage::AwaitVerify)),
+        _ => None,
+    }
+}
+
 impl BeaconStateTile {
     pub fn try_apply_block(&mut self, data: &[u8], emit: impl FnMut(BeaconStateEvent)) -> Feedback {
         match self.parse_and_verify_block(data, false) {
             Ok(parsed) => {
-                let feedback = self.apply_and_import(parsed, data, None, emit);
+                let feedback = match self.apply_or_reject(&parsed, data) {
+                    Ok(applied) => {
+                        let block_root = parsed.block_root;
+                        self.import_block(parsed, applied, data, emit);
+                        Feedback::BlockImported(block_root)
+                    }
+                    Err(feedback) => feedback,
+                };
                 self.maybe_finalize();
                 feedback
             }
@@ -149,12 +190,20 @@ impl BeaconStateTile {
         producers: &mut Producers,
         mut send_gossip: impl FnMut(B256, &mut Producers),
     ) -> Feedback {
-        if let Err(e) = Self::check_block_size(data) {
-            silver_log::warn!(?source, "{e}");
-            return e.feedback();
+        let layout = match self.block_layout(data) {
+            Ok(layout) => layout,
+            Err(e) => {
+                silver_log::warn!(?source, "{e}");
+                return e.feedback();
+            }
+        };
+
+        // Before the XMSS proposer signature, the costliest check a PQ block has.
+        if layout == SignedBlockLayout::Pq && self.held_is_full(self.held.awaiting_verify_len()) {
+            return Feedback::Ignore;
         }
 
-        let slot = SignedBeaconBlockView::slot(data);
+        let slot = layout.slot(data);
         let parsed = match self.parse_and_verify_block(data, pre_verified) {
             Ok(parsed) => {
                 if parsed.relay_eligible {
@@ -163,16 +212,10 @@ impl BeaconStateTile {
                 parsed
             }
             Err(PrecheckError::AwaitingData { block_root }) => {
-                if matches!(source, BlockSource::Rpc) {
-                    self.emit_block_received(
-                        data,
-                        block_root,
-                        BlockStage::AwaitData,
-                        source,
-                        producers,
-                    );
-                }
-                return Feedback::AwaitData(block_root);
+                return self.still_held(data, Feedback::AwaitData(block_root), source, producers);
+            }
+            Err(PrecheckError::AwaitingVerify { block_root }) => {
+                return self.still_held(data, Feedback::AwaitVerify(block_root), source, producers);
             }
             Err(e) => {
                 let f = e.feedback();
@@ -195,16 +238,18 @@ impl BeaconStateTile {
             }
         };
 
-        let waits_for_columns = self.waits_for_columns(&parsed);
-        if waits_for_columns && self.held.staged_len() >= self.pending_bounds.max_dc {
-            silver_log::warn!(
-                block = hex32(&parsed.block_root),
-                "too many blocks awaiting data availability; dropped"
-            );
-            return Feedback::Ignore;
-        }
+        let gate = if parsed.fork == BlockFork::Pq {
+            ImportGate::StarkVerdict(ssz.clone(), source)
+        } else if self.waits_for_columns(&parsed) {
+            if self.held_is_full(self.held.staged_len()) {
+                return Feedback::Ignore;
+            }
+            ImportGate::DataColumns(ssz.clone(), source)
+        } else {
+            ImportGate::Now
+        };
 
-        if !parsed.fork.is_gloas() {
+        if !parsed.fork.post_gloas_fork() {
             producers.produce(EngineReq::NewPayload(EngineNewPayloadReq {
                 data: ssz.to_read(),
                 block_root: parsed.block_root,
@@ -214,19 +259,19 @@ impl BeaconStateTile {
         }
 
         let block_root = parsed.block_root;
-        let hold = waits_for_columns.then(|| (ssz.clone(), source));
-        let f = self.apply_and_import(parsed, data, hold, |event| producers.produce(event));
+        let f = self.apply_and_import(parsed, data, gate, producers);
         match f {
             Feedback::BlockImported(_) => {
                 self.announce_imported(block_root, slot, data, ssz.to_read(), source, producers)
             }
-            Feedback::AwaitData(_) => {
-                self.emit_block_received(data, block_root, BlockStage::AwaitData, source, producers)
-            }
             Feedback::Reject { .. } => {
                 producers.produce(BeaconStateEvent::BlockRejected { block_root, source })
             }
-            _ => {}
+            _ => {
+                if let Some((root, stage)) = held_stage(f) {
+                    self.emit_block_received(data, root, stage, source, producers)
+                }
+            }
         }
         silver_log::info!(
             ?source,
@@ -238,6 +283,28 @@ impl BeaconStateTile {
             f
         );
         f
+    }
+
+    fn held_is_full(&self, held: usize) -> bool {
+        if held < self.pending_bounds.max_dc {
+            return false;
+        }
+        silver_log::warn!(held, "too many blocks held before import; dropped");
+        true
+    }
+
+    /// A re-fetch of a block already held: sync learns its transition ran.
+    fn still_held(
+        &self,
+        data: &[u8],
+        feedback: Feedback,
+        source: BlockSource,
+        producers: &mut Producers,
+    ) -> Feedback {
+        if let (BlockSource::Rpc, Some((root, stage))) = (source, held_stage(feedback)) {
+            self.emit_block_received(data, root, stage, source, producers);
+        }
+        feedback
     }
 
     /// Everything the rest of the node learns from an import, in the order it
@@ -310,7 +377,7 @@ impl BeaconStateTile {
 
     /// Gloas checks data availability on the payload envelope, not the block.
     pub(super) fn waits_for_columns(&self, parsed: &ParsedBlock) -> bool {
-        !parsed.fork.is_gloas() &&
+        !parsed.fork.post_gloas_fork() &&
             parsed.has_data_columns &&
             self.columns_pending(&parsed.block_root)
     }
@@ -325,12 +392,12 @@ impl BeaconStateTile {
             return;
         };
 
-        if !SignedBeaconBlockView::check_size(data) {
+        let Ok(layout) = self.block_layout(data) else {
             silver_log::error!(len = data.len(), "replayed on-disk block malformed");
             return;
-        }
+        };
 
-        let block_slot = SignedBeaconBlockView::slot(data);
+        let block_slot = layout.slot(data);
         let feedback = self.try_apply_block(data, emit);
 
         match feedback {
@@ -407,7 +474,12 @@ impl BeaconStateTile {
         };
 
         if !pre_verified &&
-            !self.verify_block_signature(data, parsed.parent_state_id, &parsed.block_root)
+            !self.verify_block_signature(
+                parsed.layout,
+                data,
+                parsed.parent_state_id,
+                &parsed.block_root,
+            )
         {
             silver_log::warn!(
                 head_slot = self.head_state_slot(),
@@ -420,30 +492,116 @@ impl BeaconStateTile {
         Ok(parsed)
     }
 
-    /// The STF, then the fork-choice import, unless the block still waits for
-    /// its data columns: then its applied state is staged under `hold` until
-    /// they arrive.
+    /// The STF, then the fork-choice import, unless `gate` holds the applied
+    /// block back.
     #[timed]
     pub(super) fn apply_and_import(
         &mut self,
         parsed: ParsedBlock,
         data: &[u8],
-        hold: Option<(TRead, BlockSource)>,
-        emit: impl FnMut(BeaconStateEvent),
+        gate: ImportGate,
+        producers: &mut Producers,
     ) -> Feedback {
         let applied = match self.apply_or_reject(&parsed, data) {
             Ok(applied) => applied,
             Err(feedback) => return feedback,
         };
         let block_root = parsed.block_root;
-        match hold {
-            Some((ssz, source)) => {
+        match gate {
+            ImportGate::Now => {
+                self.import_block(parsed, applied, data, |event| producers.produce(event));
+                Feedback::BlockImported(block_root)
+            }
+            ImportGate::DataColumns(ssz, source) => {
                 self.held.stage(StagedBlock { parsed, applied, ssz, source, el_valid: false });
                 Feedback::AwaitData(block_root)
             }
-            None => {
-                self.import_block(parsed, applied, data, emit);
-                Feedback::BlockImported(block_root)
+            ImportGate::StarkVerdict(ssz, source) => {
+                match self.send_stark_proofs(data, applied.id, producers) {
+                    StarkRequests::Sent(requests) if requests.is_empty() => {
+                        self.import_block(parsed, applied, data, |event| producers.produce(event));
+                        Feedback::BlockImported(block_root)
+                    }
+                    StarkRequests::Sent(requests) => {
+                        let block = StagedBlock { parsed, applied, ssz, source, el_valid: false };
+                        self.held.park_for_verify(block, requests);
+                        Feedback::AwaitVerify(block_root)
+                    }
+                    StarkRequests::ProofOfNoClaims => {
+                        self.held.reject(block_root, parsed.header.slot);
+                        self.stf_scratch.votes.recycle(applied.votes);
+                        Feedback::reject_block(block_root, "a STARK proof of no claims")
+                    }
+                    StarkRequests::Unsent => {
+                        self.stf_scratch.votes.recycle(applied.votes);
+                        Feedback::Ignore
+                    }
+                }
+            }
+        }
+    }
+
+    /// Sends each STARK proof the block's transition collected, before the
+    /// next block reuses them. A proof of no claims has nothing for leanVM
+    /// to check: it must be empty.
+    fn send_stark_proofs(
+        &mut self,
+        data: &[u8],
+        state_id: StateId,
+        producers: &mut Producers,
+    ) -> StarkRequests {
+        let Self { state, stf_scratch, leanvm_verifier, events_producer, .. } = self;
+        let validators = &state.read_view(state_id).validators;
+        let first = leanvm_verifier.next_request_id();
+        let mut claims = Vec::new();
+        for (signed, proof) in stf_scratch.stark.proofs(data) {
+            claims.clear();
+            claims.extend(signed.map(|(signer, message)| {
+                claim(xmss_pubkey(validators.pubkey(signer as usize)), message)
+            }));
+            if claims.is_empty() {
+                if !proof.is_empty() {
+                    return StarkRequests::ProofOfNoClaims;
+                }
+                continue;
+            }
+            claims.sort_unstable();
+            claims.dedup();
+            if leanvm_verifier.send(&claims, proof, events_producer, producers).is_none() {
+                return StarkRequests::Unsent;
+            }
+        }
+        StarkRequests::Sent(first..leanvm_verifier.next_request_id())
+    }
+
+    pub(super) fn handle_stark_verdict(
+        &mut self,
+        request_id: u64,
+        verdict: ProofVerdict,
+        producers: &mut Producers,
+    ) {
+        match self.held.on_proof_verdict(request_id, verdict) {
+            VerifyProgress::NotHeld => {
+                silver_log::debug!(request_id, "STARK verdict for a block no longer held")
+            }
+            VerifyProgress::Waiting => {}
+            VerifyProgress::Verified(block) => self.import_held(block, producers),
+            VerifyProgress::Rejected(block) => {
+                let block_root = block.parsed.block_root;
+                silver_log::warn!(
+                    block = hex32(&block_root),
+                    "leanVM rejected the block's STARK proofs"
+                );
+                self.stf_scratch.votes.recycle(block.applied.votes);
+                let source = block.source;
+                producers.produce(BeaconStateEvent::BlockRejected { block_root, source });
+            }
+            VerifyProgress::Unanswered(block) => {
+                silver_log::warn!(
+                    block = hex32(&block.parsed.block_root),
+                    "leanVM did not judge the block's STARK proofs; dropped"
+                );
+                self.stf_scratch.votes.recycle(block.applied.votes);
             }
         }
     }
@@ -481,14 +639,19 @@ impl BeaconStateTile {
             self.publish_status(producers);
             return;
         };
-        let StagedBlock { parsed, applied, ssz, source, el_valid } = staged;
+        self.import_held(staged, producers);
+    }
+
+    fn import_held(&mut self, held: StagedBlock, producers: &mut Producers) {
+        let StagedBlock { parsed, applied, ssz, source, el_valid } = held;
+        let (block_root, slot) = (parsed.block_root, parsed.header.slot);
 
         // Only lag eviction of the pin can lose the bytes; counted as a fault.
         let Ok((data, _)) = ssz.buffer() else {
             silver_log::error!(
                 block = hex32(&block_root),
                 slot,
-                "staged block evicted from the tcache before its data columns arrived; re-requesting"
+                "held block evicted from the tcache before its import; re-requesting"
             );
             producers.produce(SyncNeed::missing_block(block_root, slot));
             self.stf_scratch.votes.recycle(applied.votes);
@@ -541,9 +704,8 @@ impl BeaconStateTile {
             })?
         };
 
-        let body =
-            BodyOffsets::validated(SignedBeaconBlockView::body(data), parsed.fork.body_fork())
-                .map_err(|e| Error::invalid_block(parsed.header.state_root, e.into()))?;
+        let body = BodyOffsets::validated(parsed.layout.body(data), parsed.fork.body_fork())
+            .map_err(|e| Error::invalid_block(parsed.header.state_root, e.into()))?;
         let mut fork = self.state.apply_block_view(parent);
         let mut votes = self.stf_scratch.votes.take();
         let input = BlockInput {
@@ -553,12 +715,13 @@ impl BeaconStateTile {
             fork: parsed.fork,
             shuffling: &sref,
         };
+        let stubbed = self.xmss_stubbed && parsed.fork == BlockFork::Pq;
         let transition = stf::apply_block(
             &self.spec,
             &mut fork,
             &input,
             &mut self.stf_scratch,
-            &mut self.sig_batch,
+            (!stubbed).then_some(&mut self.sig_batch),
             &mut votes,
         );
         if let Err(e) = transition {
@@ -588,7 +751,7 @@ impl BeaconStateTile {
             votes,
         } = applied;
 
-        let is_gloas = parsed.fork.is_gloas();
+        let is_gloas = parsed.fork.post_gloas_fork();
         let (parent_payload_status, bid_block_hash, payload_verified) = if is_gloas {
             (parsed.parent_payload_status, bid_block_hash, false)
         } else {
@@ -658,7 +821,7 @@ impl BeaconStateTile {
         // `last_applied` back to the head if this block lost.
         self.last_applied = new_id;
 
-        if is_gloas {
+        if parsed.fork == BlockFork::Gloas {
             self.notify_ptc_from_block(block_data);
         }
 
@@ -669,9 +832,19 @@ impl BeaconStateTile {
         self.fork_choice.lift_finalized(self.head_finalized_checkpoint());
     }
 
-    fn check_block_size(data: &[u8]) -> Result<(), PrecheckError> {
+    pub(super) fn block_layout(&self, data: &[u8]) -> Result<SignedBlockLayout, PrecheckError> {
+        if let Some(layout) = SignedBlockLayout::of(&self.spec, data) {
+            return Ok(layout);
+        }
         if SignedBeaconBlockView::check_size(data) {
-            return Ok(());
+            return Err(PrecheckError::SignatureForkMismatch {
+                slot: SignedBeaconBlockView::slot(data),
+            });
+        }
+        if SignedBeaconBlockPqView::check_size(data) {
+            return Err(PrecheckError::SignatureForkMismatch {
+                slot: SignedBeaconBlockPqView::slot(data),
+            });
         }
         Err(PrecheckError::SizeMismatch {
             expected_min: ssz_view::SIGNED_BEACON_BLOCK_MIN,
@@ -681,35 +854,21 @@ impl BeaconStateTile {
     }
 
     fn precheck_block(&mut self, data: &[u8]) -> Result<ParsedBlock, PrecheckError> {
-        Self::check_block_size(data)?;
+        let layout = self.block_layout(data)?;
 
-        let block_slot = SignedBeaconBlockView::slot(data);
+        let block_slot = layout.slot(data);
         let block_epoch = block_slot / SLOTS_PER_EPOCH;
-        if self.spec.is_pq_at(block_epoch) {
-            return Err(PrecheckError::SignatureForkMismatch { slot: block_slot });
-        }
-        let proposer_index = SignedBeaconBlockView::proposer_index(data);
-        let parent_root = *SignedBeaconBlockView::parent_root(data);
-        let state_root = *SignedBeaconBlockView::state_root(data);
+        let proposer_index = layout.proposer_index(data);
+        let parent_root = layout.parent_root(data);
+        let state_root = layout.state_root(data);
 
-        let body = SignedBeaconBlockView::body(data);
-
-        if self.spec.is_pq_at(block_epoch) {
-            return Err(PrecheckError::PqBlockUnimplemented { block_slot });
-        }
-        let is_gloas = self.spec.is_gloas_at(block_epoch);
-
-        let canonical = if is_gloas {
-            BeaconBlockBodyGloasView::check_canonical(body)
-        } else {
-            BeaconBlockBodyFuluView::check_canonical(body)
-        };
-        if !canonical {
+        let body = layout.body(data);
+        if !layout.check_canonical(data) {
             return Err(PrecheckError::NonCanonicalBody { block_slot, body_len: body.len() });
         }
 
-        let body_fork = if is_gloas { BodyFork::Gloas } else { BodyFork::Fulu };
-        let offsets = BodyOffsets::validated(body, body_fork)
+        let post_gloas = layout != SignedBlockLayout::Fulu;
+        let offsets = BodyOffsets::validated(body, layout.body_fork())
             .map_err(|kind| PrecheckError::BodyOverLimits { block_slot, kind })?;
         let HashedBody { root: body_root, fork } =
             self.built_body_hash(block_slot, body).unwrap_or_else(|| HashedBody::of(&offsets));
@@ -728,6 +887,9 @@ impl BeaconStateTile {
         }
         if self.held.is_staged(&block_root) {
             return Err(PrecheckError::AwaitingData { block_root });
+        }
+        if self.held.is_awaiting_verify(&block_root) {
+            return Err(PrecheckError::AwaitingVerify { block_root });
         }
         if let Some(reason) = self.held.rejected_reason(&block_root) {
             return Err(PrecheckError::Rejected { block_root, reason });
@@ -757,8 +919,11 @@ impl BeaconStateTile {
         let rv = self.state.read_view(parent_state_id);
         let parent_slot = rv.slot.slot_number();
 
-        let parent_payload_status = if is_gloas {
-            self.precheck_gloas_bid(body, parent_node, &rv, block_epoch, parent_root, block_root)?
+        let parent_payload_status = if post_gloas {
+            let bid = layout
+                .bid(data)
+                .ok_or(PrecheckError::NonCanonicalBody { block_slot, body_len: body.len() })?;
+            self.precheck_gloas_bid(bid, parent_node, &rv, block_epoch, parent_root, block_root)?
         } else {
             PayloadStatus::Full
         };
@@ -810,13 +975,15 @@ impl BeaconStateTile {
             });
         }
 
-        if !is_gloas {
+        if !post_gloas {
             self.precheck_fulu_payload(body, block_slot, block_epoch, &rv, block_root)?;
         }
 
-        let has_data_columns = SignedBeaconBlockView::has_data_columns(data, is_gloas);
+        let has_data_columns = layout != SignedBlockLayout::Pq &&
+            SignedBeaconBlockView::has_data_columns(data, post_gloas);
 
         Ok(ParsedBlock {
+            layout,
             header: block_header,
             block_root,
             has_data_columns,
@@ -857,19 +1024,42 @@ impl BeaconStateTile {
     }
 
     /// The proposer's key is read from `state_id`, where its index must exist.
-    fn verify_block_signature(&self, data: &[u8], state_id: StateId, block_root: &B256) -> bool {
-        let block_epoch = SignedBeaconBlockView::slot(data) / SLOTS_PER_EPOCH;
+    fn verify_block_signature(
+        &self,
+        layout: SignedBlockLayout,
+        data: &[u8],
+        state_id: StateId,
+        block_root: &B256,
+    ) -> bool {
+        let block_slot = layout.slot(data);
         let rv = self.state.read_view(state_id);
-        let fork_version = self.spec.fork_version_at(block_epoch);
-        let proposer_index = SignedBeaconBlockView::proposer_index(data);
-        let proposer_pubkey = rv.validators.pubkey_decompressed(proposer_index as usize);
+        let fork_version = self.spec.fork_version_at(block_slot / SLOTS_PER_EPOCH);
+        let proposer_index = layout.proposer_index(data) as usize;
         let domain = bls::compute_domain(
             bls::DOMAIN_BEACON_PROPOSER,
             fork_version,
             &rv.imm.genesis_validators_root,
         );
         let signing_root = bls::compute_signing_root(block_root, &domain);
-        bls::verify_one(proposer_pubkey, SignedBeaconBlockView::signature(data), &signing_root)
+        if layout != SignedBlockLayout::Pq {
+            let proposer_pubkey = rv.validators.pubkey_decompressed(proposer_index);
+            return bls::verify_one(
+                proposer_pubkey,
+                SignedBeaconBlockView::signature(data),
+                &signing_root,
+            );
+        }
+        if self.xmss_stubbed {
+            return true;
+        }
+        let Some(public_key) = rv.validator_xmss_pubkey(proposer_index) else { return false };
+        SignatureCheck {
+            public_key,
+            leaf_index: compute_xmss_leaf_index(block_slot, LeafOffset::BeaconProposer),
+            signing_root,
+            signature: SignedBeaconBlockPqView::signature(data),
+        }
+        .verify()
     }
 
     /// A block that parks on `err` pins its bytes, and precheck returned before
@@ -882,15 +1072,16 @@ impl BeaconStateTile {
         else {
             return err;
         };
-        let parent_root = SignedBeaconBlockView::parent_root(data);
+        let Ok(layout) = self.block_layout(data) else { return err };
+        let parent_root = layout.parent_root(data);
         let state_id = self
             .fork_choice
-            .find_node_idx(parent_root)
+            .find_node_idx(&parent_root)
             .map_or(self.last_applied, |idx| self.fork_choice.node(idx).state_id);
         let rv = self.state.read_view(state_id);
 
-        let block_slot = SignedBeaconBlockView::slot(data);
-        let proposer_index = SignedBeaconBlockView::proposer_index(data);
+        let block_slot = layout.slot(data);
+        let proposer_index = layout.proposer_index(data);
         let unconfirmed = PrecheckError::UnconfirmedProposer { proposer_index, block_root };
         if proposer_index as usize >= rv.validators.count() {
             return unconfirmed;
@@ -900,7 +1091,7 @@ impl BeaconStateTile {
             return unconfirmed;
         }
 
-        if !self.verify_block_signature(data, state_id, &block_root) {
+        if !self.verify_block_signature(layout, data, state_id, &block_root) {
             return PrecheckError::InvalidSignature { block_root };
         }
         err
@@ -909,26 +1100,15 @@ impl BeaconStateTile {
     /// The Gloas gossip rules on the bid: blob count, parent root, and, for a
     /// block declaring its parent EMPTY, that it builds on the parent's
     /// execution head. Returns the parent payload status the bid declares.
-    #[allow(clippy::too_many_arguments)]
     fn precheck_gloas_bid(
         &self,
-        body: &[u8],
+        bid: &[u8],
         parent_node: &ForkChoiceNode,
         rv: &StateReadView<'_>,
         block_epoch: Epoch,
         parent_root: B256,
         block_root: B256,
     ) -> Result<PayloadStatus, PrecheckError> {
-        let bid_off =
-            ssz_view::BeaconBlockBodyGloasView::signed_execution_payload_bid_offset(body) as usize;
-        let bid_end =
-            ssz_view::BeaconBlockBodyGloasView::payload_attestations_offset(body) as usize;
-        let bid = body
-            .get(bid_off..bid_end)
-            .filter(|bid| ssz_view::SignedExecutionPayloadBidView::check_size(bid))
-            .map(ssz_view::SignedExecutionPayloadBidView::message)
-            .ok_or(PrecheckError::NonCanonicalBody { block_slot: 0, body_len: body.len() })?;
-
         let max = self.spec.blob_params_at(block_epoch).max_blobs_per_block as usize;
         let got = ssz_view::ExecutionPayloadBidView::blob_kzg_commitments(bid).len() /
             ssz_view::BYTES_PER_KZG_COMMITMENT;

@@ -7,7 +7,7 @@ use silver_beacon_state_data::{
 };
 use silver_common::ssz_hash_gloas::EMPTY_EXECUTION_REQUESTS_ROOT;
 
-use super::{epoch::is_valid_deposit_signature, gloas::fill_epoch_ptc};
+use super::{EpochShuffling, epoch::is_valid_deposit_signature, gloas::fill_epoch_ptc};
 
 /// Initialise the Gloas-only state on a fork view that has just advanced to the
 /// first slot of `GLOAS_FORK_EPOCH`.
@@ -72,13 +72,20 @@ fn build_ptc_window(view: &StateWriterView) -> Box<[PtcCommittee; PTC_WINDOW_LEN
     let mut active = Vec::new();
     for e in 0..=MIN_SEED_LOOKAHEAD {
         let out = SLOTS_PER_EPOCH as usize * (1 + e as usize);
+        let target_epoch = current_epoch + e;
+        let shuffling = EpochShuffling::from_views(
+            &validators,
+            &randao,
+            target_epoch,
+            target_epoch >= view.imm.pq_fork_epoch,
+            &mut active,
+        );
         fill_epoch_ptc(
             &mut window[out..out + SLOTS_PER_EPOCH as usize],
             &validators,
             &randao,
-            current_epoch + e,
-            current_epoch + e >= view.imm.pq_fork_epoch,
-            &mut active,
+            &shuffling,
+            target_epoch,
         );
     }
     window

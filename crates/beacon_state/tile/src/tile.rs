@@ -71,7 +71,7 @@ mod fork_choice;
 mod fork_data_roots;
 mod gossip;
 mod held_blocks;
-pub mod leanvm_verifier;
+mod leanvm_verifier;
 mod orphan_pool;
 mod payload_attestation_pool;
 mod payload_attributes;
@@ -104,6 +104,8 @@ pub enum Feedback {
         block_root: B256,
     },
     AwaitData(B256),
+    /// Applied, and out of fork choice until leanVM verifies its STARK proofs.
+    AwaitVerify(B256),
     AwaitParentPayload {
         parent_root: B256,
         block_root: B256,
@@ -137,6 +139,7 @@ impl Debug for Feedback {
                 hex32(block_root)
             ),
             Self::AwaitData(r) => write!(f, "AwaitData(0x{})", hex32(r)),
+            Self::AwaitVerify(r) => write!(f, "AwaitVerify(0x{})", hex32(r)),
             Self::AwaitParentPayload { parent_root, block_root } => write!(
                 f,
                 "AwaitPayload(parent=0x{}, block=0x{})",
@@ -272,11 +275,14 @@ pub struct BeaconStateTile {
     payload_execution_requests: PayloadExecutionRequests,
     payload_attestation_pool: PayloadAttestationPool,
     pq_aggregator: PqAggregator,
+    leanvm_verifier: LeanVmVerifier,
     seen_proposer_preferences: SeenProposerPreferences,
     /// Resolved pending-buffer admission / eviction / fallback bounds.
     pending_bounds: PendingBounds,
 
     verify_weak_subjectivity: bool,
+    /// Spec vectors stub XMSS: every PQ signature and STARK proof verifies.
+    xmss_stubbed: bool,
 
     // Last: acquired reads above point into it.
     reader: TCacheReader,
@@ -369,9 +375,11 @@ impl BeaconStateTile {
             payload_execution_requests: PayloadExecutionRequests::default(),
             payload_attestation_pool: PayloadAttestationPool::default(),
             pq_aggregator: PqAggregator::default(),
+            leanvm_verifier: LeanVmVerifier::default(),
             seen_proposer_preferences: SeenProposerPreferences::default(),
             pending_bounds: syncing.pending,
             verify_weak_subjectivity,
+            xmss_stubbed: false,
             reader: TCacheReader::new(tcaches),
         };
         tile.seed_anchor(anchor, anchor_header, val_cap);
@@ -1144,10 +1152,11 @@ impl BeaconStateTile {
         // Health first: a disconnect fails the batch in flight once, before
         // its `None` answer arrives.
         adapter.consume(|health: LeanVmHealthEvent, _| self.pq_aggregator.on_health(health));
-        adapter.consume(|resp: LeanVmResp, _| {
+        adapter.consume(|resp: LeanVmResp, producers| {
             if let Some(verdict) = LeanVmVerifier::verdict(&resp, &mut self.reader) {
                 let request_id = resp.request_id;
                 silver_log::debug!(request_id, ?verdict, "leanvm proof verdict");
+                self.handle_stark_verdict(request_id, verdict, producers);
                 return;
             }
             self.pq_aggregator.on_response(resp, &mut self.reader);
@@ -1202,14 +1211,19 @@ impl BeaconStateTile {
         };
         if let Some((topic, ssz)) = pq {
             let acquired = self.reader.acquire(ssz);
-            if let Ok((data, _)) = acquired.buffer() &&
-                topic.check_pq_signed_message(data).is_err()
-            {
+            let Ok((data, _)) = acquired.buffer() else { return };
+            if topic.check_pq_signed_message(data).is_err() {
                 producers.produce(silver_common::PeerEvent::RpcMisbehaviour {
                     p2p_peer: stream_id.peer(),
                     severity: silver_common::RpcSeverity::LowTolerance,
                     offence: silver_common::RpcOffence::ChunkFraming,
                 });
+                return;
+            }
+            // todo(CL-239): PQ envelopes reach the EL over gossip only.
+            if topic == GossipTopic::BeaconBlock {
+                silver_log::debug!(?stream_id, "received PQ beacon block over rpc");
+                self.handle_rpc_block(stream_id, ssz, false, producers);
             }
             return;
         }
@@ -1271,6 +1285,11 @@ impl BeaconStateTile {
         &self.fork_choice
     }
 
+    /// Spec vectors stub XMSS, so every PQ signature and STARK proof passes.
+    pub fn ef_stub_xmss(&mut self) {
+        self.xmss_stubbed = true;
+    }
+
     pub fn ef_tick(&mut self, since_genesis_ms: u64) {
         self.ticker.set_since_genesis_ms(since_genesis_ms);
         self.fork_choice_tick(|_| {});
@@ -1289,9 +1308,22 @@ impl BeaconStateTile {
     }
 
     pub fn ef_apply_attester_slashing(&mut self, ssz: &[u8]) {
-        if self.handle_attester_slashing(ssz) == Feedback::Accept {
-            self.recompute_head(|_| {});
+        // PQ gossip slashings wait on leanVM, so the spec handler runs here.
+        if !self.state.read_view(self.last_applied).is_pq() {
+            if self.handle_attester_slashing(ssz) == Feedback::Accept {
+                self.recompute_head(|_| {});
+            }
+            return;
         }
+        let n = self.head_validator_count();
+        let equivocators = &mut self.stf_scratch.active;
+        if stf::attester_slashing_equivocators(ssz, true, n, equivocators).is_err() {
+            return;
+        }
+        for &idx in equivocators.iter() {
+            self.fork_choice.mark_equivocating(idx as usize);
+        }
+        self.recompute_head(|_| {});
     }
 
     pub fn ef_apply_execution_payload(&mut self, ssz: &[u8]) -> bool {
@@ -1319,6 +1351,21 @@ impl BeaconStateTile {
     }
 
     pub fn ef_apply_payload_attestation(&mut self, ssz: &[u8]) -> bool {
+        use silver_common::ssz_view::{
+            PAYLOAD_ATTESTATION_MESSAGE_PQ_SIZE, PayloadAttestationMessagePqView as Message,
+        };
+
+        if let Ok(message) = <&[u8; PAYLOAD_ATTESTATION_MESSAGE_PQ_SIZE]>::try_from(ssz) {
+            debug_assert!(self.xmss_stubbed, "PQ vectors stub XMSS");
+            let resolved =
+                self.resolve_ptc_vote(Message::validator_index(message), Message::data(message));
+            let Ok((vote, _)) = resolved else { return false };
+            if !self.record_pq_ptc_vote(&vote) {
+                return false;
+            }
+            self.recompute_head(|_| {});
+            return true;
+        }
         match self.prepare_ptc(ssz) {
             Ok(p) => {
                 let Some(signature) = CheckedSignature::parse(&p.signature) else {

@@ -1,9 +1,11 @@
 use silver_ssz::{
+    body_offsets::{BodyFork, BodyOffsets},
     merkle::FixedContainer,
+    ssz_hash::{BlockFork, HashedBody},
     ssz_hash_pq::ExecutionRequestsPqView,
     ssz_view::{
         AttestationPqView, AttesterSlashingPqView, BeaconBlockBodyPqView, IndexedAttestationPqView,
-        PROPOSER_SLASHING_PQ_SIZE, ProposerSlashingPqView, SIGNED_PQ_FIXED,
+        MAX_STARK_PROOF_SIZE, PROPOSER_SLASHING_PQ_SIZE, ProposerSlashingPqView, SIGNED_PQ_FIXED,
         SignedAggregateAndProofPqView, SignedExecutionPayloadBidPqView,
     },
 };
@@ -109,5 +111,39 @@ fn beacon_block_body() {
         assert!(BeaconBlockBodyPqView::check_canonical(&ssz));
         assert!(BeaconBlockBodyPqView::check_operation_limits(&ssz).is_ok());
         assert_eq!(BeaconBlockBodyPqView::hash_tree_root(&ssz), root);
+
+        let offsets = BodyOffsets::validated(&ssz, BodyFork::Pq).unwrap();
+        assert_eq!(HashedBody::of(&offsets), HashedBody { root, fork: BlockFork::Pq });
+        let fields = [
+            (offsets.proposer_slashings(), BeaconBlockBodyPqView::proposer_slashings(&ssz)),
+            (offsets.attester_slashings(), BeaconBlockBodyPqView::attester_slashings(&ssz)),
+            (offsets.attestations(), BeaconBlockBodyPqView::attestations(&ssz)),
+            (offsets.deposits(), BeaconBlockBodyPqView::deposits(&ssz)),
+            (offsets.signed_bid(), BeaconBlockBodyPqView::signed_execution_payload_bid(&ssz)),
+        ];
+        for (got, expected) in fields {
+            assert_eq!(got, Some(expected));
+        }
+        assert_eq!(
+            offsets.parent_execution_requests(),
+            BeaconBlockBodyPqView::parent_execution_requests(&ssz),
+        );
+        assert_eq!(offsets.proof(), BeaconBlockBodyPqView::proof(&ssz));
+        assert_eq!(offsets.voluntary_exits(), None);
+        assert_eq!(offsets.bls_changes(), None);
+        assert_eq!(offsets.payload_attestations(), None);
     }
+}
+
+/// The proof is the body's last field, so trailing bytes lengthen it. A
+/// proof past its `ByteList` limit does not decode, so the body is invalid.
+#[test]
+fn beacon_block_body_rejects_an_oversized_proof() {
+    let (mut ssz, _) = vectors("BeaconBlockBody").remove(0);
+    let proof_len = BeaconBlockBodyPqView::proof(&ssz).len();
+    ssz.resize(ssz.len() + MAX_STARK_PROOF_SIZE - proof_len, 0);
+    assert!(BodyOffsets::validated(&ssz, BodyFork::Pq).is_ok(), "a proof at the limit");
+
+    ssz.push(0);
+    assert!(BodyOffsets::validated(&ssz, BodyFork::Pq).is_err());
 }

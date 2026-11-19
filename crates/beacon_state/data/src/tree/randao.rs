@@ -1,5 +1,7 @@
 use super::{TreeGroup, TreeSpec, TreeView, TreeWriteView};
 use crate::{
+    bls::DOMAIN_RANDAO,
+    merkle::sha256,
     ring::Id,
     types::{B256, EPOCHS_PER_HISTORICAL_VECTOR, Epoch, MIN_SEED_LOOKAHEAD},
 };
@@ -54,6 +56,17 @@ impl RandaoMixesWriteView<'_> {
             *b ^= r;
         }
         self.set(bucket(epoch) as u32, mix);
+    }
+
+    /// Spec `process_randao`'s write under PQ: a VRF secret is not a
+    /// signature a proposer could choose among, so it is hashed in rather
+    /// than XORed.
+    pub fn mix_in_vrf_secret(&mut self, epoch: Epoch, secret: &B256) {
+        let mut preimage = [0u8; 2 * 32 + 4];
+        preimage[..32].copy_from_slice(&self.at_epoch(epoch));
+        preimage[32..64].copy_from_slice(secret);
+        preimage[64..].copy_from_slice(&DOMAIN_RANDAO.to_le_bytes());
+        self.set(bucket(epoch) as u32, sha256(&preimage));
     }
 
     /// Spec `process_randao_mixes_reset`: the finished epoch's mix seeds the

@@ -29,12 +29,21 @@ impl Seed {
         Self::new(&randao.seed_mix(e), e, domain)
     }
 
+    /// `sha256(seed ++ uint_to_bytes(value) ++ ...)`, for up to two values.
+    pub fn mixed_with(&self, values: &[u64]) -> Self {
+        let mut input = [0u8; 32 + 2 * 8];
+        let len = 32 + values.len() * 8;
+        assert!(len <= input.len(), "at most two values");
+        input[..32].copy_from_slice(&self.0);
+        for (chunk, value) in input[32..len].chunks_exact_mut(8).zip(values) {
+            chunk.copy_from_slice(&value.to_le_bytes());
+        }
+        Self(sha256(&input[..len]))
+    }
+
     /// The per-slot seed the proposer and PTC selections sample against.
     pub fn for_slot(&self, slot: u64) -> Self {
-        let mut input = [0u8; 40];
-        input[..32].copy_from_slice(&self.0);
-        input[32..40].copy_from_slice(&slot.to_le_bytes());
-        Self(sha256(&input))
+        self.mixed_with(&[slot])
     }
 
     /// Rejection-sampling stream over `active_indices`, weighted by effective

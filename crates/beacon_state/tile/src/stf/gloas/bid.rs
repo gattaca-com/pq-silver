@@ -1,12 +1,18 @@
 use blst::min_pk::PublicKey;
 use flux_profiler::timed;
 use silver_beacon_state_data::{
-    B256, BUILDER_INDEX_SELF_BUILD, BidBuilderError, BuilderPendingPayment,
+    B256, BLSPubkey, BUILDER_INDEX_SELF_BUILD, BidBuilderError, BuilderPendingPayment,
     BuilderPendingWithdrawal, BuilderRegistry, BuildersView, Epoch, EpochView, ExecutionPayloadBid,
     Immutable, SLOTS_PER_EPOCH, SpecConfig, StateWriterView, bid_signing_root,
     bls::{self, G2_POINT_AT_INFINITY, SigBatch},
+    pq::xmss_pubkey,
+    xmss::{SignatureCheck, is_builder_bid_leaf_index},
 };
-use silver_common::ssz_view::{ExecutionPayloadBidView, SignedExecutionPayloadBidView};
+use silver_common::ssz_view::{
+    ExecutionPayloadBidView, SignedExecutionPayloadBidPqView, SignedExecutionPayloadBidView,
+    XMSS_SIGNATURE_SIZE,
+};
+use silver_crypto_simd::xmss::leaf_index;
 
 use crate::{
     error::ExecutionPayloadBidError as E, ssz_hash_gloas::hash_execution_payload_bid,
@@ -23,9 +29,19 @@ pub fn process_execution_payload_bid(
     cfg: &SpecConfig,
     signed_bid: &[u8],
 ) -> Result<(), E> {
-    let bid = decode_bid(signed_bid)?;
-    let signature = SignedExecutionPayloadBidView::signature(signed_bid);
-    validate_execution_payload_bid(view, epoch, cfg, &bid, signature)?;
+    let (bid, has_empty_signature) = if epoch.is_pq(view.imm) {
+        let signature = SignedExecutionPayloadBidPqView::signature(signed_bid);
+        let bid = decode_bid_pq(signed_bid)?;
+        let leaf_index = u64::from(leaf_index(signature));
+        if bid.builder_index != BUILDER_INDEX_SELF_BUILD && !is_builder_bid_leaf_index(leaf_index) {
+            return Err(E::LeafNotForBids { index: bid.builder_index, leaf_index });
+        }
+        (bid, *signature == [0; XMSS_SIGNATURE_SIZE])
+    } else {
+        let signature = SignedExecutionPayloadBidView::signature(signed_bid);
+        (decode_bid(signed_bid)?, *signature == G2_POINT_AT_INFINITY)
+    };
+    validate_execution_payload_bid(view, epoch, cfg, &bid, has_empty_signature)?;
 
     if bid.value > 0 {
         let payment = BuilderPendingPayment {
@@ -49,7 +65,7 @@ fn validate_execution_payload_bid(
     epoch: &EpochView,
     cfg: &SpecConfig,
     bid: &ExecutionPayloadBid,
-    signature: &[u8; 96],
+    has_empty_signature: bool,
 ) -> Result<(), E> {
     let current_epoch = view.slot.state().slot / SLOTS_PER_EPOCH;
 
@@ -57,7 +73,7 @@ fn validate_execution_payload_bid(
         if bid.value != 0 {
             return Err(E::SelfBuildNonZeroValue { value: bid.value });
         }
-        if *signature != G2_POINT_AT_INFINITY {
+        if !has_empty_signature {
             return Err(E::SelfBuildSignature);
         }
     } else {
@@ -113,16 +129,53 @@ fn bid_signing_input(
     if bid.builder_index == BUILDER_INDEX_SELF_BUILD {
         return Ok(None);
     }
-    let pubkey_bytes = builders
-        .get(bid.builder_index as usize)
-        .map(|b| b.pubkey)
-        .ok_or(BidBuilderError::OutOfRange { index: bid.builder_index, count: builders.len() })?;
-    let Ok(pubkey) = PublicKey::key_validate(&pubkey_bytes) else {
+    let Ok(pubkey) = PublicKey::key_validate(&builder_pubkey(builders, bid.builder_index)?) else {
         return Err(E::BadBuilderPubkey { index: bid.builder_index });
     };
 
     let signing_root = bid_signing_root(imm, epoch, &hash_execution_payload_bid(bid), fork_epoch);
     Ok(Some((pubkey, signing_root)))
+}
+
+fn builder_pubkey(builders: &BuildersView, index: u64) -> Result<BLSPubkey, E> {
+    let pubkey = builders
+        .get(index as usize)
+        .map(|b| b.pubkey)
+        .ok_or(BidBuilderError::OutOfRange { index, count: builders.len() })?;
+    Ok(pubkey)
+}
+
+/// Spec `verify_execution_payload_bid_signature` under PQ. A self-build
+/// carries no signature to verify.
+#[timed]
+pub fn verify_execution_payload_bid_signature_pq(
+    imm: &Immutable,
+    epoch: &EpochView,
+    builders: &BuildersView,
+    signed_bid: &[u8],
+    current_epoch: Epoch,
+) -> Result<(), E> {
+    let bid = decode_bid_pq(signed_bid)?;
+    let index = bid.builder_index;
+    if index == BUILDER_INDEX_SELF_BUILD {
+        return Ok(());
+    }
+    let builder_pubkey = builder_pubkey(builders, index)?;
+    let domain = bls::compute_domain(
+        bls::DOMAIN_BEACON_BUILDER,
+        epoch.fork_version_at(current_epoch),
+        &imm.genesis_validators_root,
+    );
+    let Some(check) =
+        SignatureCheck::execution_payload_bid(signed_bid, xmss_pubkey(&builder_pubkey), &domain)
+    else {
+        let leaf_index = leaf_index(SignedExecutionPayloadBidPqView::signature(signed_bid)).into();
+        return Err(E::LeafNotForBids { index, leaf_index });
+    };
+    if !check.verify() {
+        return Err(E::BadSignature { index });
+    }
+    Ok(())
 }
 
 /// Push an external builder's bid signature onto `batch`.
@@ -167,11 +220,29 @@ pub fn verify_execution_payload_bid_signature(
 }
 
 pub fn decode_bid(signed_bid: &[u8]) -> Result<ExecutionPayloadBid, E> {
-    if !SignedExecutionPayloadBidView::check_size(signed_bid) {
-        return Err(E::Malformed { len: signed_bid.len() });
+    decode_signed_bid(signed_bid, false)
+}
+
+fn decode_bid_pq(signed_bid: &[u8]) -> Result<ExecutionPayloadBid, E> {
+    decode_signed_bid(signed_bid, true)
+}
+
+fn decode_signed_bid(signed_bid: &[u8], is_pq: bool) -> Result<ExecutionPayloadBid, E> {
+    let malformed = || E::Malformed { len: signed_bid.len() };
+    let message = bid_message(signed_bid, is_pq).ok_or_else(malformed)?;
+    decode_bid_message(message).map_err(|_| malformed())
+}
+
+/// The `ExecutionPayloadBid` a signed bid wraps: BLS-signed, or XMSS-signed
+/// under PQ.
+pub(crate) fn bid_message(signed_bid: &[u8], is_pq: bool) -> Option<&[u8]> {
+    if is_pq {
+        SignedExecutionPayloadBidPqView::check_size(signed_bid)
+            .then(|| SignedExecutionPayloadBidPqView::message(signed_bid))
+    } else {
+        SignedExecutionPayloadBidView::check_size(signed_bid)
+            .then(|| SignedExecutionPayloadBidView::message(signed_bid))
     }
-    decode_bid_message(SignedExecutionPayloadBidView::message(signed_bid))
-        .map_err(|_| E::Malformed { len: signed_bid.len() })
 }
 
 pub fn decode_bid_message(message: &[u8]) -> Result<ExecutionPayloadBid, E> {

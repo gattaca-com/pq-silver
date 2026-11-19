@@ -1,14 +1,17 @@
 use std::ops::Deref;
 
 use super::{
-    EpochGroup, EpochId, aggregation_committee_window::AggregationCommitteeWindow,
-    effective_increments::EffectiveIncrements, finalized::EpochStateFinalized,
+    EpochGroup, EpochId,
+    aggregation_committee_window::{AggregationCommittee, AggregationCommitteeWindow},
+    effective_increments::EffectiveIncrements,
+    finalized::EpochStateFinalized,
     ptc_window::PtcWindow,
 };
 use crate::{
     gloas::{PTC_WINDOW_LEN, PtcCommittee},
+    pq::MIN_ATTESTATION_INCLUSION_DELAY_PQ,
     ring::{Reset, Slot as RingSlot},
-    types::{Epoch, EpochState, Fork, Immutable, Version},
+    types::{Epoch, EpochState, Fork, Immutable, MIN_ATTESTATION_INCLUSION_DELAY, Slot, Version},
 };
 
 #[derive(Clone, Default)]
@@ -112,6 +115,15 @@ impl<'a> EpochReadView<'a> {
     }
 
     #[inline]
+    pub fn min_attestation_inclusion_delay(&self, imm: &Immutable) -> Slot {
+        if self.is_pq(imm) {
+            MIN_ATTESTATION_INCLUSION_DELAY_PQ
+        } else {
+            MIN_ATTESTATION_INCLUSION_DELAY
+        }
+    }
+
+    #[inline]
     pub fn fork_version_at(&self, block_epoch: Epoch) -> Version {
         let f = &self.state().fork;
         if block_epoch >= f.epoch { f.current_version } else { f.previous_version }
@@ -173,5 +185,13 @@ impl<'a> EpochWriteView<'a> {
     #[inline]
     pub fn rotate_ptc_window(&mut self, new_last_epoch: &[PtcCommittee]) {
         self.fork.ptc_window.rotate(new_last_epoch);
+    }
+
+    pub fn rotate_aggregation_committee_window(
+        &mut self,
+        committees_per_slot: usize,
+        committee: impl FnMut(usize, usize) -> AggregationCommittee,
+    ) {
+        self.fork.aggregation_committee_window.rotate(committees_per_slot, committee);
     }
 }

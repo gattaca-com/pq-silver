@@ -5,7 +5,8 @@ use std::fs;
 mod ef_common;
 
 use ef_common::{
-    compare_states, iter_test_cases, load_state, load_state_gloas, snappy_decode, spec_tests_dir,
+    compare_states, iter_test_cases, load_state, load_state_gloas, pq_config, snappy_decode,
+    spec_tests_dir,
 };
 use silver_beacon_state_data::SpecConfig;
 
@@ -19,6 +20,11 @@ fn gloas_finality() {
     let mut cfg = SpecConfig::mainnet();
     cfg.gloas_fork_epoch = 0;
     finality_fork("gloas", cfg);
+}
+
+#[test]
+fn pq_finality() {
+    finality_fork("pq", pq_config());
 }
 
 fn finality_fork(fork: &str, cfg: SpecConfig) {

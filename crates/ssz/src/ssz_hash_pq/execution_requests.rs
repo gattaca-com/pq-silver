@@ -1,3 +1,5 @@
+use std::sync::LazyLock;
+
 use flux_profiler::timed;
 
 use crate::{
@@ -18,6 +20,9 @@ use crate::{
         ValidatorPreregistrationRequestView, VoluntaryExitRequestView, WithdrawalRequestView,
     },
 };
+
+pub static EMPTY_EXECUTION_REQUESTS_PQ_ROOT: LazyLock<B256> =
+    LazyLock::new(|| ExecutionRequestsPqView::hash_tree_root(&[]));
 
 /// PQ `ExecutionRequests`: eight ProgressiveLists, serialized in field order
 /// with the two removed EIP-8483 registration lists skipped.

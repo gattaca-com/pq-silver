@@ -1,4 +1,4 @@
-use silver_beacon_state_data::{ForkName, SpecConfig};
+use silver_beacon_state_data::{BodyFork, ForkName, SpecConfig};
 
 use crate::{
     block_root::{block_root_fulu, block_root_gloas, block_root_pq},
@@ -43,10 +43,43 @@ impl SignedBlockLayout {
     }
 
     #[inline]
+    pub fn body_fork(self) -> BodyFork {
+        match self {
+            Self::Fulu => BodyFork::Fulu,
+            Self::Gloas => BodyFork::Gloas,
+            Self::Pq => BodyFork::Pq,
+        }
+    }
+
+    #[inline]
     pub fn slot(self, block: &[u8]) -> u64 {
         match self {
             Self::Fulu | Self::Gloas => SignedBeaconBlockView::slot(block),
             Self::Pq => SignedBeaconBlockPqView::slot(block),
+        }
+    }
+
+    #[inline]
+    pub fn proposer_index(self, block: &[u8]) -> u64 {
+        match self {
+            Self::Fulu | Self::Gloas => SignedBeaconBlockView::proposer_index(block),
+            Self::Pq => SignedBeaconBlockPqView::proposer_index(block),
+        }
+    }
+
+    #[inline]
+    pub fn state_root(self, block: &[u8]) -> B256 {
+        match self {
+            Self::Fulu | Self::Gloas => *SignedBeaconBlockView::state_root(block),
+            Self::Pq => *SignedBeaconBlockPqView::state_root(block),
+        }
+    }
+
+    #[inline]
+    pub fn body(self, block: &[u8]) -> &[u8] {
+        match self {
+            Self::Fulu | Self::Gloas => SignedBeaconBlockView::body(block),
+            Self::Pq => SignedBeaconBlockPqView::body(block),
         }
     }
 
@@ -156,6 +189,8 @@ mod tests {
         ] {
             assert_eq!(SignedBlockLayout::of(&spec(), &block), Some(layout));
             assert_eq!(layout.slot(&block), slot);
+            assert_eq!(layout.proposer_index(&block), 0);
+            assert_eq!(layout.state_root(&block), [0; 32]);
             assert_eq!(layout.parent_root(&block), PARENT_ROOT);
             assert_eq!(layout.parent_root(&block[..layout.parent_root_end()]), PARENT_ROOT);
         }

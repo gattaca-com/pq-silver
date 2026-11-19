@@ -1,7 +1,7 @@
 use silver_ssz::scalar::SszScalar;
 
 use super::{
-    BalancesGroup, BalancesWriteView, Previous, TreeGroup,
+    BalancesGroup, BalancesWriteView, BuildersHash, Previous, TreeGroup,
     tests::{group, le_bytes},
 };
 use crate::{
@@ -371,4 +371,42 @@ fn u8_column_migrate_and_rehash() {
     updated[40] = 9;
     assert_eq!(wv.iter().collect::<Vec<_>>(), updated);
     assert_eq!(wv.hash_root(), progressive_u8_root(&updated));
+}
+
+fn progressive_root_list(leaves: &[B256]) -> B256 {
+    let mut hasher = ProgressiveHasher::new();
+    leaves.iter().for_each(|&leaf| hasher.push_chunk(leaf));
+    mix_in_length(&hasher.finalize(), leaves.len())
+}
+
+/// Removals cross segment boundaries (chunks 1, 5, 21) and shrink the list
+/// back across them; a committed child reads the same root from its pages,
+/// and appends land on the zeroed slots.
+#[test]
+fn remove_slides_later_leaves_down() {
+    let mut leaves: Vec<B256> = (0..30u8).map(|i| [i + 1; 32]).collect();
+    let mut g = TreeGroup::<BuildersHash>::from_leaves(
+        leaves.len(),
+        leaves.len(),
+        leaves.iter().copied(),
+        HashFormat::Progressive,
+    );
+    let mut wv = g.roll_fresh();
+    for idx in [0, 4, 20, 25] {
+        wv.remove(idx);
+        leaves.remove(idx as usize);
+    }
+    while leaves.len() > 3 {
+        wv.pop();
+        leaves.pop();
+    }
+    assert_eq!(wv.hash_root(), progressive_root_list(&leaves));
+    let parent = wv.commit();
+    assert_eq!(g.view(parent).hash_root(), progressive_root_list(&leaves));
+
+    let mut child = g.roll_from(parent);
+    let idx = child.append_empty();
+    child.set(idx, [0xEE; 32]);
+    leaves.push([0xEE; 32]);
+    assert_eq!(child.hash_root(), progressive_root_list(&leaves));
 }

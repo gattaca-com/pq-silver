@@ -1,3 +1,4 @@
+mod aggregation_committees;
 mod attestation;
 mod block;
 mod common;
@@ -7,20 +8,22 @@ mod fork_transition;
 mod gloas;
 mod operations;
 mod slashings;
+mod stark;
 mod sync_aggregate;
 mod validator;
 mod withdrawals;
 
-pub(crate) use attestation::ParsedAttestationData;
+pub use aggregation_committees::process_aggregation_committee_window;
 pub use attestation::{
     AttestedCommittees, BlockAttestations, collect_sigs_attestations,
     collect_sigs_single_attestation,
 };
+pub(crate) use attestation::{ParsedAttestationData, voted_block_slot};
 #[cfg(feature = "ef_tests")]
 pub use block::apply_signed_block_debug;
 pub use block::{
     BlockInput, apply_block, collect_sigs_randao, post_state_root_unchecked, process_block_body,
-    process_block_header, process_slot, process_slots, randao_signing_root,
+    process_block_header, process_randao_pq, process_slot, process_slots, randao_signing_root,
 };
 pub use common::{BlockVotes, StfScratch, VoteBatch, VoteTarget};
 pub(crate) use common::{MIN_ACTIVATION_BALANCE, for_each_ssz_list_item};
@@ -40,14 +43,17 @@ pub(crate) use operations::process_execution_requests;
 pub use operations::{
     collect_sigs_bls_to_execution_changes, collect_sigs_voluntary_exits,
     process_bls_to_execution_changes, process_consolidation_requests, process_deposit_requests,
+    process_validator_preregistration_requests, process_voluntary_exit_requests,
     process_voluntary_exits, process_withdrawal_requests,
 };
 pub(crate) use slashings::signing_root_for_block_header;
 pub use slashings::{
-    attester_slashing_names_unseen, collect_sigs_attester_slashings,
-    collect_sigs_proposer_slashings, process_attester_slashings, process_proposer_slashings,
-    validate_attester_slashing_for_gossip,
+    attester_slashing_equivocators, attester_slashing_names_unseen,
+    collect_sigs_attester_slashings, collect_sigs_proposer_slashings, process_attester_slashings,
+    process_proposer_slashings, validate_attester_slashing_for_gossip,
+    verify_proposer_slashing_signatures_pq,
 };
+pub use stark::StarkClaims;
 pub use sync_aggregate::{collect_sigs_sync_aggregate, process_sync_aggregate};
 pub(crate) use validator::{
     compute_consolidation_epoch_and_update_churn, compute_exit_epoch_and_update_churn,

@@ -1,7 +1,7 @@
 use blst::min_pk::PublicKey;
 use silver_beacon_state_data::{
-    Epoch, RandaoMixesView, Slot, StateReadView, ValidatorsView, committee_range,
-    committees_per_slot,
+    Epoch, MIN_SEED_LOOKAHEAD, RandaoMixesView, Slot, StateReadView, StateWriterView,
+    ValidatorsView, committee_range, committees_per_slot,
 };
 
 use crate::shuffling::{DOMAIN_BEACON_ATTESTER, Seed};
@@ -26,6 +26,17 @@ impl<'a> EpochShuffling<'a> {
             &rv.randao_mixes,
             epoch,
             epoch >= rv.imm.pq_fork_epoch,
+            buf,
+        )
+    }
+
+    pub fn lookahead(view: &StateWriterView, current_epoch: Epoch, buf: &'a mut Vec<u32>) -> Self {
+        let target_epoch = current_epoch + MIN_SEED_LOOKAHEAD + 1;
+        Self::from_views(
+            &view.validators.reader(),
+            &view.randao_mixes.reader(),
+            target_epoch,
+            target_epoch >= view.imm.pq_fork_epoch,
             buf,
         )
     }

@@ -18,7 +18,7 @@ pub enum RejectReason {
 pub enum PrecheckError {
     #[error("block size precheck failed: expected {expected_min}..={expected_max} got {got}")]
     SizeMismatch { expected_min: usize, expected_max: usize, got: usize },
-    #[error("BLS signed block at PQ slot {slot}")]
+    #[error("block signature scheme is not the one slot {slot} signs with")]
     SignatureForkMismatch { slot: Slot },
     #[error(
         "block parent precheck failed: parent_root=0x{} last_applied_slot={last_applied_slot} \
@@ -36,8 +36,6 @@ pub enum PrecheckError {
     PreFinalized { block_slot: Slot, finalized_slot: Slot },
     #[error("block body is not canonical SSZ: block_slot={block_slot} body_len={body_len}")]
     NonCanonicalBody { block_slot: Slot, body_len: usize },
-    #[error("PQ block processing is not implemented: block_slot={block_slot}")]
-    PqBlockUnimplemented { block_slot: Slot },
     #[error("block body over its limits: block_slot={block_slot}: {kind}")]
     BodyOverLimits { block_slot: Slot, kind: BlockBodyError },
     #[error("block past-slot precheck failed: block_slot={block_slot} parent_slot={parent_slot}")]
@@ -46,6 +44,8 @@ pub enum PrecheckError {
     BlockKnown { block_root: B256 },
     #[error("block awaiting data availability: block_root=0x{}", b256_hex(block_root))]
     AwaitingData { block_root: B256 },
+    #[error("block awaiting its STARK verdict: block_root=0x{}", b256_hex(block_root))]
+    AwaitingVerify { block_root: B256 },
     #[error("block already rejected: block_root=0x{} reason={reason:?}", b256_hex(block_root))]
     Rejected { block_root: B256, reason: RejectReason },
     #[error("block ticker slot precheck failed: block_slot={block_slot} wall_slot={wall_slot}")]
@@ -104,14 +104,15 @@ impl PrecheckError {
     pub fn feedback(self) -> Feedback {
         match self {
             Self::SizeMismatch { .. } => Feedback::reject("block size mismatch"),
-            Self::SignatureForkMismatch { .. } => Feedback::reject("BLS block for a PQ slot"),
+            Self::SignatureForkMismatch { .. } => {
+                Feedback::reject("block signature scheme not its fork's")
+            }
             Self::NonCanonicalBody { .. } => Feedback::reject("block body not canonical"),
             Self::BodyOverLimits { .. } => Feedback::reject("block body over limits"),
             Self::ParentMissing { parent_root, block_root, .. } => {
                 Feedback::RequestParent { parent_root, block_root }
             }
             Self::PreFinalized { .. } |
-            Self::PqBlockUnimplemented { .. } |
             Self::FutureSlot { .. } |
             Self::UnconfirmedProposer { .. } |
             Self::AwaitingData { .. } |
@@ -119,6 +120,7 @@ impl PrecheckError {
             Self::ParentRejected { reason: RejectReason::InvalidPayload, .. } => Feedback::Ignore,
             Self::PastSlot { .. } => Feedback::reject("block slot not after parent"),
             Self::BlockKnown { block_root } => Feedback::BlockKnown(block_root),
+            Self::AwaitingVerify { block_root } => Feedback::AwaitVerify(block_root),
             Self::UnverifiedParentPayload { parent_root, block_root } => {
                 Feedback::AwaitParentPayload { parent_root, block_root }
             }
@@ -158,7 +160,7 @@ pub enum Error {
     #[error("invalid block (block_state_root=0x{}): {kind}", b256_hex(state_root))]
     InvalidBlock { state_root: B256, kind: BlockError },
 
-    #[error("block BLS signature invalid")]
+    #[error("block signature invalid")]
     InvalidBlockSig,
     #[error("BLS sig batch verification failed")]
     SigBatchFailed,
@@ -209,7 +211,7 @@ pub enum ExecutionPayloadBidError {
     Malformed { len: usize },
     #[error("self-build bid value must be zero, got {value}")]
     SelfBuildNonZeroValue { value: u64 },
-    #[error("self-build bid signature must be the infinity point")]
+    #[error("self-build bid signature must be empty")]
     SelfBuildSignature,
     #[error(transparent)]
     Builder(#[from] BidBuilderError),
@@ -217,6 +219,8 @@ pub enum ExecutionPayloadBidError {
     BadBuilderPubkey { index: u64 },
     #[error("builder {index} bid signature is invalid")]
     BadSignature { index: u64 },
+    #[error("builder {index} bid signed at leaf {leaf_index}, which is not reserved for bids")]
+    LeafNotForBids { index: u64, leaf_index: u64 },
     #[error("self-build bid has no builder signature to verify")]
     SelfBuildUnsigned,
     #[error("{got} blob commitments exceeds max {max}")]
@@ -297,8 +301,10 @@ pub type Result<T, E = Error> = core::result::Result<T, E>;
 
 #[derive(Debug, Error)]
 pub enum BlockError {
-    #[error("block too short: len={len} min={min}")]
-    TooShort { len: usize, min: usize },
+    #[error("malformed signed block (len {len})")]
+    Malformed { len: usize },
+    #[error("randao reveal is not proposer {proposer_index}'s VRF leaf for the slot")]
+    InvalidRandaoReveal { proposer_index: u64 },
     #[error("block slot {slot} not after latest header slot {latest}")]
     SlotNotAfterHeader { slot: u64, latest: u64 },
     #[error("block slot != state slot: block={block} state={state}")]
@@ -313,8 +319,6 @@ pub enum BlockError {
     ParentRootMismatch { expected: B256, got: B256 },
     #[error("post-state root mismatch: expected=0x{} got=0x{}", b256_hex(expected), b256_hex(got))]
     PostStateRootMismatch { expected: B256, got: B256 },
-    #[error("PQ block processing is not implemented: slot={slot}")]
-    PqUnimplemented { slot: u64 },
     #[error(transparent)]
     Body(#[from] BlockBodyError),
 }
@@ -323,10 +327,12 @@ pub enum BlockError {
 pub enum AttestationError {
     #[error("attestation too short: len={len} min={min}")]
     TooShort { len: usize, min: usize },
+    #[error("malformed PQ attestation (len {len})")]
+    Malformed { len: usize },
     #[error("Gloas attestation payload-vote index invalid: {index}")]
     InvalidPayloadIndex { index: u64 },
-    #[error("att_slot {att_slot} not before state slot {state_slot}")]
-    SlotNotPast { att_slot: u64, state_slot: u64 },
+    #[error("att_slot {att_slot} not {min_inclusion_delay} slot(s) before state slot {state_slot}")]
+    InclusionDelayTooShort { att_slot: u64, state_slot: u64, min_inclusion_delay: u64 },
     #[error("target_epoch mismatch: expected={att} got={target}")]
     TargetEpochMismatch { target: u64, att: u64 },
     #[error("target_epoch {target} not in [prev={prev}, curr={curr}]")]
@@ -371,6 +377,8 @@ pub enum ProposerSlashingError {
     ValidatorOutOfRange { vi: usize, count: usize },
     #[error("validator {vi} (pubkey=0x{}) not slashable in epoch {epoch}", pubkey_hex(pubkey))]
     NotSlashable { vi: usize, pubkey: BLSPubkey, epoch: u64 },
+    #[error("validator {vi} header signature is invalid")]
+    BadSignature { vi: usize },
 }
 
 #[derive(Debug, Error)]
@@ -389,6 +397,10 @@ pub enum AttesterSlashingError {
     NotSlashableData,
     #[error("attesting_indices not strictly ascending")]
     IndicesNotSorted,
+    #[error("malformed PQ attester slashing (len {len})")]
+    Malformed { len: usize },
+    #[error("indexed attestation has no attesting indices")]
+    NoAttestingIndices,
     #[error("no slashable validator in attesting-indices intersection")]
     NoSlashedIntersection,
 }

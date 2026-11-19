@@ -228,6 +228,11 @@ pub struct ValidatorsView<'a> {
 
 impl<'a> ValidatorsView<'a> {
     #[inline]
+    pub fn scheme(&self) -> KeyScheme {
+        self.base.scheme()
+    }
+
+    #[inline]
     pub(crate) fn new(base: &'a FinalizedValidators, delta: &'a ValidatorsDelta) -> Self {
         Self { base, delta }
     }

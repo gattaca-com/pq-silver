@@ -60,6 +60,31 @@ impl<'a, C: TreeSpec> TreeWriteView<'a, C> {
         self.group.tree_mut().append_empty()
     }
 
+    #[inline]
+    pub fn len(&self) -> usize {
+        self.group.tree().len()
+    }
+
+    #[inline]
+    pub fn is_empty(&self) -> bool {
+        self.group.tree().is_empty()
+    }
+
+    #[inline]
+    pub fn pop(&mut self) {
+        debug_assert!(C::IS_LIST, "a vector tree has fixed length");
+        self.group.tree_mut().pop();
+    }
+
+    /// Rewrites every leaf past `idx`.
+    pub fn remove(&mut self, idx: u32) {
+        for i in idx + 1..self.len() as u32 {
+            let next = self.get(i as usize);
+            self.set(i - 1, next);
+        }
+        self.pop();
+    }
+
     pub fn copy_from<D: TreeSpec<Val = C::Val, Page = C::Page>>(
         &mut self,
         other: &mut TreeWriteView<'_, D>,

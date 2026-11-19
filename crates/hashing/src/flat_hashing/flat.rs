@@ -201,6 +201,24 @@ impl<C: TreeSpec> FlatTree<C> {
         }
     }
 
+    #[inline]
+    pub fn len(&self) -> usize {
+        self.count()
+    }
+
+    #[inline]
+    pub fn is_empty(&self) -> bool {
+        self.count() == 0
+    }
+
+    /// Drops the last value. Its slot is zeroed, as `append_empty` expects,
+    /// and the root reads only the segments the shorter list spans.
+    pub fn pop(&mut self) {
+        let last = self.count().checked_sub(1).expect("pop from an empty tree");
+        self.set_val(last as u32, C::Val::default());
+        self.store_mut().count = last;
+    }
+
     pub fn append_empty(&mut self) -> u32 {
         let idx = self.count() as u32;
         self.store_mut().count += 1;

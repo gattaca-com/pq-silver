@@ -14,7 +14,7 @@ use silver_beacon_state_data::{
 use silver_common::{
     BeaconStateEvent, BlockSource, BroadcastValidation, EngineNewPayloadEnvelopeReq, EngineReq,
     GossipTopic, LOCAL_GOSSIP_STREAM_ID, LocalGossipFailure, MAX_BLOBS_PER_BLOCK, NewGossipMsg,
-    PayloadValidationStatus, PeerEvent, SyncNeed, TCacheRead, TRead,
+    PayloadValidationStatus, PeerEvent, SignedBlockLayout, SyncNeed, TCacheRead, TRead,
     compute_subnet_for_attestation, hex32,
     metrics::timed,
     ssz_view::{
@@ -26,15 +26,16 @@ use silver_common::{
         SIGNED_BLS_CHANGE_SIZE, SIGNED_CONTRIBUTION_AND_PROOF_SIZE,
         SIGNED_PROPOSER_PREFERENCES_PQ_SIZE, SIGNED_PROPOSER_PREFERENCES_SIZE,
         SIGNED_VOLUNTARY_EXIT_SIZE, SINGLE_ATT_SIZE, SYNC_COMMITTEE_MSG_SIZE,
-        SignedBeaconBlockView, SignedBlsToExecutionChangeView,
-        SignedExecutionPayloadEnvelopeView as SignedPayload, SignedProposerPreferencesPqView,
-        SignedProposerPreferencesView, SignedSyncCommitteeProofView, SignedVoluntaryExitView,
-        SingleAttestationView, SyncCommitteeView,
+        SignedBlsToExecutionChangeView, SignedExecutionPayloadEnvelopeView as SignedPayload,
+        SignedProposerPreferencesPqView, SignedProposerPreferencesView,
+        SignedSyncCommitteeProofView, SignedVoluntaryExitView, SingleAttestationView,
+        SyncCommitteeView,
     },
 };
 use silver_ssz::ssz_view::{
     PAYLOAD_ATTESTATION_MESSAGE_PQ_SIZE, SINGLE_ATT_PQ_SIZE, SignedExecutionPayloadBidPqView,
-    SignedExecutionPayloadBidView, SingleAttestationPqView, XMSSPubkey,
+    SignedExecutionPayloadBidView, SignedExecutionPayloadEnvelopePqView, SingleAttestationPqView,
+    XMSSPubkey,
 };
 
 use super::{
@@ -707,10 +708,7 @@ impl BeaconStateTile {
             }
             match p {
                 PreparedPqVote::Attestation(p) => self.record_pq_attestation(&p),
-                PreparedPqVote::Ptc(p) => {
-                    self.record_ptc_vote(&p.vote);
-                    committed_ptc = true;
-                }
+                PreparedPqVote::Ptc(p) => committed_ptc |= self.record_pq_ptc_vote(&p.vote),
             }
             Self::relay_gossip(&m, None, producers);
             accepted = true;
@@ -1459,11 +1457,15 @@ impl BeaconStateTile {
                 return Feedback::Ignore;
             }
             let shuffling = self.shuffling_cache.get(request);
-            if stf::AttestedCommittees::new(att, &shuffling)
+            let is_pq = self.spec.is_pq_at_slot(data.slot());
+            if stf::AttestedCommittees::new(att, is_pq, &shuffling)
                 .and_then(|c| c.attesters_into(n, &mut self.stf_scratch.active))
                 .is_err()
             {
                 return Feedback::reject("attestation committees invalid");
+            }
+            if self.stf_scratch.active.is_empty() {
+                return Feedback::reject("attestation has no attesters");
             }
         }
 
@@ -1553,7 +1555,8 @@ impl BeaconStateTile {
         }
         let committee_len = committee.len();
 
-        let Ok(committees) = stf::AttestedCommittees::new(parsed.aggregate_bytes, &shuffling)
+        let Ok(committees) =
+            stf::AttestedCommittees::new(parsed.aggregate_bytes, false, &shuffling)
         else {
             return attested.committee_reject("aggregate committees invalid");
         };
@@ -1628,15 +1631,18 @@ impl BeaconStateTile {
     }
 
     pub(super) fn validate_execution_payload_envelope(&self, ssz: &[u8]) -> EnvelopeCheck {
-        if !SignedPayload::check_size(ssz) || !Envelope::check_size(SignedPayload::message(ssz)) {
+        let Some((layout, envelope)) = [SignedBlockLayout::Gloas, SignedBlockLayout::Pq]
+            .into_iter()
+            .find_map(|layout| layout.envelope_message(ssz).map(|envelope| (layout, envelope)))
+        else {
             return EnvelopeCheck::Reject;
-        }
-        let block_root = *Envelope::beacon_block_root(SignedPayload::message(ssz));
+        };
+        let block_root = *Envelope::beacon_block_root(envelope);
         let Some(idx) = self.fork_choice.find_node_idx(&block_root) else {
             return EnvelopeCheck::AwaitBlock(block_root);
         };
         let node = self.fork_choice.node(idx);
-        if self.spec.is_pq_at_slot(node.slot) {
+        if SignedBlockLayout::at_slot(&self.spec, node.slot) != layout {
             return EnvelopeCheck::Reject;
         }
         if node.slot < self.fork_choice.finalized_checkpoint().epoch * SLOTS_PER_EPOCH {
@@ -1644,7 +1650,10 @@ impl BeaconStateTile {
         }
         let state_id = node.state_id;
         let rv = self.state.read_view(state_id);
-        if let Err(e) = stf::verify_execution_payload_envelope(&rv, &self.spec, ssz) {
+        let verify_xmss = !self.xmss_stubbed;
+        if let Err(e) =
+            stf::verify_execution_payload_envelope(&rv, &self.spec, layout, ssz, verify_xmss)
+        {
             silver_log::info!(error = %e, "execution_payload_envelope rejected");
             return EnvelopeCheck::Reject;
         }
@@ -1716,6 +1725,10 @@ impl BeaconStateTile {
         source: BlockSource,
         producers: &mut Producers,
     ) -> Feedback {
+        // todo(CL-239): the EL submission reads BLS-signed envelopes only.
+        if SignedExecutionPayloadEnvelopePqView::check_size(ssz) {
+            return Feedback::Ignore;
+        }
         // BLS signatures are deterministic: a rejected one either repeats the
         // rejected envelope or fails verification.
         if SignedPayload::check_size(ssz) &&
@@ -2224,23 +2237,9 @@ impl BeaconStateTile {
     fn precheck_pq_gossip(&self, topic: GossipTopic, bytes: &[u8]) -> Result<(), Feedback> {
         use silver_common::ssz_view::{
             BeaconBlockHeaderView as Header, ProposerSlashingPqView as Slashing,
-            SignedAggregateAndProofPqView as Aggregate, SignedBeaconBlockPqView as Block,
-            SingleAttestationPqView as Attestation,
+            SignedAggregateAndProofPqView as Aggregate, SingleAttestationPqView as Attestation,
         };
 
-        if topic == GossipTopic::BeaconBlock && Block::check_size(bytes) {
-            let slot = Block::slot(bytes);
-            let finalized_slot =
-                self.fork_choice.finalized_checkpoint().epoch.saturating_mul(SLOTS_PER_EPOCH);
-            if self.ticker.is_future_slot(slot, MAXIMUM_GOSSIP_CLOCK_DISPARITY) ||
-                slot <= finalized_slot
-            {
-                return Err(Feedback::Ignore);
-            }
-            if !self.spec.is_pq_at_slot(slot) {
-                return Err(Feedback::reject("PQ block precedes fork"));
-            }
-        }
         if let Err(reason) = topic.check_pq_signed_message(bytes) {
             return Err(Feedback::reject(reason));
         }
@@ -2355,7 +2354,9 @@ impl BeaconStateTile {
         let pre_verified = pre_verified || m.is_api_verified();
 
         let feedback = match m.topic {
-            _ if m.domain.format() == ForkName::Pq => self.handle_pq_gossip(&m, data),
+            _ if m.domain.format() == ForkName::Pq && m.topic != GossipTopic::BeaconBlock => {
+                self.handle_pq_gossip(&m, data)
+            }
             GossipTopic::BeaconBlock if self.sync_target.is_syncing() => {
                 match self.parse_and_verify_block(data, pre_verified) {
                     Ok(parsed) if do_relay && parsed.relay_eligible => {
@@ -2448,14 +2449,14 @@ impl BeaconStateTile {
                 Self::local_verdict(&m, feedback, producers)
             }
             Feedback::BlockKnown(_) => Self::local_verdict(&m, feedback, producers),
-            Feedback::BlockImported(_) | Feedback::AwaitData(_) => {}
+            Feedback::BlockImported(_) | Feedback::AwaitData(_) | Feedback::AwaitVerify(_) => {}
         }
         true
     }
 
     /// A local block the parse did not relay, held by a `consensus` level or
     /// staged before it arrived, is relayed once its transition has passed; a
-    /// block waiting on its columns has passed it.
+    /// block waiting on its columns or its STARK verdict has passed it.
     pub(super) fn relay_once_applied(
         &self,
         m: &NewGossipMsg,
@@ -2463,12 +2464,15 @@ impl BeaconStateTile {
         feedback: Feedback,
         producers: &mut Producers,
     ) {
-        let (Feedback::BlockImported(block_root) | Feedback::AwaitData(block_root)) = feedback
+        let (Feedback::BlockImported(block_root) |
+        Feedback::AwaitData(block_root) |
+        Feedback::AwaitVerify(block_root)) = feedback
         else {
             return;
         };
-        let slot = SignedBeaconBlockView::slot(data);
-        let proposer_index = SignedBeaconBlockView::proposer_index(data);
+        let Ok(layout) = self.block_layout(data) else { return };
+        let slot = layout.slot(data);
+        let proposer_index = layout.proposer_index(data);
         if m.validation == BroadcastValidation::ConsensusAndEquivocation &&
             self.equivocates(slot, proposer_index, &block_root)
         {
@@ -2486,6 +2490,9 @@ impl BeaconStateTile {
 
     /// Another block in fork choice from the same proposer for the same slot.
     pub(super) fn equivocates(&self, slot: Slot, proposer_index: u64, block_root: &B256) -> bool {
+        if self.held.holds_other_proposal(slot, proposer_index, block_root) {
+            return true;
+        }
         self.fork_choice.nodes.iter().any(|node| {
             node.slot == slot &&
                 node.block_root != *block_root &&

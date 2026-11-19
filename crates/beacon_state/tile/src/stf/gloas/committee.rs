@@ -29,16 +29,14 @@ pub(crate) fn fill_epoch_ptc(
     out: &mut [PtcCommittee],
     validators: &ValidatorsView,
     randao: &RandaoMixesView,
+    shuffling: &EpochShuffling<'_>,
     target_epoch: u64,
-    is_pq: bool,
-    active: &mut Vec<u32>,
 ) {
-    let shuffling = EpochShuffling::from_views(validators, randao, target_epoch, is_pq, active);
     let ptc_seed = Seed::from_randao(randao, target_epoch, DOMAIN_PTC_ATTESTER);
     for (i, dst) in out.iter_mut().enumerate() {
         *dst = compute_ptc(
             validators,
-            &shuffling,
+            shuffling,
             &ptc_seed,
             target_epoch * SLOTS_PER_EPOCH + i as u64,
         );
@@ -75,31 +73,42 @@ fn balance_weighted_select(
     seed: &Seed,
     out: &mut [u64],
 ) {
-    let total = indices.len() as u64;
-    let mut i: u64 = 0;
-    let mut filled = 0;
-    let mut draws = seed.draws();
-    while filled < out.len() {
-        let next = (i % total) as usize;
-        if draws.accept(i, validators.effective_balance(indices[next] as usize)) {
-            out[filled] = indices[next] as u64;
-            filled += 1;
-        }
-        i += 1;
+    let draws = balance_weighted_draws(validators, indices.len(), |k| indices[k], seed);
+    for (selected, position) in out.iter_mut().zip(draws) {
+        *selected = indices[position] as u64;
     }
 }
 
-pub fn process_ptc_window(view: &StateWriterView, epoch: &mut EpochWriteView, current_epoch: u64) {
-    let target_epoch = current_epoch + MIN_SEED_LOOKAHEAD + 1;
+/// Endless: the candidates are cycled through in order until the caller stops.
+pub(crate) fn balance_weighted_draws(
+    validators: &ValidatorsView,
+    count: usize,
+    candidate: impl Fn(usize) -> u32,
+    seed: &Seed,
+) -> impl Iterator<Item = usize> {
+    let total = count as u64;
+    let mut draws = seed.draws();
+    (0u64..).filter_map(move |i| {
+        let position = (i % total) as usize;
+        let effective_balance = validators.effective_balance(candidate(position) as usize);
+        draws.accept(i, effective_balance).then_some(position)
+    })
+}
+
+/// `lookahead` is [`EpochShuffling::lookahead`] from `current_epoch`.
+pub fn process_ptc_window(
+    view: &StateWriterView,
+    epoch: &mut EpochWriteView,
+    current_epoch: u64,
+    lookahead: &EpochShuffling<'_>,
+) {
     let mut new_epoch = vec![[0u64; PTC_SIZE]; SPE];
-    let mut active = Vec::new();
     fill_epoch_ptc(
         &mut new_epoch,
         &view.validators.reader(),
         &view.randao_mixes.reader(),
-        target_epoch,
-        target_epoch >= view.imm.pq_fork_epoch,
-        &mut active,
+        lookahead,
+        current_epoch + MIN_SEED_LOOKAHEAD + 1,
     );
     epoch.rotate_ptc_window(&new_epoch);
 }

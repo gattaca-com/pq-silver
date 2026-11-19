@@ -19,6 +19,11 @@ mod loaded_state;
 #[allow(unused_imports)]
 pub use loaded_state::{LoadedState, load_state, load_state_gloas, snappy_decode};
 
+/// The PQ EF config: mainnet preset with Gloas and PQ active from genesis.
+pub fn pq_config() -> SpecConfig {
+    SpecConfig { gloas_fork_epoch: 0, pq_fork_epoch: 0, ..SpecConfig::mainnet() }
+}
+
 impl LoadedState {
     /// The loaded state's working slot number (resolved through the slot
     /// group, keyed by the bundle's `slot_idx`).
@@ -419,6 +424,9 @@ pub fn ef_tile(state: silver_beacon_state_data::BeaconState) -> BeaconStateTile 
     if state.is_finalized_post_gloas() {
         spec.gloas_fork_epoch = 0;
     }
+    if state.is_finalized_pq() {
+        spec.pq_fork_epoch = 0;
+    }
     ef_tile_with_spec(state, spec)
 }
 
@@ -433,6 +441,8 @@ pub fn ef_tile_with_spec(
     use silver_common::{TCache, TCacheProducer, TCacheTable};
     use silver_config::{EngineConfig, SyncingConfig};
 
+    // PQ vectors stub XMSS, since an XMSS key takes minutes to generate.
+    let pq = state.is_finalized_pq();
     let ticker = SlotTicker::new(0, &spec, std::time::Duration::from_secs(4));
     // Producers stay bound through `new`; the tile's consumers keep their caches
     // alive afterward (mirrors the `make_tile` unit-test harness).
@@ -456,5 +466,8 @@ pub fn ef_tile_with_spec(
         EngineConfig::default().get_payload_timeout(),
     );
     tile.open_tcaches().unwrap();
+    if pq {
+        tile.ef_stub_xmss();
+    }
     tile
 }

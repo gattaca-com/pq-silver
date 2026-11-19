@@ -1,10 +1,13 @@
+use flux_profiler::timed;
 use silver_beacon_state_data::{
-    Builder, BuilderPendingPayment, BuilderRegistry, Epoch, FAR_FUTURE_EPOCH,
-    PAYLOAD_BUILDER_VERSION, SLOTS_PER_EPOCH, StateWriterView, Withdrawals,
+    Builder, BuilderPendingPayment, BuilderPreregistration, BuilderRegistry, Epoch,
+    FAR_FUTURE_EPOCH, PAYLOAD_BUILDER_VERSION, PREREGISTRATION_EXPIRY_SLOTS, SLOTS_PER_EPOCH,
+    StateWriterView, Withdrawals,
+    pq::{KeyScheme, xmss_pubkey, xmss_pubkey_padded},
 };
 use silver_common::ssz_view::{
-    BUILDER_DEPOSIT_REQUEST_SIZE, BUILDER_EXIT_REQUEST_SIZE, BuilderDepositRequestView,
-    BuilderExitRequestView,
+    BUILDER_DEPOSIT_REQUEST_SIZE, BUILDER_EXIT_REQUEST_SIZE, BUILDER_PREREGISTRATION_REQUEST_SIZE,
+    BuilderDepositRequestView, BuilderExitRequestView, BuilderPreregistrationRequestView,
 };
 
 use crate::stf::is_valid_builder_deposit_signature;
@@ -82,9 +85,30 @@ pub fn process_builder_deposit_request(view: &mut StateWriterView, request: &[u8
         return;
     }
 
-    let current_epoch = view.slot.state().slot / SLOTS_PER_EPOCH;
+    let state = view.slot.state();
+    let (current_epoch, parent_slot) =
+        (state.slot / SLOTS_PER_EPOCH, state.latest_execution_payload_bid.slot);
+    let scheme = view.builders.reader().scheme();
+    let registry_pubkey = scheme.deposit_pubkey(&pubkey);
+    if scheme == KeyScheme::Xmss &&
+        !view.preregistrations.builders().admit_deposit(
+            xmss_pubkey(&registry_pubkey),
+            parent_slot,
+            |binding| binding.withdrawal_credentials == credentials.0,
+        )
+    {
+        return;
+    }
 
-    match view.builders.reader().find_by_pubkey(&pubkey) {
+    match view.builders.reader().find_by_pubkey(&registry_pubkey) {
+        // A PQ deposit carries no signature to verify.
+        None if scheme == KeyScheme::Xmss => {
+            let builder_index =
+                add_builder_to_registry(view, registry_pubkey, &credentials, amount, current_epoch);
+            if scheme.is_legacy(&pubkey) {
+                initiate_builder_exit(view, builder_index);
+            }
+        }
         None => {
             if is_valid_builder_deposit_signature(
                 view.imm.genesis_fork_version,
@@ -110,13 +134,37 @@ pub fn process_builder_deposit_request(view: &mut StateWriterView, request: &[u8
     }
 }
 
+#[timed]
+pub fn process_builder_preregistration_requests(view: &mut StateWriterView, data: &[u8]) {
+    let state = view.slot.state();
+    let (expiry_slot, parent_slot) =
+        (state.slot + PREREGISTRATION_EXPIRY_SLOTS, state.latest_execution_payload_bid.slot);
+    for request in data.chunks_exact(BUILDER_PREREGISTRATION_REQUEST_SIZE) {
+        let request = request.try_into().unwrap();
+        let pubkey = *BuilderPreregistrationRequestView::pubkey(request);
+        if view.builders.reader().find_by_pubkey(&xmss_pubkey_padded(&pubkey)).is_some() {
+            continue;
+        }
+        view.preregistrations.builders().admit(
+            BuilderPreregistration {
+                pubkey,
+                withdrawal_credentials: *BuilderPreregistrationRequestView::withdrawal_credentials(
+                    request,
+                ),
+                expiry_slot,
+            },
+            parent_slot,
+        );
+    }
+}
+
 fn add_builder_to_registry(
     view: &mut StateWriterView,
     pubkey: [u8; 48],
     credentials: &Withdrawals,
     amount: u64,
     current_epoch: u64,
-) {
+) -> usize {
     let builder = Builder {
         pubkey,
         version: PAYLOAD_BUILDER_VERSION,
@@ -126,8 +174,14 @@ fn add_builder_to_registry(
         withdrawable_epoch: FAR_FUTURE_EPOCH,
     };
     match get_index_for_new_builder(view, current_epoch) {
-        Some(builder_index) => view.builders.set_builder(builder_index, builder),
-        None => view.builders.push(builder),
+        Some(builder_index) => {
+            view.builders.set_builder(builder_index, builder);
+            builder_index
+        }
+        None => {
+            view.builders.push(builder);
+            view.builders.len() - 1
+        }
     }
 }
 
@@ -148,7 +202,8 @@ pub fn process_builder_exit_request(
     let source_address = *BuilderExitRequestView::source_address(request);
     let pubkey = *BuilderExitRequestView::pubkey(request);
 
-    let Some(builder_index) = view.builders.reader().find_by_pubkey(&pubkey) else {
+    let registry_pubkey = view.builders.reader().scheme().request_pubkey(&pubkey);
+    let Some(builder_index) = view.builders.reader().find_by_pubkey(&registry_pubkey) else {
         return;
     };
     let builder = *view.builders.reader().get(builder_index).unwrap();

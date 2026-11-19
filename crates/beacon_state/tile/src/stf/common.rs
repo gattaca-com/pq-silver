@@ -1,7 +1,7 @@
 use silver_beacon_state_data::{B256, Epoch, PendingDeposit, Slot};
 use silver_ssz::ssz_view::{MAX_ATTESTATIONS_ELECTRA, MAX_ATTESTING_INDICES};
 
-use crate::stf::MAX_PENDING_DEPOSITS_PER_EPOCH;
+use crate::stf::{MAX_PENDING_DEPOSITS_PER_EPOCH, StarkClaims};
 
 pub(crate) const MIN_ACTIVATION_BALANCE: u64 = 32_000_000_000;
 
@@ -134,6 +134,8 @@ pub struct StfScratch {
     pub replace_u64: Vec<(u32, u64)>,
     pub eff: Vec<u64>,
     pub votes: VotePool,
+    /// Filled while a PQ block applies, for leanVM to verify.
+    pub stark: StarkClaims,
 }
 
 impl StfScratch {
@@ -144,6 +146,7 @@ impl StfScratch {
             replace_u64: Vec::with_capacity(validator_cap),
             eff: Vec::with_capacity(validator_cap),
             votes: VotePool::default(),
+            stark: StarkClaims::default(),
         }
     }
 }

@@ -1,4 +1,4 @@
-use std::collections::hash_map::Entry;
+use std::{collections::hash_map::Entry, ops::Range};
 
 use rustc_hash::FxHashMap;
 use silver_beacon_state_data::{B256, Slot, StateId};
@@ -8,7 +8,7 @@ use silver_common::{
 };
 use silver_config::PendingBounds;
 
-use super::block::StagedBlock;
+use super::{block::StagedBlock, leanvm_verifier::ProofVerdict};
 use crate::error::RejectReason;
 
 const MAX_ORPHANS_PER_PARENT: usize = 4;
@@ -146,13 +146,32 @@ pub(super) enum StagedVerdict {
     Rejected(BlockSource),
 }
 
+/// A PQ block whose STARK proofs went to leanVM as `requests`, one each.
+struct AwaitingVerify {
+    block: StagedBlock,
+    requests: Range<u64>,
+    unverified: usize,
+}
+
+pub(super) enum VerifyProgress {
+    NotHeld,
+    Waiting,
+    Verified(StagedBlock),
+    /// The proofs are part of the transition, so the block failed it.
+    Rejected(StagedBlock),
+    /// Dropped, not rejected: the block may yet verify when re-delivered.
+    Unanswered(StagedBlock),
+}
+
 /// Every block held for a dependency, and what travels with it. Orphans wait on
 /// a parent (or its payload envelope); staged blocks wait on their data
-/// columns. A staged root is in at most one of `staged` / `available` at rest.
+/// columns; PQ blocks wait on leanVM's verdict on their STARK proofs. A staged
+/// root is in at most one of `staged` / `available` at rest.
 pub(super) struct HeldBlocks {
     pub(super) orphans: OrphanPool,
     pub(super) payload_orphans: OrphanPool,
     staged: FxHashMap<B256, StagedBlock>,
+    awaiting_verify: FxHashMap<B256, AwaitingVerify>,
     available: FxHashMap<B256, Slot>,
     /// Roots whose block failed the state transition or the EL, so a re-fetch
     /// or a child's parent chase does not run the same block again.
@@ -165,6 +184,7 @@ impl HeldBlocks {
             orphans: OrphanPool::new(bounds.max_parents),
             payload_orphans: OrphanPool::new(bounds.max_dc),
             staged: FxHashMap::default(),
+            awaiting_verify: FxHashMap::default(),
             available: FxHashMap::default(),
             rejected: FxHashMap::default(),
         }
@@ -178,9 +198,18 @@ impl HeldBlocks {
         self.staged.contains_key(block_root)
     }
 
+    pub(super) fn awaiting_verify_len(&self) -> usize {
+        self.awaiting_verify.len()
+    }
+
+    pub(super) fn is_awaiting_verify(&self, block_root: &B256) -> bool {
+        self.awaiting_verify.contains_key(block_root)
+    }
+
     /// Whether the block waits here on a dependency, so fetching it is waste.
     pub(super) fn holds(&self, block_root: &B256) -> bool {
         self.staged.contains_key(block_root) ||
+            self.awaiting_verify.contains_key(block_root) ||
             self.available.contains_key(block_root) ||
             self.orphans.holds(block_root) ||
             self.payload_orphans.holds(block_root)
@@ -205,6 +234,58 @@ impl HeldBlocks {
         debug_assert!(!self.available.contains_key(&block_root));
         self.staged.insert(block_root, staged);
         block_root
+    }
+
+    /// Whether a held block other than `block_root` is `proposer`'s at `slot`.
+    pub(super) fn holds_other_proposal(
+        &self,
+        slot: Slot,
+        proposer: u64,
+        block_root: &B256,
+    ) -> bool {
+        let awaiting = self.awaiting_verify.iter().map(|(root, held)| (root, &held.block));
+        self.staged.iter().chain(awaiting).any(|(root, block)| {
+            let header = &block.parsed.header;
+            header.slot == slot && header.proposer_index == proposer && root != block_root
+        })
+    }
+
+    pub(super) fn park_for_verify(&mut self, block: StagedBlock, requests: Range<u64>) {
+        debug_assert!(!requests.is_empty(), "a block of no requests imports at once");
+        let unverified = (requests.end - requests.start) as usize;
+        let held = AwaitingVerify { block, requests, unverified };
+        let previous = self.awaiting_verify.insert(held.block.parsed.block_root, held);
+        debug_assert!(previous.is_none());
+    }
+
+    /// A block's request ranges never overlap another's, so a verdict for a
+    /// block dropped meanwhile matches nothing.
+    pub(super) fn on_proof_verdict(
+        &mut self,
+        request_id: u64,
+        verdict: ProofVerdict,
+    ) -> VerifyProgress {
+        let Some((&block_root, held)) =
+            self.awaiting_verify.iter_mut().find(|(_, held)| held.requests.contains(&request_id))
+        else {
+            return VerifyProgress::NotHeld;
+        };
+        if verdict == ProofVerdict::Valid {
+            held.unverified -= 1;
+            if held.unverified > 0 {
+                return VerifyProgress::Waiting;
+            }
+        }
+        let block = self.awaiting_verify.remove(&block_root).expect("found above").block;
+        match verdict {
+            ProofVerdict::Valid => VerifyProgress::Verified(block),
+            ProofVerdict::Invalid => {
+                self.reject(block_root, block.parsed.header.slot);
+                self.orphans.drop_children(&block_root);
+                VerifyProgress::Rejected(block)
+            }
+            ProofVerdict::Unanswered => VerifyProgress::Unanswered(block),
+        }
     }
 
     /// Availability is announced once, so the record outlives the release
@@ -241,21 +322,29 @@ impl HeldBlocks {
         StagedVerdict::Kept
     }
 
-    /// Finalization pruned fork choice; staged blocks whose parent went with
-    /// it, and the orphans parked on them, no longer descend from it.
-    pub(super) fn drop_outdated(&mut self, parent_known: impl Fn(&B256) -> bool) {
-        let Self { staged, orphans, .. } = self;
-        staged.retain(|root, block| {
-            if parent_known(&block.parsed.header.parent_root) {
+    /// Finalization pruned fork choice. A held block no longer descends from
+    /// the finalized block when its parent went with it, or when it sits at or
+    /// below the finalized slot, beside that block. Its orphans go with it.
+    pub(super) fn drop_outdated(
+        &mut self,
+        finalized_slot: Slot,
+        parent_known: impl Fn(&B256) -> bool,
+    ) {
+        let Self { staged, awaiting_verify, orphans, .. } = self;
+        let mut descends = |root: &B256, block: &StagedBlock| {
+            let header = &block.parsed.header;
+            if header.slot > finalized_slot && parent_known(&header.parent_root) {
                 return true;
             }
             silver_log::warn!(
                 block = hex32(root),
-                "staged block dropped at finalization: its parent left fork choice"
+                "held block dropped at finalization: it conflicts with the finalized block"
             );
             orphans.drop_children(root);
             false
-        });
+        };
+        staged.retain(|root, block| descends(root, block));
+        awaiting_verify.retain(|root, held| descends(root, &held.block));
     }
 
     /// Below a finalized target no block waits for its columns, and range sync
@@ -278,6 +367,9 @@ impl HeldBlocks {
     }
 
     pub(super) fn state_ids_mut(&mut self) -> impl Iterator<Item = &mut StateId> {
-        self.staged.values_mut().map(StagedBlock::state_id_mut)
+        self.staged
+            .values_mut()
+            .chain(self.awaiting_verify.values_mut().map(|held| &mut held.block))
+            .map(StagedBlock::state_id_mut)
     }
 }

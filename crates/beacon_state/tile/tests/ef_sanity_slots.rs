@@ -4,7 +4,9 @@ use std::fs;
 
 mod ef_common;
 
-use ef_common::{compare_states, iter_test_cases, load_state, load_state_gloas, spec_tests_dir};
+use ef_common::{
+    compare_states, iter_test_cases, load_state, load_state_gloas, pq_config, spec_tests_dir,
+};
 use silver_beacon_state::stf;
 use silver_beacon_state_data::SpecConfig;
 
@@ -18,6 +20,11 @@ fn gloas_sanity_slots() {
     let mut cfg = SpecConfig::mainnet();
     cfg.gloas_fork_epoch = 0;
     sanity_slots_fork("gloas", cfg);
+}
+
+#[test]
+fn pq_sanity_slots() {
+    sanity_slots_fork("pq", pq_config());
 }
 
 fn sanity_slots_fork(fork: &str, cfg: SpecConfig) {

@@ -268,3 +268,10 @@ fn gloas_rewards_leak() {
 fn gloas_rewards_random() {
     run_rewards_handler_fork("gloas", "random");
 }
+
+#[test]
+fn pq_rewards() {
+    for handler_name in ["basic", "leak", "random", "inactivity_scores"] {
+        run_rewards_handler_fork("pq", handler_name);
+    }
+}

@@ -47,10 +47,16 @@ impl LeanVmVerifier {
             silver_log::error!(len = request.len(), "beacon_state tcache full; verify not sent");
             return None;
         };
-        let request_id = VERIFY_ID_BIT | self.sent;
+        let request_id = self.next_request_id();
         self.sent += 1;
         producers.produce(LeanVmReq { request_id, body });
         Some(request_id)
+    }
+
+    /// Ids go out in order, so the requests sent between two calls form a
+    /// range.
+    pub fn next_request_id(&self) -> u64 {
+        VERIFY_ID_BIT | self.sent
     }
 
     /// The verdict `resp` carries, if it answers a verify request.

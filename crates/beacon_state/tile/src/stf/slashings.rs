@@ -2,22 +2,27 @@ use core::cmp::max;
 
 use flux_profiler::timed;
 use silver_beacon_state_data::{
-    B256, BeaconBlockHeader, BuilderPendingPayment, EPOCHS_PER_SLASHINGS_VECTOR, EpochBalancesRow,
-    EpochView, Immutable, SLOTS_PER_EPOCH, SlotStateWriteView, SpecConfig, StateReadView,
-    StateWriterView, ValidatorsView,
+    B256, BeaconBlockHeader, BuilderPendingPayment, EPOCHS_PER_SLASHINGS_VECTOR, Epoch,
+    EpochBalancesRow, EpochView, Immutable, SLOTS_PER_EPOCH, SlotStateWriteView, SpecConfig,
+    StateReadView, StateWriterView, ValidatorsView, Version,
     bls::{self, SigBatch},
     hash_tree_root_block_header,
+    pq::xmss_pubkey,
+    xmss::SignatureCheck,
 };
 use silver_common::ssz_view::{
-    ATTESTATION_DATA_SIZE, AttestationDataView, BEACON_BLOCK_HEADER_SIZE, BeaconBlockHeaderView,
-    PROPOSER_SLASHING_SIZE, ProposerSlashingView,
+    ATTESTATION_DATA_SIZE, AttestationDataView, AttesterSlashingPqView, BEACON_BLOCK_HEADER_SIZE,
+    BeaconBlockHeaderView, IndexedAttestationPqView, PROPOSER_SLASHING_PQ_SIZE,
+    PROPOSER_SLASHING_SIZE, ProposerSlashingPqView, ProposerSlashingView,
 };
 use silver_ssz::ssz_view::{IndexedAttestationView, MAX_ATTESTING_INDICES};
 
 use crate::{
     error::{AttesterSlashingError, ProposerSlashingError, Result},
-    ssz_hash,
-    stf::{for_each_ssz_list_item, get_beacon_proposer_index, initiate_validator_exit},
+    stf::{
+        StarkClaims, attestation::attester_signing_root, for_each_ssz_list_item,
+        get_beacon_proposer_index, initiate_validator_exit,
+    },
     validate,
 };
 
@@ -78,6 +83,42 @@ pub fn collect_sigs_proposer_slashings(
     Ok(())
 }
 
+/// Spec `process_proposer_slashing`'s signature checks under PQ: both headers
+/// sign at the proposer leaf of their shared slot.
+#[timed]
+pub fn verify_proposer_slashing_signatures_pq(
+    imm: &Immutable,
+    epoch: &EpochView,
+    validators: &ValidatorsView,
+    data: &[u8],
+) -> Result<(), ProposerSlashingError> {
+    let (fork_epoch, prev_ver, cur_ver) = epoch.fork_descriptor();
+    let n = validators.count();
+    for s in data.chunks_exact(PROPOSER_SLASHING_PQ_SIZE) {
+        let s: &[u8; PROPOSER_SLASHING_PQ_SIZE] = s.try_into().unwrap();
+        let header = ProposerSlashingPqView::header_1(s);
+        let vi = BeaconBlockHeaderView::proposer_index(header) as usize;
+        if vi >= n {
+            return Err(ProposerSlashingError::ValidatorOutOfRange { vi, count: n });
+        }
+        let header_epoch = BeaconBlockHeaderView::slot(header) / SLOTS_PER_EPOCH;
+        let fork_version = bls::fork_version_at_epoch(fork_epoch, prev_ver, cur_ver, header_epoch);
+        let domain = bls::compute_domain(
+            bls::DOMAIN_BEACON_PROPOSER,
+            fork_version,
+            &imm.genesis_validators_root,
+        );
+        let checks =
+            SignatureCheck::proposer_slashing(s, xmss_pubkey(validators.pubkey(vi)), &domain);
+        let mut valid = [false; 2];
+        SignatureCheck::verify_batch(checks, &mut valid);
+        if valid != [true; 2] {
+            return Err(ProposerSlashingError::BadSignature { vi });
+        }
+    }
+    Ok(())
+}
+
 /// Requires verified BLS signatures. Rechecks slashability after earlier
 /// entries, so a second slashing of the same validator rejects the block.
 pub fn process_proposer_slashings(
@@ -87,16 +128,22 @@ pub fn process_proposer_slashings(
     data: &[u8],
 ) -> Result<u64, ProposerSlashingError> {
     let post_gloas_fork = epoch.post_gloas_fork(view.imm);
-    let count = data.len() / PROPOSER_SLASHING_SIZE;
+    let is_pq = epoch.is_pq(view.imm);
+    let size = if is_pq { PROPOSER_SLASHING_PQ_SIZE } else { PROPOSER_SLASHING_SIZE };
     let n = view.validators.count();
     let proposer_index = get_beacon_proposer_index(&view.slot, epoch);
     let current_epoch = view.slot.state().slot / SLOTS_PER_EPOCH;
     let mut proposer_reward = 0;
-    for i in 0..count {
-        let s: &[u8; PROPOSER_SLASHING_SIZE] =
-            data[i * PROPOSER_SLASHING_SIZE..(i + 1) * PROPOSER_SLASHING_SIZE].try_into().unwrap();
-        validate::validate_proposer_slashing(s)?;
-        let vi = ProposerSlashingView::h1_proposer_index(s);
+    for s in data.chunks_exact(size) {
+        let (h1, h2) = if is_pq {
+            let s = s.try_into().unwrap();
+            (ProposerSlashingPqView::header_1(s), ProposerSlashingPqView::header_2(s))
+        } else {
+            let s = s.try_into().unwrap();
+            (ProposerSlashingView::header_1(s), ProposerSlashingView::header_2(s))
+        };
+        validate::validate_proposer_slashing_headers(h1, h2)?;
+        let vi = BeaconBlockHeaderView::proposer_index(h1);
         if vi >= n as u64 {
             return Err(ProposerSlashingError::ValidatorOutOfRange { vi: vi as usize, count: n });
         }
@@ -149,7 +196,7 @@ pub fn collect_sigs_attester_slashings(
     active_scratch: &mut Vec<u32>,
     sig_batch: &mut SigBatch,
 ) -> Result<(), AttesterSlashingError> {
-    let (fork_epoch, prev_ver, cur_ver) = epoch.fork_descriptor();
+    let fork = epoch.fork_descriptor();
     for_each_ssz_list_item(
         data,
         |start, end| AttesterSlashingError::BadOffsets { start, end, parent_len: data.len() },
@@ -160,8 +207,6 @@ pub fn collect_sigs_attester_slashings(
 
             for (ia_off, ia_end, indices) in [(off1, off2, i1), (off2, slashing.len(), i2)] {
                 let ia = &slashing[ia_off..ia_end];
-                let target_epoch = IndexedAttestationView::target_epoch(ia);
-                let fv = bls::fork_version_at_epoch(fork_epoch, prev_ver, cur_ver, target_epoch);
                 active_scratch.clear();
                 let n_idx = indices.len() / 8;
                 let count = validators.count();
@@ -177,13 +222,7 @@ pub fn collect_sigs_attester_slashings(
                 }
                 let data = IndexedAttestationView::data(ia);
                 let sig: &[u8; 96] = IndexedAttestationView::signature(ia);
-                let object_root = ssz_hash::hash_attestation_data(data.as_bytes());
-                let domain = bls::compute_domain(
-                    bls::DOMAIN_BEACON_ATTESTER,
-                    fv,
-                    &imm.genesis_validators_root,
-                );
-                let signing_root = bls::compute_signing_root(&object_root, &domain);
+                let signing_root = attester_signing_root(imm, fork, data);
                 sig_batch.push_aggregate(
                     active_scratch.iter().map(|&vi| validators.pubkey_decompressed(vi as usize)),
                     sig,
@@ -227,30 +266,27 @@ pub fn process_attester_slashings(
     cfg: &SpecConfig,
     data: &[u8],
     slashed_sink: &mut Vec<u32>,
+    mut stark: Option<&mut StarkClaims>,
 ) -> Result<u64, AttesterSlashingError> {
     if data.is_empty() {
         return Ok(0);
     }
     let post_gloas_fork = epoch.post_gloas_fork(view.imm);
+    let is_pq = epoch.is_pq(view.imm);
     let proposer_index = get_beacon_proposer_index(&view.slot, epoch);
     let n = view.validators.count();
     let current_epoch = view.slot.state().slot / SLOTS_PER_EPOCH;
+    let fork = epoch.fork_descriptor();
 
     let mut proposer_reward = 0;
     for_each_ssz_list_item(
         data,
         |start, end| AttesterSlashingError::BadOffsets { start, end, parent_len: data.len() },
         |slashing| {
-            let (off1, off2) = attester_slashing_inner_offsets(slashing)?;
-            let d1 = &slashing[off1 + 4..off1 + 132];
-            let d2 = &slashing[off2 + 4..off2 + 132];
-            if !is_slashable_attestation_data(d1, d2) {
-                return Err(AttesterSlashingError::NotSlashableData);
-            }
-            let i1 = attesting_indices_bytes(slashing, off1, off2);
-            let i2 = attesting_indices_bytes(slashing, off2, slashing.len());
-            if !indices_sorted_unique(i1) || !indices_sorted_unique(i2) {
-                return Err(AttesterSlashingError::IndicesNotSorted);
+            let pair = SlashedAttestation::checked_pair(slashing, is_pq, n)?;
+            let (i1, i2) = (pair[0].indices, pair[1].indices);
+            if let Some(claims) = stark.as_deref_mut() {
+                pair.iter().for_each(|attestation| attestation.push_claims(claims, view.imm, fork));
             }
 
             // Spec requires ≥1 currently-slashable validator in the
@@ -273,6 +309,111 @@ pub fn process_attester_slashings(
         },
     )?;
     Ok(proposer_reward)
+}
+
+/// Spec `on_attester_slashing` short of its `is_valid_indexed_attestation`
+/// proofs: fills `equivocators` with the attestations' common attesters.
+pub fn attester_slashing_equivocators(
+    slashing: &[u8],
+    is_pq: bool,
+    validator_count: usize,
+    equivocators: &mut Vec<u32>,
+) -> Result<(), AttesterSlashingError> {
+    let [first, second] = SlashedAttestation::checked_pair(slashing, is_pq, validator_count)?;
+    equivocators.clear();
+    for_each_sorted_intersection(first.indices, second.indices, |vi| {
+        equivocators.push(vi as u32);
+        false
+    });
+    Ok(())
+}
+
+fn check_attesting_indices(
+    indices: &[u8],
+    validator_count: usize,
+) -> Result<(), AttesterSlashingError> {
+    let Some(last) = indices.len().checked_sub(8) else {
+        return Err(AttesterSlashingError::NoAttestingIndices);
+    };
+    if !indices_sorted_unique(indices) {
+        return Err(AttesterSlashingError::IndicesNotSorted);
+    }
+    let last = u64::from_le_bytes(indices[last..].try_into().unwrap()) as usize;
+    if last >= validator_count {
+        return Err(AttesterSlashingError::ValidatorOutOfRange { vi: last, count: validator_count });
+    }
+    Ok(())
+}
+
+/// One attestation of an attester slashing, read from either fork's layout.
+struct SlashedAttestation<'a> {
+    data: AttestationDataView<'a>,
+    indices: &'a [u8],
+    /// Empty before PQ, where a BLS signature stands in for it.
+    proof: &'a [u8],
+}
+
+impl<'a> SlashedAttestation<'a> {
+    fn pair(
+        slashing: &'a [u8],
+        is_pq: bool,
+    ) -> std::result::Result<[Self; 2], AttesterSlashingError> {
+        if is_pq {
+            if !AttesterSlashingPqView::check_size(slashing) {
+                return Err(AttesterSlashingError::Malformed { len: slashing.len() });
+            }
+            return Ok([
+                AttesterSlashingPqView::attestation_1(slashing),
+                AttesterSlashingPqView::attestation_2(slashing),
+            ]
+            .map(|indexed| Self {
+                data: IndexedAttestationPqView::data(indexed),
+                indices: IndexedAttestationPqView::attesting_indices(indexed),
+                proof: IndexedAttestationPqView::proof(indexed),
+            }));
+        }
+        let (off1, off2) = attester_slashing_inner_offsets(slashing)?;
+        let bls = |start: usize, end: usize| Self {
+            data: AttestationDataView::new(slashing[start + 4..start + 132].try_into().unwrap()),
+            indices: attesting_indices_bytes(slashing, start, end),
+            proof: &[],
+        };
+        Ok([bls(off1, off2), bls(off2, slashing.len())])
+    }
+
+    /// Spec `is_slashable_attestation_data` on the pair, and
+    /// `is_valid_indexed_attestation` short of its signature on each.
+    fn checked_pair(
+        slashing: &'a [u8],
+        is_pq: bool,
+        validator_count: usize,
+    ) -> std::result::Result<[Self; 2], AttesterSlashingError> {
+        let pair = Self::pair(slashing, is_pq)?;
+        let [first, second] = &pair;
+        if !is_slashable_attestation_data(first.data.as_bytes(), second.data.as_bytes()) {
+            return Err(AttesterSlashingError::NotSlashableData);
+        }
+        check_attesting_indices(first.indices, validator_count)?;
+        check_attesting_indices(second.indices, validator_count)?;
+        Ok(pair)
+    }
+
+    /// Spec `is_valid_indexed_attestation`'s `stark.VerifyAggregates` call:
+    /// `proof` over the one statement the attesters sign.
+    fn push_claims(
+        &self,
+        claims: &mut StarkClaims,
+        imm: &Immutable,
+        fork: (Epoch, Version, Version),
+    ) {
+        let first_statement = claims.statement_count();
+        let attesters = self
+            .indices
+            .chunks_exact(8)
+            .map(|index| u64::from_le_bytes(index.try_into().unwrap()) as u32);
+        claims.attestation(imm, fork, self.data).push(attesters);
+        claims.push_proof(first_statement, self.proof);
+    }
 }
 
 /// Gossip's dedup, ahead of any validity check: does the intersection of the
@@ -306,7 +447,7 @@ pub fn validate_attester_slashing_for_gossip(
     equivocating_out: &mut Vec<u32>,
     sig_batch: &mut SigBatch,
 ) -> bool {
-    let (fork_epoch, prev_ver, cur_ver) = view.epoch.fork_descriptor();
+    let fork = view.epoch.fork_descriptor();
     let Ok((off1, off2)) = attester_slashing_inner_offsets(slashing) else {
         return false;
     };
@@ -346,8 +487,6 @@ pub fn validate_attester_slashing_for_gossip(
     sig_batch.clear();
     for (ia_off, ia_end, indices) in [(off1, off2, i1), (off2, slashing.len(), i2)] {
         let ia = &slashing[ia_off..ia_end];
-        let target_epoch = IndexedAttestationView::target_epoch(ia);
-        let fv = bls::fork_version_at_epoch(fork_epoch, prev_ver, cur_ver, target_epoch);
         let n_idx = indices.len() / 8;
         for k in 0..n_idx {
             let vi = u64::from_le_bytes(indices[k * 8..k * 8 + 8].try_into().unwrap()) as usize;
@@ -357,10 +496,7 @@ pub fn validate_attester_slashing_for_gossip(
         }
         let data = IndexedAttestationView::data(ia);
         let sig: &[u8; 96] = IndexedAttestationView::signature(ia);
-        let object_root = ssz_hash::hash_attestation_data(data.as_bytes());
-        let domain =
-            bls::compute_domain(bls::DOMAIN_BEACON_ATTESTER, fv, &view.imm.genesis_validators_root);
-        let signing_root = bls::compute_signing_root(&object_root, &domain);
+        let signing_root = attester_signing_root(view.imm, fork, data);
         sig_batch.push_aggregate(
             (0..n_idx).map(|k| {
                 let vi = u64::from_le_bytes(indices[k * 8..k * 8 + 8].try_into().unwrap()) as u32;

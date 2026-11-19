@@ -7,7 +7,8 @@ mod ptc_window;
 mod tests;
 
 pub use aggregation_committee_window::{
-    AGGREGATION_COMMITTEE_WINDOW_LEN, AggregationCommitteeWindow,
+    AGGREGATION_COMMITTEE_WINDOW_LEN, AGGREGATORS_PER_COMMITTEE, AggregationCommittee,
+    AggregationCommitteeWindow,
 };
 pub(crate) use delta::EpochStateDelta;
 pub use delta::{EpochReadView, EpochView, EpochWriteView};

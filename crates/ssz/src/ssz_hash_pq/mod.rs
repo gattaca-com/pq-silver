@@ -6,4 +6,4 @@ mod operations;
 #[cfg(test)]
 mod tests;
 
-pub use execution_requests::ExecutionRequestsPqView;
+pub use execution_requests::{EMPTY_EXECUTION_REQUESTS_PQ_ROOT, ExecutionRequestsPqView};

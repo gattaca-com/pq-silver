@@ -1,6 +1,7 @@
 use std::ops::Deref;
 
 use blst::min_pk::PublicKey;
+use silver_ssz::ssz_view::XMSSPubkey;
 
 use crate::{
     BalancesWriteView, BlockRoots, BuildersWriteView, Current, EpochId, EpochView, Eth1View,
@@ -8,7 +9,7 @@ use crate::{
     PendingView, PendingWriteView, PreregistrationsView, PreregistrationsWriteView, Previous,
     RandaoMixesWriteView, RootsWriteView, SlashingsWriteView, SlotStateWriteView, StateReadView,
     StateRoots, ValidatorsWriteView, Withdrawals,
-    types::{BLSPubkey, Immutable, StateId},
+    types::{B256, BLSPubkey, Immutable, StateId},
 };
 
 /// Owner-side reads exclude concurrent writes through the owner's borrow.
@@ -66,6 +67,23 @@ impl<'a> StateWriterView<'a> {
         credentials: Withdrawals,
     ) -> u32 {
         let idx = self.validators.append(pubkey, pubkey_decompressed, credentials);
+        self.append_validator_columns(idx);
+        idx
+    }
+
+    /// [`Self::append_validator`] for a PQ registry.
+    pub fn append_xmss_validator(
+        &mut self,
+        pubkey: &XMSSPubkey,
+        vrf_root: B256,
+        credentials: Withdrawals,
+    ) -> u32 {
+        let idx = self.validators.append_xmss(pubkey, vrf_root, credentials);
+        self.append_validator_columns(idx);
+        idx
+    }
+
+    fn append_validator_columns(&mut self, idx: u32) {
         let bal_idx = self.balances.append_empty();
         debug_assert_eq!(idx, bal_idx, "validator/balance append indices must agree");
         let prev_idx = self.previous_participation.append_empty();
@@ -75,7 +93,6 @@ impl<'a> StateWriterView<'a> {
             idx == prev_idx && idx == cur_idx && idx == inact_idx,
             "validator/participation/inactivity append indices must agree",
         );
-        idx
     }
 
     pub fn adopt_gloas(&mut self) {
@@ -140,7 +157,7 @@ impl<'a> StateWriterView<'a> {
             epoch,
             longtail,
             pending: self.pending.reader(),
-            preregistrations: self.preregistrations.reader(),
+            preregistrations: self.preregistrations.hashed_reader(),
         }
     }
 }

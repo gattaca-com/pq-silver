@@ -122,31 +122,24 @@ pub(super) struct PtcVotes {
 impl PtcVotes {
     #[inline]
     pub(super) fn record(&mut self, idx: usize, present: bool, da: bool) {
-        let (w, b) = (idx / 64, idx % 64);
-        self.voted[w] |= 1u64 << b;
-        if present {
-            self.present[w] |= 1u64 << b;
-        }
-        if da {
-            self.da[w] |= 1u64 << b;
-        }
+        self.record_word(idx / 64, 1u64 << (idx % 64), present, da);
     }
 
     #[inline]
     pub(super) fn record_mask(&mut self, positions: &[u64; 8], present: bool, da: bool) {
-        for (word, &positions) in self.voted.iter_mut().zip(positions) {
-            *word |= positions;
+        for (w, &positions) in positions.iter().enumerate() {
+            self.record_word(w, positions, present, da);
         }
-        if present {
-            for (word, &positions) in self.present.iter_mut().zip(positions) {
-                *word |= positions;
-            }
-        }
-        if da {
-            for (word, &positions) in self.da.iter_mut().zip(positions) {
-                *word |= positions;
-            }
-        }
+    }
+
+    #[inline]
+    fn record_word(&mut self, w: usize, positions: u64, present: bool, da: bool) {
+        let assign = |word: &mut u64, value: bool| {
+            *word = if value { *word | positions } else { *word & !positions };
+        };
+        self.voted[w] |= positions;
+        assign(&mut self.present[w], present);
+        assign(&mut self.da[w], da);
     }
 
     #[inline]

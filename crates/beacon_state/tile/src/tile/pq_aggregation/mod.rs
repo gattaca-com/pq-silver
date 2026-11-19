@@ -21,4 +21,4 @@ pub(super) mod test_util;
 pub(super) mod wire;
 
 pub use aggregator::PqAggregator;
-pub use claims::{Aggregate, Claim, VerifiedVote};
+pub use claims::{Aggregate, Claim, VerifiedVote, claim};

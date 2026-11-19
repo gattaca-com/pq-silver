@@ -1,5 +1,7 @@
 use blst::min_pk::PublicKey;
 use flux_profiler::timed;
+#[cfg(feature = "ef_tests")]
+use silver_beacon_state_data::ValidatorsView;
 use silver_beacon_state_data::{
     B256, BeaconBlockHeader, BodyOffsets, Epoch, EpochView, EpochWriteView, Eth1Data,
     Eth1WriteView, ForkWriter, Immutable, LongtailGroup, LongtailId, SLOTS_PER_EPOCH,
@@ -7,23 +9,19 @@ use silver_beacon_state_data::{
     StateWriterView,
     bls::{self, SigBatch},
     hash_tree_root_block_header,
+    pq::{is_valid_vrf_proof, vrf_secret},
 };
+use silver_common::ssz_view::{BeaconBlockBodyPqView, ETH1_DATA_SIZE, Eth1DataView};
 #[cfg(feature = "ef_tests")]
-use silver_beacon_state_data::{BodyFork, ValidatorsView};
-use silver_common::ssz_view::Eth1DataView;
-#[cfg(feature = "ef_tests")]
-use silver_common::{
-    ssz_hash::HashedBody,
-    ssz_view::{SIGNED_BEACON_BLOCK_MIN, SignedBeaconBlockView},
-};
+use silver_common::{SignedBlockLayout, ssz_hash::HashedBody, ssz_view::SignedBeaconBlockView};
 
 use crate::{
     error::{BlockError, Error, Result},
     merkle,
     ssz_hash::{self, BlockFork},
     stf::{
-        BlockAttestations, BlockVotes, EPOCHS_PER_ETH1_VOTING_PERIOD, ShufflingRef, StfScratch,
-        collect_sigs_attestations, collect_sigs_attester_slashings,
+        BlockAttestations, BlockVotes, EPOCHS_PER_ETH1_VOTING_PERIOD, ShufflingRef, StarkClaims,
+        StfScratch, collect_sigs_attestations, collect_sigs_attester_slashings,
         collect_sigs_bls_to_execution_changes, collect_sigs_execution_payload_bid,
         collect_sigs_proposer_slashings, collect_sigs_sync_aggregate, collect_sigs_voluntary_exits,
         gloas::collect_sigs_payload_attestations, process_attester_slashings,
@@ -31,7 +29,8 @@ use crate::{
         process_execution_payload, process_execution_payload_bid, process_execution_requests,
         process_parent_execution_payload, process_payload_attestations, process_proposer_slashings,
         process_sync_aggregate, process_voluntary_exits, process_withdrawals_fulu,
-        process_withdrawals_gloas, upgrade_to_gloas,
+        process_withdrawals_gloas, upgrade_to_gloas, verify_execution_payload_bid_signature_pq,
+        verify_proposer_slashing_signatures_pq,
     },
 };
 
@@ -59,10 +58,10 @@ pub fn apply_block(
     fork: &mut ForkWriter,
     input: &BlockInput<'_>,
     scratch: &mut StfScratch,
-    sig_batch: &mut SigBatch,
+    sig_batch: Option<&mut SigBatch>,
     out: &mut BlockVotes,
 ) -> Result<()> {
-    let actual = transition(cfg, fork, input, scratch, Some(sig_batch), out)?;
+    let actual = transition(cfg, fork, input, scratch, sig_batch, out)?;
     let expected = input.header.state_root;
     if actual != expected {
         return Err(input.invalid(BlockError::PostStateRootMismatch { expected, got: actual }));
@@ -123,23 +122,16 @@ pub fn apply_signed_block_debug(
     fork: &mut ForkWriter,
     block_bytes: &[u8],
 ) -> Result<()> {
-    if block_bytes.len() < SIGNED_BEACON_BLOCK_MIN {
-        return Err(Error::invalid_block([0; 32], BlockError::TooShort {
-            len: block_bytes.len(),
-            min: SIGNED_BEACON_BLOCK_MIN,
-        }));
-    }
+    let Some(layout) = SignedBlockLayout::of(cfg, block_bytes) else {
+        let len = block_bytes.len();
+        return Err(Error::invalid_block([0; 32], BlockError::Malformed { len }));
+    };
+    let block_slot = layout.slot(block_bytes);
+    let proposer_index = layout.proposer_index(block_bytes) as u32;
+    let state_root = layout.state_root(block_bytes);
     let (head_slot, head_block_header_slot) =
         (fork.view.slot.state().slot, fork.view.slot.state().latest_block_header.slot);
-    let block_slot = SignedBeaconBlockView::slot(block_bytes);
-    let proposer_index = SignedBeaconBlockView::proposer_index(block_bytes) as u32;
-    let parent_root: B256 = *SignedBeaconBlockView::parent_root(block_bytes);
-    let state_root: B256 = *SignedBeaconBlockView::state_root(block_bytes);
-    let body = SignedBeaconBlockView::body(block_bytes);
     let wrap = |kind: BlockError| Error::invalid_block(state_root, kind);
-    if cfg.is_pq_at_slot(block_slot) {
-        return Err(wrap(BlockError::PqUnimplemented { slot: block_slot }));
-    }
     let mut sig_batch = SigBatch::new();
     let mut votes = BlockVotes::default();
 
@@ -171,31 +163,33 @@ pub fn apply_signed_block_debug(
     // body_root + proposer-sig read the block's fork from the post-`process_slots`
     // epoch view, so a block at the fork boundary uses the upgraded fork (Gloas
     // body layout / signing version), not the parent's.
-    let block_epoch = block_slot / SLOTS_PER_EPOCH;
-    let body_fork =
-        if epoch_view.post_gloas_fork(view.imm) { BodyFork::Gloas } else { BodyFork::Fulu };
-    let offsets = BodyOffsets::validated(body, body_fork).map_err(|e| wrap(e.into()))?;
+    let offsets = BodyOffsets::validated(layout.body(block_bytes), layout.body_fork())
+        .map_err(|e| wrap(e.into()))?;
     let HashedBody { root: body_root, fork: block_fork } = HashedBody::of(&offsets);
-    if !verify_block_sig(
-        view.imm,
-        &epoch_view,
-        &view.validators.reader(),
-        block_bytes,
-        &body_root,
-        block_epoch,
-        proposer_index,
-    ) {
-        return Err(Error::InvalidBlockSig);
-    }
-
     let header = BeaconBlockHeader {
         slot: block_slot,
         proposer_index: proposer_index as u64,
-        parent_root,
+        parent_root: layout.parent_root(block_bytes),
         state_root,
         body_root,
     };
     let block_root = hash_tree_root_block_header(&header);
+    // The pyspec stubs XMSS in its vectors, since an XMSS key takes minutes to
+    // generate: every PQ signature and STARK proof verifies, so none is checked.
+    let is_pq = layout == SignedBlockLayout::Pq;
+    if !is_pq &&
+        !verify_block_sig(
+            view.imm,
+            &epoch_view,
+            &view.validators.reader(),
+            &header,
+            &block_root,
+            SignedBeaconBlockView::signature(block_bytes),
+        )
+    {
+        return Err(Error::InvalidBlockSig);
+    }
+
     process_block_header(view, &epoch_view, &header, block_root).map_err(wrap)?;
 
     let mut curr = Vec::new();
@@ -210,13 +204,14 @@ pub fn apply_signed_block_debug(
         fork: block_fork,
         shuffling: &sref,
     };
+    let sig_batch = (!is_pq).then_some(&mut sig_batch);
     process_block_body(
         cfg,
         fork,
         &input,
         head_block_header_slot,
         &mut scratch,
-        Some(&mut sig_batch),
+        sig_batch,
         &mut votes,
     )?;
 
@@ -267,19 +262,19 @@ fn verify_block_sig(
     imm: &Immutable,
     epoch: &EpochView,
     validators: &ValidatorsView,
-    block_bytes: &[u8],
-    body_root: &B256,
-    block_epoch: Epoch,
-    proposer_index: u32,
+    header: &BeaconBlockHeader,
+    block_root: &B256,
+    signature: &[u8; 96],
 ) -> bool {
-    let fork_version = epoch.fork_version_at(block_epoch);
-    let pk = validators.pubkey_decompressed(proposer_index as usize);
+    let fork_version = epoch.fork_version_at(header.slot / SLOTS_PER_EPOCH);
     let domain = bls::compute_domain(
         bls::DOMAIN_BEACON_PROPOSER,
         fork_version,
         &imm.genesis_validators_root,
     );
-    bls::verify_block_signature(block_bytes, pk, body_root, &domain)
+    let signing_root = bls::compute_signing_root(block_root, &domain);
+    let proposer = validators.pubkey_decompressed(header.proposer_index as usize);
+    bls::verify_one(proposer, signature, &signing_root)
 }
 
 /// Advance state from `view.slot`'s slot to `target_slot`, processing empty
@@ -454,9 +449,10 @@ pub fn process_block_body(
     sig_batch: Option<&mut SigBatch>,
     out: &mut BlockVotes,
 ) -> Result<()> {
+    let state_epoch = fork.epoch_view();
     debug_assert_eq!(
-        input.fork.is_gloas(),
-        fork.epoch_view().post_gloas_fork(fork.view.imm),
+        (input.fork.post_gloas_fork(), input.fork == BlockFork::Pq),
+        (state_epoch.post_gloas_fork(fork.view.imm), state_epoch.is_pq(fork.view.imm)),
         "body parsed for one fork, state on another",
     );
     let offsets = &input.body;
@@ -468,38 +464,48 @@ pub fn process_block_body(
         return Err(input.invalid(BlockError::ProposerOutOfRange { idx, count }));
     }
 
+    let StfScratch { active, stark, .. } = scratch;
+    let mut stark_claims = None;
     if let Some(sig_batch) = sig_batch {
-        sig_batch.clear();
         // Pass 1 is read-only: hand it the read-only sibling over the same fork.
-        collect_sigs_block_body(cfg, &fork.read(), &mut scratch.active, sig_batch, offsets, input)?;
-        if !sig_batch.verify_all() {
-            return Err(Error::SigBatchFailed);
+        if input.fork == BlockFork::Pq {
+            verify_xmss_signatures_pq(&fork.read(), offsets, input)?;
+            // STARK proofs are verified after the block applies, so the claims
+            // are collected while applying it.
+            stark.begin(offsets.serialized().expect("a PQ body is parsed whole"));
+            stark_claims = Some(stark);
+        } else {
+            sig_batch.clear();
+            collect_sigs_block_body(cfg, &fork.read(), active, sig_batch, offsets, input)?;
+            if !sig_batch.verify_all() {
+                return Err(Error::SigBatchFailed);
+            }
         }
     }
 
-    apply_block_body(cfg, fork, offsets, input, parent_slot, scratch, out)
+    apply_block_body(cfg, fork, input, parent_slot, active, stark_claims, out)
 }
 
 fn apply_block_body(
     cfg: &SpecConfig,
     fork: &mut ForkWriter,
-    offsets: &BodyOffsets<'_>,
     input: &BlockInput<'_>,
     parent_slot: Slot,
-    scratch: &mut StfScratch,
+    active: &mut Vec<u32>,
+    mut stark: Option<&mut StarkClaims>,
     out: &mut BlockVotes,
 ) -> Result<()> {
+    let offsets = &input.body;
     let ForkWriter { view, epoch, longtail, epoch_idx, longtail_idx, .. } = fork;
     let epoch = epoch.view_opt(*epoch_idx);
     let longtail = longtail.view_opt(*longtail_idx);
-    let is_gloas = input.fork.is_gloas();
+    let post_gloas_fork = input.fork.post_gloas_fork();
     let block_slot = input.header.slot;
     let proposer_index = input.proposer_index();
 
     match input.fork {
-        BlockFork::Gloas => {
-            let body = offsets.serialized().expect("a Gloas body is parsed whole");
-            process_parent_execution_payload(&mut *view, &epoch, cfg, body, parent_slot)?;
+        BlockFork::Gloas | BlockFork::Pq => {
+            process_parent_execution_payload(&mut *view, &epoch, cfg, offsets, parent_slot)?;
             process_withdrawals_gloas(&mut *view);
             if let Some(bid) = offsets.signed_bid() {
                 process_execution_payload_bid(&mut *view, &epoch, cfg, bid)?;
@@ -523,23 +529,45 @@ fn apply_block_body(
         }
     }
 
-    process_randao(view, offsets.fixed(), block_slot / SLOTS_PER_EPOCH);
-    process_eth1_data(&mut view.slot, &mut view.eth1, offsets.fixed());
+    let block_epoch = block_slot / SLOTS_PER_EPOCH;
+    if input.fork == BlockFork::Pq {
+        process_randao_pq(view, offsets.fixed(), proposer_index, block_slot)
+            .map_err(|e| input.invalid(e))?;
+    } else {
+        process_randao(view, offsets.fixed(), block_epoch);
+    }
+    process_eth1_data(&mut view.slot, &mut view.eth1, offsets.eth1_data());
 
     let mut proposer_reward = 0;
     if let Some(section) = offsets.proposer_slashings() {
         proposer_reward += process_proposer_slashings(&mut *view, epoch, cfg, section)?;
     }
     if let Some(section) = offsets.attester_slashings() {
-        proposer_reward +=
-            process_attester_slashings(&mut *view, epoch, cfg, section, &mut out.slashed)?;
+        proposer_reward += process_attester_slashings(
+            &mut *view,
+            epoch,
+            cfg,
+            section,
+            &mut out.slashed,
+            stark.as_deref_mut(),
+        )?;
     }
+    let block_statements = stark.as_deref().map_or(0, StarkClaims::statement_count);
     if let Some(section) = offsets.attestations() {
-        let parent_slot = is_gloas.then_some(parent_slot);
+        let parent_slot = post_gloas_fork.then_some(parent_slot);
         let attestations =
-            BlockAttestations::new(&view.slot, epoch, block_slot, parent_slot, input.shuffling);
-        proposer_reward +=
-            attestations.process_body(view, section, proposer_index, &mut out.votes, scratch)?;
+            BlockAttestations::new(view, epoch, block_slot, parent_slot, input.shuffling);
+        proposer_reward += attestations.process_body(
+            view,
+            section,
+            proposer_index,
+            &mut out.votes,
+            active,
+            stark.as_deref_mut(),
+        )?;
+    }
+    if let Some(claims) = stark {
+        claims.push_proof(block_statements, offsets.proof());
     }
 
     if let Some(section) = offsets.voluntary_exits() {
@@ -549,7 +577,7 @@ fn apply_block_body(
         process_bls_to_execution_changes(&mut view.validators, section)?;
     }
 
-    if is_gloas {
+    if post_gloas_fork {
         if let Some(section) = offsets.payload_attestations() {
             process_payload_attestations(&*view, section)?;
         }
@@ -557,8 +585,10 @@ fn apply_block_body(
         process_execution_requests(&mut *view, cfg, offsets.execution_requests());
     }
 
-    proposer_reward +=
-        process_sync_aggregate(&mut *view, longtail, offsets.sync_aggregate(), proposer_index)?;
+    if let Some(sync_aggregate) = offsets.sync_aggregate() {
+        proposer_reward +=
+            process_sync_aggregate(&mut *view, longtail, sync_aggregate, proposer_index)?;
+    }
 
     out.proposer_reward = proposer_reward;
     Ok(())
@@ -614,7 +644,7 @@ fn collect_sigs_block_body(
         collect_sigs_bls_to_execution_changes(imm, &validators, section, sig_batch)?;
     }
 
-    if input.fork.is_gloas() {
+    if input.fork.post_gloas_fork() {
         let current_epoch = block_slot / SLOTS_PER_EPOCH;
         if let Some(bid) = offsets.signed_bid() {
             collect_sigs_execution_payload_bid(
@@ -639,13 +669,34 @@ fn collect_sigs_block_body(
         }
     }
 
-    collect_sigs_sync_aggregate(
-        rv,
-        offsets.sync_aggregate(),
-        block_slot,
-        active_scratch,
-        sig_batch,
-    );
+    if let Some(sync_aggregate) = offsets.sync_aggregate() {
+        collect_sigs_sync_aggregate(rv, sync_aggregate, block_slot, active_scratch, sig_batch);
+    }
+    Ok(())
+}
+
+/// XMSS has no aggregation to batch into, so each signature verifies on its
+/// own. Attestation and attester-slashing signatures are proved by STARKs
+/// instead, collected as [`StarkClaims`] while the block applies.
+#[timed]
+fn verify_xmss_signatures_pq(
+    rv: &StateView,
+    offsets: &BodyOffsets<'_>,
+    input: &BlockInput<'_>,
+) -> Result<()> {
+    if let Some(section) = offsets.proposer_slashings() {
+        verify_proposer_slashing_signatures_pq(rv.imm, &rv.epoch, &rv.validators, section)?;
+    }
+    if let Some(bid) = offsets.signed_bid() {
+        let current_epoch = input.header.slot / SLOTS_PER_EPOCH;
+        verify_execution_payload_bid_signature_pq(
+            rv.imm,
+            &rv.epoch,
+            &rv.builders,
+            bid,
+            current_epoch,
+        )?;
+    }
     Ok(())
 }
 
@@ -675,6 +726,27 @@ pub fn randao_signing_root(imm: &Immutable, epoch: &EpochView, block_slot: Slot)
     bls::compute_signing_root(&epoch_chunk, &domain)
 }
 
+/// Spec `process_randao` under PQ: the reveal must open the proposer's VRF
+/// tree at the block's slot, and its secret is mixed in.
+pub fn process_randao_pq(
+    view: &mut StateWriterView,
+    body: &[u8],
+    proposer_index: u32,
+    block_slot: Slot,
+) -> std::result::Result<(), BlockError> {
+    let reveal = BeaconBlockBodyPqView::randao_reveal(body);
+    let is_valid_reveal = view
+        .validators
+        .reader()
+        .vrf_root(proposer_index as usize)
+        .is_some_and(|vrf_root| is_valid_vrf_proof(reveal, block_slot, vrf_root));
+    if !is_valid_reveal {
+        return Err(BlockError::InvalidRandaoReveal { proposer_index: proposer_index as u64 });
+    }
+    view.randao_mixes.mix_in_vrf_secret(block_slot / SLOTS_PER_EPOCH, vrf_secret(reveal));
+    Ok(())
+}
+
 /// Pass 2 — XOR the reveal's hash into the current epoch's mix. BLS already
 /// verified in pass 1; if it failed, we never reach here.
 fn process_randao(view: &mut StateWriterView, body: &[u8], block_epoch: Epoch) {
@@ -682,9 +754,11 @@ fn process_randao(view: &mut StateWriterView, body: &[u8], block_epoch: Epoch) {
     view.randao_mixes.mix_in_reveal(block_epoch, &merkle::sha256(reveal));
 }
 
-fn process_eth1_data(slot: &mut SlotStateWriteView, eth1: &mut Eth1WriteView, body: &[u8]) {
-    // BeaconBlockBody.eth1_data at body[96..168].
-    let data: &[u8; 72] = body[96..168].try_into().unwrap();
+fn process_eth1_data(
+    slot: &mut SlotStateWriteView,
+    eth1: &mut Eth1WriteView,
+    data: &[u8; ETH1_DATA_SIZE],
+) {
     let deposit_root: B256 = *Eth1DataView::deposit_root(data);
     let deposit_count = Eth1DataView::deposit_count(data);
     let block_hash: B256 = *Eth1DataView::block_hash(data);
@@ -728,22 +802,21 @@ mod tests {
         let (mut view, _, _) = st.view();
         view.slot.state_mut().slot = 32;
 
-        // Build a body with eth1_data at [96..168).
-        let mut body = vec![0u8; 396];
+        let mut data = [0u8; ETH1_DATA_SIZE];
         let deposit_root = [0xAA; 32];
-        body[96..128].copy_from_slice(&deposit_root);
-        body[128..136].copy_from_slice(&42u64.to_le_bytes());
-        body[136..168].copy_from_slice(&[0xBB; 32]);
+        data[..32].copy_from_slice(&deposit_root);
+        data[32..40].copy_from_slice(&42u64.to_le_bytes());
+        data[40..].copy_from_slice(&[0xBB; 32]);
 
         // slots_per_eth1_voting_period = 64 * 32 = 2048; need > 1024 votes.
-        process_eth1_data(&mut view.slot, &mut view.eth1, &body);
+        process_eth1_data(&mut view.slot, &mut view.eth1, &data);
         assert_eq!(view.eth1.len(), 1);
         assert_ne!(view.slot.state().eth1_data.deposit_root, deposit_root);
 
         for _ in 0..1024 {
             view.eth1.push(Eth1Data { deposit_root, deposit_count: 42, block_hash: [0xBB; 32] });
         }
-        process_eth1_data(&mut view.slot, &mut view.eth1, &body);
+        process_eth1_data(&mut view.slot, &mut view.eth1, &data);
         assert_eq!(view.slot.state().eth1_data.deposit_root, deposit_root);
     }
 }

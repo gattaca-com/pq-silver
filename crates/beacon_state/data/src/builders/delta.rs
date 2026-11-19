@@ -4,6 +4,7 @@ use super::{BuildersGroup, builder_hash, finalized::FinalizedBuilders};
 use crate::{
     B256,
     gloas::{BUILDER_REGISTRY_LIMIT, Builder},
+    pq::KeyScheme,
     ring::{Reset, Slot},
     sparse::Edits,
     tree::{BuildersHash, TreeView, TreeWriteView},
@@ -100,6 +101,11 @@ impl<'a> BuildersView<'a> {
     #[inline]
     pub(super) fn new(base: &'a FinalizedBuilders, delta: &'a BuildersDelta) -> Self {
         Self { base, delta }
+    }
+
+    #[inline]
+    pub fn scheme(&self) -> KeyScheme {
+        self.base.scheme()
     }
 
     #[inline]

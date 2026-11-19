@@ -231,9 +231,7 @@ impl BeaconStateTile {
         validator_index: u64,
         data: &[u8; PAYLOAD_ATTESTATION_DATA_SIZE],
     ) -> Result<(PtcVote, StateId), Feedback> {
-        let block_root = *PayloadAttestationData::beacon_block_root(data);
         let slot = PayloadAttestationData::slot(data);
-
         if !self.ticker.is_current_slot_with_disparity(slot, MAXIMUM_GOSSIP_CLOCK_DISPARITY) {
             return Err(self.slot_window_miss(slot));
         }
@@ -242,6 +240,18 @@ impl BeaconStateTile {
         if self.seen_ptc.contains(slot, validator_index as usize) {
             return Err(Feedback::AlreadySeen);
         }
+        self.resolve_ptc_vote(validator_index, data)
+    }
+
+    /// The checks spec `on_payload_attestation_message` makes on the vote's
+    /// block and committee, without the gossip clock and dedup rules.
+    pub(super) fn resolve_ptc_vote(
+        &self,
+        validator_index: u64,
+        data: &[u8; PAYLOAD_ATTESTATION_DATA_SIZE],
+    ) -> Result<(PtcVote, StateId), Feedback> {
+        let block_root = *PayloadAttestationData::beacon_block_root(data);
+        let slot = PayloadAttestationData::slot(data);
 
         let Some(idx) = self.fork_choice.find_node_idx(&block_root) else {
             return Err(Feedback::Ignore);
@@ -290,6 +300,18 @@ impl BeaconStateTile {
             vote.da,
         );
         self.seen_ptc.mark(vote.slot, vote.validator as usize);
+    }
+
+    /// Spec `on_payload_attestation_message` under PQ counts a vote only in
+    /// its own slot, while gossip admits one within the clock disparity. True
+    /// when fork choice counted it.
+    pub(super) fn record_pq_ptc_vote(&mut self, vote: &PtcVote) -> bool {
+        if vote.slot != self.ticker.current_slot() {
+            self.seen_ptc.mark(vote.slot, vote.validator as usize);
+            return false;
+        }
+        self.record_ptc_vote(vote);
+        true
     }
 
     pub(super) fn commit_ptc(&mut self, p: &PreparedPtc, signature: &CheckedSignature) {

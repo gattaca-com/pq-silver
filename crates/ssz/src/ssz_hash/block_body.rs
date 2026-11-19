@@ -12,8 +12,9 @@ use crate::{
         hash_variable_list, merkleize, uint64_chunk,
     },
     ssz_view::{
-        BeaconBlockBodyGloasView, DepositView, ExecutionPayloadHeaderFuluView,
-        ProposerSlashingView, SignedBlsToExecutionChangeView, SignedVoluntaryExitView,
+        BeaconBlockBodyGloasView, BeaconBlockBodyPqView, DepositView,
+        ExecutionPayloadHeaderFuluView, ProposerSlashingView, SignedBlsToExecutionChangeView,
+        SignedVoluntaryExitView,
     },
 };
 
@@ -53,11 +54,13 @@ pub enum BlockFork {
     Fulu { payload_roots: PayloadRoots },
     FuluBlinded,
     Gloas,
+    Pq,
 }
 
 impl BlockFork {
-    pub fn is_gloas(self) -> bool {
-        matches!(self, Self::Gloas)
+    /// The payload arrives in an envelope, after the block.
+    pub fn post_gloas_fork(self) -> bool {
+        matches!(self, Self::Gloas | Self::Pq)
     }
 
     pub fn body_fork(self) -> BodyFork {
@@ -65,6 +68,7 @@ impl BlockFork {
             Self::Fulu { .. } => BodyFork::Fulu,
             Self::FuluBlinded => BodyFork::FuluBlinded,
             Self::Gloas => BodyFork::Gloas,
+            Self::Pq => BodyFork::Pq,
         }
     }
 }
@@ -93,6 +97,10 @@ impl HashedBody {
                 root: hash_tree_root_body_fulu_with_roots(offsets).0,
                 fork: BlockFork::FuluBlinded,
             },
+            BodyFork::Pq => {
+                let body = offsets.serialized().expect("a PQ body is parsed whole");
+                Self { root: BeaconBlockBodyPqView::hash_tree_root(body), fork: BlockFork::Pq }
+            }
         }
     }
 }
@@ -154,13 +162,15 @@ struct BodyFieldRoots {
 }
 
 fn field_roots(body_offsets: &BodyOffsets<'_>) -> BodyFieldRoots {
-    debug_assert_ne!(body_offsets.fork(), BodyFork::Gloas);
+    debug_assert!(matches!(body_offsets.fork(), BodyFork::Fulu | BodyFork::FuluBlinded));
     let fixed = body_offsets.fixed();
 
     let randao = hash_fixed_bytes(&fixed[0..96]);
     let eth1 = hash_eth1_data_bytes(&fixed[96..168]);
     let graffiti: B256 = fixed[168..200].try_into().unwrap();
-    let sync_agg = hash_sync_aggregate(body_offsets.sync_aggregate());
+    let sync_agg = hash_sync_aggregate(
+        body_offsets.sync_aggregate().expect("a Fulu body has a sync aggregate"),
+    );
 
     fn or_empty(field: Option<&[u8]>) -> &[u8] {
         field.unwrap_or(&[])

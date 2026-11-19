@@ -8,6 +8,13 @@ use super::strategy::{Committee, Positions};
 /// `pubkey | message`, so byte order is the leanVM sidecar's claim order.
 pub type Claim = [u8; 64];
 
+pub fn claim(pubkey: &[u8; 32], message: &[u8; 32]) -> Claim {
+    let mut claim = [0; 64];
+    claim[..32].copy_from_slice(pubkey);
+    claim[32..].copy_from_slice(message);
+    claim
+}
+
 /// A single attestation whose XMSS signature the tile has verified, with the
 /// facts only the tile has.
 pub struct VerifiedVote<'a> {
@@ -34,9 +41,7 @@ impl Vote {
         message: [u8; 32],
         signature: &[u8; XMSS_SIGNATURE_SIZE],
     ) -> Self {
-        let mut claim = [0; 64];
-        claim[..32].copy_from_slice(&pubkey);
-        claim[32..].copy_from_slice(&message);
+        let claim = claim(&pubkey, &message);
         Self { committee_position, claim, signature: Box::new(*signature) }
     }
 }

@@ -5,8 +5,8 @@ use std::{fs, path::Path};
 mod ef_common;
 
 use ef_common::{
-    LoadedState, compare_states, iter_test_cases, load_state, load_state_gloas, snappy_decode,
-    spec_tests_dir,
+    LoadedState, compare_states, iter_test_cases, load_state, load_state_gloas, pq_config,
+    snappy_decode, spec_tests_dir,
 };
 use silver_beacon_state::{
     error::ExecutionPayloadBidError,
@@ -14,9 +14,13 @@ use silver_beacon_state::{
     stf::{self, ShufflingRef},
 };
 use silver_beacon_state_data::{
-    BeaconBlockHeader, Payload, SLOTS_PER_EPOCH, bls::SigBatch, hash_tree_root_block_header,
+    B256, BeaconBlockHeader, BodyFork, BodyOffsets, Payload, SLOTS_PER_EPOCH, SpecConfig,
+    bls::SigBatch, hash_tree_root_block_header,
 };
-use silver_common::ssz_view::{PTC_AGGREGATION_BITS_SIZE, SignedExecutionPayloadBidView};
+use silver_common::ssz_view::{
+    AttestationPqView, BeaconBlockBodyPqView, PTC_AGGREGATION_BITS_SIZE,
+    SignedExecutionPayloadBidView,
+};
 
 fn operations_handler(
     handler_name: &str,
@@ -202,15 +206,25 @@ fn fulu_attester_slashing() {
             return false;
         }
         s.with_view_and_epoch(|view, e| {
-            stf::process_attester_slashings(view, *e, &cfg, &list, &mut Vec::new()).is_ok()
+            stf::process_attester_slashings(view, *e, &cfg, &list, &mut Vec::new(), None).is_ok()
         })
     });
 }
 
 fn run_attestation(s: &mut LoadedState, op: &[u8]) -> bool {
+    process_attestation(s, op, true)
+}
+
+/// A single operation SSZ wrapped as a one-element list.
+fn as_list(op: &[u8]) -> Vec<u8> {
     let mut list = Vec::with_capacity(4 + op.len());
     list.extend_from_slice(&4u32.to_le_bytes());
     list.extend_from_slice(op);
+    list
+}
+
+fn process_attestation(s: &mut LoadedState, op: &[u8], checks_bls: bool) -> bool {
+    let list = as_list(op);
     let block_slot = s.slot();
     let curr_epoch = block_slot / SLOTS_PER_EPOCH;
 
@@ -229,7 +243,7 @@ fn run_attestation(s: &mut LoadedState, op: &[u8]) -> bool {
     let mut scratch = stf::StfScratch::new(0);
     let mut batch = SigBatch::new();
     let sid = s.state_id;
-    {
+    if checks_bls {
         let (p, eg, _) = s.view();
         let ev = eg.view_opt(sid.epoch_idx);
         if stf::collect_sigs_attestations(
@@ -241,21 +255,38 @@ fn run_attestation(s: &mut LoadedState, op: &[u8]) -> bool {
             &sref,
             &mut batch,
         )
-        .is_err()
+        .is_err() ||
+            !batch.verify_all()
         {
             return false;
         }
     }
-    if !batch.verify_all() {
-        return false;
-    }
-    s.with_view_and_epoch(|view, e| {
+    // A PQ attestation proves one statement per committee it names.
+    let mut stark = (!checks_bls).then(|| {
+        let mut claims = stf::StarkClaims::default();
+        claims.begin(&list);
+        claims
+    });
+    let processed = s.with_view_and_epoch(|view, e| {
         let parent_slot =
             e.post_gloas_fork(view.imm).then(|| view.slot.state().latest_block_header.slot);
-        stf::BlockAttestations::new(&view.slot, *e, block_slot, parent_slot, &sref)
-            .process_body(view, &list, proposer_index, &mut votes_sink, &mut scratch)
+        stf::BlockAttestations::new(view, *e, block_slot, parent_slot, &sref)
+            .process_body(
+                view,
+                &list,
+                proposer_index,
+                &mut votes_sink,
+                &mut scratch.active,
+                stark.as_mut(),
+            )
             .is_ok()
-    })
+    });
+    if let Some(claims) = stark.filter(|_| processed) {
+        let committees: u32 =
+            AttestationPqView::committee_bits(op).iter().map(|byte| byte.count_ones()).sum();
+        assert_eq!(claims.statement_count(), committees as usize, "one statement per committee");
+    }
+    processed
 }
 
 #[test]
@@ -442,11 +473,13 @@ fn gloas_builder_deposit_request() {
         "builder_deposit_request",
         "builder_deposit_request",
         false,
-        |s, op| {
-            s.with_view(|view| stf::process_builder_deposit_request(view, op));
-            true
-        },
+        run_builder_deposit_request,
     );
+}
+
+fn run_builder_deposit_request(s: &mut LoadedState, op: &[u8]) -> bool {
+    s.with_view(|view| stf::process_builder_deposit_request(view, op));
+    true
 }
 
 #[test]
@@ -456,16 +489,18 @@ fn gloas_builder_exit_request() {
         "builder_exit_request",
         "builder_exit_request",
         false,
-        |s, op| {
-            let sid = s.state_id;
-            let finalized_epoch = {
-                let (_, epoch, _) = s.view();
-                epoch.view_opt(sid.epoch_idx).state().finalized_checkpoint.epoch
-            };
-            s.with_view(|view| stf::process_builder_exit_request(view, finalized_epoch, op));
-            true
-        },
+        run_builder_exit_request,
     );
+}
+
+fn run_builder_exit_request(s: &mut LoadedState, op: &[u8]) -> bool {
+    let sid = s.state_id;
+    let finalized_epoch = {
+        let (_, epoch, _) = s.view();
+        epoch.view_opt(sid.epoch_idx).state().finalized_checkpoint.epoch
+    };
+    s.with_view(|view| stf::process_builder_exit_request(view, finalized_epoch, op));
+    true
 }
 
 #[test]
@@ -522,12 +557,16 @@ fn gloas_execution_payload_bid() {
 
 #[test]
 fn gloas_withdrawals() {
-    // Gloas `process_withdrawals` is deterministic (no payload); the EF case
-    // carries only pre/post, so this runs like an epoch handler.
-    let base = spec_tests_dir().join("tests/mainnet/gloas/operations/withdrawals");
+    withdrawals_fork("gloas", load_state_gloas);
+}
+
+/// Post-Gloas `process_withdrawals` takes no payload; the EF case carries only
+/// pre/post, so this runs like an epoch handler.
+fn withdrawals_fork(fork: &str, loader: fn(&Path) -> LoadedState) {
+    let base = spec_tests_dir().join(format!("tests/mainnet/{fork}/operations/withdrawals"));
     let cases = iter_test_cases(&base);
     if cases.is_empty() {
-        eprintln!("gloas withdrawals: no test cases, skipping");
+        eprintln!("{fork} withdrawals: no test cases, skipping");
         return;
     }
     let mut fail = 0;
@@ -536,9 +575,9 @@ fn gloas_withdrawals() {
         if !post_path.exists() {
             continue;
         }
-        let mut pre = load_state_gloas(&dir.join("pre.ssz_snappy"));
+        let mut pre = loader(&dir.join("pre.ssz_snappy"));
         pre.with_view(|view| stf::process_withdrawals_gloas(view));
-        let mut post = load_state_gloas(&post_path);
+        let mut post = loader(&post_path);
         let diffs = compare_states(name, &mut pre, &mut post);
         if !diffs.is_empty() {
             fail += 1;
@@ -547,27 +586,33 @@ fn gloas_withdrawals() {
             }
         }
     }
-    assert_eq!(fail, 0, "gloas withdrawals: {fail} test(s) failed");
+    assert_eq!(fail, 0, "{fork} withdrawals: {fail} test(s) failed");
 }
 
 #[test]
 fn gloas_parent_execution_payload() {
     let cfg = gloas_cfg();
     operations_handler_fork("gloas", "parent_execution_payload", "block", true, move |s, op| {
-        // op is a BeaconBlock: the body offset sits at [80..84).
-        if op.len() < 84 {
-            return false;
-        }
-        let body_off = u32::from_le_bytes(op[80..84].try_into().unwrap()) as usize;
-        if body_off > op.len() {
-            return false;
-        }
-        let body = &op[body_off..];
-        s.with_view_and_epoch(|view, e| {
-            let parent_slot = view.slot.state().latest_block_header.slot;
-            stf::process_parent_execution_payload(view, e, &cfg, body, parent_slot).is_ok()
-        })
+        process_parent_execution_payload(&cfg, s, op)
     });
+}
+
+/// `op` is a BeaconBlock: the body offset sits at [80..84).
+fn process_parent_execution_payload(cfg: &SpecConfig, s: &mut LoadedState, op: &[u8]) -> bool {
+    if op.len() < 84 {
+        return false;
+    }
+    let body_off = u32::from_le_bytes(op[80..84].try_into().unwrap()) as usize;
+    if body_off > op.len() {
+        return false;
+    }
+    let body = &op[body_off..];
+    s.with_view_and_epoch(|view, e| {
+        let fork = if e.is_pq(view.imm) { BodyFork::Pq } else { BodyFork::Gloas };
+        let Ok(body) = BodyOffsets::validated(body, fork) else { return false };
+        let parent_slot = view.slot.state().latest_block_header.slot;
+        stf::process_parent_execution_payload(view, e, cfg, &body, parent_slot).is_ok()
+    })
 }
 
 #[test]
@@ -630,28 +675,195 @@ fn gloas_payload_attestation_rejects_max_slot() {
 
 #[test]
 fn fulu_block_header() {
-    operations_handler("block_header", "block", true, move |s, op| {
-        // op is a BeaconBlock SSZ: slot(8) + proposer_index(8) + parent_root(32) +
-        // state_root(32) + body_offset(4) + body(...)
-        if op.len() < 84 {
-            return false;
+    operations_handler("block_header", "block", true, |s, op| {
+        process_block_header(s, op, silver_beacon_state::ssz_hash::hash_tree_root_body_fulu)
+    });
+}
+
+/// `op` is a BeaconBlock SSZ: slot(8) + proposer_index(8) + parent_root(32) +
+/// state_root(32) + body_offset(4) + body(...).
+fn process_block_header(s: &mut LoadedState, op: &[u8], body_root: fn(&[u8]) -> B256) -> bool {
+    if op.len() < 84 {
+        return false;
+    }
+    let slot = u64::from_le_bytes(op[0..8].try_into().unwrap());
+    let proposer_index = u64::from_le_bytes(op[8..16].try_into().unwrap());
+    let parent_root = op[16..48].try_into().unwrap();
+    let body_off = u32::from_le_bytes(op[80..84].try_into().unwrap()) as usize;
+    let body = if body_off <= op.len() { &op[body_off..] } else { &[] };
+    let header = BeaconBlockHeader {
+        slot,
+        proposer_index,
+        parent_root,
+        state_root: [0; 32],
+        body_root: body_root(body),
+    };
+    let block_root = hash_tree_root_block_header(&header);
+    s.with_view_and_epoch(|view, e| stf::process_block_header(view, e, &header, block_root).is_ok())
+}
+
+/// PQ vectors stub XMSS, since an XMSS key takes minutes to generate: every
+/// signature and STARK proof verifies, so these run without signature checks.
+fn pq_handler(
+    handler_name: &str,
+    operation_file: &str,
+    detects_reject: bool,
+    run: impl Fn(&mut LoadedState, &[u8]) -> bool,
+) {
+    operations_handler_fork("pq", handler_name, operation_file, detects_reject, run);
+}
+
+#[test]
+fn pq_attestation() {
+    pq_handler("attestation", "attestation", true, |s, op| process_attestation(s, op, false));
+}
+
+#[test]
+fn pq_attester_slashing() {
+    let cfg = pq_config();
+    pq_handler("attester_slashing", "attester_slashing", true, move |s, op| {
+        let list = as_list(op);
+        let mut claims = stf::StarkClaims::default();
+        claims.begin(&list);
+        let processed = s.with_view_and_epoch(|view, e| {
+            stf::process_attester_slashings(
+                view,
+                *e,
+                &cfg,
+                &list,
+                &mut Vec::new(),
+                Some(&mut claims),
+            )
+            .is_ok()
+        });
+        if processed {
+            assert_eq!(claims.statement_count(), 2, "one statement per slashed attestation");
         }
-        let slot = u64::from_le_bytes(op[0..8].try_into().unwrap());
-        let proposer_index = u64::from_le_bytes(op[8..16].try_into().unwrap());
-        let parent_root = op[16..48].try_into().unwrap();
-        let body_off = u32::from_le_bytes(op[80..84].try_into().unwrap()) as usize;
-        let body = if body_off <= op.len() { &op[body_off..] } else { &[] };
-        let body_root = silver_beacon_state::ssz_hash::hash_tree_root_body_fulu(body);
-        let header = BeaconBlockHeader {
-            slot,
-            proposer_index,
-            parent_root,
-            state_root: [0u8; 32],
-            body_root,
-        };
-        let block_root = hash_tree_root_block_header(&header);
+        processed
+    });
+}
+
+#[test]
+fn pq_block_header() {
+    pq_handler("block_header", "block", true, |s, op| {
+        process_block_header(s, op, BeaconBlockBodyPqView::hash_tree_root)
+    });
+}
+
+#[test]
+fn pq_builder_deposit_request() {
+    pq_handler(
+        "builder_deposit_request",
+        "builder_deposit_request",
+        false,
+        run_builder_deposit_request,
+    );
+}
+
+#[test]
+fn pq_builder_exit_request() {
+    pq_handler("builder_exit_request", "builder_exit_request", false, run_builder_exit_request);
+}
+
+#[test]
+fn pq_consolidation_request() {
+    let cfg = pq_config();
+    pq_handler("consolidation_request", "consolidation_request", false, move |s, op| {
+        s.with_view(|view| stf::process_consolidation_requests(view, &cfg, op));
+        true
+    });
+}
+
+#[test]
+fn pq_deposit_request() {
+    pq_handler("deposit_request", "deposit_request", false, |s, op| {
+        s.with_view(|view| stf::process_deposit_requests(view, op));
+        true
+    });
+}
+
+#[test]
+fn pq_execution_payload_bid() {
+    let cfg = pq_config();
+    pq_handler("execution_payload_bid", "execution_payload_bid", true, move |s, op| {
         s.with_view_and_epoch(|view, e| {
-            stf::process_block_header(view, e, &header, block_root).is_ok()
+            stf::process_execution_payload_bid(view, e, &cfg, op).is_ok()
         })
     });
+}
+
+#[test]
+fn pq_parent_execution_payload() {
+    let cfg = pq_config();
+    pq_handler("parent_execution_payload", "block", true, move |s, op| {
+        process_parent_execution_payload(&cfg, s, op)
+    });
+}
+
+#[test]
+fn pq_proposer_slashing() {
+    let cfg = pq_config();
+    pq_handler("proposer_slashing", "proposer_slashing", true, move |s, op| {
+        s.with_view_and_epoch(|view, e| stf::process_proposer_slashings(view, *e, &cfg, op).is_ok())
+    });
+}
+
+#[test]
+fn pq_randao() {
+    pq_handler("randao", "body", true, |s, body| {
+        let slot = s.slot();
+        s.with_view_and_epoch(|view, e| {
+            let proposer_index = e.proposer_at((slot % SLOTS_PER_EPOCH) as usize).unwrap() as u32;
+            stf::process_randao_pq(view, body, proposer_index, slot).is_ok()
+        })
+    });
+}
+
+#[test]
+fn pq_validator_preregistration_request() {
+    pq_handler(
+        "validator_preregistration_request",
+        "validator_preregistration_request",
+        false,
+        |s, op| {
+            s.with_view(|view| stf::process_validator_preregistration_requests(view, op));
+            true
+        },
+    );
+}
+
+#[test]
+fn pq_builder_preregistration_request() {
+    pq_handler(
+        "builder_preregistration_request",
+        "builder_preregistration_request",
+        false,
+        |s, op| {
+            s.with_view(|view| stf::process_builder_preregistration_requests(view, op));
+            true
+        },
+    );
+}
+
+#[test]
+fn pq_voluntary_exit_request() {
+    let cfg = pq_config();
+    pq_handler("voluntary_exit_request", "voluntary_exit_request", false, move |s, op| {
+        s.with_view(|view| stf::process_voluntary_exit_requests(view, &cfg, op));
+        true
+    });
+}
+
+#[test]
+fn pq_withdrawal_request() {
+    let cfg = pq_config();
+    pq_handler("withdrawal_request", "withdrawal_request", false, move |s, op| {
+        s.with_view(|view| stf::process_withdrawal_requests(view, &cfg, op));
+        true
+    });
+}
+
+#[test]
+fn pq_withdrawals() {
+    withdrawals_fork("pq", load_state);
 }

@@ -2,7 +2,7 @@ use silver_beacon_state_data::{
     Epoch, Payload, SLOTS_PER_EPOCH, Slot, SpecConfig, StateWriterView, ValidatorsView,
 };
 use silver_common::ssz_view::{
-    ATTESTATION_FIXED, AttestationDataView, AttestationView, ExecutionPayloadView,
+    AttestationDataView, BEACON_BLOCK_HEADER_SIZE, BeaconBlockHeaderView, ExecutionPayloadView,
     PROPOSER_SLASHING_SIZE, ProposerSlashingView,
 };
 
@@ -22,38 +22,24 @@ pub fn attestation_index_ok(is_gloas: bool, index: u64) -> bool {
     if is_gloas { index < 2 } else { index == 0 }
 }
 
-pub fn validate_attestation_data(
-    att: &[u8],
-    state_slot: Slot,
-    current_epoch: Epoch,
-    previous_epoch: Epoch,
-    is_gloas: bool,
-) -> Result<(), AttestationError> {
-    if att.len() < ATTESTATION_FIXED {
-        return Err(AttestationError::TooShort { len: att.len(), min: ATTESTATION_FIXED });
-    }
-    validate_attestation_data_view(
-        AttestationView::data(att),
-        state_slot,
-        current_epoch,
-        previous_epoch,
-        is_gloas,
-    )
-}
-
 pub fn validate_attestation_data_view(
     data: AttestationDataView,
     state_slot: Slot,
     current_epoch: Epoch,
     previous_epoch: Epoch,
     is_gloas: bool,
+    min_inclusion_delay: Slot,
 ) -> Result<(), AttestationError> {
     let att_slot = data.slot();
     let att_index = data.index();
     let target_epoch = data.target_epoch();
 
-    if att_slot >= state_slot {
-        return Err(AttestationError::SlotNotPast { att_slot, state_slot });
+    if att_slot.saturating_add(min_inclusion_delay) > state_slot {
+        return Err(AttestationError::InclusionDelayTooShort {
+            att_slot,
+            state_slot,
+            min_inclusion_delay,
+        });
     }
 
     let att_epoch = att_slot / SLOTS_PER_EPOCH;
@@ -84,18 +70,28 @@ pub fn validate_proposer_slashing(data: &[u8]) -> Result<(), ProposerSlashingErr
         });
     }
     let s: &[u8; PROPOSER_SLASHING_SIZE] = data[..PROPOSER_SLASHING_SIZE].try_into().unwrap();
-    let h1_idx = ProposerSlashingView::h1_proposer_index(s);
-    let h2_idx = ProposerSlashingView::h2_proposer_index(s);
+    validate_proposer_slashing_headers(
+        ProposerSlashingView::header_1(s),
+        ProposerSlashingView::header_2(s),
+    )
+}
+
+/// The spec's checks on the two headers a proposer slashing pairs.
+pub fn validate_proposer_slashing_headers(
+    h1: &[u8; BEACON_BLOCK_HEADER_SIZE],
+    h2: &[u8; BEACON_BLOCK_HEADER_SIZE],
+) -> Result<(), ProposerSlashingError> {
+    let h1_idx = BeaconBlockHeaderView::proposer_index(h1);
+    let h2_idx = BeaconBlockHeaderView::proposer_index(h2);
     if h1_idx != h2_idx {
         return Err(ProposerSlashingError::ProposerIndexMismatch { h1: h1_idx, h2: h2_idx });
     }
-    let h1_slot = ProposerSlashingView::h1_slot(s);
-    let h2_slot = ProposerSlashingView::h2_slot(s);
+    let h1_slot = BeaconBlockHeaderView::slot(h1);
+    let h2_slot = BeaconBlockHeaderView::slot(h2);
     if h1_slot != h2_slot {
         return Err(ProposerSlashingError::SlotMismatch { h1: h1_slot, h2: h2_slot });
     }
-    // Distinct headers — same SignedBeaconBlockHeader is not slashable.
-    if data[0..112] == data[208..320] {
+    if h1 == h2 {
         return Err(ProposerSlashingError::SameHeader);
     }
     Ok(())

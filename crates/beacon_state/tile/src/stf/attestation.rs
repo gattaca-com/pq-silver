@@ -1,20 +1,22 @@
 use blst::min_pk::PublicKey;
 use flux_profiler::timed;
 use silver_beacon_state_data::{
-    B256, Checkpoint, Epoch, EpochView, Immutable, PARTICIPATION_WEIGHTS, ParticipationWriteView,
-    SLOTS_PER_EPOCH, Slot, SlotStateWriteView, StateWriterView, TIMELY_HEAD_FLAG,
-    TIMELY_SOURCE_FLAG, TIMELY_TARGET_FLAG, TreeSpec, ValidatorsView,
+    B256, BlockRoots, Checkpoint, Epoch, EpochView, Immutable, PARTICIPATION_WEIGHTS,
+    ParticipationWriteView, RootsView, SLOTS_PER_EPOCH, Slot, SlotStateWriteView, StateWriterView,
+    TIMELY_HEAD_FLAG, TIMELY_SOURCE_FLAG, TIMELY_TARGET_FLAG, TreeSpec, ValidatorsView, Version,
     bls::{self, SigBatch},
 };
-use silver_common::ssz_view::{AttestationDataView, AttestationView};
+use silver_common::ssz_view::{
+    ATTESTATION_FIXED, AttestationDataView, AttestationPqView, AttestationView,
+};
 
 use crate::{
     error::{AttestationError, Result},
     merkle, ssz_hash,
     stf::{
         BASE_REWARD_FACTOR, EFFECTIVE_BALANCE_INCREMENT, EpochShuffling, PROPOSER_WEIGHT,
-        ShufflingRef, StfScratch, VoteBatch, VoteTarget, WEIGHT_DENOMINATOR,
-        for_each_ssz_list_item, integer_sqrt,
+        ShufflingRef, StarkClaims, VoteBatch, VoteTarget, WEIGHT_DENOMINATOR,
+        for_each_ssz_list_item, integer_sqrt, stark::AttestationStatements,
     },
     validate,
 };
@@ -53,6 +55,89 @@ pub fn collect_sigs_attestations(
     )
 }
 
+/// The slot of the block whose payload availability a vote at `att_slot` is
+/// checked against. Gloas includes votes a slot later and checks the parent.
+/// PQ includes them two slots later, so the voted block may be older.
+pub(crate) fn voted_block_slot(
+    block_roots: &RootsView<BlockRoots>,
+    att_slot: Slot,
+    parent_slot: Slot,
+    block_slot: Slot,
+    is_pq: bool,
+) -> Slot {
+    if is_pq {
+        block_roots.latest_block_slot(att_slot, parent_slot, block_slot)
+    } else {
+        parent_slot
+    }
+}
+
+pub(crate) fn attester_signing_root(
+    imm: &Immutable,
+    (fork_epoch, previous_version, current_version): (Epoch, Version, Version),
+    data: AttestationDataView,
+) -> B256 {
+    let fork_version = bls::fork_version_at_epoch(
+        fork_epoch,
+        previous_version,
+        current_version,
+        data.target_epoch(),
+    );
+    let domain = bls::compute_domain(
+        bls::DOMAIN_BEACON_ATTESTER,
+        fork_version,
+        &imm.genesis_validators_root,
+    );
+    bls::compute_signing_root(&ssz_hash::hash_attestation_data(data.as_bytes()), &domain)
+}
+
+/// The fields an attestation keeps across forks, read from its fork's layout.
+pub(crate) struct Attestation<'a> {
+    pub(crate) data: AttestationDataView<'a>,
+    committee_bits: u64,
+    aggregation_bits: &'a [u8],
+    /// PQ has no `is_valid_indexed_attestation` to reject an attestation
+    /// naming no committee, so it applies as a no-op.
+    may_name_no_committee: bool,
+}
+
+impl<'a> Attestation<'a> {
+    fn parse(att: &'a [u8], is_pq: bool) -> Result<Self, AttestationError> {
+        if is_pq {
+            return Self::pq(att);
+        }
+        if att.len() < ATTESTATION_FIXED {
+            return Err(AttestationError::TooShort { len: att.len(), min: ATTESTATION_FIXED });
+        }
+        Ok(Self::electra(att))
+    }
+
+    /// `att` holds at least the fixed part.
+    fn electra(att: &'a [u8]) -> Self {
+        Self {
+            data: AttestationView::data(att),
+            committee_bits: u64::from_le_bytes(*AttestationView::committee_bits(att)),
+            aggregation_bits: AttestationView::aggregation_bits(att),
+            may_name_no_committee: false,
+        }
+    }
+
+    fn pq(att: &'a [u8]) -> Result<Self, AttestationError> {
+        if !AttestationPqView::check_canonical(att) {
+            return Err(AttestationError::Malformed { len: att.len() });
+        }
+        let mut committee_bits = [0; 8];
+        let bits = AttestationPqView::committee_bits(att);
+        committee_bits[..bits.len()].copy_from_slice(bits);
+        Ok(Self {
+            data: AttestationPqView::data(att),
+            committee_bits: u64::from_le_bytes(committee_bits),
+            aggregation_bits: AttestationPqView::aggregation_bits(att),
+            may_name_no_committee: true,
+        })
+    }
+}
+
 pub struct AttestedCommittees<'a> {
     shuffling: &'a EpochShuffling<'a>,
     slot: Slot,
@@ -61,9 +146,20 @@ pub struct AttestedCommittees<'a> {
 }
 
 impl<'a> AttestedCommittees<'a> {
-    pub fn new(att: &'a [u8], shuffling: &'a EpochShuffling<'a>) -> Result<Self, AttestationError> {
-        let committee_bits = u64::from_le_bytes(*AttestationView::committee_bits(att));
-        if committee_bits == 0 {
+    pub fn new(
+        att: &'a [u8],
+        is_pq: bool,
+        shuffling: &'a EpochShuffling<'a>,
+    ) -> Result<Self, AttestationError> {
+        Self::of(&Attestation::parse(att, is_pq)?, shuffling)
+    }
+
+    fn of(
+        att: &Attestation<'a>,
+        shuffling: &'a EpochShuffling<'a>,
+    ) -> Result<Self, AttestationError> {
+        let committee_bits = att.committee_bits;
+        if committee_bits == 0 && !att.may_name_no_committee {
             return Err(AttestationError::EmptyCommitteeBits);
         }
         let committees_per_slot = shuffling.committees_per_slot;
@@ -76,14 +172,14 @@ impl<'a> AttestedCommittees<'a> {
         }
         Ok(Self {
             shuffling,
-            slot: AttestationView::data(att).slot(),
+            slot: att.data.slot(),
             committee_bits,
-            agg_bits: AttestationView::aggregation_bits(att),
+            agg_bits: att.aggregation_bits,
         })
     }
 
-    pub fn resolve(
-        att: &'a [u8],
+    pub(crate) fn resolve(
+        att: &Attestation<'a>,
         shuffling: &'a ShufflingRef<'a>,
         is_current: bool,
         validators_count: usize,
@@ -92,7 +188,7 @@ impl<'a> AttestedCommittees<'a> {
         if epoch_shuffling.is_empty() {
             return Err(AttestationError::EmptyShuffling);
         }
-        let committees = Self::new(att, epoch_shuffling)?;
+        let committees = Self::of(att, epoch_shuffling)?;
         committees.check_indices_addressable(validators_count)?;
         Ok(committees)
     }
@@ -225,17 +321,15 @@ pub fn collect_sigs_single_attestation(
     let data = AttestationView::data(att);
     let target_epoch = data.target_epoch();
     let is_current = target_epoch == current_epoch;
-    let committees = AttestedCommittees::resolve(att, shuffling, is_current, validators.count())?;
+    let committees = AttestedCommittees::resolve(
+        &Attestation::electra(att),
+        shuffling,
+        is_current,
+        validators.count(),
+    )?;
 
-    let fork_version = bls::fork_version_at_epoch(fork_epoch, prev_v, curr_v, target_epoch);
     let sig = AttestationView::signature(att);
-    let object_root = ssz_hash::hash_attestation_data(data.as_bytes());
-    let domain = bls::compute_domain(
-        bls::DOMAIN_BEACON_ATTESTER,
-        fork_version,
-        &imm.genesis_validators_root,
-    );
-    let signing_root = bls::compute_signing_root(&object_root, &domain);
+    let signing_root = attester_signing_root(imm, (fork_epoch, prev_v, curr_v), data);
 
     committees.push_aggregate_sig(validators, sig, signing_root, sig_batch);
     Ok(())
@@ -247,17 +341,19 @@ pub struct BlockAttestations<'a> {
     epoch: EpochView<'a>,
     current_epoch: Epoch,
     previous_epoch: Epoch,
-    /// Gloas: the payload availability bit at the parent block's slot, which
-    /// every vote's `index` is checked against. It is not at `data.slot`:
-    /// the two differ across skipped slots.
-    payload_index: Option<u64>,
+    /// Gloas: the slot of the block's parent, which locates the payload
+    /// availability bit every vote's `index` is checked against.
+    parent_slot: Option<Slot>,
+    post_gloas_fork: bool,
+    is_pq: bool,
+    min_inclusion_delay: Slot,
     base_reward_per_increment: u64,
     shuffling: &'a ShufflingRef<'a>,
 }
 
 impl<'a> BlockAttestations<'a> {
     pub fn new(
-        slot: &SlotStateWriteView,
+        view: &StateWriterView,
         epoch: EpochView<'a>,
         block_slot: Slot,
         parent_slot: Option<Slot>,
@@ -265,12 +361,15 @@ impl<'a> BlockAttestations<'a> {
     ) -> Self {
         let current_epoch = block_slot / SLOTS_PER_EPOCH;
         Self {
-            epoch,
             current_epoch,
             previous_epoch: current_epoch.saturating_sub(1),
-            payload_index: parent_slot.map(|parent| slot.state().payload_available(parent) as u64),
+            parent_slot,
+            post_gloas_fork: epoch.post_gloas_fork(view.imm),
+            is_pq: epoch.is_pq(view.imm),
+            min_inclusion_delay: epoch.min_attestation_inclusion_delay(view.imm),
             base_reward_per_increment: EFFECTIVE_BALANCE_INCREMENT * BASE_REWARD_FACTOR /
-                integer_sqrt(slot.total_active_balance(current_epoch)),
+                integer_sqrt(view.slot.total_active_balance(current_epoch)),
+            epoch,
             shuffling,
         }
     }
@@ -282,7 +381,8 @@ impl<'a> BlockAttestations<'a> {
         attestation_data: &[u8],
         proposer_index: u32,
         votes_sink: &mut VoteBatch,
-        scratch: &mut StfScratch,
+        active: &mut Vec<u32>,
+        mut stark: Option<&mut StarkClaims>,
     ) -> Result<u64, AttestationError> {
         if attestation_data.is_empty() {
             return Ok(0);
@@ -298,7 +398,8 @@ impl<'a> BlockAttestations<'a> {
                 parent_len: attestation_data.len(),
             },
             |att| {
-                let reward_numerator = self.process(view, att, votes_sink, scratch)?;
+                let reward_numerator =
+                    self.process(view, att, votes_sink, active, stark.as_deref_mut())?;
                 proposer_reward += reward_numerator / proposer_reward_denominator;
                 Ok(())
             },
@@ -315,29 +416,33 @@ impl<'a> BlockAttestations<'a> {
         view: &mut StateWriterView,
         att: &[u8],
         votes_sink: &mut VoteBatch,
-        scratch: &mut StfScratch,
+        active: &mut Vec<u32>,
+        stark: Option<&mut StarkClaims>,
     ) -> Result<u64, AttestationError> {
         let current_slot = view.slot.state().slot;
-        let post_gloas_fork = self.epoch.post_gloas_fork(view.imm);
-        validate::validate_attestation_data(
-            att,
+        let Self { post_gloas_fork, min_inclusion_delay, .. } = *self;
+        let att = Attestation::parse(att, self.is_pq)?;
+        validate::validate_attestation_data_view(
+            att.data,
             current_slot,
             self.current_epoch,
             self.previous_epoch,
             post_gloas_fork,
+            min_inclusion_delay,
         )?;
 
-        let parsed = ParsedAttestationData::parse(AttestationView::data(att));
+        let parsed = ParsedAttestationData::parse(att.data);
         let is_current = self.target_is_current(parsed.target_epoch)?;
         parsed.check_source(self.justified(is_current))?;
 
-        let payload_index = if post_gloas_fork {
-            Some(self.payload_index.ok_or(AttestationError::MissingParentSlot)?)
-        } else {
-            None
-        };
-        let flags =
-            parsed.flags(|slot| view.block_roots.at_slot(slot), current_slot, payload_index)?;
+        let payload_index =
+            if post_gloas_fork { Some(self.payload_index(view, parsed.att_slot)?) } else { None };
+        let flags = parsed.flags(
+            |slot| view.block_roots.at_slot(slot),
+            current_slot,
+            payload_index,
+            min_inclusion_delay,
+        )?;
 
         let target = VoteTarget {
             block_root: *parsed.beacon_block_root,
@@ -345,9 +450,14 @@ impl<'a> BlockAttestations<'a> {
             attestation_slot: parsed.att_slot,
             payload_present: parsed.payload_present(),
         };
-        self.collect_participants(view.validators.count(), att, is_current, &mut scratch.active)?;
-        votes_sink.push(target, &scratch.active);
-        let attesters = &scratch.active;
+        let statements = stark
+            .map(|claims| claims.attestation(view.imm, self.epoch.fork_descriptor(), att.data));
+        self.collect_participants(view.validators.count(), &att, is_current, active, statements)?;
+        if active.is_empty() {
+            return Ok(0);
+        }
+        votes_sink.push(target, active);
+        let attesters = &*active;
 
         if flags == 0 {
             return Ok(0);
@@ -378,6 +488,23 @@ impl<'a> BlockAttestations<'a> {
         Ok(applied.proposer_reward_numerator)
     }
 
+    fn payload_index(
+        &self,
+        view: &StateWriterView,
+        att_slot: Slot,
+    ) -> Result<u64, AttestationError> {
+        let parent_slot = self.parent_slot.ok_or(AttestationError::MissingParentSlot)?;
+        let slot_state = view.slot.state();
+        let block_slot = voted_block_slot(
+            &view.block_roots.reader(),
+            att_slot,
+            parent_slot,
+            slot_state.slot,
+            self.is_pq,
+        );
+        Ok(slot_state.payload_available(block_slot) as u64)
+    }
+
     fn target_is_current(&self, target: Epoch) -> Result<bool, AttestationError> {
         let (curr, prev) = (self.current_epoch, self.previous_epoch);
         if target == curr {
@@ -396,13 +523,15 @@ impl<'a> BlockAttestations<'a> {
 
     /// Append the attesting validator indices to `out`, in ascending order:
     /// committee order is shuffled, and a monotonic sweep makes the
-    /// per-attester column reads that follow sequential.
+    /// per-attester column reads that follow sequential. Each committee's
+    /// attesters, in committee order, are also one of `statements`.
     fn collect_participants(
         &self,
         validator_count: usize,
-        att: &[u8],
+        att: &Attestation<'_>,
         is_current: bool,
         out: &mut Vec<u32>,
+        mut statements: Option<AttestationStatements<'_>>,
     ) -> Result<(), AttestationError> {
         let committees =
             AttestedCommittees::resolve(att, self.shuffling, is_current, validator_count)?;
@@ -419,10 +548,13 @@ impl<'a> BlockAttestations<'a> {
             if out.len() == before {
                 return Err(AttestationError::EmptyCommittee);
             }
+            if let Some(statements) = &mut statements {
+                statements.push(out[before..].iter().copied());
+            }
             agg_offset += committee.len();
         }
 
-        let bitlist_len = merkle::bitlist_len(AttestationView::aggregation_bits(att));
+        let bitlist_len = merkle::bitlist_len(att.aggregation_bits);
         if bitlist_len != agg_offset {
             return Err(AttestationError::BitlistLenMismatch {
                 expected: agg_offset,
@@ -550,12 +682,14 @@ impl<'a> ParsedAttestationData<'a> {
 
     /// The spec's `get_attestation_participation_flag_indices`, as flag bits.
     /// `root_at` is the state's `get_block_root_at_slot`; `payload_index` is
-    /// `None` before Gloas.
+    /// `None` before Gloas. A head vote is timely only at exactly the fork's
+    /// minimum inclusion delay.
     pub(crate) fn flags(
         &self,
         root_at: impl Fn(Slot) -> B256,
         current_slot: Slot,
         payload_index: Option<u64>,
+        min_inclusion_delay: Slot,
     ) -> Result<u8, AttestationError> {
         let expected_target_root = root_at(self.target_epoch * SLOTS_PER_EPOCH);
         let is_matching_target = *self.target_root == expected_target_root;
@@ -569,7 +703,8 @@ impl<'a> ParsedAttestationData<'a> {
 
         Ok((u8::from(inclusion_delay <= 5) * TIMELY_SOURCE_FLAG) |
             (u8::from(is_matching_target) * TIMELY_TARGET_FLAG) |
-            (u8::from(is_matching_head && inclusion_delay == 1) * TIMELY_HEAD_FLAG))
+            (u8::from(is_matching_head && inclusion_delay == min_inclusion_delay) *
+                TIMELY_HEAD_FLAG))
     }
 }
 
@@ -585,7 +720,90 @@ struct AppliedFlags {
 
 #[cfg(test)]
 mod tests {
-    use super::{AttestedCommittees, EpochShuffling};
+    use silver_beacon_state_data::{
+        B256, MIN_ATTESTATION_INCLUSION_DELAY, Slot, TIMELY_HEAD_FLAG, TIMELY_SOURCE_FLAG,
+        TIMELY_TARGET_FLAG, pq::MIN_ATTESTATION_INCLUSION_DELAY_PQ,
+    };
+    use silver_common::ssz_view::{
+        ATTESTATION_DATA_SIZE, ATTESTATION_PQ_FIXED, AttestationDataView,
+    };
+
+    use super::{
+        ATTESTATION_FIXED, Attestation, AttestationError, AttestedCommittees, EpochShuffling,
+        ParsedAttestationData,
+    };
+
+    const ROOT: B256 = [7; 32];
+
+    /// A vote at slot 33 for the block at slot 32, its target, which the
+    /// empty slot 33 carries forward. It claims the payload present.
+    fn vote_bytes() -> [u8; ATTESTATION_DATA_SIZE] {
+        let mut data = [0; ATTESTATION_DATA_SIZE];
+        data[..8].copy_from_slice(&33u64.to_le_bytes());
+        data[8..16].copy_from_slice(&1u64.to_le_bytes());
+        data[16..48].copy_from_slice(&ROOT);
+        data[88..96].copy_from_slice(&1u64.to_le_bytes());
+        data[96..128].copy_from_slice(&ROOT);
+        data
+    }
+
+    fn flags(current_slot: Slot, min_inclusion_delay: Slot) -> u8 {
+        let data = vote_bytes();
+        ParsedAttestationData::parse(AttestationDataView::new(&data))
+            .flags(|_| ROOT, current_slot, Some(1), min_inclusion_delay)
+            .unwrap()
+    }
+
+    #[test]
+    fn head_is_timely_only_at_the_minimum_inclusion_delay() {
+        let all = TIMELY_SOURCE_FLAG | TIMELY_TARGET_FLAG | TIMELY_HEAD_FLAG;
+        let late = TIMELY_SOURCE_FLAG | TIMELY_TARGET_FLAG;
+        assert_eq!(flags(34, MIN_ATTESTATION_INCLUSION_DELAY), all);
+        assert_eq!(flags(35, MIN_ATTESTATION_INCLUSION_DELAY), late);
+        assert_eq!(flags(35, MIN_ATTESTATION_INCLUSION_DELAY_PQ), all);
+        assert_eq!(flags(36, MIN_ATTESTATION_INCLUSION_DELAY_PQ), late);
+    }
+
+    #[test]
+    fn pq_attestation_reads_its_own_layout() {
+        let committee_bits_len = ATTESTATION_PQ_FIXED - 4 - ATTESTATION_DATA_SIZE;
+        let mut att = Vec::from((ATTESTATION_PQ_FIXED as u32).to_le_bytes());
+        att.extend_from_slice(&vote_bytes());
+        att.extend(std::iter::once(0b101).chain(std::iter::repeat_n(0, committee_bits_len - 1)));
+        att.extend_from_slice(&[0b11, 0b1]);
+
+        let parsed = Attestation::parse(&att, true).unwrap();
+        assert_eq!(parsed.data.slot(), 33);
+        assert_eq!(parsed.committee_bits, 0b101);
+        assert_eq!(parsed.aggregation_bits, [0b11, 0b1]);
+
+        att[0] += 1;
+        assert!(Attestation::parse(&att, true).is_err(), "a misplaced offset is not canonical");
+    }
+
+    /// PQ drops `is_valid_indexed_attestation`, so an attestation naming no
+    /// committee applies as a no-op instead of failing the block.
+    #[test]
+    fn only_pq_admits_an_attestation_naming_no_committee() {
+        let shuffled: Vec<u32> = (0..64).collect();
+        let shuffling = EpochShuffling::with_committees_per_slot(&shuffled, 2);
+        let committee_bits_len = ATTESTATION_PQ_FIXED - 4 - ATTESTATION_DATA_SIZE;
+        let mut pq = Vec::from((ATTESTATION_PQ_FIXED as u32).to_le_bytes());
+        pq.extend_from_slice(&vote_bytes());
+        pq.extend(std::iter::repeat_n(0, committee_bits_len));
+        pq.push(0b1);
+
+        let committees = AttestedCommittees::new(&pq, true, &shuffling).unwrap();
+        assert_eq!(committees.committees().count(), 0);
+
+        let mut electra = vec![0; ATTESTATION_FIXED];
+        electra[..4].copy_from_slice(&(ATTESTATION_FIXED as u32).to_le_bytes());
+        electra.push(0b1);
+        assert!(matches!(
+            AttestedCommittees::new(&electra, false, &shuffling),
+            Err(AttestationError::EmptyCommitteeBits)
+        ));
+    }
 
     /// `attested_count` short-circuits the committee walk, so it has to agree
     /// with the `members` walk on every bitlist shape — including ones too

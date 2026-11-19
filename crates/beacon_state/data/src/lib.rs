@@ -12,8 +12,9 @@ pub use decompose::DecomposeError;
 pub use delta_view::{StateView, StateWriterView};
 pub use encode::{FULU_CHECKPOINT_SECTIONS, PubkeysDecodeError, decode_checkpoint_pubkeys};
 pub use epoch::{
-    AGGREGATION_COMMITTEE_WINDOW_LEN, AggregationCommitteeWindow, EffectiveIncrements, EpochGroup,
-    EpochId, EpochReadView, EpochStateFinalized, EpochView, EpochWriteView, PtcWindow,
+    AGGREGATION_COMMITTEE_WINDOW_LEN, AGGREGATORS_PER_COMMITTEE, AggregationCommittee,
+    AggregationCommitteeWindow, EffectiveIncrements, EpochGroup, EpochId, EpochReadView,
+    EpochStateFinalized, EpochView, EpochWriteView, PtcWindow,
 };
 pub use eth1::{Eth1Group, Eth1Id, Eth1View, Eth1Votes, Eth1WriteView};
 pub use fork_writer::ForkWriter;
@@ -30,9 +31,9 @@ pub use pending::{
     PendingGroup, PendingId, PendingView, PendingWriteView, QueueItem, QueueView, QueueWriteView,
 };
 pub use preregistrations::{
-    BuilderPreregistration, FinalizedList, ListView, ListWriter, PREREGISTRATIONS_LIMIT,
-    Preregistrations, PreregistrationsGroup, PreregistrationsId, PreregistrationsView,
-    PreregistrationsWriteView, Record, ValidatorPreregistration,
+    BuilderPreregistration, FinalizedList, ListView, ListWriter, PREREGISTRATION_EXPIRY_SLOTS,
+    PREREGISTRATIONS_LIMIT, Preregistration, Preregistrations, PreregistrationsGroup,
+    PreregistrationsId, PreregistrationsView, PreregistrationsWriteView, ValidatorPreregistration,
 };
 pub use silver_chain_spec::{BlobParameters, ForkName, SpecConfig};
 pub use silver_ssz::body_offsets::{BlockBodyError, BodyFork, BodyOffsets, OperationKind, Payload};
@@ -131,6 +132,10 @@ impl BeaconState {
     /// Gloas or a later fork: every Gloas tier is live.
     pub fn is_finalized_post_gloas(&self) -> bool {
         self.immutable.is_post_gloas_fork(self.epoch.finalized().state().fork.current_version)
+    }
+
+    pub fn is_finalized_pq(&self) -> bool {
+        self.immutable.is_pq(self.epoch.finalized().state().fork.current_version)
     }
 
     /// Anchor a fresh per-fork delta on every always-rolled tier (epoch/

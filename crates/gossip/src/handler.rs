@@ -649,9 +649,10 @@ impl ActiveDomains {
     /// digests are ignored, never penalized.
     pub(crate) fn parse(&self, wire: &str) -> Result<(GossipTopic, GossipDomain), Error> {
         for state in self.states() {
-            if let Ok(topic) = GossipTopic::from_wire(wire, &state.hex) &&
-                topic.supports_format(state.domain.format())
-            {
+            if let Ok(topic) = GossipTopic::from_wire(wire, &state.hex) {
+                if !topic.supports_format(state.domain.format()) {
+                    return Err(Error::TopicNotInFork);
+                }
                 return Ok((topic, state.domain));
             }
         }

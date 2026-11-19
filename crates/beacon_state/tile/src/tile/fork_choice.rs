@@ -1,24 +1,30 @@
 use flux::spine::SpineProducers;
 use flux_profiler::timed;
 use silver_beacon_state_data::{
-    B256, Checkpoint, SLOTS_PER_EPOCH, StateId,
+    B256, Checkpoint, SLOTS_PER_EPOCH, Slot, StateId, StateReadView,
     bls::{self, CheckedSignature},
 };
 use silver_common::{
     BeaconStateEvent, PayloadValidationStatus, hex32,
     ssz_view::{
-        BeaconBlockBodyGloasView as BlockBodyGloas, PAYLOAD_ATTESTATION_SIZE,
-        PayloadAttestationDataView as PayloadAttestationData,
+        BeaconBlockBodyGloasView as BlockBodyGloas, PAYLOAD_ATTESTATION_DATA_SIZE,
+        PAYLOAD_ATTESTATION_MESSAGE_PQ_SIZE, PAYLOAD_ATTESTATION_SIZE,
+        PayloadAttestationDataView as PayloadAttestationData, PayloadAttestationMessagePqView,
         PayloadAttestationMessageView as PayloadAttestationMessage,
         PayloadAttestationView as PayloadAttestation, SignedBeaconBlockView,
     },
 };
 use silver_ssz::ssz_view::PAYLOAD_ATTESTATION_MESSAGE_SIZE;
 
-use super::{BeaconStateTile, MAXIMUM_GOSSIP_CLOCK_DISPARITY, Producers};
+use super::{
+    BeaconStateTile, MAXIMUM_GOSSIP_CLOCK_DISPARITY, Producers, fork_data_roots::ForkDataRoots,
+};
 use crate::{
     stf,
-    tile::{Feedback, gossip::PreparedPtc},
+    tile::{
+        Feedback,
+        gossip::{PTC_MASK_WORDS, PreparedPqPtc, PreparedPtc, PtcVote},
+    },
 };
 
 impl BeaconStateTile {
@@ -159,13 +165,9 @@ impl BeaconStateTile {
     }
 
     pub(super) fn prepare_ptc(&mut self, ssz: &[u8]) -> Result<PreparedPtc, Feedback> {
-        if ssz.len() != PAYLOAD_ATTESTATION_MESSAGE_SIZE {
+        let Ok(buf) = <&[u8; PAYLOAD_ATTESTATION_MESSAGE_SIZE]>::try_from(ssz) else {
             return Err(Feedback::reject("ptc message size"));
-        }
-        let buf: &[u8; PAYLOAD_ATTESTATION_MESSAGE_SIZE] =
-            ssz[..PAYLOAD_ATTESTATION_MESSAGE_SIZE].try_into().unwrap();
-
-        let validator_index = PayloadAttestationMessage::validator_index(buf);
+        };
         let data = PayloadAttestationMessage::data(buf);
         // SSZ bools have exactly two canonical encodings. The view accessors
         // intentionally expose bool semantics, so reject non-canonical bytes
@@ -173,13 +175,64 @@ impl BeaconStateTile {
         if data[40] > 1 || data[41] > 1 {
             return Err(Feedback::reject("ptc non-canonical bool"));
         }
-        let block_root = *PayloadAttestationData::beacon_block_root(data);
         let slot = PayloadAttestationData::slot(data);
         if self.spec.is_pq_at_slot(slot) {
             return Err(Feedback::reject("BLS payload attestation for a PQ slot"));
         }
-        let present = PayloadAttestationData::payload_present(data);
-        let da = PayloadAttestationData::blob_data_available(data);
+        let (vote, state_id) =
+            self.check_ptc_vote(PayloadAttestationMessage::validator_index(buf), data)?;
+
+        let rv = self.state.read_view(state_id);
+        let signing_root = bls::compute_signing_root(
+            &stf::hash_payload_attestation_data(data),
+            &Self::ptc_domain(&mut self.fork_data_roots, &rv, slot),
+        );
+        Ok(PreparedPtc {
+            pubkey: *rv.validators.pubkey_decompressed(vote.validator as usize),
+            vote,
+            signing_root,
+            signature: *PayloadAttestationMessage::signature(buf),
+        })
+    }
+
+    pub(super) fn prepare_pq_ptc(&mut self, ssz: &[u8]) -> Result<PreparedPqPtc, Feedback> {
+        let message: &[u8; PAYLOAD_ATTESTATION_MESSAGE_PQ_SIZE] =
+            ssz.try_into().expect("checked PQ payload attestation size");
+        let data = PayloadAttestationMessagePqView::data(message);
+        let slot = PayloadAttestationData::slot(data);
+        if !self.spec.is_pq_at_slot(slot) {
+            return Err(Feedback::reject("XMSS payload attestation before the PQ fork"));
+        }
+        let (vote, state_id) =
+            self.check_ptc_vote(PayloadAttestationMessagePqView::validator_index(message), data)?;
+
+        let rv = self.state.read_view(state_id);
+        let Some(pubkey) = rv.validator_xmss_pubkey(vote.validator as usize) else {
+            return Err(Feedback::Ignore);
+        };
+        Ok(PreparedPqPtc {
+            message: *message,
+            pubkey: *pubkey,
+            domain: Self::ptc_domain(&mut self.fork_data_roots, &rv, slot),
+            vote,
+        })
+    }
+
+    fn ptc_domain(fork_data_roots: &mut ForkDataRoots, rv: &StateReadView, slot: Slot) -> B256 {
+        let fork_version = rv.epoch.fork_version_at(slot / SLOTS_PER_EPOCH);
+        bls::domain_from_fork_data(
+            bls::DOMAIN_PTC_ATTESTER,
+            &fork_data_roots.root(fork_version, &rv.imm.genesis_validators_root),
+        )
+    }
+
+    fn check_ptc_vote(
+        &mut self,
+        validator_index: u64,
+        data: &[u8; PAYLOAD_ATTESTATION_DATA_SIZE],
+    ) -> Result<(PtcVote, StateId), Feedback> {
+        let block_root = *PayloadAttestationData::beacon_block_root(data);
+        let slot = PayloadAttestationData::slot(data);
 
         if !self.ticker.is_current_slot_with_disparity(slot, MAXIMUM_GOSSIP_CLOCK_DISPARITY) {
             return Err(self.slot_window_miss(slot));
@@ -205,7 +258,7 @@ impl BeaconStateTile {
         else {
             return Err(Feedback::Ignore);
         };
-        let mut ptc_positions = [0u64; crate::tile::gossip::PTC_MASK_WORDS];
+        let mut ptc_positions = [0u64; PTC_MASK_WORDS];
         for (position, &member) in ptc.iter().enumerate() {
             if member == validator_index {
                 ptc_positions[position / 64] |= 1 << (position % 64);
@@ -218,37 +271,35 @@ impl BeaconStateTile {
             return Err(Feedback::reject("ptc validator out of range"));
         }
 
-        let fork_version = rv.epoch.fork_version_at(slot / SLOTS_PER_EPOCH);
-        let domain = bls::domain_from_fork_data(
-            bls::DOMAIN_PTC_ATTESTER,
-            &self.fork_data_roots.root(fork_version, &rv.imm.genesis_validators_root),
-        );
-        let signing_root =
-            bls::compute_signing_root(&stf::hash_payload_attestation_data(data), &domain);
-        let signature = *PayloadAttestationMessage::signature(buf);
-
-        Ok(PreparedPtc {
+        let vote = PtcVote {
             block_root,
             slot,
             validator: validator_index,
             ptc_positions,
-            present,
-            da,
-            pubkey: *rv.validators.pubkey_decompressed(validator_index as usize),
-            signing_root,
-            signature,
-        })
+            present: PayloadAttestationData::payload_present(data),
+            da: PayloadAttestationData::blob_data_available(data),
+        };
+        Ok((vote, state_id))
+    }
+
+    pub(super) fn record_ptc_vote(&mut self, vote: &PtcVote) {
+        self.fork_choice.record_ptc_votes(
+            &vote.block_root,
+            &vote.ptc_positions,
+            vote.present,
+            vote.da,
+        );
+        self.seen_ptc.mark(vote.slot, vote.validator as usize);
     }
 
     pub(super) fn commit_ptc(&mut self, p: &PreparedPtc, signature: &CheckedSignature) {
-        self.fork_choice.record_ptc_votes(&p.block_root, &p.ptc_positions, p.present, p.da);
-        self.seen_ptc.mark(p.slot, p.validator as usize);
+        self.record_ptc_vote(&p.vote);
         self.payload_attestation_pool.insert(
-            &p.block_root,
-            p.slot,
-            p.present,
-            p.da,
-            &p.ptc_positions,
+            &p.vote.block_root,
+            p.vote.slot,
+            p.vote.present,
+            p.vote.da,
+            &p.vote.ptc_positions,
             &signature.into_sig(),
         );
     }

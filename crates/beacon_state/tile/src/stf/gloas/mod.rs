@@ -7,8 +7,9 @@ mod payload_attestation;
 mod withdrawals;
 
 pub use bid::{
-    collect_sigs_execution_payload_bid, decode_bid, is_gas_limit_target_compatible,
-    process_execution_payload_bid, verify_execution_payload_bid_signature,
+    collect_sigs_execution_payload_bid, decode_bid, decode_bid_message,
+    is_gas_limit_target_compatible, process_execution_payload_bid,
+    verify_execution_payload_bid_signature,
 };
 pub use builders::{
     get_builder_payment_quorum_threshold, process_builder_deposit_request,

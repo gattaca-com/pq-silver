@@ -170,11 +170,15 @@ pub fn decode_bid(signed_bid: &[u8]) -> Result<ExecutionPayloadBid, E> {
     if !SignedExecutionPayloadBidView::check_size(signed_bid) {
         return Err(E::Malformed { len: signed_bid.len() });
     }
-    let message = SignedExecutionPayloadBidView::message(signed_bid);
+    decode_bid_message(SignedExecutionPayloadBidView::message(signed_bid))
+        .map_err(|_| E::Malformed { len: signed_bid.len() })
+}
+
+pub fn decode_bid_message(message: &[u8]) -> Result<ExecutionPayloadBid, E> {
     if !ExecutionPayloadBidView::check_size(message) {
-        return Err(E::Malformed { len: signed_bid.len() });
+        return Err(E::Malformed { len: message.len() });
     }
-    ExecutionPayloadBid::from_ssz(message).map_err(|_| E::Malformed { len: signed_bid.len() })
+    ExecutionPayloadBid::from_ssz(message).map_err(|_| E::Malformed { len: message.len() })
 }
 
 /// Spec `is_gas_limit_target_compatible`: the EIP-1559 step from `parent`

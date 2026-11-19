@@ -35,6 +35,7 @@ use super::{
     BeaconStateTile, Feedback, Producers,
     bid_pool::BidBranch,
     block::AppliedBlock,
+    gossip::BidSignature,
     payload_attributes::{PayloadBasis, PayloadContext},
 };
 use crate::stf::{self, BlockInput, decode_bid, get_expected_withdrawals};
@@ -1251,7 +1252,7 @@ impl BeaconStateTile {
             );
             return None;
         }
-        let signature = SignedExecutionPayloadBidView::signature(bid.signed_bid);
+        let signature = BidSignature::Bls(SignedExecutionPayloadBidView::signature(bid.signed_bid));
         if let Err(feedback) = self.check_bid_on_parent(&decoded, signature, |key| bid.accepts(key))
         {
             let reason = match feedback {

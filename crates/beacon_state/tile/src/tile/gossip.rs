@@ -2,11 +2,14 @@ use std::fmt::{self, Display};
 
 use flux::spine::SpineProducers;
 use silver_beacon_state_data::{
-    B256, BLSPubkey, BidBuilderError, BuilderRegistry, Epoch, ExecutionPayloadBid,
+    B256, BLSPubkey, BidBuilderError, BuilderRegistry, Epoch, ExecutionPayloadBid, ForkName,
     MIN_SEED_LOOKAHEAD, ParsedAggregateAndProof, SLOTS_PER_EPOCH, SYNC_SUBCOMMITTEE_MASK_WORDS,
-    SYNC_SUBCOMMITTEE_SIZE, ShufflingId, Slot, StateId, StateReadView, SyncSubcommittee,
+    SYNC_SUBCOMMITTEE_SIZE, ShufflingId, Slot, SpecConfig, StateId, StateReadView,
+    SyncSubcommittee,
     bls::{self, CheckedSignature, PublicKey, Signature, VerifiedSingleAttestation},
     gloas::PTC_SIZE,
+    pq::xmss_pubkey,
+    xmss::SignatureCheck,
 };
 use silver_common::{
     BeaconStateEvent, BlockSource, BroadcastValidation, EngineNewPayloadEnvelopeReq, EngineReq,
@@ -15,19 +18,24 @@ use silver_common::{
     compute_subnet_for_attestation, hex32,
     metrics::timed,
     ssz_view::{
-        AttestationDataView, AttesterSlashingView, BuilderExitRequestView,
+        AttestationDataView, AttesterSlashingView, BeaconBlockHeaderView, BuilderExitRequestView,
         ExecutionPayloadEnvelopeView as Envelope, ExecutionPayloadView,
-        PAYLOAD_ATTESTATION_MESSAGE_SIZE, PROPOSER_SLASHING_SIZE, PayloadAttestationDataView,
-        PayloadAttestationMessageView, ProposerPreferencesView as Prefs, ProposerSlashingView,
+        PAYLOAD_ATTESTATION_MESSAGE_SIZE, PROPOSER_PREFERENCES_SIZE, PROPOSER_SLASHING_PQ_SIZE,
+        PROPOSER_SLASHING_SIZE, PayloadAttestationDataView, PayloadAttestationMessageView,
+        ProposerPreferencesView as Prefs, ProposerSlashingPqView, ProposerSlashingView,
         SIGNED_BLS_CHANGE_SIZE, SIGNED_CONTRIBUTION_AND_PROOF_SIZE,
-        SIGNED_PROPOSER_PREFERENCES_SIZE, SIGNED_VOLUNTARY_EXIT_SIZE, SINGLE_ATT_SIZE,
-        SYNC_COMMITTEE_MSG_SIZE, SignedBeaconBlockView, SignedBlsToExecutionChangeView,
-        SignedExecutionPayloadEnvelopeView as SignedPayload, SignedProposerPreferencesView,
-        SignedSyncCommitteeProofView, SignedVoluntaryExitView, SingleAttestationView,
-        SyncCommitteeView,
+        SIGNED_PROPOSER_PREFERENCES_PQ_SIZE, SIGNED_PROPOSER_PREFERENCES_SIZE,
+        SIGNED_VOLUNTARY_EXIT_SIZE, SINGLE_ATT_SIZE, SYNC_COMMITTEE_MSG_SIZE,
+        SignedBeaconBlockView, SignedBlsToExecutionChangeView,
+        SignedExecutionPayloadEnvelopeView as SignedPayload, SignedProposerPreferencesPqView,
+        SignedProposerPreferencesView, SignedSyncCommitteeProofView, SignedVoluntaryExitView,
+        SingleAttestationView, SyncCommitteeView,
     },
 };
-use silver_ssz::ssz_view::SignedExecutionPayloadBidView;
+use silver_ssz::ssz_view::{
+    PAYLOAD_ATTESTATION_MESSAGE_PQ_SIZE, SINGLE_ATT_PQ_SIZE, SignedExecutionPayloadBidPqView,
+    SignedExecutionPayloadBidView, SingleAttestationPqView, XMSSPubkey,
+};
 
 use super::{
     BeaconStateTile, Feedback, MAXIMUM_GOSSIP_CLOCK_DISPARITY, Producers,
@@ -49,7 +57,8 @@ use crate::{
     },
     merkle, ssz_hash,
     stf::{
-        self, decode_bid, is_gas_limit_target_compatible, verify_execution_payload_bid_signature,
+        self, decode_bid_message, is_gas_limit_target_compatible,
+        verify_execution_payload_bid_signature,
     },
     validate,
 };
@@ -57,6 +66,34 @@ use crate::{
 pub(super) const VOTE_BATCH_CAP: usize = 1024;
 
 pub(super) const PTC_MASK_WORDS: usize = PTC_SIZE.div_ceil(64);
+
+#[derive(Clone, Copy)]
+pub(super) enum BidSignature<'a> {
+    Bls(&'a [u8; 96]),
+    Xmss { signed_bid: &'a [u8] },
+}
+
+enum SignedPreferences<'a> {
+    Bls(&'a [u8; SIGNED_PROPOSER_PREFERENCES_SIZE]),
+    Xmss(&'a [u8; SIGNED_PROPOSER_PREFERENCES_PQ_SIZE]),
+}
+
+impl<'a> SignedPreferences<'a> {
+    fn parse(data: &'a [u8], format: ForkName) -> Option<Self> {
+        if format == ForkName::Pq {
+            data.try_into().ok().map(Self::Xmss)
+        } else {
+            data.try_into().ok().map(Self::Bls)
+        }
+    }
+
+    fn message(&self) -> &'a [u8; PROPOSER_PREFERENCES_SIZE] {
+        match self {
+            Self::Bls(signed) => SignedProposerPreferencesView::message(signed),
+            Self::Xmss(signed) => SignedProposerPreferencesPqView::message(signed),
+        }
+    }
+}
 
 pub(super) struct PreparedAttestation {
     buf: [u8; SINGLE_ATT_SIZE],
@@ -89,16 +126,80 @@ pub(super) struct PreparedSyncMessage {
     signature: [u8; 96],
 }
 
-pub(crate) struct PreparedPtc {
+pub(crate) struct PtcVote {
     pub block_root: B256,
     pub slot: Slot,
     pub validator: u64,
     pub ptc_positions: [u64; PTC_MASK_WORDS],
     pub present: bool,
     pub da: bool,
+}
+
+pub(crate) struct PreparedPtc {
+    pub vote: PtcVote,
     pub pubkey: PublicKey,
     pub signing_root: B256,
     pub signature: [u8; 96],
+}
+
+pub(crate) struct PreparedPqPtc {
+    pub message: [u8; PAYLOAD_ATTESTATION_MESSAGE_PQ_SIZE],
+    pub pubkey: XMSSPubkey,
+    pub domain: B256,
+    pub vote: PtcVote,
+}
+
+struct CheckedAttestation {
+    committee_position: usize,
+    committee_len: usize,
+    attester: u32,
+    target: stf::VoteTarget,
+    attested: AttestedBlock,
+    shuffling: ShufflingId,
+    committee_state: StateId,
+}
+
+pub(super) struct PreparedPqAttestation {
+    buf: [u8; SINGLE_ATT_PQ_SIZE],
+    pubkey: XMSSPubkey,
+    signing_root: B256,
+    attester: u32,
+    target: stf::VoteTarget,
+}
+
+#[allow(clippy::large_enum_variant)]
+pub(super) enum PreparedPqVote {
+    Attestation(PreparedPqAttestation),
+    Ptc(PreparedPqPtc),
+}
+
+impl PreparedPqVote {
+    fn signature_check(&self) -> SignatureCheck<'_> {
+        match self {
+            Self::Attestation(p) => {
+                SignatureCheck::single_attestation(&p.buf, &p.pubkey, p.signing_root)
+            }
+            Self::Ptc(p) => {
+                SignatureCheck::payload_attestation_message(&p.message, &p.pubkey, &p.domain)
+            }
+        }
+    }
+
+    fn message(&self) -> &[u8] {
+        match self {
+            Self::Attestation(p) => &p.buf,
+            Self::Ptc(p) => &p.message,
+        }
+    }
+
+    fn is_seen(&self, tile: &BeaconStateTile) -> bool {
+        match self {
+            Self::Attestation(p) => {
+                tile.seen_attesters.contains(p.target.target_epoch, p.attester as usize)
+            }
+            Self::Ptc(p) => tile.seen_ptc.contains(p.vote.slot, p.vote.validator as usize),
+        }
+    }
 }
 
 #[allow(clippy::large_enum_variant)]
@@ -149,7 +250,7 @@ impl PreparedVote {
             Self::SyncMessage(p) => {
                 tile.seen_sync_msgs[p.subnet as usize].contains(p.slot, p.validator as usize)
             }
-            Self::Ptc(p) => tile.seen_ptc.contains(p.slot, p.validator as usize),
+            Self::Ptc(p) => tile.seen_ptc.contains(p.vote.slot, p.vote.validator as usize),
         }
     }
 
@@ -157,7 +258,7 @@ impl PreparedVote {
         match self {
             Self::Attestation(p) => (0, p.attester as u64, p.target.target_epoch, 0),
             Self::SyncMessage(p) => (1, p.validator, p.slot, p.subnet),
-            Self::Ptc(p) => (2, p.validator, p.slot, 0),
+            Self::Ptc(p) => (2, p.vote.validator, p.vote.slot, 0),
         }
     }
 }
@@ -237,14 +338,96 @@ impl BeaconStateTile {
             return Err(Feedback::reject("attestation size"));
         }
         let buf: &[u8; SINGLE_ATT_SIZE] = data[..SINGLE_ATT_SIZE].try_into().unwrap();
-        let attester_index = SingleAttestationView::attester_index(buf) as usize;
-        let block_root = *SingleAttestationView::beacon_block_root(buf);
-        let target_epoch = SingleAttestationView::target_epoch(buf);
-        let att_slot = SingleAttestationView::slot(buf);
-        if self.spec.is_pq_at_slot(att_slot) {
+        let data = SingleAttestationView::data(buf);
+        if self.spec.is_pq_at_slot(data.slot()) {
             return Err(Feedback::reject("BLS attestation for a PQ slot"));
         }
-        let committee_index = SingleAttestationView::committee_index(buf) as usize;
+        let checked = self.check_attestation(
+            SingleAttestationView::committee_index(buf) as usize,
+            SingleAttestationView::attester_index(buf) as usize,
+            data,
+            subnet,
+        )?;
+
+        let view = self.state.read_view(checked.committee_state);
+        let (data_root, signing_root) = self.attestation_root_memo.roots(
+            data.as_bytes(),
+            &Self::attester_domain(&self.spec, &mut self.fork_data_roots, &view, data),
+        );
+        Ok(PreparedAttestation {
+            buf: *buf,
+            committee_position: checked.committee_position,
+            committee_len: checked.committee_len,
+            pubkey: *view.validators.pubkey_decompressed(checked.attester as usize),
+            signing_root,
+            data_root,
+            attester: checked.attester,
+            target: checked.target,
+            attested: checked.attested,
+            shuffling: checked.shuffling,
+        })
+    }
+
+    fn prepare_pq_attestation(
+        &mut self,
+        data: &[u8],
+        subnet: u64,
+    ) -> Result<PreparedPqAttestation, Feedback> {
+        let buf: &[u8; SINGLE_ATT_PQ_SIZE] = data.try_into().expect("checked PQ attestation size");
+        let data = SingleAttestationPqView::data(buf);
+        if !self.spec.is_pq_at_slot(data.slot()) {
+            return Err(Feedback::reject("XMSS attestation before the PQ fork"));
+        }
+        let checked = self.check_attestation(
+            SingleAttestationPqView::committee_index(buf) as usize,
+            SingleAttestationPqView::attester_index(buf) as usize,
+            data,
+            subnet,
+        )?;
+        if !checked.attested.is_ready() {
+            return Err(Feedback::Ignore);
+        }
+
+        let view = self.state.read_view(checked.committee_state);
+        let Some(pubkey) = view.validator_xmss_pubkey(checked.attester as usize) else {
+            return Err(Feedback::Ignore);
+        };
+        let (_, signing_root) = self.attestation_root_memo.roots(
+            data.as_bytes(),
+            &Self::attester_domain(&self.spec, &mut self.fork_data_roots, &view, data),
+        );
+        Ok(PreparedPqAttestation {
+            buf: *buf,
+            pubkey: *pubkey,
+            signing_root,
+            attester: checked.attester,
+            target: checked.target,
+        })
+    }
+
+    fn attester_domain(
+        spec: &SpecConfig,
+        fork_data_roots: &mut ForkDataRoots,
+        view: &StateReadView,
+        data: AttestationDataView<'_>,
+    ) -> B256 {
+        bls::domain_from_fork_data(
+            bls::DOMAIN_BEACON_ATTESTER,
+            &fork_data_roots
+                .root(spec.fork_version_at(data.target_epoch()), &view.imm.genesis_validators_root),
+        )
+    }
+
+    fn check_attestation(
+        &mut self,
+        committee_index: usize,
+        attester_index: usize,
+        data: AttestationDataView<'_>,
+        subnet: u64,
+    ) -> Result<CheckedAttestation, Feedback> {
+        let block_root = *data.beacon_block_root();
+        let target_epoch = data.target_epoch();
+        let att_slot = data.slot();
 
         if !self.attestation_slot_is_open(att_slot) {
             return Err(self.slot_window_miss(att_slot));
@@ -258,9 +441,8 @@ impl BeaconStateTile {
         // Pre-Gloas single attestations encode the committee in
         // `committee_index`, so `AttestationData.index` must be 0. Gloas widens
         // it to a payload-status bit (`index == 1` ⇒ payload present).
-        let data_index = SingleAttestationView::data_index(buf);
         let is_gloas = self.spec.is_gloas_at(target_epoch);
-        if !validate::attestation_index_ok(is_gloas, data_index) {
+        if !validate::attestation_index_ok(is_gloas, data.index()) {
             return Err(Feedback::reject("attestation data index"));
         }
 
@@ -272,7 +454,7 @@ impl BeaconStateTile {
             return Err(Feedback::Ignore);
         };
         let shuffling_id = request.id();
-        let attested = self.check_attested_block(SingleAttestationView::data(buf), shuffling_id)?;
+        let attested = self.check_attested_block(data, shuffling_id)?;
         let shuffling = self.shuffling_cache.get(request);
         if committee_index >= shuffling.committees_per_slot {
             return Err(attested.committee_reject("attestation committee index out of range"));
@@ -296,21 +478,10 @@ impl BeaconStateTile {
         if attester_index >= view.validators.count() {
             return Err(Feedback::reject("attester index out of range"));
         }
-        let fork_version = self.spec.fork_version_at(target_epoch);
-        let domain = bls::domain_from_fork_data(
-            bls::DOMAIN_BEACON_ATTESTER,
-            &self.fork_data_roots.root(fork_version, &view.imm.genesis_validators_root),
-        );
-        let (data_root, signing_root) =
-            self.attestation_root_memo.roots(SingleAttestationView::data(buf).as_bytes(), &domain);
 
-        Ok(PreparedAttestation {
-            buf: *buf,
+        Ok(CheckedAttestation {
             committee_position,
             committee_len,
-            pubkey: *view.validators.pubkey_decompressed(attester_index),
-            signing_root,
-            data_root,
             attester: attester_index as u32,
             target: stf::VoteTarget {
                 block_root,
@@ -320,6 +491,7 @@ impl BeaconStateTile {
             },
             attested,
             shuffling: shuffling_id,
+            committee_state: canon_id,
         })
     }
 
@@ -491,8 +663,13 @@ impl BeaconStateTile {
 
     pub(super) fn defer_vote(&mut self, vote: NewGossipMsg, producers: &mut Producers) {
         let pin = self.reader.acquire(vote.ssz);
-        self.votes.batch.push(BatchedVote { vote, pin });
-        if self.votes.batch.len() >= VOTE_BATCH_CAP {
+        let batch = if vote.domain.format() == ForkName::Pq {
+            &mut self.votes.pq_batch
+        } else {
+            &mut self.votes.batch
+        };
+        batch.push(BatchedVote { vote, pin });
+        if batch.len() >= VOTE_BATCH_CAP {
             self.flush_votes(producers);
         }
     }
@@ -501,6 +678,95 @@ impl BeaconStateTile {
         if !self.votes.batch.is_empty() {
             self.verify_and_commit_votes(producers);
         }
+        if !self.votes.pq_batch.is_empty() {
+            self.verify_and_commit_pq_votes(producers);
+        }
+    }
+
+    #[timed]
+    fn verify_and_commit_pq_votes(&mut self, producers: &mut Producers) {
+        BeaconStateCounters::VoteBatchSize.set(self.votes.pq_batch.len() as u64);
+        self.prepare_pq_votes(producers);
+
+        let mut prepared = std::mem::take(&mut self.votes.pq_prepared);
+        let mut valid = std::mem::take(&mut self.votes.pq_valid);
+        let checks: Vec<_> = prepared.iter().map(|(_, p)| p.signature_check()).collect();
+        valid.clear();
+        valid.resize(checks.len(), false);
+        SignatureCheck::verify_batch(&checks, &mut valid);
+        drop(checks);
+
+        let mut accepted = false;
+        let mut committed_ptc = false;
+        for ((m, p), valid) in prepared.drain(..).zip(valid.drain(..)) {
+            if p.is_seen(self) {
+                Self::local_verdict(&m, Feedback::AlreadySeen, producers);
+                continue;
+            }
+            if !valid {
+                self.reject_gossip(&m, p.message(), "vote bad signature", producers);
+                continue;
+            }
+            match p {
+                PreparedPqVote::Attestation(p) => self.record_pq_attestation(&p),
+                PreparedPqVote::Ptc(p) => {
+                    self.record_ptc_vote(&p.vote);
+                    committed_ptc = true;
+                }
+            }
+            Self::relay_gossip(&m, None, producers);
+            accepted = true;
+        }
+        self.votes.pq_prepared = prepared;
+        self.votes.pq_valid = valid;
+
+        if committed_ptc {
+            self.recompute_head(|event| producers.produce(event));
+        }
+        if accepted {
+            self.publish_status(producers);
+        }
+    }
+
+    fn prepare_pq_votes(&mut self, producers: &mut Producers) {
+        debug_assert!(self.votes.pq_prepared.is_empty());
+        let mut batch = std::mem::take(&mut self.votes.pq_batch);
+        for BatchedVote { vote, pin } in batch.drain(..) {
+            let Some(data) = pin.buffer().ok().map(|(d, _)| d) else {
+                Self::local_verdict(&vote, Feedback::Ignore, producers);
+                continue;
+            };
+            let prepared =
+                self.precheck_pq_gossip(vote.topic, data).and_then(|()| match vote.topic {
+                    GossipTopic::BeaconAttestation(subnet) => {
+                        self.prepare_pq_attestation(data, subnet).map(PreparedPqVote::Attestation)
+                    }
+                    GossipTopic::PayloadAttestationMessage => {
+                        self.prepare_pq_ptc(data).map(PreparedPqVote::Ptc)
+                    }
+                    _ => Err(Feedback::Ignore),
+                });
+            match prepared {
+                Ok(p) => self.votes.pq_prepared.push((vote, p)),
+                Err(Feedback::Reject { reason, .. }) => {
+                    self.reject_gossip(&vote, data, reason, producers)
+                }
+                Err(feedback) => Self::local_verdict(&vote, feedback, producers),
+            }
+        }
+        self.votes.pq_batch = batch;
+    }
+
+    fn record_pq_attestation(&mut self, p: &PreparedPqAttestation) {
+        self.seen_attesters.mark(p.target.target_epoch, p.attester as usize);
+        let n = self.head_validator_count();
+        let slot = self.ticker.current_slot();
+        self.fork_choice.record_or_defer_votes(
+            p.target,
+            std::slice::from_ref(&p.attester),
+            n,
+            slot,
+        );
     }
 
     /// Apply the deferred votes (attestations, sync committee messages, PTC
@@ -836,13 +1102,25 @@ impl BeaconStateTile {
     }
 
     #[timed]
-    fn handle_execution_payload_bid(&mut self, signed_bid: &[u8]) -> Feedback {
-        let Ok(bid) = decode_bid(signed_bid) else {
+    fn handle_execution_payload_bid(&mut self, signed_bid: &[u8], format: ForkName) -> Feedback {
+        let (message, signature) = if format == ForkName::Pq {
+            (SignedExecutionPayloadBidPqView::message(signed_bid), BidSignature::Xmss {
+                signed_bid,
+            })
+        } else {
+            if !SignedExecutionPayloadBidView::check_size(signed_bid) {
+                return Feedback::reject("bid malformed");
+            }
+            (
+                SignedExecutionPayloadBidView::message(signed_bid),
+                BidSignature::Bls(SignedExecutionPayloadBidView::signature(signed_bid)),
+            )
+        };
+        let Ok(bid) = decode_bid_message(message) else {
             return Feedback::reject("bid malformed");
         };
-        let signature = SignedExecutionPayloadBidView::signature(signed_bid);
-        if self.spec.is_pq_at_slot(bid.slot) {
-            return Feedback::reject("BLS bid for a PQ slot");
+        if self.spec.is_pq_at_slot(bid.slot) != (format == ForkName::Pq) {
+            return Feedback::reject("bid signature scheme does not match the slot's fork");
         }
 
         if !self.payload_bids_pool.is_candidate(&bid) {
@@ -871,7 +1149,7 @@ impl BeaconStateTile {
     pub(super) fn check_bid_on_parent(
         &mut self,
         bid: &ExecutionPayloadBid,
-        signature: &[u8; 96],
+        signature: BidSignature<'_>,
         accepts_builder: impl Fn(&BLSPubkey) -> bool,
     ) -> Result<(), Feedback> {
         if bid.block_hash == bid.parent_block_hash {
@@ -939,14 +1217,34 @@ impl BeaconStateTile {
         }
 
         // Last of the checks: a pairing costs more than all of them together.
-        if let Err(e) = verify_execution_payload_bid_signature(
-            view.imm,
-            &view.epoch,
-            &view.builders,
-            bid,
-            signature,
-        ) {
-            silver_log::debug!(?e, "execution payload bid signature rejected");
+        let valid = match signature {
+            BidSignature::Bls(signature) => verify_execution_payload_bid_signature(
+                view.imm,
+                &view.epoch,
+                &view.builders,
+                bid,
+                signature,
+            )
+            .inspect_err(|e| silver_log::debug!(?e, "execution payload bid signature rejected"))
+            .is_ok(),
+            BidSignature::Xmss { signed_bid } => {
+                if !view.is_pq() {
+                    return Err(Feedback::Ignore);
+                }
+                let domain = bls::compute_domain(
+                    bls::DOMAIN_BEACON_BUILDER,
+                    view.epoch.fork_version_at(bid_epoch),
+                    &view.imm.genesis_validators_root,
+                );
+                SignatureCheck::execution_payload_bid(
+                    signed_bid,
+                    xmss_pubkey(&builder.pubkey),
+                    &domain,
+                )
+                .is_some_and(|check| check.verify())
+            }
+        };
+        if !valid {
             return Err(Feedback::reject("bid bad signature"));
         }
 
@@ -1049,14 +1347,19 @@ impl BeaconStateTile {
     }
 
     #[timed]
-    fn handle_proposer_preferences(&mut self, data: &[u8], local: bool) -> Feedback {
-        let Ok(signed) = <&[u8; SIGNED_PROPOSER_PREFERENCES_SIZE]>::try_from(data) else {
+    fn handle_proposer_preferences(
+        &mut self,
+        data: &[u8],
+        format: ForkName,
+        local: bool,
+    ) -> Feedback {
+        let Some(signed) = SignedPreferences::parse(data, format) else {
             return Feedback::reject("proposer preferences size");
         };
-        let prefs = SignedProposerPreferencesView::message(signed);
+        let prefs = signed.message();
         let proposal_slot = Prefs::proposal_slot(prefs);
-        if self.spec.is_pq_at_slot(proposal_slot) {
-            return Feedback::reject("BLS preferences for a PQ slot");
+        if self.spec.is_pq_at_slot(proposal_slot) != matches!(signed, SignedPreferences::Xmss(_)) {
+            return Feedback::reject("preferences signature scheme does not match the slot's fork");
         }
         let dependent_root = *Prefs::dependent_root(prefs);
 
@@ -1103,10 +1406,20 @@ impl BeaconStateTile {
             self.spec.fork_version_at(proposal_epoch),
             &view.imm.genesis_validators_root,
         );
-        let signing_root = bls::compute_signing_root(&Prefs::hash_tree_root(prefs), &domain);
-        let pubkey = view.validators.pubkey_decompressed(validator_index as usize);
-        if !bls::verify_one(pubkey, SignedProposerPreferencesView::signature(signed), &signing_root)
-        {
+        let valid = match signed {
+            SignedPreferences::Bls(signed) => bls::verify_one(
+                view.validators.pubkey_decompressed(validator_index as usize),
+                SignedProposerPreferencesView::signature(signed),
+                &bls::compute_signing_root(&Prefs::hash_tree_root(prefs), &domain),
+            ),
+            SignedPreferences::Xmss(signed) => {
+                let Some(pubkey) = view.validator_xmss_pubkey(validator_index as usize) else {
+                    return Feedback::Ignore;
+                };
+                SignatureCheck::proposer_preferences(signed, pubkey, &domain).verify()
+            }
+        };
+        if !valid {
             return Feedback::reject("proposer preferences bad signature");
         }
 
@@ -1910,7 +2223,7 @@ impl BeaconStateTile {
         Feedback::Accept
     }
 
-    fn precheck_pq_gossip(&self, topic: GossipTopic, bytes: &[u8]) -> Feedback {
+    fn precheck_pq_gossip(&self, topic: GossipTopic, bytes: &[u8]) -> Result<(), Feedback> {
         use silver_common::ssz_view::{
             BeaconBlockHeaderView as Header, ProposerSlashingPqView as Slashing,
             SignedAggregateAndProofPqView as Aggregate, SignedBeaconBlockPqView as Block,
@@ -1924,29 +2237,29 @@ impl BeaconStateTile {
             if self.ticker.is_future_slot(slot, MAXIMUM_GOSSIP_CLOCK_DISPARITY) ||
                 slot <= finalized_slot
             {
-                return Feedback::Ignore;
+                return Err(Feedback::Ignore);
             }
             if !self.spec.is_pq_at_slot(slot) {
-                return Feedback::reject("PQ block precedes fork");
+                return Err(Feedback::reject("PQ block precedes fork"));
             }
         }
         if let Err(reason) = topic.check_pq_signed_message(bytes) {
-            return Feedback::reject(reason);
+            return Err(Feedback::reject(reason));
         }
         match topic {
             GossipTopic::BeaconAttestation(_) => {
                 let attestation = bytes.try_into().expect("checked PQ attestation size");
                 let data = Attestation::data(attestation);
                 if data.index() > 1 {
-                    return Feedback::reject("attestation data index");
+                    return Err(Feedback::reject("attestation data index"));
                 }
             }
             GossipTopic::BeaconAggregateAndProof => {
                 if Aggregate::agg_data(bytes).index() > 1 {
-                    return Feedback::reject("aggregate data index");
+                    return Err(Feedback::reject("aggregate data index"));
                 }
                 if u16::from_le_bytes(*Aggregate::agg_committee_bits(bytes)).count_ones() != 1 {
-                    return Feedback::reject("aggregate committee bits");
+                    return Err(Feedback::reject("aggregate committee bits"));
                 }
             }
             GossipTopic::ProposerSlashing => {
@@ -1957,20 +2270,74 @@ impl BeaconStateTile {
                     Header::slot(a) != Header::slot(b) ||
                     Header::proposer_index(a) != Header::proposer_index(b)
                 {
-                    return Feedback::reject("proposer slashing headers do not conflict");
+                    return Err(Feedback::reject("proposer slashing headers do not conflict"));
                 }
                 let expected = silver_common::xmss::SlotDuty::BeaconProposer.leaf(Header::slot(a));
                 for sig in [Slashing::signature_1(slashing), Slashing::signature_2(slashing)] {
                     if expected != Some(silver_crypto_simd::xmss::leaf_index(sig)) {
-                        return Feedback::reject("incorrect XMSS proposer slashing leaf");
+                        return Err(Feedback::reject("incorrect XMSS proposer slashing leaf"));
                     }
                 }
             }
             _ => {}
         }
-        // The local registry currently exposes only BLS keys. These messages
-        // must stay out of the valid-message caches until authenticated.
-        Feedback::Ignore
+        Ok(())
+    }
+
+    fn handle_pq_gossip(&mut self, m: &NewGossipMsg, data: &[u8]) -> Feedback {
+        if let Err(feedback) = self.precheck_pq_gossip(m.topic, data) {
+            return feedback;
+        }
+        match m.topic {
+            GossipTopic::ProposerPreferences => self.handle_proposer_preferences(
+                data,
+                ForkName::Pq,
+                m.stream_id == LOCAL_GOSSIP_STREAM_ID,
+            ),
+            GossipTopic::ExecutionPayloadBid => {
+                self.handle_execution_payload_bid(data, ForkName::Pq)
+            }
+            GossipTopic::ProposerSlashing => {
+                self.handle_pq_proposer_slashing(data.try_into().expect("checked PQ slashing size"))
+            }
+            _ => Feedback::Ignore,
+        }
+    }
+
+    fn handle_pq_proposer_slashing(
+        &mut self,
+        slashing: &[u8; PROPOSER_SLASHING_PQ_SIZE],
+    ) -> Feedback {
+        let header = ProposerSlashingPqView::header_1(slashing);
+        let proposer_index = BeaconBlockHeaderView::proposer_index(header) as usize;
+        if self.seen_proposer_slashings.contains(proposer_index) {
+            return Feedback::AlreadySeen;
+        }
+        let view = self.state.read_view(self.canonical_state_id());
+        if proposer_index >= view.validators.count() {
+            return Feedback::reject("proposer slashing index out of range");
+        }
+        if !view.validators.is_slashable(proposer_index, view.slot.current_epoch()) {
+            return Feedback::reject("proposer not slashable");
+        }
+        let Some(pubkey) = view.validator_xmss_pubkey(proposer_index) else {
+            return Feedback::Ignore;
+        };
+
+        let header_epoch = BeaconBlockHeaderView::slot(header) / SLOTS_PER_EPOCH;
+        let domain = bls::compute_domain(
+            bls::DOMAIN_BEACON_PROPOSER,
+            view.epoch.fork_version_at(header_epoch),
+            &view.imm.genesis_validators_root,
+        );
+        let checks = SignatureCheck::proposer_slashing(slashing, pubkey, &domain);
+        let mut valid = [false; 2];
+        SignatureCheck::verify_batch(&checks, &mut valid);
+        if valid != [true; 2] {
+            return Feedback::reject("proposer slashing bad signature");
+        }
+        self.seen_proposer_slashings.mark(proposer_index);
+        Feedback::Accept
     }
 
     /// False when the ring lapped `read` before it could be handled.
@@ -1987,17 +2354,10 @@ impl BeaconStateTile {
         }
         let acquired = self.reader.acquire(read);
         let Some(data) = acquired.buffer().ok().map(|(d, _)| d) else { return false };
-        if m.domain.format() == silver_common::ForkName::Pq {
-            let feedback = self.precheck_pq_gossip(m.topic, data);
-            match feedback {
-                Feedback::Reject { reason, .. } => self.reject_gossip(&m, data, reason, producers),
-                other => Self::local_verdict(&m, other, producers),
-            }
-            return true;
-        }
         let pre_verified = pre_verified || m.is_api_verified();
 
         let feedback = match m.topic {
+            _ if m.domain.format() == ForkName::Pq => self.handle_pq_gossip(&m, data),
             GossipTopic::BeaconBlock if self.sync_target.is_syncing() => {
                 match self.parse_and_verify_block(data, pre_verified) {
                     Ok(parsed) if do_relay && parsed.relay_eligible => {
@@ -2048,9 +2408,12 @@ impl BeaconStateTile {
                 producers,
             ),
             GossipTopic::SyncCommitteeContributionAndProof => self.handle_sync_contribution(data),
-            GossipTopic::ExecutionPayloadBid => self.handle_execution_payload_bid(data),
+            GossipTopic::ExecutionPayloadBid => {
+                self.handle_execution_payload_bid(data, m.domain.format())
+            }
             GossipTopic::ProposerPreferences => {
-                self.handle_proposer_preferences(data, m.stream_id == LOCAL_GOSSIP_STREAM_ID)
+                let local = m.stream_id == LOCAL_GOSSIP_STREAM_ID;
+                self.handle_proposer_preferences(data, m.domain.format(), local)
             }
             _ => return true,
         };
@@ -2245,11 +2608,11 @@ pub(super) fn is_sync_aggregator(selection_proof: &[u8; 96]) -> bool {
 #[cfg(feature = "ef_tests")]
 impl BeaconStateTile {
     pub fn ef_gossip_proposer_preferences(&mut self, ssz: &[u8]) -> Feedback {
-        self.handle_proposer_preferences(ssz, false)
+        self.handle_proposer_preferences(ssz, ForkName::Gloas, false)
     }
 
     pub fn ef_gossip_execution_payload_bid(&mut self, ssz: &[u8]) -> Feedback {
-        self.handle_execution_payload_bid(ssz)
+        self.handle_execution_payload_bid(ssz, ForkName::Gloas)
     }
 
     pub fn ef_gossip_sync_committee_message(&mut self, ssz: &[u8], subnet: u64) -> Feedback {

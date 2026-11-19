@@ -1,7 +1,10 @@
+use silver_ssz::ssz_view::XMSSPubkey;
+
 use crate::{
     BalancesReader, BlockRoots, BuildersView, Current, EpochReadView, InactivityView,
     LongtailReadView, ParticipationView, Previous, RandaoMixesView, RootsView, SlashingsView,
     SlotStateView, StateRoots, ValidatorsView,
+    pq::xmss_pubkey,
     tree::{BuildersHash, TreeView, ValidatorsHash},
     types::Immutable,
 };
@@ -81,5 +84,11 @@ impl StateReadView<'_> {
     #[inline]
     pub fn is_pq(&self) -> bool {
         self.epoch.is_pq(self.imm)
+    }
+
+    #[inline]
+    pub fn validator_xmss_pubkey(&self, validator_index: usize) -> Option<&XMSSPubkey> {
+        debug_assert!(validator_index < self.validators.count());
+        self.is_pq().then(|| xmss_pubkey(self.validators.pubkey(validator_index)))
     }
 }

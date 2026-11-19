@@ -177,6 +177,9 @@ struct Votes {
     checker: SignatureChecker,
     checked: Vec<Option<CheckedSignature>>,
     pending: Vec<(NewGossipMsg, gossip::PreparedVote, CheckedSignature)>,
+    pq_batch: Vec<BatchedVote>,
+    pq_prepared: Vec<(NewGossipMsg, gossip::PreparedPqVote)>,
+    pq_valid: Vec<bool>,
 }
 
 impl Votes {
@@ -187,6 +190,9 @@ impl Votes {
             checker: SignatureChecker::with_capacity(gossip::VOTE_BATCH_CAP),
             checked: Vec::with_capacity(gossip::VOTE_BATCH_CAP),
             pending: Vec::with_capacity(gossip::VOTE_BATCH_CAP),
+            pq_batch: Vec::new(),
+            pq_prepared: Vec::new(),
+            pq_valid: Vec::new(),
         }
     }
 }
@@ -1077,14 +1083,12 @@ impl BeaconStateTile {
     /// flushes it first, so the queue order the batch reorders is restored
     /// here.
     fn on_gossip(&mut self, m: NewGossipMsg, producers: &mut Producers) {
-        if m.domain.format() != silver_common::ForkName::Pq &&
-            matches!(
-                m.topic,
-                GossipTopic::BeaconAttestation(_) |
-                    GossipTopic::SyncCommittee(_) |
-                    GossipTopic::PayloadAttestationMessage
-            )
-        {
+        if matches!(
+            m.topic,
+            GossipTopic::BeaconAttestation(_) |
+                GossipTopic::SyncCommittee(_) |
+                GossipTopic::PayloadAttestationMessage
+        ) {
             self.defer_vote(m, producers);
             return;
         }

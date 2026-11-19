@@ -13,6 +13,7 @@ mio.workspace = true
 rustc-hash.workspace = true
 silver_beacon_state_data.workspace = true
 silver_common.workspace = true
+silver_crypto_simd = { workspace = true, features = ["simd"] }
 silver_httpcore.workspace = true
 serde.workspace = true
 serde_json = { workspace = true, features = ["raw_value"] }
@@ -21,8 +22,6 @@ silver_pbs.workspace = true
 smallvec.workspace = true
 
 [dev-dependencies]
-# Enable the IFMA decoder in this crate's tests on supported CPUs.
-silver_crypto_simd = { workspace = true, features = ["simd"] }
 silver_beacon_state_data = { workspace = true, features = ["test-util"] }
 silver_common = { workspace = true, features = ["test-util"] }
 tempfile = "3"

@@ -607,4 +607,39 @@ mod tests {
         let pk = std::fs::read(slot_dir.join("64.pubkeys")).unwrap();
         assert!(decode_checkpoint_pubkeys(&pk).unwrap().is_empty());
     }
+
+    /// A PQ state streams to disk as its exact SSZ: the XMSS registries, the
+    /// PQ-only sections, and a header-only pubkey sidecar, since XMSS keys need
+    /// no decompression.
+    #[test]
+    fn streamed_pq_checkpoint_is_the_state_ssz() {
+        use silver_beacon_state_data::decode_checkpoint_pubkeys;
+        use silver_common::TCache;
+
+        let fixture = concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../beacon_state/tile/tests/fixtures/pq/state.ssz_snappy"
+        );
+        let ssz = snap::Decoder::new().decompress_vec(&std::fs::read(fixture).unwrap()).unwrap();
+        let bs = BeaconState::decompose(&ssz, &SpecConfig::mainnet(), None).unwrap();
+        let slot = bs.slot_states.finalized_view().slot_number();
+        let owner = published_owner(bs);
+
+        let temp = TempDir::new().unwrap();
+        let dir = temp.path().to_str().unwrap().to_owned();
+        let mut store = Store::load(dir.clone(), crate::store::test_spec(0), 0).unwrap();
+        store.begin_checkpoint(owner.reader());
+        let mut producer = TCache::producer(TCacheId::NetworkProcessing, 1 << 20);
+        let mut turns = 0;
+        while store.checkpoint_in_flight() {
+            store.file_io(|_| [0u8; 4], &mut producer, &mut |_: IoEvent| {}).unwrap();
+            turns += 1;
+            assert!(turns <= 64, "checkpoint did not finish");
+        }
+
+        let slot_dir = Path::new(&dir).join(FINALIZED_CHECKPOINTS_DIR).join(slot.to_string());
+        assert!(std::fs::read(slot_dir.join(format!("{slot}.ssz"))).unwrap() == ssz);
+        let pubkeys = std::fs::read(slot_dir.join(format!("{slot}.pubkeys"))).unwrap();
+        assert!(decode_checkpoint_pubkeys(&pubkeys).unwrap().is_empty());
+    }
 }

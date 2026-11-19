@@ -2,7 +2,7 @@ use std::{io::Error, path::Path};
 
 use fxhash::FxHashMap;
 use silver_beacon_state_data::SpecConfig;
-use silver_common::{merkle::B256, ssz_view::SignedBeaconBlockView};
+use silver_common::{SignedBlockLayout, merkle::B256};
 
 use super::{PayloadKey, read_unfinalized_dir};
 use crate::store::{Head, PendingWrite, WriteQueue, backfill::PayloadFacts, io};
@@ -31,11 +31,10 @@ impl UnfinalizedBlocks {
         let dir = Path::new(store_dir).join(Self::UNFINALIZED_DIR);
         read_unfinalized_dir(&dir, |name| {
             if let Some((block_root, slot, parent_root)) = io::parse_unfinalized_name(name) {
-                let facts = match std::fs::read(dir.join(name)) {
-                    Ok(ssz) if SignedBeaconBlockView::check_size(&ssz) => {
-                        PayloadFacts::of(&ssz, spec.is_gloas_at_slot(slot))
-                    }
-                    _ => PayloadFacts::default(),
+                let ssz = std::fs::read(dir.join(name)).unwrap_or_default();
+                let facts = match SignedBlockLayout::of(spec, &ssz) {
+                    Some(layout) => PayloadFacts::of(&ssz, layout),
+                    None => PayloadFacts::default(),
                 };
                 map.insert(block_root, UnfinalizedBlock {
                     slot,

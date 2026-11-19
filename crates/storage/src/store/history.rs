@@ -187,7 +187,7 @@ impl History {
                 continue;
             }
             let slot = prefill.start + offset;
-            if !coverage::read_block(store_dir, slot, &mut block) {
+            if coverage::read_block(store_dir, slot, &mut block, &self.spec).is_none() {
                 silver_log::error!(slot, "held block unreadable; its columns stay missing");
                 continue;
             }
@@ -195,11 +195,13 @@ impl History {
         }
         self.block_scratch = block;
     }
+    /// `block` is one whose layout was checked when it was read or received.
     pub(super) fn seed_pending(&mut self, slot: u64, block: &[u8], finalized: &Finalized) {
         let is_gloas = self.spec.is_gloas_at_slot(slot);
         let missing = finalized.coverage().columns_missing(slot);
         let envelope = is_gloas && finalized.coverage().envelope_missing(slot);
-        self.pending.seed_block(slot, block, is_gloas, missing, envelope);
+        let layout = SignedBlockLayout::at_slot(&self.spec, slot);
+        self.pending.seed_block(slot, block, layout, missing, envelope);
     }
 
     /// Every served block waits for the chain to reach it, held or not: one

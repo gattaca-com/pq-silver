@@ -5,8 +5,9 @@ use crate::{
     merkle::B256,
     ssz_view::{
         BeaconBlockBodyFuluView, BeaconBlockBodyGloasView, BeaconBlockBodyPqView,
-        ExecutionPayloadEnvelopeView, SignedBeaconBlockPqView, SignedBeaconBlockView,
-        SignedExecutionPayloadEnvelopePqView, SignedExecutionPayloadEnvelopeView,
+        ExecutionPayloadEnvelopeView, SIGNED_PQ_FIXED, SignedBeaconBlockPqView,
+        SignedBeaconBlockView, SignedExecutionPayloadEnvelopePqView,
+        SignedExecutionPayloadEnvelopeView,
     },
 };
 
@@ -47,6 +48,16 @@ impl SignedBlockLayout {
             Self::Fulu | Self::Gloas => SignedBeaconBlockView::slot(block),
             Self::Pq => SignedBeaconBlockPqView::slot(block),
         }
+    }
+
+    /// The bytes [`Self::parent_root`] reads, from the start of the block.
+    #[inline]
+    pub const fn parent_root_end(self) -> usize {
+        let message_at = match self {
+            Self::Fulu | Self::Gloas => 100,
+            Self::Pq => SIGNED_PQ_FIXED,
+        };
+        message_at + 16 + 32
     }
 
     #[inline]

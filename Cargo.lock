@@ -6602,6 +6602,7 @@ dependencies = [
  "silver_beacon_state_data",
  "silver_common",
  "silver_log",
+ "snap 0.1.2",
  "tempfile",
 ]
 

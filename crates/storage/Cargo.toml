@@ -22,4 +22,5 @@ workspace = true
 c-kzg.workspace = true
 silver_common = { workspace = true, features = ["test-util"] }
 rand.workspace = true
+snap = "0.1"
 tempfile = "3"

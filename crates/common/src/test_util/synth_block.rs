@@ -2,14 +2,25 @@ use crate::{
     merkle::B256,
     ssz_hash_gloas::EMPTY_EXECUTION_REQUESTS,
     ssz_view::{
-        BEACON_BLOCK_BODY_FIXED, EXECUTION_PAYLOAD_BID_MIN, EXECUTION_PAYLOAD_FIXED,
-        SIGNED_BEACON_BLOCK_MIN, SIGNED_EXECUTION_PAYLOAD_BID_MIN,
+        BEACON_BLOCK_BODY_FIXED, BEACON_BLOCK_BODY_PQ_FIXED, BEACON_BLOCK_FIXED,
+        BeaconBlockBodyPqView, EXECUTION_PAYLOAD_BID_MIN, EXECUTION_PAYLOAD_FIXED,
+        SIGNED_EXECUTION_PAYLOAD_BID_MIN, SIGNED_PQ_FIXED,
     },
 };
 
-const MESSAGE_AT: usize = 100;
+/// Where a BLS-signed container's message starts.
+const BLS_MESSAGE_AT: usize = SIGNED_EXECUTION_PAYLOAD_BID_MIN - EXECUTION_PAYLOAD_BID_MIN;
 const EMPTY_FULU_EXECUTION_REQUESTS: [u8; 12] = [12, 0, 0, 0, 12, 0, 0, 0, 12, 0, 0, 0];
-const SIGNED_BID_PREFIX: usize = SIGNED_EXECUTION_PAYLOAD_BID_MIN - EXECUTION_PAYLOAD_BID_MIN;
+/// Eight empty lists: every offset is the table's own length.
+const EMPTY_PQ_EXECUTION_REQUESTS: [u8; 8 * 4] = {
+    let mut requests = [0; 8 * 4];
+    let mut i = 0;
+    while i < requests.len() {
+        requests[i] = if i % 4 == 0 { 8 * 4 } else { 0 };
+        i += 1;
+    }
+    requests
+};
 
 fn write_offset(buf: &mut [u8], at: usize, offset: usize) {
     buf[at..at + 4].copy_from_slice(&(offset as u32).to_le_bytes());
@@ -52,9 +63,10 @@ impl SynthBid {
         self
     }
 
-    fn signed(self) -> Vec<u8> {
-        let mut signed = vec![0u8; SIGNED_BID_PREFIX];
-        write_offset(&mut signed, 0, SIGNED_BID_PREFIX);
+    /// Behind a zeroed signature that puts the message at `message_at`.
+    fn signed(self, message_at: usize) -> Vec<u8> {
+        let mut signed = vec![0u8; message_at];
+        write_offset(&mut signed, 0, message_at);
         signed.extend_from_slice(&self.0);
         signed
     }
@@ -63,41 +75,50 @@ impl SynthBid {
 /// `SignedBeaconBlock` bytes for layout-level tests: every field zero but the
 /// ones set here, so a `body_root` and its inclusion proof stay
 /// self-consistent with the encoded commitments.
-pub struct SynthBlock(Vec<u8>);
+pub struct SynthBlock {
+    bytes: Vec<u8>,
+    message_at: usize,
+}
 
 impl SynthBlock {
     pub fn fulu(slot: u64, commitments: &[u8]) -> Self {
-        Self::around(slot, &fulu_body(commitments))
+        Self::around(slot, &fulu_body(commitments), BLS_MESSAGE_AT)
     }
 
     pub fn gloas(slot: u64, bid: SynthBid) -> Self {
-        Self::around(slot, &gloas_body(bid))
+        Self::around(slot, &gloas_body(bid), BLS_MESSAGE_AT)
+    }
+
+    /// XMSS-signed, so the message starts after the longer signature.
+    pub fn pq(slot: u64, bid: SynthBid) -> Self {
+        Self::around(slot, &pq_body(bid), SIGNED_PQ_FIXED)
     }
 
     pub fn parent_root(mut self, root: B256) -> Self {
-        self.0[116..148].copy_from_slice(&root);
+        let at = self.message_at + 16;
+        self.bytes[at..at + 32].copy_from_slice(&root);
         self
     }
 
     pub fn body(&self) -> &[u8] {
-        &self.0[SIGNED_BEACON_BLOCK_MIN..]
+        &self.bytes[self.message_at + BEACON_BLOCK_FIXED..]
     }
 
     pub fn bytes(&self) -> &[u8] {
-        &self.0
+        &self.bytes
     }
 
     pub fn into_bytes(self) -> Vec<u8> {
-        self.0
+        self.bytes
     }
 
-    fn around(slot: u64, body: &[u8]) -> Self {
-        let mut block = vec![0u8; SIGNED_BEACON_BLOCK_MIN];
-        write_offset(&mut block, 0, MESSAGE_AT);
-        block[100..108].copy_from_slice(&slot.to_le_bytes());
-        write_offset(&mut block, 180, SIGNED_BEACON_BLOCK_MIN - MESSAGE_AT);
-        block.extend_from_slice(body);
-        Self(block)
+    fn around(slot: u64, body: &[u8], message_at: usize) -> Self {
+        let mut bytes = vec![0u8; message_at + BEACON_BLOCK_FIXED];
+        write_offset(&mut bytes, 0, message_at);
+        bytes[message_at..message_at + 8].copy_from_slice(&slot.to_le_bytes());
+        write_offset(&mut bytes, message_at + BEACON_BLOCK_FIXED - 4, BEACON_BLOCK_FIXED);
+        bytes.extend_from_slice(body);
+        Self { bytes, message_at }
     }
 }
 
@@ -127,7 +148,7 @@ fn fulu_body(commitments: &[u8]) -> Vec<u8> {
 /// Empty operation lists, the signed bid, then empty parent execution requests.
 fn gloas_body(bid: SynthBid) -> Vec<u8> {
     const FIXED: usize = BEACON_BLOCK_BODY_FIXED;
-    let signed_bid = bid.signed();
+    let signed_bid = bid.signed(BLS_MESSAGE_AT);
     let mut body = vec![0u8; FIXED + signed_bid.len()];
     let bid_end = body.len();
     for at in [200usize, 204, 208, 212, 216, 380, 384] {
@@ -138,5 +159,31 @@ fn gloas_body(bid: SynthBid) -> Vec<u8> {
     }
     body[FIXED..].copy_from_slice(&signed_bid);
     body.extend_from_slice(&EMPTY_EXECUTION_REQUESTS);
+    body
+}
+
+/// Empty operation lists, the XMSS-signed bid, empty parent execution
+/// requests, then an empty proof.
+fn pq_body(bid: SynthBid) -> Vec<u8> {
+    const FIXED: usize = BEACON_BLOCK_BODY_PQ_FIXED;
+    let [
+        proposer_slashings,
+        attester_slashings,
+        attestations,
+        deposits,
+        bid_at,
+        requests_at,
+        proof_at,
+    ] = BeaconBlockBodyPqView::VARIABLE_OFFSETS;
+    let mut body = vec![0u8; FIXED];
+    for at in [proposer_slashings, attester_slashings, attestations, deposits, bid_at] {
+        write_offset(&mut body, at, FIXED);
+    }
+    body.extend_from_slice(&bid.signed(SIGNED_PQ_FIXED));
+    let requests_start = body.len();
+    write_offset(&mut body, requests_at, requests_start);
+    body.extend_from_slice(&EMPTY_PQ_EXECUTION_REQUESTS);
+    let proof_start = body.len();
+    write_offset(&mut body, proof_at, proof_start);
     body
 }

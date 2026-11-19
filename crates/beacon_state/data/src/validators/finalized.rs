@@ -400,7 +400,7 @@ impl FinalizedValidators {
         end: usize,
         w: &mut W,
     ) -> io::Result<()> {
-        assert_eq!(self.scheme(), KeyScheme::Bls, "only BLS keys are decompressed");
+        assert!(start >= end || self.scheme() == KeyScheme::Bls, "only BLS keys are decompressed");
         for i in start..end {
             w.write_all(&self.scheme_keys.bls(i).serialize())?;
         }

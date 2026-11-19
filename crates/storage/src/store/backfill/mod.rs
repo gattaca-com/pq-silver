@@ -3,12 +3,9 @@ mod pending;
 pub(super) use pending::{Pending, VerifiedColumns, envelope_block_root, sidecar_head};
 use silver_beacon_state_data::SpecConfig;
 use silver_common::{
-    block_root,
+    SignedBlockLayout,
     merkle::B256,
-    ssz_view::{
-        BeaconBlockBodyFuluView, BeaconBlockBodyGloasView, ExecutionPayloadBidView,
-        SignedBeaconBlockView,
-    },
+    ssz_view::{ExecutionPayloadBidView, SignedBeaconBlockView},
 };
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -25,20 +22,19 @@ pub(super) struct Needs {
 }
 
 impl PayloadFacts {
-    pub(in crate::store) fn of(block: &[u8], is_gloas: bool) -> Self {
-        if !is_gloas {
+    pub(in crate::store) fn of(block: &[u8], layout: SignedBlockLayout) -> Self {
+        if layout == SignedBlockLayout::Fulu {
             let has_blobs = SignedBeaconBlockView::has_data_columns_fulu(block);
             return Self { has_blobs, ..Self::default() };
         }
 
-        if !SignedBeaconBlockView::check_gloas_size(block) {
+        let Some(bid) = layout.bid(block) else {
             silver_log::error!(
-                slot = SignedBeaconBlockView::slot(block),
-                "gloas block bid out of bounds; taken as missing nothing"
+                slot = layout.slot(block),
+                "block bid out of bounds; taken as missing nothing"
             );
             return Self::default();
-        }
-        let bid = SignedBeaconBlockView::gloas_bid(block);
+        };
         Self {
             has_blobs: !ExecutionPayloadBidView::blob_kzg_commitments(bid).is_empty(),
             payload_hash: *ExecutionPayloadBidView::block_hash(bid),
@@ -68,29 +64,22 @@ pub(super) struct BlockFacts {
 
 impl BlockFacts {
     pub(in crate::store) fn of(buffer: &[u8], spec: &SpecConfig) -> Option<Self> {
-        if !SignedBeaconBlockView::check_size(buffer) {
+        let Some(layout) = SignedBlockLayout::of(spec, buffer) else {
             silver_log::warn!(len = buffer.len(), "backfill block has invalid size");
             return None;
-        }
-        let slot = SignedBeaconBlockView::slot(buffer);
-        let is_gloas = spec.is_gloas_at_slot(slot);
-        let body = SignedBeaconBlockView::body(buffer);
-        let canonical = if is_gloas {
-            BeaconBlockBodyGloasView::check_canonical(body)
-        } else {
-            BeaconBlockBodyFuluView::check_canonical(body)
         };
+        let slot = layout.slot(buffer);
         // the root hashes some malformed bodies like a valid one, so linkage alone does
         // not pin the bytes
-        if !canonical {
+        if !layout.check_canonical(buffer) {
             silver_log::warn!(slot, "backfill block has non-canonical body");
             return None;
         }
         Some(Self {
             slot,
-            block_root: block_root(buffer, is_gloas),
-            parent_root: *SignedBeaconBlockView::parent_root(buffer),
-            payload: PayloadFacts::of(buffer, is_gloas),
+            block_root: layout.block_root(buffer),
+            parent_root: layout.parent_root(buffer),
+            payload: PayloadFacts::of(buffer, layout),
         })
     }
 
@@ -115,7 +104,7 @@ pub(in crate::store) mod fixtures {
         TCache, TCacheProducer, TRead, body_root, column_util,
         merkle::B256,
         ssz_hash::kzg_commitments_inclusion_proof,
-        ssz_view::{EXECUTION_PAYLOAD_FIXED_GLOAS, NUMBER_OF_COLUMNS},
+        ssz_view::{EXECUTION_PAYLOAD_FIXED_GLOAS, NUMBER_OF_COLUMNS, SIGNED_PQ_FIXED},
         test_util::{SynthBid, SynthBlock},
     };
 
@@ -156,6 +145,17 @@ pub(in crate::store) mod fixtures {
         commitments: &[u8],
     ) -> Vec<u8> {
         SynthBlock::gloas(slot, gloas_bid(commitments).parent_block_hash(BID_BLOCK_HASH))
+            .parent_root(parent_root)
+            .into_bytes()
+    }
+
+    /// [`gloas_chain_block`]'s PQ twin: the same bid, XMSS-signed.
+    pub(in crate::store) fn pq_chain_block(
+        slot: u64,
+        parent_root: B256,
+        commitments: &[u8],
+    ) -> Vec<u8> {
+        SynthBlock::pq(slot, gloas_bid(commitments).parent_block_hash(BID_BLOCK_HASH))
             .parent_root(parent_root)
             .into_bytes()
     }
@@ -251,6 +251,14 @@ pub(in crate::store) mod fixtures {
         envelope_bytes(block_root, BID_BUILDER_INDEX, BID_BLOCK_HASH)
     }
 
+    /// `signed` with its BLS signature swapped for an XMSS-sized one.
+    pub(in crate::store) fn xmss_signed(signed: &[u8]) -> Vec<u8> {
+        let mut xmss_signed = vec![0; SIGNED_PQ_FIXED];
+        xmss_signed[..4].copy_from_slice(&(SIGNED_PQ_FIXED as u32).to_le_bytes());
+        xmss_signed.extend_from_slice(&signed[100..]);
+        xmss_signed
+    }
+
     /// Producer + reader pair turning bytes into acquired `TRead`s. Declared
     /// reader-after-producer so parked reads (which dereference the reader on
     /// release) drop first.
@@ -283,8 +291,12 @@ pub(in crate::store) mod fixtures {
 
 #[cfg(test)]
 mod tests {
+    use silver_common::block_root_pq;
+
     use super::{
-        fixtures::{BID_BLOCK_HASH, GLOAS_FORK_SLOT, block_bytes, gloas_block_bytes},
+        fixtures::{
+            BID_BLOCK_HASH, GLOAS_FORK_SLOT, block_bytes, gloas_block_bytes, pq_chain_block,
+        },
         *,
     };
 
@@ -294,7 +306,8 @@ mod tests {
     #[test]
     fn withheld_payload_needs_neither_envelope_nor_columns() {
         let commitments = [0x11u8; 48];
-        let facts = PayloadFacts::of(&gloas_block_bytes(GLOAS_FORK_SLOT, &commitments), true);
+        let block = gloas_block_bytes(GLOAS_FORK_SLOT, &commitments);
+        let facts = PayloadFacts::of(&block, SignedBlockLayout::Gloas);
         assert_eq!(facts.payload_hash, BID_BLOCK_HASH);
         assert!(facts.has_blobs);
 
@@ -304,7 +317,23 @@ mod tests {
         assert_eq!(facts.needs(true, Some([0xFF; 32])), withheld, "the child builds past it");
         assert_eq!(facts.needs(true, None), revealed, "no child to ask");
 
-        let fulu = PayloadFacts::of(&block_bytes(1, [0; 32]), false);
+        let fulu = PayloadFacts::of(&block_bytes(1, [0; 32]), SignedBlockLayout::Fulu);
         assert!(!fulu.needs(false, None).envelope, "no envelopes before the fork");
+    }
+
+    #[test]
+    fn pq_block_facts_read_its_xmss_offsets_and_bid() {
+        let spec = SpecConfig { gloas_fork_epoch: 0, pq_fork_epoch: 1, ..SpecConfig::mainnet() };
+        let commitments = [0x11u8; 48];
+        let block = pq_chain_block(32, [0x31; 32], &commitments);
+
+        let facts = BlockFacts::of(&block, &spec).expect("a canonical PQ block");
+        assert_eq!(facts.slot, 32);
+        assert_eq!(facts.parent_root, [0x31; 32]);
+        assert_eq!(facts.block_root, block_root_pq(&block));
+        assert_eq!(facts.payload.payload_hash, BID_BLOCK_HASH);
+        assert_eq!(facts.payload.parent_payload_hash, BID_BLOCK_HASH);
+        assert!(facts.payload.has_blobs);
+        assert!(BlockFacts::of(&block, &SpecConfig { pq_fork_epoch: 2, ..spec }).is_none());
     }
 }

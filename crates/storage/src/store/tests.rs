@@ -1465,6 +1465,54 @@ fn rebuild_across_the_fork_misses_envelopes_only_above_it() {
     let _ = std::fs::remove_dir_all(&store_path);
 }
 
+/// PQ blocks are read at their XMSS offsets: 34's parent root links the chain
+/// over the hole at 33, and only the PQ block without its XMSS-signed envelope
+/// misses one.
+#[test]
+fn rebuild_reads_pq_blocks_and_envelopes_across_a_hole() {
+    use silver_beacon_state_data::SpecConfig;
+    use silver_common::block_root_pq;
+
+    use super::backfill::fixtures::{envelope_for, gloas_chain_block, pq_chain_block, xmss_signed};
+
+    let store_path = format!("/tmp/test_store_rebuild_pq_{}", rand::random::<u32>());
+    let _ = std::fs::remove_dir_all(&store_path);
+    let spec = std::sync::Arc::new(SpecConfig {
+        gloas_fork_epoch: 0,
+        pq_fork_epoch: 1,
+        ..SpecConfig::mainnet()
+    });
+
+    let gloas = gloas_chain_block(31, [0x31; 32], &[]);
+    let root_gloas = block_root(&gloas, true);
+    let pq_a = pq_chain_block(32, root_gloas, &[]);
+    let root_a = block_root_pq(&pq_a);
+    let pq_b = pq_chain_block(34, root_a, &[]);
+    let root_b = block_root_pq(&pq_b);
+    for (slot, block, root) in [(31, &gloas, root_gloas), (32, &pq_a, root_a), (34, &pq_b, root_b)]
+    {
+        place_block(&store_path, slot, block, root);
+    }
+    for (slot, envelope) in
+        [(31, envelope_for(root_gloas)), (34, xmss_signed(&envelope_for(root_b)))]
+    {
+        let path = envelope_path(&store_path, slot);
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(path, envelope).unwrap();
+    }
+
+    let mut store = super::Store::load(store_path.clone(), spec, 0).unwrap();
+    following(&mut store, 34, root_b);
+    assert_eq!(store.finalized.coverage().wanted_parent(34), Some([0x31; 32]), "one chain");
+    let prefill = first_prefill(&mut store);
+
+    let coverage = store.finalized.coverage();
+    assert!(coverage.envelope_missing(32), "a PQ block without its envelope");
+    assert!(!coverage.envelope_missing(34) && !coverage.envelope_missing(31));
+    assert_eq!(prefill.start + 31, 32, "the window ends at the missing envelope");
+    let _ = std::fs::remove_dir_all(&store_path);
+}
+
 /// A blob block backfilled under the column floor owes no columns. If it did,
 /// the walk would wait on the window it sits in until finality moved.
 #[test]

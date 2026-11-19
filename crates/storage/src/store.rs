@@ -10,8 +10,8 @@ use flux_profiler::timed;
 use silver_beacon_state_data::{SLOTS_PER_EPOCH, SpecConfig};
 use silver_common::{
     BeaconApiResponse, BlockLookup, Enr, P2pSend, P2pStreamId, PayloadResolution, PeerEvent,
-    RpcOutbound, RpcRequestInbound, RpcResponse, RpcResponseOutbound, ServedBlock, SyncUpdate,
-    TCacheRead, TCacheReader, TRead,
+    RpcOutbound, RpcRequestInbound, RpcResponse, RpcResponseOutbound, ServedBlock,
+    SignedBlockLayout, SyncUpdate, TCacheRead, TCacheReader, TRead,
     merkle::B256,
     rpc_rate_limit::{RPC_ERR_RATE_LIMITED, RPC_RATE_LIMITED_MSG},
     ssz_view::{
@@ -19,7 +19,6 @@ use silver_common::{
         DataColumnSidecarsByRangeRequestView, DataColumnsByRootIdentifierView,
         DataColumnsByRootRequestView, ExecutionPayloadEnvelopesByRangeRequestView,
         ExecutionPayloadEnvelopesByRootRequestView, MAX_REQUEST_BLOCKS_DENEB,
-        SignedBeaconBlockView,
     },
 };
 
@@ -567,10 +566,11 @@ impl Store {
             return;
         }
         let facts = match block_ssz.buffer() {
-            Ok((buffer, _)) if SignedBeaconBlockView::check_size(buffer) => {
-                PayloadFacts::of(buffer, self.spec.is_gloas_at_slot(slot))
-            }
-            _ => PayloadFacts::default(),
+            Ok((buffer, _)) => match SignedBlockLayout::of(&self.spec, buffer) {
+                Some(layout) => PayloadFacts::of(buffer, layout),
+                None => PayloadFacts::default(),
+            },
+            Err(_) => PayloadFacts::default(),
         };
         self.unfinalized.insert(block_root, slot, parent_root, facts);
         self.write_queue.push_back(PendingWrite::WriteUnfinalized {

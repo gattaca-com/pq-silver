@@ -1,10 +1,7 @@
 use std::io::{Error, ErrorKind, Read};
 
 use silver_beacon_state_data::SpecConfig;
-use silver_common::{
-    merkle::B256,
-    ssz_view::{NUMBER_OF_COLUMNS, SignedBeaconBlockView},
-};
+use silver_common::{SignedBlockLayout, merkle::B256, ssz_view::NUMBER_OF_COLUMNS};
 
 use super::{
     Coverage, Floors, Missing,
@@ -94,20 +91,19 @@ impl Coverage {
                 (false, _) => None,
                 (true, Some(child)) => match child_read {
                     Some((read, payload_parent)) if read == child => Some(payload_parent),
-                    _ => read_block(store_dir, child, block).then(|| {
-                        PayloadFacts::of(block, spec.is_gloas_at_slot(child)).parent_payload_hash
-                    }),
+                    _ => read_block(store_dir, child, block, spec)
+                        .map(|layout| PayloadFacts::of(block, layout).parent_payload_hash),
                 },
                 (true, None) => finalized_block
                     .and_then(|(finalized, child)| (finalized == slot).then_some(child))
                     .flatten(),
             };
-            if !read_block(store_dir, slot, block) {
+            let Some(layout) = read_block(store_dir, slot, block, spec) else {
                 silver_log::error!(slot, "held block unreadable; taken as missing nothing");
                 child_read = None;
                 continue;
-            }
-            let facts = PayloadFacts::of(block, is_gloas);
+            };
+            let facts = PayloadFacts::of(block, layout);
             child_read = Some((slot, facts.parent_payload_hash));
 
             let needs = facts.needs(is_gloas, child);
@@ -137,7 +133,7 @@ fn chain(blocks: &BlockIndex, store_dir: &str, spec: &SpecConfig) -> Chain {
             None => false,
             Some(above) if above == slot + 1 => true,
             Some(above) => {
-                parent_of_above = read_parent_root(store_dir, above);
+                parent_of_above = read_parent_root(store_dir, above, spec);
                 parent_of_above.is_some_and(|parent| blocks.slot_of(&parent) == Some(slot))
             }
         };
@@ -173,24 +169,32 @@ fn close_bottom(
         span.wanted_parent = parent_root;
         return;
     }
-    if !read_block(store_dir, slot, block) {
+    let Some(layout) = read_block(store_dir, slot, block, spec) else {
         silver_log::error!(slot, "held block unreadable; nothing links below it");
         return;
-    }
-    span.wanted_parent = *SignedBeaconBlockView::parent_root(block);
-    span.wanted_payload = PayloadFacts::of(block, is_gloas).parent_payload_hash;
+    };
+    span.wanted_parent = layout.parent_root(block);
+    span.wanted_payload = PayloadFacts::of(block, layout).parent_payload_hash;
 }
 
-fn read_parent_root(store_dir: &str, slot: u64) -> Option<B256> {
-    let mut prefix = [0u8; 148];
-    open_file_read(block_path(store_dir, slot)).ok()?.read_exact(&mut prefix).ok()?;
-    Some(prefix[116..148].try_into().expect("32"))
+fn read_parent_root(store_dir: &str, slot: u64, spec: &SpecConfig) -> Option<B256> {
+    let layout = SignedBlockLayout::at_slot(spec, slot);
+    let mut prefix = [0u8; SignedBlockLayout::Pq.parent_root_end()];
+    let prefix = &mut prefix[..layout.parent_root_end()];
+    open_file_read(block_path(store_dir, slot)).ok()?.read_exact(prefix).ok()?;
+    Some(layout.parent_root(prefix))
 }
 
-pub(in crate::store) fn read_block(store_dir: &str, slot: u64, block: &mut Vec<u8>) -> bool {
+pub(in crate::store) fn read_block(
+    store_dir: &str,
+    slot: u64,
+    block: &mut Vec<u8>,
+    spec: &SpecConfig,
+) -> Option<SignedBlockLayout> {
     block.clear();
-    let Ok(mut file) = open_file_read(block_path(store_dir, slot)) else { return false };
-    file.read_to_end(block).is_ok() && SignedBeaconBlockView::check_size(block)
+    let mut file = open_file_read(block_path(store_dir, slot)).ok()?;
+    file.read_to_end(block).ok()?;
+    SignedBlockLayout::of(spec, block)
 }
 
 /// Every `<slot>_<index>.ssz` of `group`'s directory as (offset in the group,

@@ -2,9 +2,9 @@ use std::fmt::{self, Display};
 
 use flux::spine::SpineProducers;
 use silver_beacon_state_data::{
-    B256, BidBuilderError, BuilderRegistry, Epoch, ExecutionPayloadBid, MIN_SEED_LOOKAHEAD,
-    ParsedAggregateAndProof, SLOTS_PER_EPOCH, SYNC_SUBCOMMITTEE_MASK_WORDS, SYNC_SUBCOMMITTEE_SIZE,
-    ShufflingId, Slot, StateId, StateReadView, SyncSubcommittee,
+    B256, BLSPubkey, BidBuilderError, BuilderRegistry, Epoch, ExecutionPayloadBid,
+    MIN_SEED_LOOKAHEAD, ParsedAggregateAndProof, SLOTS_PER_EPOCH, SYNC_SUBCOMMITTEE_MASK_WORDS,
+    SYNC_SUBCOMMITTEE_SIZE, ShufflingId, Slot, StateId, StateReadView, SyncSubcommittee,
     bls::{self, CheckedSignature, PublicKey, Signature, VerifiedSingleAttestation},
     gloas::PTC_SIZE,
 };
@@ -859,9 +859,7 @@ impl BeaconStateTile {
         if bid.execution_payment != 0 {
             return Feedback::reject("bid has execution payment");
         }
-        if let Err(feedback) = self.check_bid_on_parent(&bid, signature, |builder, pool| {
-            pool.within_limit(&bid, builder.balance)
-        }) {
+        if let Err(feedback) = self.check_bid_on_parent(&bid, signature, |_| true) {
             return feedback;
         }
         self.payload_bids_pool.add(bid, signed_bid);
@@ -874,7 +872,7 @@ impl BeaconStateTile {
         &mut self,
         bid: &ExecutionPayloadBid,
         signature: &[u8; 96],
-        accepts_builder: impl Fn(&silver_beacon_state_data::Builder, &super::BidPool) -> bool,
+        accepts_builder: impl Fn(&BLSPubkey) -> bool,
     ) -> Result<(), Feedback> {
         if bid.block_hash == bid.parent_block_hash {
             return Err(Feedback::reject("bid block hash equals parent"));
@@ -936,7 +934,7 @@ impl BeaconStateTile {
                 return Err(Feedback::Ignore);
             }
         }
-        if !accepts_builder(builder, &self.payload_bids_pool) {
+        if !accepts_builder(&builder.pubkey) {
             return Err(Feedback::Ignore);
         }
 

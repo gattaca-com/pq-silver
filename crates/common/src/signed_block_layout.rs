@@ -5,7 +5,8 @@ use crate::{
     merkle::B256,
     ssz_view::{
         BeaconBlockBodyFuluView, BeaconBlockBodyGloasView, BeaconBlockBodyPqView,
-        SignedBeaconBlockPqView, SignedBeaconBlockView,
+        ExecutionPayloadEnvelopeView, SignedBeaconBlockPqView, SignedBeaconBlockView,
+        SignedExecutionPayloadEnvelopePqView, SignedExecutionPayloadEnvelopeView,
     },
 };
 
@@ -76,6 +77,19 @@ impl SignedBlockLayout {
                 BeaconBlockBodyPqView::check_canonical(SignedBeaconBlockPqView::body(block))
             }
         }
+    }
+
+    /// The `ExecutionPayloadEnvelope` in `envelope`, signed with this layout's
+    /// scheme: `None` before Gloas, or when the envelope is out of bounds.
+    pub fn envelope_message(self, envelope: &[u8]) -> Option<&[u8]> {
+        let message = match self {
+            Self::Fulu => None,
+            Self::Gloas => SignedExecutionPayloadEnvelopeView::check_size(envelope)
+                .then(|| SignedExecutionPayloadEnvelopeView::message(envelope)),
+            Self::Pq => SignedExecutionPayloadEnvelopePqView::check_size(envelope)
+                .then(|| SignedExecutionPayloadEnvelopePqView::message(envelope)),
+        }?;
+        ExecutionPayloadEnvelopeView::check_size(message).then_some(message)
     }
 
     /// The serialized `ExecutionPayloadBid`: `None` before Gloas, or when the

@@ -3,8 +3,8 @@ use std::{sync::Arc, time::Instant};
 use fxhash::FxHashMap;
 use silver_beacon_state_data::{SLOTS_PER_EPOCH, SpecConfig};
 use silver_common::{
-    DataKind, PREFILL_SLOTS, PeerEvent, Prefill, RpcOffence, RpcSeverity, SyncNeed, TRead,
-    merkle::B256, ssz_view::MAX_PAYLOAD_SIZE,
+    DataKind, PREFILL_SLOTS, PeerEvent, Prefill, RpcOffence, RpcSeverity, SignedBlockLayout,
+    SyncNeed, TRead, merkle::B256, ssz_view::MAX_PAYLOAD_SIZE,
 };
 
 use super::{
@@ -288,7 +288,8 @@ impl History {
             emit(IoEvent::Need(finalized.persisted(DataKind::Envelope, slot, None)));
             return;
         }
-        if self.pending.add_envelope(buffer, slot) {
+        let layout = SignedBlockLayout::at_slot(&self.spec, slot);
+        if self.pending.add_envelope(buffer, slot, layout) {
             write_queue.push_back(PendingWrite::BackfillEnvelope { slot, ssz: signed });
         }
     }

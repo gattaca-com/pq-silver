@@ -6,9 +6,9 @@ use silver_beacon_state_data::{B256, BeaconStateReader, SLOTS_PER_EPOCH, SpecCon
 use silver_common::{
     BeaconApiRequest, BeaconApiResponse, BeaconStateEvent, DataColumnsEvent, DataKind, Origin,
     P2pSend, PayloadResolution, PeerControl, PeerEvent, ReplayBlock, RequestId, RpcInbound,
-    SilverSpine, SilverSpineProducers, SyncNeed, SyncUpdate, SyncingStrategy, TCacheError,
-    TCacheId, TCacheProducer, TCacheReader, TCacheTable, TProducer, TReadMode, TileId, block_root,
-    ssz_view::{SignedBeaconBlockView, SignedExecutionPayloadEnvelopeView, StatusView},
+    SignedBlockLayout, SilverSpine, SilverSpineProducers, SyncNeed, SyncUpdate, SyncingStrategy,
+    TCacheError, TCacheId, TCacheProducer, TCacheReader, TCacheTable, TProducer, TReadMode, TileId,
+    ssz_view::{SignedBeaconBlockView, StatusView},
 };
 
 use crate::{
@@ -295,16 +295,18 @@ impl StorageTile {
             BeaconStateEvent::Status { .. } => {
                 latest_status_event = Some(event);
             }
-            BeaconStateEvent::PersistBlock { ssz, source, slot, block_root: announced_root } => {
+            // The beacon state tile announces the root it hashed these bytes to.
+            BeaconStateEvent::PersistBlock { ssz, source, slot, block_root } => {
                 let t_read = self.persist_reader.acquire(ssz);
 
                 match t_read.buffer() {
-                    Ok((buf, _)) => {
-                        let slot = SignedBeaconBlockView::slot(buf);
-                        let parent_root = *SignedBeaconBlockView::parent_root(buf);
-                        let block_root = block_root(buf, self.spec.is_gloas_at_slot(slot));
-                        self.store.add_block(block_root, t_read, slot, parent_root);
-                    }
+                    Ok((buf, _)) => match SignedBlockLayout::of(&self.spec, buf) {
+                        Some(layout) => {
+                            let parent_root = layout.parent_root(buf);
+                            self.store.add_block(block_root, t_read, slot, parent_root);
+                        }
+                        None => silver_log::error!(slot, "persist block: bad ssz size"),
+                    },
                     Err(e) => {
                         silver_log::error!(
                             ?e,
@@ -314,7 +316,7 @@ impl StorageTile {
                             "persist block buffer acquire failed"
                         );
                         StorageCounters::PersistAcquireFailed.inc();
-                        needs(SyncNeed::missing_block(announced_root, slot));
+                        needs(SyncNeed::missing_block(block_root, slot));
                     }
                 }
             }
@@ -324,7 +326,11 @@ impl StorageTile {
                 }
                 let t_read = self.persist_reader.acquire(ssz);
                 match t_read.buffer() {
-                    Ok((buf, _)) if SignedExecutionPayloadEnvelopeView::check_size(buf) => {
+                    Ok((buf, _))
+                        if SignedBlockLayout::at_slot(&self.spec, slot)
+                            .envelope_message(buf)
+                            .is_some() =>
+                    {
                         self.store.add_envelope(block_root, t_read);
                     }
                     Ok(_) => silver_log::error!(slot, "envelope available: bad ssz size"),

@@ -6,14 +6,13 @@ use std::{
 use fxhash::FxHashMap;
 use silver_beacon_state_data::{SLOTS_PER_EPOCH, SpecConfig};
 use silver_common::{
-    MAX_BLOBS_PER_BLOCK, PREFILL_SLOTS, TRead,
+    MAX_BLOBS_PER_BLOCK, PREFILL_SLOTS, SignedBlockLayout, TRead,
     column_util::{self, KzgBatchEntry, KzgScratch},
     merkle::B256,
     ssz_view::{
         BYTES_PER_KZG_COMMITMENT, DataColumnSidecarFuluView, DataColumnSidecarGloasView,
         EXECUTION_PAYLOAD_FIXED_GLOAS, ExecutionPayloadBidView, ExecutionPayloadEnvelopeView,
         ExecutionPayloadView, NUMBER_OF_COLUMNS, SidecarLayout, SignedBeaconBlockView,
-        SignedExecutionPayloadEnvelopeView,
     },
 };
 
@@ -67,13 +66,13 @@ pub(in crate::store) fn sidecar_head(buffer: &[u8]) -> Option<SidecarHead> {
     (head.index < NUMBER_OF_COLUMNS as u64).then_some(head)
 }
 
+/// Either signature scheme: the slot, and with it the expected scheme, is
+/// known only once the root has found the block.
 pub(in crate::store) fn envelope_block_root(buffer: &[u8]) -> Option<B256> {
-    if !SignedExecutionPayloadEnvelopeView::check_size(buffer) {
-        return None;
-    }
-    let envelope = SignedExecutionPayloadEnvelopeView::message(buffer);
-    ExecutionPayloadEnvelopeView::check_size(envelope)
-        .then(|| *ExecutionPayloadEnvelopeView::beacon_block_root(envelope))
+    let envelope = [SignedBlockLayout::Gloas, SignedBlockLayout::Pq]
+        .into_iter()
+        .find_map(|layout| layout.envelope_message(buffer))?;
+    Some(*ExecutionPayloadEnvelopeView::beacon_block_root(envelope))
 }
 
 struct Commitments {
@@ -117,8 +116,8 @@ impl Bid {
         })
     }
 
-    fn matches_envelope(&self, signed: &[u8]) -> bool {
-        let envelope = SignedExecutionPayloadEnvelopeView::message(signed);
+    fn matches_envelope(&self, signed: &[u8], layout: SignedBlockLayout) -> bool {
+        let Some(envelope) = layout.envelope_message(signed) else { return false };
         let payload = ExecutionPayloadEnvelopeView::payload(envelope);
         if payload.len() < EXECUTION_PAYLOAD_FIXED_GLOAS {
             return false;
@@ -346,10 +345,15 @@ impl Pending {
         (None, rejected)
     }
 
-    pub(in crate::store) fn add_envelope(&mut self, signed: &[u8], slot: u64) -> bool {
+    pub(in crate::store) fn add_envelope(
+        &mut self,
+        signed: &[u8],
+        slot: u64,
+        layout: SignedBlockLayout,
+    ) -> bool {
         let Some(block) = self.blocks.get_mut(&slot) else { return false };
         let Some(bid) = block.bid.as_ref().filter(|_| block.envelope) else { return false };
-        if !bid.matches_envelope(signed) {
+        if !bid.matches_envelope(signed, layout) {
             silver_log::warn!(slot, "backfill envelope does not match its block's bid");
             return false;
         }
@@ -385,6 +389,8 @@ impl Pending {
 
 #[cfg(test)]
 mod tests {
+    use silver_common::ssz_view::SIGNED_PQ_FIXED;
+
     use super::{
         super::fixtures::{
             BID_BLOCK_HASH, BID_BUILDER_INDEX, GLOAS_FORK_SLOT, KZG, Tc, block_bytes,
@@ -550,17 +556,39 @@ mod tests {
         let good = envelope_bytes(ROOT, BID_BUILDER_INDEX, BID_BLOCK_HASH);
         let wrong_hash = envelope_bytes(ROOT, BID_BUILDER_INDEX, [0xFF; 32]);
         let wrong_builder = envelope_bytes(ROOT, 0, BID_BLOCK_HASH);
+        let xmss_signed = xmss_signed(&good);
         for (envelope, slot, why) in [
             (&wrong_hash, GLOAS_FORK_SLOT, "payload block_hash the bid did not commit to"),
             (&wrong_builder, GLOAS_FORK_SLOT, "another builder's payload"),
             (&good, GLOAS_FORK_SLOT + 1, "an envelope for a block we were not asked about"),
+            (&xmss_signed, GLOAS_FORK_SLOT, "a signature scheme its fork does not use"),
         ] {
-            assert!(!pending.add_envelope(envelope, slot), "refuses {why}");
+            assert!(
+                !pending.add_envelope(envelope, slot, SignedBlockLayout::Gloas),
+                "refuses {why}"
+            );
         }
         assert!(pending.blocks.contains_key(&GLOAS_FORK_SLOT), "a refusal leaves the block held");
 
-        assert!(pending.add_envelope(&good, GLOAS_FORK_SLOT), "accepted");
+        assert!(pending.add_envelope(&good, GLOAS_FORK_SLOT, SignedBlockLayout::Gloas), "accepted");
         assert!(!pending.blocks.contains_key(&GLOAS_FORK_SLOT), "acceptance retires the block");
+    }
+
+    /// `signed` with its BLS signature swapped for an XMSS-sized one.
+    fn xmss_signed(signed: &[u8]) -> Vec<u8> {
+        let mut xmss_signed = vec![0; SIGNED_PQ_FIXED];
+        xmss_signed[..4].copy_from_slice(&(SIGNED_PQ_FIXED as u32).to_le_bytes());
+        xmss_signed.extend_from_slice(&signed[100..]);
+        xmss_signed
+    }
+
+    #[test]
+    fn envelope_block_root_reads_either_signature_scheme() {
+        const ROOT: B256 = [0x5A; 32];
+        let bls_signed = envelope_bytes(ROOT, BID_BUILDER_INDEX, BID_BLOCK_HASH);
+        assert_eq!(envelope_block_root(&bls_signed), Some(ROOT));
+        assert_eq!(envelope_block_root(&xmss_signed(&bls_signed)), Some(ROOT));
+        assert_eq!(envelope_block_root(&bls_signed[..120]), None);
     }
 
     #[test]
@@ -572,7 +600,7 @@ mod tests {
             "held, since the caller said an envelope is missing"
         );
         assert!(
-            !pending.add_envelope(&envelope_bytes([0; 32], 0, [0; 32]), 1),
+            !pending.add_envelope(&envelope_bytes([0; 32], 0, [0; 32]), 1, SignedBlockLayout::Fulu),
             "but no bid can match"
         );
 

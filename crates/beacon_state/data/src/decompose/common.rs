@@ -204,8 +204,8 @@ impl BeaconState {
 
         let current_version = epoch.state().fork.current_version;
         let is_pq = immutable.is_pq(current_version);
-        let post_gloas = immutable.is_post_gloas(current_version);
-        let format = if post_gloas { HashFormat::Progressive } else { HashFormat::Fixed };
+        let post_gloas_fork = immutable.is_post_gloas_fork(current_version);
+        let format = if post_gloas_fork { HashFormat::Progressive } else { HashFormat::Fixed };
 
         let eth1 = Eth1Group::new(Eth1Votes::from_ssz(ssz, offsets)?);
 
@@ -245,7 +245,7 @@ impl BeaconState {
         )?);
 
         let mut pending = decode_pending(ssz, offsets, consolidations_end, builder_withdrawals)?;
-        if post_gloas {
+        if post_gloas_fork {
             pending.mark_gloas_base();
         }
 
@@ -279,7 +279,7 @@ impl BeaconState {
             builders: BuildersGroup::new(builders),
             preregistrations: PreregistrationsGroup::new(preregistrations),
         };
-        debug_assert_eq!(state.is_finalized_post_gloas(), post_gloas);
+        debug_assert_eq!(state.is_finalized_post_gloas(), post_gloas_fork);
         Ok(state)
     }
 }

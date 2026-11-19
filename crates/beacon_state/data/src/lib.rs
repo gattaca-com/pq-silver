@@ -129,7 +129,7 @@ pub struct BeaconState {
 impl BeaconState {
     /// Gloas or a later fork: every Gloas tier is live.
     pub fn is_finalized_post_gloas(&self) -> bool {
-        self.immutable.is_post_gloas(self.epoch.finalized().state().fork.current_version)
+        self.immutable.is_post_gloas_fork(self.epoch.finalized().state().fork.current_version)
     }
 
     /// Anchor a fresh per-fork delta on every always-rolled tier (epoch/

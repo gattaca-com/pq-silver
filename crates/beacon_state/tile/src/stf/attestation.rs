@@ -318,20 +318,20 @@ impl<'a> BlockAttestations<'a> {
         scratch: &mut StfScratch,
     ) -> Result<u64, AttestationError> {
         let current_slot = view.slot.state().slot;
-        let post_gloas = self.epoch.post_gloas(view.imm);
+        let post_gloas_fork = self.epoch.post_gloas_fork(view.imm);
         validate::validate_attestation_data(
             att,
             current_slot,
             self.current_epoch,
             self.previous_epoch,
-            post_gloas,
+            post_gloas_fork,
         )?;
 
         let parsed = ParsedAttestationData::parse(AttestationView::data(att));
         let is_current = self.target_is_current(parsed.target_epoch)?;
         parsed.check_source(self.justified(is_current))?;
 
-        let payload_index = if post_gloas {
+        let payload_index = if post_gloas_fork {
             Some(self.payload_index.ok_or(AttestationError::MissingParentSlot)?)
         } else {
             None
@@ -363,7 +363,7 @@ impl<'a> BlockAttestations<'a> {
 
         view.slot.epoch_balances_mut().add_target_attesters(is_current, applied.new_target_eb);
 
-        if post_gloas &&
+        if post_gloas_fork &&
             applied.first_participation_eb > 0 &&
             parsed.is_same_slot(|slot| view.block_roots.at_slot(slot))
         {

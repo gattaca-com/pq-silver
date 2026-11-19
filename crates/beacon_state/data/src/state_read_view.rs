@@ -74,8 +74,8 @@ pub struct StateReadView<'a> {
 
 impl StateReadView<'_> {
     #[inline]
-    pub fn post_gloas(&self) -> bool {
-        self.epoch.post_gloas(self.imm)
+    pub fn post_gloas_fork(&self) -> bool {
+        self.epoch.post_gloas_fork(self.imm)
     }
 
     #[inline]

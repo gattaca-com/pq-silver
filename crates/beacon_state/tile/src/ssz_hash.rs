@@ -51,7 +51,7 @@ pub fn hash_checkpoint(cp: &Checkpoint) -> B256 {
 pub fn hash_tree_root_state(rv: &StateView) -> B256 {
     if rv.is_pq() {
         BeaconStatePq::hash_tree_root(rv)
-    } else if rv.post_gloas() {
+    } else if rv.post_gloas_fork() {
         BeaconStateGloas::hash_tree_root(rv)
     } else {
         hash_tree_root_state_fulu(rv)

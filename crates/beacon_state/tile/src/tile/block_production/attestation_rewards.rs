@@ -39,7 +39,7 @@ impl<'a> AttestationRewards<'a> {
         builds_on_full_parent: bool,
     ) -> Self {
         let slot_state = pre_state.slot.state();
-        let payload_index = pre_state.post_gloas().then(|| {
+        let payload_index = pre_state.post_gloas_fork().then(|| {
             let parent_slot = slot_state.latest_block_header.slot;
             (builds_on_full_parent || slot_state.payload_available(parent_slot)) as u64
         });

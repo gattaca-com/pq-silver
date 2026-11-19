@@ -239,7 +239,7 @@ impl Immutable {
     /// Whether a state at `current_version` carries the Gloas tiers, which PQ
     /// keeps.
     #[inline]
-    pub fn is_post_gloas(&self, current_version: Version) -> bool {
+    pub fn is_post_gloas_fork(&self, current_version: Version) -> bool {
         current_version == self.gloas_fork_version || self.is_pq(current_version)
     }
 

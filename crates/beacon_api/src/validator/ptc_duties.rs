@@ -33,7 +33,7 @@ pub(crate) fn post_ptc_duties(req: &Request<'_>, ctx: &ApiCtx, resp: &mut Respon
             let is_gloas_epoch = epoch >= ctx.spec.gloas_fork_epoch;
             // An empty answer here would be cached against a dependent root
             // the fork transition does not change.
-            if is_gloas_epoch && !view.post_gloas() {
+            if is_gloas_epoch && !view.post_gloas_fork() {
                 return Err((503, "the fork epoch's PTC exists once the head state is Gloas"));
             }
             let Some(id) = ShufflingId::from_state(&view, epoch) else {

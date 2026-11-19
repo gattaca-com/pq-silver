@@ -251,7 +251,7 @@ fn run_attestation(s: &mut LoadedState, op: &[u8]) -> bool {
     }
     s.with_view_and_epoch(|view, e| {
         let parent_slot =
-            e.post_gloas(view.imm).then(|| view.slot.state().latest_block_header.slot);
+            e.post_gloas_fork(view.imm).then(|| view.slot.state().latest_block_header.slot);
         stf::BlockAttestations::new(&view.slot, *e, block_slot, parent_slot, &sref)
             .process_body(view, &list, proposer_index, &mut votes_sink, &mut scratch)
             .is_ok()

@@ -102,8 +102,8 @@ impl<'a> EpochReadView<'a> {
     }
 
     #[inline]
-    pub fn post_gloas(&self, imm: &Immutable) -> bool {
-        imm.is_post_gloas(self.state().fork.current_version)
+    pub fn post_gloas_fork(&self, imm: &Immutable) -> bool {
+        imm.is_post_gloas_fork(self.state().fork.current_version)
     }
 
     #[inline]

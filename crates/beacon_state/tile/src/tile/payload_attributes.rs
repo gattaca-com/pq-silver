@@ -145,7 +145,7 @@ impl BeaconStateTile {
 
     fn head_gas_limit(&self) -> u64 {
         let head = self.state.read_view(self.last_applied);
-        if head.post_gloas() {
+        if head.post_gloas_fork() {
             head.slot.state().latest_execution_payload_bid.gas_limit
         } else {
             head.slot.state().latest_execution_payload_header.gas_limit

@@ -59,6 +59,7 @@ const MAX_EFFECTIVE_BALANCE: u64 = 32_000_000_000;
 mod gloas_production;
 #[cfg(feature = "ef_tests")]
 mod payload_preparation;
+mod pq_gossip;
 
 const TEST_RING_BYTES: usize = 1 << 20;
 const ANCHOR_ROOT: B256 = [0x01u8; 32];

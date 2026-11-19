@@ -81,6 +81,7 @@ mod tree;
 pub mod types;
 mod validators;
 mod view;
+pub mod xmss;
 
 pub struct BeaconState {
     /// Chain constants fixed at genesis/fork boundaries (fork versions,

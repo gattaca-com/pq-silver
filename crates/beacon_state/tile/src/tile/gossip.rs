@@ -690,11 +690,9 @@ impl BeaconStateTile {
 
         let mut prepared = std::mem::take(&mut self.votes.pq_prepared);
         let mut valid = std::mem::take(&mut self.votes.pq_valid);
-        let checks: Vec<_> = prepared.iter().map(|(_, p)| p.signature_check()).collect();
         valid.clear();
-        valid.resize(checks.len(), false);
-        SignatureCheck::verify_batch(&checks, &mut valid);
-        drop(checks);
+        valid.resize(prepared.len(), false);
+        SignatureCheck::verify_batch(prepared.iter().map(|(_, p)| p.signature_check()), &mut valid);
 
         let mut accepted = false;
         let mut committed_ptc = false;
@@ -2332,7 +2330,7 @@ impl BeaconStateTile {
         );
         let checks = SignatureCheck::proposer_slashing(slashing, pubkey, &domain);
         let mut valid = [false; 2];
-        SignatureCheck::verify_batch(&checks, &mut valid);
+        SignatureCheck::verify_batch(checks, &mut valid);
         if valid != [true; 2] {
             return Feedback::reject("proposer slashing bad signature");
         }

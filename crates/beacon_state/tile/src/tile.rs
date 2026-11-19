@@ -190,9 +190,9 @@ impl Votes {
             checker: SignatureChecker::with_capacity(gossip::VOTE_BATCH_CAP),
             checked: Vec::with_capacity(gossip::VOTE_BATCH_CAP),
             pending: Vec::with_capacity(gossip::VOTE_BATCH_CAP),
-            pq_batch: Vec::new(),
-            pq_prepared: Vec::new(),
-            pq_valid: Vec::new(),
+            pq_batch: Vec::with_capacity(gossip::VOTE_BATCH_CAP),
+            pq_prepared: Vec::with_capacity(gossip::VOTE_BATCH_CAP),
+            pq_valid: Vec::with_capacity(gossip::VOTE_BATCH_CAP),
         }
     }
 }

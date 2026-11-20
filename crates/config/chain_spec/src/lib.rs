@@ -1021,8 +1021,8 @@ mod tests {
     #[test]
     fn a_fork_scheduled_before_its_predecessor_is_misordered() {
         assert_eq!(SpecConfig::mainnet().misordered_forks(), None);
-        let pq_without_gloas = SpecConfig { pq_fork_epoch: 0, ..SpecConfig::mainnet() };
-        assert_eq!(pq_without_gloas.misordered_forks(), Some((ForkName::Gloas, ForkName::Pq)));
+        let pq_without_eip8483 = SpecConfig { pq_fork_epoch: 0, ..SpecConfig::mainnet() };
+        assert_eq!(pq_without_eip8483.misordered_forks(), Some((ForkName::Eip8483, ForkName::Pq)));
         let fulu_without_deneb = SpecConfig { fulu_fork_epoch: 0, ..SpecConfig::mainnet() };
         assert_eq!(fulu_without_deneb.misordered_forks(), None);
     }

@@ -19,6 +19,8 @@ use silver_httpcore::{Readiness, TokenRange};
 use silver_leanvm_api::LeanVmApi;
 use tempfile::TempDir;
 
+const CONNECTIONS: usize = LeanVmApi::MAX_SOCKETS;
+
 struct Injector;
 impl Tile<SilverSpine> for Injector {
     fn loop_body(&mut self, _: &mut SpineAdapter<SilverSpine>) {}
@@ -91,6 +93,14 @@ impl Rig {
 
     fn wait_ready(&mut self) {
         self.wait_until("ready", |rig| rig.health.last() == Some(&true));
+    }
+
+    /// Every connection is accepted, and long enough has passed to read the
+    /// hello each was sent at once: no connection is left mid-handshake.
+    fn wait_all_ready(&mut self, sidecar: &FakeSidecar) {
+        self.wait_until("every connection accepted", |_| sidecar.accepted() >= CONNECTIONS);
+        let settled = Instant::now() + Duration::from_millis(100);
+        self.wait_until("the hellos read", |_| Instant::now() >= settled);
     }
 
     fn request(&mut self, request_id: u64, body: &[u8]) {
@@ -205,40 +215,83 @@ fn a_request_goes_out_framed_and_the_response_comes_back_whole() {
     assert_eq!(rig.answer(2), None, "over the hello's max request length");
     rig.request(3, &[5]);
     assert_eq!(rig.answer(3), Some(vec![7, 5]));
-    assert_eq!(sidecar.accepted(), 1);
+    // A reopened connection would pass the count and never come back to it.
+    rig.wait_until("every connection up, none reopened", |_| sidecar.accepted() == CONNECTIONS);
 }
 
+/// Each answer waits until both requests have arrived, which one connection
+/// could not do: it sends the second only after the first is answered.
 #[test]
-fn a_hang_up_mid_request_answers_none_and_reconnects() {
-    let sidecar = FakeSidecar::spawn(|mut stream, index| {
-        send_frame(&mut stream, &hello(b"leanvmsc", 64));
-        if index == 0 {
-            read_request(&mut stream);
-        } else {
-            while read_request(&mut stream).is_some() {}
+fn requests_on_separate_connections_are_in_flight_at_once() {
+    let arrived = Arc::new(AtomicUsize::new(0));
+    let sidecar = FakeSidecar::spawn({
+        let arrived = arrived.clone();
+        move |mut stream, _| {
+            send_frame(&mut stream, &hello(b"leanvmsc", 64));
+            while let Some(request) = read_request(&mut stream) {
+                arrived.fetch_add(1, Ordering::SeqCst);
+                while arrived.load(Ordering::SeqCst) < 2 {
+                    thread::sleep(Duration::from_millis(1));
+                }
+                send_frame(&mut stream, &request);
+            }
         }
     });
     let mut rig = Rig::new(Some(&sidecar.path));
     rig.wait_ready();
     rig.request(1, &[1]);
+    rig.request(2, &[2]);
+    assert_eq!(rig.answer(1), Some(vec![1]));
+    assert_eq!(rig.answer(2), Some(vec![2]));
+}
+
+/// A fake sidecar whose first request served, on whichever connection, gets
+/// `misbehave`; every other one is echoed.
+fn first_request_misbehaves(
+    misbehave: impl Fn(&mut UnixStream) + Send + Sync + 'static,
+) -> FakeSidecar {
+    let first = Arc::new(AtomicBool::new(true));
+    FakeSidecar::spawn(move |mut stream, _| {
+        send_frame(&mut stream, &hello(b"leanvmsc", 64));
+        while let Some(request) = read_request(&mut stream) {
+            if first.swap(false, Ordering::SeqCst) {
+                return misbehave(&mut stream);
+            }
+            send_frame(&mut stream, &request);
+        }
+    })
+}
+
+/// The connection that failed is replaced; the others serve meanwhile, so the
+/// sidecar stays ready.
+fn assert_replaced(rig: &mut Rig, sidecar: &FakeSidecar) {
+    rig.request(2, &[2]);
+    assert_eq!(rig.answer(2), Some(vec![2]));
+    rig.wait_until("the connection replaced", |_| sidecar.accepted() == CONNECTIONS + 1);
+    assert_eq!(rig.health, [true]);
+}
+
+#[test]
+fn a_hang_up_mid_request_answers_none_and_reconnects() {
+    let sidecar = first_request_misbehaves(|_| {});
+    let mut rig = Rig::new(Some(&sidecar.path));
+    rig.wait_all_ready(&sidecar);
+    rig.request(1, &[1]);
     assert_eq!(rig.answer(1), None);
-    rig.wait_until("ready again", |rig| rig.health == [true, false, true]);
-    assert_eq!(sidecar.accepted(), 2);
+    assert_replaced(&mut rig, &sidecar);
 }
 
 #[test]
 fn an_oversized_response_frame_closes_the_connection() {
-    let sidecar = FakeSidecar::spawn(|mut stream, _| {
-        send_frame(&mut stream, &hello(b"leanvmsc", 64));
-        read_request(&mut stream);
+    let sidecar = first_request_misbehaves(|stream| {
         stream.write_all(&((8u64 << 20) + 1).to_le_bytes()).unwrap();
-        read_request(&mut stream);
+        read_request(stream);
     });
     let mut rig = Rig::new(Some(&sidecar.path));
-    rig.wait_ready();
+    rig.wait_all_ready(&sidecar);
     rig.request(1, &[1]);
     assert_eq!(rig.answer(1), None);
-    rig.wait_until("closed", |rig| rig.health == [true, false]);
+    assert_replaced(&mut rig, &sidecar);
 }
 
 #[test]
@@ -260,16 +313,12 @@ fn a_response_that_arrives_while_the_request_is_written_is_delivered() {
 
 #[test]
 fn a_sidecar_that_never_answers_is_dropped_after_the_timeout() {
-    let sidecar = FakeSidecar::spawn(|mut stream, _| {
-        send_frame(&mut stream, &hello(b"leanvmsc", 64));
-        while read_request(&mut stream).is_some() {}
-    });
+    let sidecar = first_request_misbehaves(|stream| while read_request(stream).is_some() {});
     let mut rig = Rig::new(Some(&sidecar.path));
-    rig.wait_ready();
+    rig.wait_all_ready(&sidecar);
     rig.request(1, &[1]);
     assert_eq!(rig.answer(1), None);
-    rig.wait_until("ready again", |rig| rig.health == [true, false, true]);
-    assert_eq!(sidecar.accepted(), 2);
+    assert_replaced(&mut rig, &sidecar);
 }
 
 #[test]
@@ -283,8 +332,23 @@ fn a_byte_while_idle_closes_the_connection() {
         while read_request(&mut stream).is_some() {}
     });
     let mut rig = Rig::new(Some(&sidecar.path));
-    rig.wait_until("closed, then ready again", |rig| rig.health == [true, false, true]);
-    assert_eq!(sidecar.accepted(), 2);
+    rig.wait_until("the connection replaced", |_| sidecar.accepted() == CONNECTIONS + 1);
+    assert_eq!(rig.health, [true]);
+}
+
+/// Health goes down only with the last connection, and up with the first.
+#[test]
+fn the_sidecar_is_down_once_every_connection_is() {
+    let sidecar = FakeSidecar::spawn(|mut stream, index| {
+        send_frame(&mut stream, &hello(b"leanvmsc", 64));
+        if index < CONNECTIONS {
+            thread::sleep(Duration::from_millis(200));
+            return;
+        }
+        while read_request(&mut stream).is_some() {}
+    });
+    let mut rig = Rig::new(Some(&sidecar.path));
+    rig.wait_until("down, then ready again", |rig| rig.health == [true, false, true]);
 }
 
 #[test]

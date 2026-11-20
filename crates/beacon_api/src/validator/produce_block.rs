@@ -1,9 +1,10 @@
 use flux_profiler::timed;
+use serde::{Deserialize, de::IgnoredAny};
 use silver_beacon_state_data::{Slot, SpecConfig};
 use silver_common::{
     BeaconApiRequest, BidPolicy, ForkName, PayloadFrame, ProduceBlockFailure, ProducedBlock,
     RandaoReveal, TCacheReader,
-    json_fields::{parse_hex, parse_uint64},
+    json_fields::{parse_hex, parse_uint64, uint64},
     ssz_view::VRF_PROOF_SIZE,
 };
 use silver_pbs::BuilderConfig;
@@ -11,14 +12,15 @@ use silver_pbs::BuilderConfig;
 use crate::{
     ctx::ApiCtx,
     http::{
+        json::wei_decimal,
         response::Response,
         router::{Outcome, Request, SSZ_MEDIA_TYPE},
     },
 };
 
 pub(crate) fn produce_block_v4(req: &Request<'_>, ctx: &ApiCtx, resp: &mut Response<'_>) {
-    let Some(slot) = proposal_slot(req, resp) else {
-        return;
+    let Some(slot) = req.params.get("slot").and_then(parse_uint64) else {
+        return resp.error(400, "invalid slot");
     };
     if !ctx.spec.is_pq_at_slot(slot) {
         return resp.error(400, "produceBlockV4 serves PQ slots only");
@@ -31,21 +33,11 @@ pub(crate) fn produce_block_v4(req: &Request<'_>, ctx: &ApiCtx, resp: &mut Respo
         Some("false") => false,
         _ => return resp.error(400, "include_payload is a required boolean query parameter"),
     };
-    if !req.body_is_ssz() {
-        return resp.error(415, "only an SSZ BuilderConfig body is read");
-    }
-    let Some(builder_config) = BuilderConfig::parse(req.body) else {
-        return resp.error(400, "invalid BuilderConfig");
-    };
-    if builder_config.entries().next().is_some() {
-        return resp.error(400, "PQ blocks are built locally; the BuilderConfig names builders");
-    }
-    let Some((randao_reveal, graffiti)) = proposal_query(req, resp) else {
+    let Some(bid_policy) = bid_policy(req, resp) else {
         return;
     };
-    let bid_policy = BidPolicy {
-        min_bid: builder_config.min_bid(),
-        builder_boost_factor: builder_config.builder_boost_factor(),
+    let Some((randao_reveal, graffiti)) = proposal_query(req, resp) else {
+        return;
     };
     resp.defer(Outcome::AwaitingProducedBlock(ProduceBlockRequest {
         slot,
@@ -53,20 +45,52 @@ pub(crate) fn produce_block_v4(req: &Request<'_>, ctx: &ApiCtx, resp: &mut Respo
         graffiti,
         bid_policy,
         include_payload,
+        ssz_response: req.accepts_ssz(),
     }));
 }
 
-fn proposal_slot(req: &Request<'_>, resp: &mut Response<'_>) -> Option<Slot> {
-    if !req.accepts_ssz() {
-        resp.error(406, "only application/octet-stream is served");
+/// The `BuilderConfig` body, in SSZ or JSON, as the p2p bid terms. `None`
+/// having answered: PQ blocks are built locally, so naming a builder is an
+/// error.
+fn bid_policy(req: &Request<'_>, resp: &mut Response<'_>) -> Option<BidPolicy> {
+    let (bid_policy, names_builders) = if req.body_is_ssz() {
+        let Some(config) = BuilderConfig::parse(req.body) else {
+            resp.error(400, "invalid BuilderConfig");
+            return None;
+        };
+        let bid_policy = BidPolicy {
+            min_bid: config.min_bid(),
+            builder_boost_factor: config.builder_boost_factor(),
+        };
+        (bid_policy, config.entries().next().is_some())
+    } else if req.body_is_json() {
+        let Ok(config) = serde_json::from_slice::<JsonBuilderConfig>(req.body) else {
+            resp.error(400, "invalid BuilderConfig");
+            return None;
+        };
+        let bid_policy = BidPolicy {
+            min_bid: config.min_bid,
+            builder_boost_factor: config.builder_boost_factor,
+        };
+        (bid_policy, !config.builders.is_empty())
+    } else {
+        resp.error(415, "only an SSZ or JSON BuilderConfig body is read");
+        return None;
+    };
+    if names_builders {
+        resp.error(400, "PQ blocks are built locally; the BuilderConfig names builders");
         return None;
     }
-    let slot = req.params.get("slot").expect("{slot} in the route pattern");
-    let slot = parse_uint64(slot);
-    if slot.is_none() {
-        resp.error(400, "invalid slot");
-    }
-    slot
+    Some(bid_policy)
+}
+
+#[derive(Deserialize)]
+struct JsonBuilderConfig {
+    #[serde(deserialize_with = "uint64")]
+    min_bid: u64,
+    #[serde(deserialize_with = "uint64")]
+    builder_boost_factor: u64,
+    builders: Vec<IgnoredAny>,
 }
 
 /// The reveal, a `VRFProof` too wide for a spine message, is held in the
@@ -98,6 +122,39 @@ pub(crate) struct ProduceBlockRequest {
     graffiti: [u8; 32],
     bid_policy: BidPolicy,
     include_payload: bool,
+    ssz_response: bool,
+}
+
+/// What a produced block is answered with beside the block, as headers and,
+/// in JSON, as the body's top-level fields.
+pub(crate) struct ProducedBlockMetadata {
+    pub(crate) version: &'static str,
+    pub(crate) payload_included: bool,
+    pub(crate) execution_payload_value: String,
+    pub(crate) consensus_block_value: String,
+}
+
+impl ProducedBlockMetadata {
+    fn new(block: &ProducedBlock, version: &'static str, payload_included: bool) -> Self {
+        Self {
+            version,
+            payload_included,
+            execution_payload_value: wei_decimal(&block.execution_payload_value),
+            consensus_block_value: wei_decimal(&block.consensus_block_value),
+        }
+    }
+
+    fn headers(&self) -> [(&str, &str); 4] {
+        [
+            ("Eth-Consensus-Version", self.version),
+            (
+                "Eth-Execution-Payload-Included",
+                if self.payload_included { "true" } else { "false" },
+            ),
+            ("Eth-Execution-Payload-Value", &self.execution_payload_value),
+            ("Eth-Consensus-Block-Value", &self.consensus_block_value),
+        ]
+    }
 }
 
 impl ProduceBlockRequest {
@@ -138,9 +195,10 @@ impl ProduceBlockRequest {
                 return resp.error(500, "the block could not be produced");
             }
         };
+        let version = spec.fork_at_slot(self.slot).name();
         let payload = block.payload.filter(|_| self.include_payload);
         let Some(payload) = payload else {
-            return self.respond_without_payload(resp, &block, reader, spec);
+            return self.respond_without_payload(resp, &block, reader, version);
         };
         let header = reader.acquire(block.header);
         let payload = reader.acquire(payload);
@@ -155,6 +213,14 @@ impl ProduceBlockRequest {
         let Some(envelope) = &block.envelope_header else {
             return resp.error(500, "the local envelope is unavailable");
         };
+        let metadata = ProducedBlockMetadata::new(&block, version, true);
+        if !self.ssz_response {
+            return resp.json_with_headers(&metadata.headers(), |json| {
+                json.produced_block(&metadata, |json| {
+                    json.pq_block_and_envelope(head, envelope, &payload)
+                })
+            });
+        }
         let envelope_at = 4 * 4 + head.len();
         let proofs_at = envelope_at +
             envelope.len() +
@@ -164,15 +230,7 @@ impl ProduceBlockRequest {
         let offsets = [16u32, envelope_at as u32, proofs_at as u32, blobs_at as u32]
             .map(u32::to_le_bytes)
             .concat();
-        let payload_value = wei_decimal(&block.execution_payload_value);
-        let block_value = wei_decimal(&block.consensus_block_value);
-        let headers = [
-            ("Eth-Consensus-Version", spec.fork_at_slot(self.slot).name()),
-            ("Eth-Execution-Payload-Included", "true"),
-            ("Eth-Execution-Payload-Value", payload_value.as_str()),
-            ("Eth-Consensus-Block-Value", block_value.as_str()),
-        ];
-        resp.send(200, Some(SSZ_MEDIA_TYPE), &headers, &[
+        resp.send(200, Some(SSZ_MEDIA_TYPE), &metadata.headers(), &[
             &offsets,
             head,
             envelope,
@@ -190,22 +248,21 @@ impl ProduceBlockRequest {
         resp: &mut Response<'_>,
         block: &ProducedBlock,
         reader: &mut TCacheReader,
-        spec: &SpecConfig,
+        version: &'static str,
     ) {
         let acquired = reader.acquire(block.header);
         let Ok((beacon_block, _)) = acquired.buffer() else {
             silver_log::warn!(slot = self.slot, "produced block unavailable");
             return resp.error(500, "the block could not be read");
         };
-        let payload_value = wei_decimal(&block.execution_payload_value);
-        let block_value = wei_decimal(&block.consensus_block_value);
-        let headers = [
-            ("Eth-Consensus-Version", spec.fork_at_slot(self.slot).name()),
-            ("Eth-Execution-Payload-Included", "false"),
-            ("Eth-Execution-Payload-Value", payload_value.as_str()),
-            ("Eth-Consensus-Block-Value", block_value.as_str()),
-        ];
-        resp.send(200, Some(SSZ_MEDIA_TYPE), &headers, &[beacon_block]);
+        let metadata = ProducedBlockMetadata::new(block, version, false);
+        if self.ssz_response {
+            resp.send(200, Some(SSZ_MEDIA_TYPE), &metadata.headers(), &[beacon_block]);
+        } else {
+            resp.json_with_headers(&metadata.headers(), |json| {
+                json.produced_block(&metadata, |json| json.beacon_block_pq(beacon_block))
+            });
+        }
     }
 }
 
@@ -216,28 +273,6 @@ fn parse_graffiti(text: &str) -> Option<[u8; 32]> {
     let mut graffiti = [0; 32];
     hex::decode_to_slice(hex, graffiti.get_mut(..hex.len() / 2)?).ok()?;
     Some(graffiti)
-}
-
-fn wei_decimal(little_endian: &[u8; 32]) -> String {
-    let mut limbs = [0u64; 4];
-    for (limb, bytes) in limbs.iter_mut().zip(little_endian.chunks_exact(8)) {
-        *limb = u64::from_le_bytes(bytes.try_into().expect("8 bytes"));
-    }
-    let mut digits = Vec::new();
-    loop {
-        let mut remainder = 0u128;
-        for limb in limbs.iter_mut().rev() {
-            let current = (remainder << 64) | u128::from(*limb);
-            *limb = (current / 10) as u64;
-            remainder = current % 10;
-        }
-        digits.push(b'0' + remainder as u8);
-        if limbs == [0; 4] {
-            break;
-        }
-    }
-    digits.reverse();
-    String::from_utf8(digits).expect("ascii digits")
 }
 
 #[cfg(test)]
@@ -325,6 +360,7 @@ mod tests {
             graffiti,
             bid_policy: BidPolicy { min_bid: 7, builder_boost_factor: 150 },
             include_payload: false,
+            ssz_response: true,
         });
     }
 
@@ -355,20 +391,37 @@ mod tests {
             assert_eq!(refused(&ctx, &query, version, body), "400", "{query} {version:?}");
         }
 
-        let json = Some("application/json");
-        let (_, out) = post_v4(&ctx, &query(), pq, json, &body, &mut submissions());
+        let text = Some("text/plain");
+        let (_, out) = post_v4(&ctx, &query(), pq, text, &body, &mut submissions());
         assert_eq!(status_code(&out), "415");
     }
 
+    /// Lighthouse's PQ client: a JSON `BuilderConfig`, and a JSON answer.
     #[test]
-    fn json_only_client_is_a_406() {
+    fn json_request_defers_for_a_json_answer() {
         let path = format!("/eth/v4/validator/blocks/{}", SLOT + 1);
-        let req = ParsedRequest {
-            query: &query(),
+        let config = r#"{"min_bid":"7","builder_boost_factor":"150","builders":[]}"#;
+        let query = query();
+        let req = |body: &'static str| ParsedRequest {
+            query: &query,
             accept: Some("application/json"),
+            content_type: Some("application/json"),
+            eth_consensus_version: Some("pq"),
+            body: body.as_bytes(),
             ..request("POST", &path)
         };
-        assert_eq!(status_code(&dispatch(&pq_ctx(), &req).1), "406");
+        let (outcome, out) = dispatch(&pq_ctx(), &req(config));
+        assert!(out.is_empty());
+        let Outcome::AwaitingProducedBlock(request) = outcome else { panic!("{outcome:?}") };
+        assert!(!request.ssz_response);
+        assert_eq!(request.bid_policy, BidPolicy { min_bid: 7, builder_boost_factor: 150 });
+
+        let naming_a_builder = r#"{"min_bid":"0","builder_boost_factor":"100","builders":[{}]}"#;
+        for body in [naming_a_builder, r#"{"min_bid":7}"#, ""] {
+            let (outcome, out) = dispatch(&pq_ctx(), &req(body));
+            assert_eq!(outcome, Outcome::Response(None), "{body}");
+            assert_eq!(status_code(&out), "400", "{body}");
+        }
     }
 
     #[test]
@@ -376,16 +429,5 @@ mod tests {
         let mut ctx = pq_ctx();
         ctx.spec.pq_fork_epoch = u64::MAX;
         assert_eq!(refused(&ctx, &query(), Some("pq"), &builder_config(0, 100, &[])), "400");
-    }
-
-    #[test]
-    fn wei_decimal_renders_every_limb() {
-        assert_eq!(wei_decimal(&[0; 32]), "0");
-        let mut two_ether = [0; 32];
-        two_ether[..8].copy_from_slice(&2_000_000_000_000_000_000u64.to_le_bytes());
-        assert_eq!(wei_decimal(&two_ether), "2000000000000000000");
-        let mut two_to_64 = [0; 32];
-        two_to_64[8] = 1;
-        assert_eq!(wei_decimal(&two_to_64), "18446744073709551616");
     }
 }

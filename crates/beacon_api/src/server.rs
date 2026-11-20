@@ -1703,9 +1703,9 @@ mod tests {
         StreamProtocol, TCache, TCacheId, TCacheProducer, TProducer, block_root_pq,
         ssz_view::{
             ATTESTATION_PQ_FIXED, BYTES_PER_BLOB, BYTES_PER_KZG_COMMITMENT, BeaconBlockBodyPqView,
-            DATA_COLUMN_SIDECAR_GLOAS_MIN, DATA_COLUMN_SIDECAR_MIN, ProvedAttestationView,
-            SIGNED_PQ_FIXED, SINGLE_ATT_PQ_SIZE, STATUS_V2_SIZE, SignedBeaconBlockPqView,
-            VRF_PROOF_SIZE, XMSS_SIGNATURE_SIZE,
+            DATA_COLUMN_SIDECAR_GLOAS_MIN, DATA_COLUMN_SIDECAR_MIN, ExecutionPayloadEnvelopeView,
+            ProvedAttestationView, SIGNED_PQ_FIXED, SINGLE_ATT_PQ_SIZE, STATUS_V2_SIZE,
+            SignedBeaconBlockPqView, VRF_PROOF_SIZE, XMSS_SIGNATURE_SIZE,
         },
         test_util::{SynthBid, SynthBlock, empty_signed_envelope_pq},
     };
@@ -4289,6 +4289,80 @@ mod tests {
             assert_eq!(&body[offsets[2]..offsets[3]], proofs);
             assert_eq!(&body[offsets[3]..], blobs);
         }
+    }
+
+    /// Lighthouse's PQ client posts a JSON `BuilderConfig` and reads the block
+    /// and its envelope back as JSON.
+    #[test]
+    fn json_client_gets_the_block_and_envelope_as_json() {
+        let mut server = server_with(64, LONG_TIMEOUT);
+        server.api.ctx = submission::pq_ctx();
+        let mut client = connect(tcp_addr(&server));
+        let slot = submission::SLOT + 1;
+        let config = r#"{"min_bid":"0","builder_boost_factor":"100","builders":[]}"#;
+        write!(
+            client,
+            "POST /eth/v4/validator/blocks/{slot}?randao_reveal=0x{}&include_payload=true \
+             HTTP/1.1\r\nHost: localhost\r\nAccept: application/json\r\n\
+             Content-Type: application/json\r\nEth-Consensus-Version: pq\r\n\
+             Content-Length: {}\r\nConnection: close\r\n\r\n{config}",
+            "11".repeat(VRF_PROOF_SIZE),
+            config.len()
+        )
+        .unwrap();
+        let request_id = request_id(&deferred_request(&mut server));
+
+        let commitment = [0x33; BYTES_PER_KZG_COMMITMENT];
+        let block = SynthBlock::pq(slot, SynthBid::new(&commitment)).into_bytes();
+        let signed_envelope = empty_signed_envelope_pq(slot, [7; 32]);
+        let envelope = &signed_envelope[SIGNED_PQ_FIXED..];
+        let payload = ExecutionPayloadEnvelopeView::payload(envelope);
+        let requests = ExecutionPayloadEnvelopeView::execution_requests(envelope);
+        let proofs = vec![0x44; PayloadFrame::CELL_PROOFS_PER_BLOB_LEN];
+        let blobs = vec![0x55; BYTES_PER_BLOB];
+        let mut frame = vec![0; PayloadFrame::HEADER_LEN];
+        PayloadFrame::write_header(&mut frame, payload.len(), requests.len(), 1, false, &[0; 32]);
+        for part in [payload, &commitment, requests, &proofs, &blobs] {
+            frame.extend_from_slice(part);
+        }
+        let envelope_header =
+            PayloadFrame::parse(&frame).unwrap().self_build_envelope_header([7; 32], [8; 32]);
+        let frame =
+            server.submissions.write_with(frame.len(), |out| out.copy_from_slice(&frame)).unwrap();
+        let header = server.serve_bytes(&block[SIGNED_PQ_FIXED..]);
+        let mut consensus_block_value = [0; 32];
+        consensus_block_value[0] = 9;
+        server.answer(BeaconApiResponse::ProducedBlock {
+            request_id,
+            block: Ok(ProducedBlock {
+                header,
+                payload_at: (block.len() - SIGNED_PQ_FIXED) as u32,
+                payload: Some(frame),
+                envelope_header: Some(envelope_header),
+                execution_payload_value: [0; 32],
+                consensus_block_value,
+                builder_entry: None,
+                body_root: [0; 32],
+            }),
+        });
+        let reader = std::thread::spawn(move || read_to_eof(client));
+        let response = serve(&mut server, reader, "JSON block response");
+        assert!(
+            response.starts_with(b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n"),
+            "{}",
+            String::from_utf8_lossy(&response)
+        );
+        let parsed: serde_json::Value = serde_json::from_slice(body(&response)).unwrap();
+        assert_eq!(parsed["version"], "pq");
+        assert_eq!(parsed["execution_payload_included"], true);
+        assert_eq!(parsed["consensus_block_value"], "9");
+        let data = &parsed["data"];
+        assert_eq!(data["block"]["slot"], slot.to_string());
+        let envelope = &data["execution_payload_envelope"];
+        assert_eq!(envelope["beacon_block_root"], root_hex(7));
+        assert_eq!(envelope["payload"]["slot_number"], slot.to_string());
+        assert_eq!(data["kzg_proofs"].as_array().unwrap().len(), 128);
+        assert_eq!(data["blobs"].as_array().unwrap().len(), 1);
     }
 
     #[test]

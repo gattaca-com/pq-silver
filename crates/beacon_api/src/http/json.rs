@@ -9,14 +9,21 @@ use silver_beacon_state_data::{
     Version, pq::KeyScheme,
 };
 use silver_common::{
-    AGENT_VERSION, PreparedPayloadAttributes,
+    AGENT_VERSION, PayloadFrame, PreparedPayloadAttributes,
+    ssz_hash_pq::ExecutionRequestsPqView,
     ssz_view::{
-        AttestationPqView, BEACON_BLOCK_HEADER_SIZE, BYTES_PER_KZG_COMMITMENT,
-        BeaconBlockHeaderView, IndexedAttestationPqView, PAYLOAD_ATTESTATION_DATA_SIZE,
-        PROPOSER_SLASHING_PQ_SIZE, PayloadAttestationDataView, ProposerPreferencesView,
-        ProvedAttestationView, SIGNED_PROPOSER_PREFERENCES_PQ_SIZE, SINGLE_ATT_PQ_SIZE,
-        SignedProposerPreferencesPqView, SingleAttestationPqView, WITHDRAWAL_SIZE, WithdrawalView,
-        XMSSSignature,
+        AttestationPqView, BEACON_BLOCK_FIXED, BEACON_BLOCK_HEADER_SIZE, BYTES_PER_BLOB,
+        BYTES_PER_KZG_COMMITMENT, BYTES_PER_KZG_PROOF, BeaconBlockBodyPqView,
+        BeaconBlockHeaderView, BuilderDepositRequestView, BuilderExitRequestView,
+        BuilderPreregistrationRequestView, ConsolidationRequestView, DEPOSIT_SIZE, DepositDataView,
+        DepositRequestView, DepositView, ETH1_DATA_SIZE, EXECUTION_PAYLOAD_ENVELOPE_MIN,
+        Eth1DataView, ExecutionPayloadBidView, ExecutionPayloadEnvelopeView, ExecutionPayloadView,
+        IndexedAttestationPqView, PAYLOAD_ATTESTATION_DATA_SIZE, PROPOSER_SLASHING_PQ_SIZE,
+        PayloadAttestationDataView, ProposerPreferencesView, ProvedAttestationView,
+        SIGNED_PROPOSER_PREFERENCES_PQ_SIZE, SINGLE_ATT_PQ_SIZE, SignedExecutionPayloadBidPqView,
+        SignedProposerPreferencesPqView, SingleAttestationPqView,
+        ValidatorPreregistrationRequestView, VoluntaryExitRequestView, WITHDRAWAL_SIZE,
+        WithdrawalRequestView, WithdrawalView, XMSSSignature, variable_list_items,
     },
 };
 
@@ -26,7 +33,7 @@ use crate::{
     node::peers::Peer,
     validator::{
         attestation_data::AttestationData, attester_duties::AttesterDuty,
-        proposer_duties::ProposerDuties, ptc_duties::PtcDuty,
+        produce_block::ProducedBlockMetadata, proposer_duties::ProposerDuties, ptc_duties::PtcDuty,
     },
 };
 
@@ -41,6 +48,29 @@ const HEX_PAIRS: [[u8; 2]; 256] = {
     }
     pairs
 };
+
+/// A little-endian `uint256` in decimal, as the schemas spell Wei.
+pub(crate) fn wei_decimal(little_endian: &[u8; 32]) -> String {
+    let mut limbs = [0u64; 4];
+    for (limb, bytes) in limbs.iter_mut().zip(little_endian.chunks_exact(8)) {
+        *limb = u64::from_le_bytes(bytes.try_into().expect("8 bytes"));
+    }
+    let mut digits = Vec::new();
+    loop {
+        let mut remainder = 0u128;
+        for limb in limbs.iter_mut().rev() {
+            let current = (remainder << 64) | u128::from(*limb);
+            *limb = (current / 10) as u64;
+            remainder = current % 10;
+        }
+        digits.push(b'0' + remainder as u8);
+        if limbs == [0; 4] {
+            break;
+        }
+    }
+    digits.reverse();
+    String::from_utf8(digits).expect("ascii digits")
+}
 
 /// Appends JSON to a buffer the caller owns — fresh or reused is the caller's
 /// affair. `start` is where this body begins, so bytes already in the buffer
@@ -399,17 +429,9 @@ impl Json<'_> {
 
     /// `ssz` is a `ProvedAttestationView`.
     pub(crate) fn proved_attestation(&mut self, ssz: &[u8]) {
-        let attestation = ProvedAttestationView::attestation(ssz);
         self.begin_object();
         self.key("aggregate");
-        self.begin_object();
-        self.key("aggregation_bits");
-        self.hex(AttestationPqView::aggregation_bits(attestation));
-        self.key("data");
-        self.attestation_data(&AttestationPqView::data(attestation).into());
-        self.key("committee_bits");
-        self.hex(AttestationPqView::committee_bits(attestation));
-        self.end_object();
+        self.attestation_pq(ProvedAttestationView::attestation(ssz));
         self.key("proof");
         self.hex(ProvedAttestationView::proof(ssz));
         self.end_object();
@@ -626,6 +648,350 @@ impl Json<'_> {
         self.key("attestation_2");
         self.indexed_attestation(&ssz[second..]);
         self.end_object();
+    }
+
+    fn attestation_pq(&mut self, ssz: &[u8]) {
+        self.begin_object();
+        self.key("aggregation_bits");
+        self.hex(AttestationPqView::aggregation_bits(ssz));
+        self.key("data");
+        self.attestation_data(&AttestationPqView::data(ssz).into());
+        self.key("committee_bits");
+        self.hex(AttestationPqView::committee_bits(ssz));
+        self.end_object();
+    }
+
+    /// A produced block's body: its version and values, and `data`.
+    pub(crate) fn produced_block(
+        &mut self,
+        metadata: &ProducedBlockMetadata,
+        data: impl FnOnce(&mut Self),
+    ) {
+        self.begin_object();
+        self.key("version");
+        self.string(metadata.version);
+        self.key("consensus_block_value");
+        self.string(&metadata.consensus_block_value);
+        self.key("execution_payload_value");
+        self.string(&metadata.execution_payload_value);
+        self.key("execution_payload_included");
+        self.bool(metadata.payload_included);
+        self.key("data");
+        data(self);
+        self.end_object();
+    }
+
+    /// `ProduceBlockV4`'s `data` with the payload: the envelope is `envelope`'s
+    /// fixed part followed by `payload`'s execution payload and requests.
+    pub(crate) fn pq_block_and_envelope(
+        &mut self,
+        block: &[u8],
+        envelope: &[u8; EXECUTION_PAYLOAD_ENVELOPE_MIN],
+        payload: &PayloadFrame<'_>,
+    ) {
+        self.begin_object();
+        self.key("block");
+        self.beacon_block_pq(block);
+        self.key("execution_payload_envelope");
+        self.begin_object();
+        self.key("payload");
+        self.execution_payload_gloas(payload.execution_payload);
+        self.key("execution_requests");
+        self.execution_requests_pq(payload.execution_requests);
+        self.key("builder_index");
+        self.quoted_u64(ExecutionPayloadEnvelopeView::builder_index(envelope));
+        self.key("beacon_block_root");
+        self.hex(ExecutionPayloadEnvelopeView::beacon_block_root(envelope));
+        self.key("parent_beacon_block_root");
+        self.hex(ExecutionPayloadEnvelopeView::parent_beacon_block_root(envelope));
+        self.end_object();
+        self.key("kzg_proofs");
+        self.hex_items::<BYTES_PER_KZG_PROOF>(payload.cell_proofs);
+        self.key("blobs");
+        self.hex_items::<BYTES_PER_BLOB>(payload.blobs);
+        self.end_object();
+    }
+
+    /// A PQ `BeaconBlock`, whose fixed part opens like a header's.
+    pub(crate) fn beacon_block_pq(&mut self, block: &[u8]) {
+        let header: &[u8; BEACON_BLOCK_HEADER_SIZE] =
+            block[..BEACON_BLOCK_HEADER_SIZE].try_into().expect("a block outgrows its header");
+        self.begin_object();
+        self.key("slot");
+        self.quoted_u64(BeaconBlockHeaderView::slot(header));
+        self.key("proposer_index");
+        self.quoted_u64(BeaconBlockHeaderView::proposer_index(header));
+        self.key("parent_root");
+        self.hex(BeaconBlockHeaderView::parent_root(header));
+        self.key("state_root");
+        self.hex(BeaconBlockHeaderView::state_root(header));
+        self.key("body");
+        self.beacon_block_body_pq(&block[BEACON_BLOCK_FIXED..]);
+        self.end_object();
+    }
+
+    fn beacon_block_body_pq(&mut self, body: &[u8]) {
+        self.begin_object();
+        self.key("randao_reveal");
+        self.hex_items::<32>(BeaconBlockBodyPqView::randao_reveal(body));
+        self.key("eth1_data");
+        self.eth1_data(BeaconBlockBodyPqView::eth1_data(body));
+        self.key("graffiti");
+        self.hex(BeaconBlockBodyPqView::graffiti(body));
+        self.key("proposer_slashings");
+        self.begin_array();
+        for slashing in BeaconBlockBodyPqView::proposer_slashings(body).as_chunks().0 {
+            self.proposer_slashing(slashing);
+        }
+        self.end_array();
+        self.key("attester_slashings");
+        self.begin_array();
+        for slashing in variable_list_items(BeaconBlockBodyPqView::attester_slashings(body)) {
+            self.attester_slashing(slashing);
+        }
+        self.end_array();
+        self.key("attestations");
+        self.begin_array();
+        for attestation in variable_list_items(BeaconBlockBodyPqView::attestations(body)) {
+            self.attestation_pq(attestation);
+        }
+        self.end_array();
+        self.key("deposits");
+        self.begin_array();
+        for deposit in BeaconBlockBodyPqView::deposits(body).as_chunks().0 {
+            self.deposit(deposit);
+        }
+        self.end_array();
+        self.key("signed_execution_payload_bid");
+        self.signed_execution_payload_bid_pq(BeaconBlockBodyPqView::signed_execution_payload_bid(
+            body,
+        ));
+        self.key("parent_execution_requests");
+        self.execution_requests_pq(BeaconBlockBodyPqView::parent_execution_requests(body));
+        self.key("proof");
+        self.hex(BeaconBlockBodyPqView::proof(body));
+        self.end_object();
+    }
+
+    fn eth1_data(&mut self, ssz: &[u8; ETH1_DATA_SIZE]) {
+        self.begin_object();
+        self.key("deposit_root");
+        self.hex(Eth1DataView::deposit_root(ssz));
+        self.key("deposit_count");
+        self.quoted_u64(Eth1DataView::deposit_count(ssz));
+        self.key("block_hash");
+        self.hex(Eth1DataView::block_hash(ssz));
+        self.end_object();
+    }
+
+    fn deposit(&mut self, ssz: &[u8; DEPOSIT_SIZE]) {
+        let data = DepositView::data(ssz);
+        self.begin_object();
+        self.key("proof");
+        self.hex_items::<32>(DepositView::proof(ssz));
+        self.key("data");
+        self.begin_object();
+        self.key("pubkey");
+        self.hex(DepositDataView::pubkey(data));
+        self.key("withdrawal_credentials");
+        self.hex(DepositDataView::withdrawal_credentials(data));
+        self.key("amount");
+        self.quoted_u64(DepositDataView::amount(data));
+        self.key("signature");
+        self.hex(DepositDataView::signature(data));
+        self.end_object();
+        self.end_object();
+    }
+
+    fn signed_execution_payload_bid_pq(&mut self, ssz: &[u8]) {
+        let bid = SignedExecutionPayloadBidPqView::message(ssz);
+        self.begin_object();
+        self.key("message");
+        self.begin_object();
+        self.key("parent_block_hash");
+        self.hex(ExecutionPayloadBidView::parent_block_hash(bid));
+        self.key("parent_block_root");
+        self.hex(ExecutionPayloadBidView::parent_block_root(bid));
+        self.key("block_hash");
+        self.hex(ExecutionPayloadBidView::block_hash(bid));
+        self.key("prev_randao");
+        self.hex(ExecutionPayloadBidView::prev_randao(bid));
+        self.key("fee_recipient");
+        self.hex(ExecutionPayloadBidView::fee_recipient(bid));
+        self.key("gas_limit");
+        self.quoted_u64(ExecutionPayloadBidView::gas_limit(bid));
+        self.key("builder_index");
+        self.quoted_u64(ExecutionPayloadBidView::builder_index(bid));
+        self.key("slot");
+        self.quoted_u64(ExecutionPayloadBidView::slot(bid));
+        self.key("value");
+        self.quoted_u64(ExecutionPayloadBidView::value(bid));
+        self.key("execution_payment");
+        self.quoted_u64(ExecutionPayloadBidView::execution_payment(bid));
+        self.key("blob_kzg_commitments");
+        self.hex_items::<BYTES_PER_KZG_COMMITMENT>(ExecutionPayloadBidView::blob_kzg_commitments(
+            bid,
+        ));
+        self.key("execution_requests_root");
+        self.hex(ExecutionPayloadBidView::execution_requests_root(bid));
+        self.end_object();
+        self.key("signature");
+        self.hex(SignedExecutionPayloadBidPqView::signature(ssz));
+        self.end_object();
+    }
+
+    fn execution_payload_gloas(&mut self, ssz: &[u8]) {
+        self.begin_object();
+        self.key("parent_hash");
+        self.hex(ExecutionPayloadView::parent_hash(ssz));
+        self.key("fee_recipient");
+        self.hex(ExecutionPayloadView::fee_recipient(ssz));
+        self.key("state_root");
+        self.hex(ExecutionPayloadView::state_root(ssz));
+        self.key("receipts_root");
+        self.hex(ExecutionPayloadView::receipts_root(ssz));
+        self.key("logs_bloom");
+        self.hex(ExecutionPayloadView::logs_bloom(ssz));
+        self.key("prev_randao");
+        self.hex(ExecutionPayloadView::prev_randao(ssz));
+        self.key("block_number");
+        self.quoted_u64(ExecutionPayloadView::block_number(ssz));
+        self.key("gas_limit");
+        self.quoted_u64(ExecutionPayloadView::gas_limit(ssz));
+        self.key("gas_used");
+        self.quoted_u64(ExecutionPayloadView::gas_used(ssz));
+        self.key("timestamp");
+        self.quoted_u64(ExecutionPayloadView::timestamp(ssz));
+        self.key("extra_data");
+        self.hex(ExecutionPayloadView::extra_data(ssz));
+        self.key("base_fee_per_gas");
+        self.string(&wei_decimal(ExecutionPayloadView::base_fee_per_gas(ssz)));
+        self.key("block_hash");
+        self.hex(ExecutionPayloadView::block_hash(ssz));
+        self.key("transactions");
+        self.begin_array();
+        for transaction in variable_list_items(ExecutionPayloadView::transactions(ssz)) {
+            self.hex(transaction);
+        }
+        self.end_array();
+        self.key("withdrawals");
+        self.begin_array();
+        for withdrawal in ExecutionPayloadView::withdrawals_gloas(ssz).as_chunks().0 {
+            self.withdrawal(withdrawal);
+        }
+        self.end_array();
+        self.key("blob_gas_used");
+        self.quoted_u64(ExecutionPayloadView::blob_gas_used(ssz));
+        self.key("excess_blob_gas");
+        self.quoted_u64(ExecutionPayloadView::excess_blob_gas(ssz));
+        self.key("block_access_list");
+        self.hex(ExecutionPayloadView::block_access_list(ssz));
+        self.key("slot_number");
+        self.quoted_u64(ExecutionPayloadView::slot_number(ssz));
+        self.end_object();
+    }
+
+    fn execution_requests_pq(&mut self, ssz: &[u8]) {
+        let [
+            deposits,
+            withdrawals,
+            consolidations,
+            builder_deposits,
+            builder_exits,
+            validator_preregistrations,
+            builder_preregistrations,
+            voluntary_exits,
+        ] = ExecutionRequestsPqView::sections(ssz);
+        self.begin_object();
+        self.key("deposits");
+        self.objects(deposits, |json, request| {
+            json.field_hex("pubkey", DepositRequestView::pubkey(request));
+            json.field_hex(
+                "withdrawal_credentials",
+                DepositRequestView::withdrawal_credentials(request),
+            );
+            json.key("amount");
+            json.quoted_u64(DepositRequestView::amount(request));
+            json.field_hex("signature", DepositRequestView::signature(request));
+            json.key("index");
+            json.quoted_u64(DepositRequestView::index(request));
+        });
+        self.key("withdrawals");
+        self.objects(withdrawals, |json, request| {
+            json.field_hex("source_address", WithdrawalRequestView::source_address(request));
+            json.field_hex("validator_pubkey", WithdrawalRequestView::validator_pubkey(request));
+            json.key("amount");
+            json.quoted_u64(WithdrawalRequestView::amount(request));
+        });
+        self.key("consolidations");
+        self.objects(consolidations, |json, request| {
+            json.field_hex("source_address", ConsolidationRequestView::source_address(request));
+            json.field_hex("source_pubkey", ConsolidationRequestView::source_pubkey(request));
+            json.field_hex("target_pubkey", ConsolidationRequestView::target_pubkey(request));
+        });
+        self.key("builder_deposits");
+        self.objects(builder_deposits, |json, request| {
+            json.field_hex("pubkey", BuilderDepositRequestView::pubkey(request));
+            json.field_hex(
+                "withdrawal_credentials",
+                BuilderDepositRequestView::withdrawal_credentials(request),
+            );
+            json.key("amount");
+            json.quoted_u64(BuilderDepositRequestView::amount(request));
+            json.field_hex("signature", BuilderDepositRequestView::signature(request));
+        });
+        self.key("builder_exits");
+        self.objects(builder_exits, |json, request| {
+            json.field_hex("source_address", BuilderExitRequestView::source_address(request));
+            json.field_hex("pubkey", BuilderExitRequestView::pubkey(request));
+        });
+        self.key("validator_preregistrations");
+        self.objects(validator_preregistrations, |json, request| {
+            json.field_hex("pubkey", ValidatorPreregistrationRequestView::pubkey(request));
+            json.field_hex(
+                "withdrawal_credentials",
+                ValidatorPreregistrationRequestView::withdrawal_credentials(request),
+            );
+            json.field_hex("vrf_root", ValidatorPreregistrationRequestView::vrf_root(request));
+        });
+        self.key("builder_preregistrations");
+        self.objects(builder_preregistrations, |json, request| {
+            json.field_hex("pubkey", BuilderPreregistrationRequestView::pubkey(request));
+            json.field_hex(
+                "withdrawal_credentials",
+                BuilderPreregistrationRequestView::withdrawal_credentials(request),
+            );
+        });
+        self.key("voluntary_exits");
+        self.objects(voluntary_exits, |json, request| {
+            json.field_hex("pubkey", VoluntaryExitRequestView::pubkey(request));
+        });
+        self.end_object();
+    }
+
+    /// An array of one object per `N`-byte element of `ssz`.
+    fn objects<const N: usize>(&mut self, ssz: &[u8], fields: impl Fn(&mut Self, &[u8; N])) {
+        self.begin_array();
+        for element in ssz.as_chunks().0 {
+            self.begin_object();
+            fields(self, element);
+            self.end_object();
+        }
+        self.end_array();
+    }
+
+    fn field_hex(&mut self, name: &str, bytes: &[u8]) {
+        self.key(name);
+        self.hex(bytes);
+    }
+
+    /// An array of one hex string per `N`-byte element of `ssz`.
+    fn hex_items<const N: usize>(&mut self, ssz: &[u8]) {
+        self.begin_array();
+        for element in ssz.as_chunks::<N>().0 {
+            self.hex(element);
+        }
+        self.end_array();
     }
 
     fn indexed_attestation(&mut self, ssz: &[u8]) {
@@ -984,6 +1350,17 @@ mod tests {
     }
 
     #[test]
+    fn wei_decimal_renders_every_limb() {
+        assert_eq!(wei_decimal(&[0; 32]), "0");
+        let mut two_ether = [0; 32];
+        two_ether[..8].copy_from_slice(&2_000_000_000_000_000_000u64.to_le_bytes());
+        assert_eq!(wei_decimal(&two_ether), "2000000000000000000");
+        let mut two_to_64 = [0; 32];
+        two_to_64[8] = 1;
+        assert_eq!(wei_decimal(&two_to_64), "18446744073709551616");
+    }
+
+    #[test]
     fn integers_are_quoted_decimal_strings() {
         assert_eq!(write(|j| j.quoted_u64(0)), "\"0\"");
         assert_eq!(write(|j| j.quoted_u64(7)), "\"7\"");
@@ -1087,5 +1464,97 @@ mod tests {
         let parsed: serde_json::Value = serde_json::from_str(&body).expect("valid JSON");
         assert_eq!(parsed["slot"], "10");
         assert!(parsed.get("kzg_commitments").is_none());
+    }
+
+    /// Lighthouse decodes the block body with `deny_unknown_fields`, so every
+    /// container carries exactly its schema's fields. Values were checked
+    /// against Lighthouse's own decoder on random blocks.
+    #[test]
+    fn pq_block_and_envelope_carry_exactly_the_schema_fields() {
+        use silver_common::{
+            ssz_view::SIGNED_PQ_FIXED,
+            test_util::{SynthBid, SynthBlock, empty_signed_envelope_pq},
+        };
+
+        let signed = SynthBlock::pq(9, SynthBid::new(&[0x33; BYTES_PER_KZG_COMMITMENT]));
+        let block = &signed.bytes()[SIGNED_PQ_FIXED..];
+        let signed_envelope = empty_signed_envelope_pq(9, [3; 32]);
+        let envelope = &signed_envelope[SIGNED_PQ_FIXED..];
+        let payload = PayloadFrame {
+            execution_payload: ExecutionPayloadEnvelopeView::payload(envelope),
+            after_payload: &[],
+            blob_count: 1,
+            commitments: &[],
+            execution_requests: ExecutionPayloadEnvelopeView::execution_requests(envelope),
+            cell_proofs: &[0x44; 128 * BYTES_PER_KZG_PROOF],
+            blobs: &[0x55; BYTES_PER_BLOB],
+            should_override_builder: false,
+            block_value: [0; 32],
+        };
+        let metadata = ProducedBlockMetadata {
+            version: "pq",
+            payload_included: true,
+            execution_payload_value: "7".into(),
+            consensus_block_value: "9".into(),
+        };
+        let body = write(|json| {
+            json.produced_block(&metadata, |json| {
+                json.pq_block_and_envelope(block, envelope[..80].try_into().unwrap(), &payload)
+            })
+        });
+        let parsed: serde_json::Value = serde_json::from_str(&body).unwrap();
+        let keys = |value: &serde_json::Value| -> Vec<String> {
+            value.as_object().unwrap().keys().cloned().collect()
+        };
+        let sorted = |names: &[&str]| -> Vec<String> {
+            let mut names: Vec<_> = names.iter().map(|name| name.to_string()).collect();
+            names.sort();
+            names
+        };
+
+        assert_eq!(
+            keys(&parsed),
+            sorted(&[
+                "version",
+                "consensus_block_value",
+                "execution_payload_value",
+                "execution_payload_included",
+                "data",
+            ])
+        );
+        let data = &parsed["data"];
+        assert_eq!(
+            keys(data),
+            sorted(&["block", "execution_payload_envelope", "kzg_proofs", "blobs"])
+        );
+        assert_eq!(data["block"]["slot"], "9");
+        assert_eq!(
+            keys(&data["block"]["body"]),
+            sorted(&[
+                "randao_reveal",
+                "eth1_data",
+                "graffiti",
+                "proposer_slashings",
+                "attester_slashings",
+                "attestations",
+                "deposits",
+                "signed_execution_payload_bid",
+                "parent_execution_requests",
+                "proof",
+            ])
+        );
+        let bid = &data["block"]["body"]["signed_execution_payload_bid"]["message"];
+        assert_eq!(bid["blob_kzg_commitments"][0], format!("0x{}", "33".repeat(48)));
+        assert_eq!(data["block"]["body"]["randao_reveal"].as_array().unwrap().len(), 32);
+
+        let envelope = &data["execution_payload_envelope"];
+        let payload = &envelope["payload"];
+        assert_eq!(payload["slot_number"], "9");
+        assert_eq!(payload["base_fee_per_gas"], "0");
+        assert_eq!(keys(payload).len(), 19);
+        assert_eq!(keys(&envelope["execution_requests"]).len(), 8);
+        assert_eq!(envelope["beacon_block_root"], format!("0x{}", "03".repeat(32)));
+        assert_eq!(data["kzg_proofs"].as_array().unwrap().len(), 128);
+        assert_eq!(data["blobs"][0], format!("0x{}", "55".repeat(BYTES_PER_BLOB)));
     }
 }

@@ -270,6 +270,14 @@ impl<'a> Response<'a> {
         result
     }
 
+    pub(crate) fn json_with_headers(
+        &mut self,
+        headers: &[(&str, &str)],
+        render: impl FnOnce(&mut Json<'_>),
+    ) {
+        self.json_framed(200, headers, render);
+    }
+
     pub(crate) fn versioned_json(&mut self, version: &str, render: impl FnOnce(&mut Json<'_>)) {
         self.json_framed(200, &[("Eth-Consensus-Version", version)], |json| {
             json.versioned_envelope(version, render)

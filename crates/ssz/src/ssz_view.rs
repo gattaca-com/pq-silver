@@ -99,6 +99,17 @@ pub(crate) fn variable_list_ok(data: &[u8], max: usize, elem_ok: impl Fn(&[u8]) 
     true
 }
 
+/// The elements of a `List` of variable-size elements that
+/// [`variable_list_ok`] accepts.
+pub fn variable_list_items(data: &[u8]) -> impl Iterator<Item = &[u8]> {
+    let count = variable_list_len(data);
+    (0..count).map(move |i| {
+        let start = u32_le(data, i * 4) as usize;
+        let end = if i + 1 < count { u32_le(data, (i + 1) * 4) as usize } else { data.len() };
+        &data[start..end]
+    })
+}
+
 /// Element count of a `List` of variable-size elements, read off its offset
 /// table's first entry.
 pub(crate) fn variable_list_len(data: &[u8]) -> usize {
@@ -2919,8 +2930,10 @@ impl ExecutionPayloadView {
     pub fn block_access_list_offset(buf: &[u8]) -> u32 {
         u32_le(buf, 528)
     }
+    const OFFSETS_GLOAS: [usize; 4] = [436, 504, 508, 528];
+
     pub fn check_canonical_gloas(buf: &[u8]) -> bool {
-        const OFFSETS: [usize; 4] = [436, 504, 508, 528];
+        const OFFSETS: [usize; 4] = ExecutionPayloadView::OFFSETS_GLOAS;
         buf.len() >= EXECUTION_PAYLOAD_FIXED_GLOAS &&
             offsets_ok(buf, &OFFSETS, EXECUTION_PAYLOAD_FIXED_GLOAS) &&
             variable_field(buf, &OFFSETS, 0).len() <= MAX_EXTRA_DATA_BYTES &&
@@ -2930,6 +2943,18 @@ impl ExecutionPayloadView {
                 WITHDRAWAL_SIZE,
                 MAX_WITHDRAWALS_PER_PAYLOAD,
             )
+    }
+
+    /// From Gloas the block access list follows the withdrawals, so
+    /// [`Self::withdrawals`] would run into it.
+    pub fn withdrawals_gloas(buf: &[u8]) -> &[u8] {
+        debug_assert!(Self::check_canonical_gloas(buf));
+        variable_field(buf, &Self::OFFSETS_GLOAS, 2)
+    }
+
+    pub fn block_access_list(buf: &[u8]) -> &[u8] {
+        debug_assert!(Self::check_canonical_gloas(buf));
+        variable_field(buf, &Self::OFFSETS_GLOAS, 3)
     }
     #[inline]
     pub fn slot_number(buf: &[u8]) -> u64 {

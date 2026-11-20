@@ -165,6 +165,13 @@ impl AggregationCommitteeWindow {
         self.slot_roots[slot] = slot_root(&ssz[slot_start..]).expect("a written slot is valid SSZ");
     }
 
+    pub fn aggregators(&self, slot: usize, index: usize) -> impl Iterator<Item = u64> + '_ {
+        let committees = element(&self.ssz, slot, AGGREGATION_COMMITTEE_WINDOW_LEN);
+        let count = if committees.is_empty() { 0 } else { u32_le(committees, 0) as usize / 4 };
+        let committee = if index < count { element(committees, index, count) } else { &[] };
+        committee.chunks_exact(8).map(|member| u64::from_le_bytes(member.try_into().unwrap()))
+    }
+
     pub(crate) fn ssz_len(&self) -> usize {
         self.ssz.len()
     }
@@ -172,6 +179,12 @@ impl AggregationCommitteeWindow {
     pub(crate) fn write_ssz<W: Write>(&self, w: &mut W) -> io::Result<()> {
         w.write_all(&self.ssz)
     }
+}
+
+fn element(ssz: &[u8], i: usize, count: usize) -> &[u8] {
+    let start = u32_le(ssz, i * 4) as usize;
+    let end = if i + 1 < count { u32_le(ssz, (i + 1) * 4) as usize } else { ssz.len() };
+    &ssz[start..end]
 }
 
 fn write_offset(ssz: &mut [u8], at: usize, offset: usize) {

@@ -5,10 +5,10 @@ use silver_ssz::{
         BeaconBlockHeaderView, ExecutionPayloadBidView, ExecutionPayloadEnvelopeView,
         PAYLOAD_ATTESTATION_MESSAGE_PQ_SIZE, PROPOSER_SLASHING_PQ_SIZE, PayloadAttestationDataView,
         PayloadAttestationMessagePqView, ProposerPreferencesView, ProposerSlashingPqView,
-        SIGNED_PROPOSER_PREFERENCES_PQ_SIZE, SINGLE_ATT_PQ_SIZE, SignedBeaconBlockPqView,
-        SignedExecutionPayloadBidPqView, SignedExecutionPayloadEnvelopePqView,
-        SignedProposerPreferencesPqView, SingleAttestationPqView, XMSS_PUBKEY_SIZE,
-        XMSS_SIGNATURE_SIZE, XMSSPubkey, XMSSSignature,
+        SIGNED_PROPOSER_PREFERENCES_PQ_SIZE, SINGLE_ATT_PQ_SIZE, SignedAggregateAndProofPqView,
+        SignedBeaconBlockPqView, SignedExecutionPayloadBidPqView,
+        SignedExecutionPayloadEnvelopePqView, SignedProposerPreferencesPqView,
+        SingleAttestationPqView, XMSS_PUBKEY_SIZE, XMSS_SIGNATURE_SIZE, XMSSPubkey, XMSSSignature,
     },
 };
 
@@ -80,6 +80,23 @@ impl<'a> SignatureCheck<'a> {
             leaf_index: compute_xmss_attestation_leaf_index(target_epoch),
             signing_root,
             signature: SingleAttestationPqView::signature(attestation),
+        }
+    }
+
+    pub fn aggregate_and_proof(
+        signed: &'a [u8],
+        aggregator_pubkey: &'a XMSSPubkey,
+        domain: &B256,
+    ) -> Self {
+        let slot = SignedAggregateAndProofPqView::agg_data(signed).slot();
+        Self {
+            public_key: aggregator_pubkey,
+            leaf_index: compute_xmss_leaf_index(slot, LeafOffset::AggregateAndProof),
+            signing_root: compute_signing_root(
+                &SignedAggregateAndProofPqView::message_root(signed),
+                domain,
+            ),
+            signature: SignedAggregateAndProofPqView::signature(signed),
         }
     }
 

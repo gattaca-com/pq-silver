@@ -3,8 +3,8 @@ use core::cmp::max;
 use flux_profiler::timed;
 use silver_beacon_state_data::{
     B256, BeaconBlockHeader, BuilderPendingPayment, EPOCHS_PER_SLASHINGS_VECTOR, EpochBalancesRow,
-    EpochView, Immutable, SLOTS_PER_EPOCH, SlotStateWriteView, SpecConfig, StateReadView,
-    StateWriterView, ValidatorsView,
+    EpochReadView, EpochView, Immutable, SLOTS_PER_EPOCH, SlotStateWriteView, SpecConfig,
+    StateReadView, StateWriterView, ValidatorsView,
     bls::{self, SigBatch},
     hash_tree_root_block_header,
     pq::xmss_pubkey,
@@ -386,18 +386,24 @@ impl<'a> SlashedAttestation<'a> {
         validator_count: usize,
     ) -> std::result::Result<[Self; 2], AttesterSlashingError> {
         let pair = Self::pair(slashing, is_pq)?;
-        let [first, second] = &pair;
+        Self::check_pair(&pair, validator_count)?;
+        Ok(pair)
+    }
+
+    fn check_pair(
+        [first, second]: &[Self; 2],
+        validator_count: usize,
+    ) -> std::result::Result<(), AttesterSlashingError> {
         if !is_slashable_attestation_data(first.data.as_bytes(), second.data.as_bytes()) {
             return Err(AttesterSlashingError::NotSlashableData);
         }
         check_attesting_indices(first.indices, validator_count)?;
-        check_attesting_indices(second.indices, validator_count)?;
-        Ok(pair)
+        check_attesting_indices(second.indices, validator_count)
     }
 
     /// Spec `is_valid_indexed_attestation`'s `stark.VerifyAggregates` call:
     /// `proof` over the one statement the attesters sign.
-    fn push_claims(&self, claims: &mut StarkClaims, imm: &Immutable, epoch: &EpochView) {
+    fn push_claims(&self, claims: &mut StarkClaims, imm: &Immutable, epoch: &EpochReadView) {
         let first_statement = claims.statement_count();
         let attesters = self
             .indices
@@ -425,6 +431,39 @@ pub fn attester_slashing_names_unseen(
         unseen
     });
     Some(unseen)
+}
+
+pub fn validate_pq_attester_slashing_for_gossip(
+    view: &StateReadView,
+    slashing: &[u8],
+    seen: impl Fn(usize) -> bool,
+    claims: &mut StarkClaims,
+) -> std::result::Result<bool, AttesterSlashingError> {
+    let pair = SlashedAttestation::pair(slashing, true)?;
+    let [first, second] = &pair;
+    let mut unseen = false;
+    for_each_sorted_intersection(first.indices, second.indices, |vi| {
+        unseen = !seen(vi);
+        unseen
+    });
+    if !unseen {
+        return Ok(false);
+    }
+    SlashedAttestation::check_pair(&pair, view.validators.count())?;
+
+    let current_epoch = view.slot.current_epoch();
+    let mut slashable = false;
+    for_each_sorted_intersection(first.indices, second.indices, |vi| {
+        slashable = view.validators.is_slashable(vi, current_epoch);
+        slashable
+    });
+    if !slashable {
+        return Err(AttesterSlashingError::NoSlashedIntersection);
+    }
+
+    claims.begin(slashing);
+    pair.iter().for_each(|attestation| attestation.push_claims(claims, view.imm, &view.epoch));
+    Ok(true)
 }
 
 /// Gossip-side `AttesterSlashing` validator (single slashing, not the

@@ -51,7 +51,7 @@ pub use slashings::{
     attester_slashing_equivocators, attester_slashing_names_unseen,
     collect_sigs_attester_slashings, collect_sigs_proposer_slashings, process_attester_slashings,
     process_proposer_slashings, validate_attester_slashing_for_gossip,
-    verify_proposer_slashing_signatures_pq,
+    validate_pq_attester_slashing_for_gossip, verify_proposer_slashing_signatures_pq,
 };
 pub use stark::StarkClaims;
 pub use sync_aggregate::{collect_sigs_sync_aggregate, process_sync_aggregate};

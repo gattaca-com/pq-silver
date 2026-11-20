@@ -1,6 +1,6 @@
 use std::ops::Range;
 
-use silver_beacon_state_data::{B256, EpochView, Immutable};
+use silver_beacon_state_data::{B256, EpochReadView, Immutable};
 use silver_common::ssz_view::AttestationDataView;
 
 use crate::stf::attestation::attester_signing_root;
@@ -50,7 +50,7 @@ impl StarkClaims {
     pub(crate) fn attestation(
         &mut self,
         imm: &Immutable,
-        epoch: &EpochView,
+        epoch: &EpochReadView,
         data: AttestationDataView,
     ) -> AttestationStatements<'_> {
         AttestationStatements { message: attester_signing_root(imm, epoch, data), claims: self }

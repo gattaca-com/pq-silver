@@ -527,10 +527,10 @@ impl BeaconStateTile {
         }
     }
 
-    /// Sends each STARK proof the block's transition collected, before the
-    /// next block reuses them: the ids they went out under, or `None` when
+    /// Sends each STARK proof collected from `data`, before the next
+    /// collection reuses them: the ids they went out under, or `None` when
     /// one did not fit in the tcache.
-    fn send_stark_proofs(
+    pub(super) fn send_stark_proofs(
         &mut self,
         data: &[u8],
         state_id: StateId,

@@ -1,7 +1,7 @@
 use silver_common::{Nanos, TCacheRead, TProducer};
 
 use super::{
-    aggregation::{Aggregation, Item, Priority},
+    aggregation::{Aggregation, Priority, VerifiedClaims},
     claims::Aggregate,
     strategy::{Batch, MarginalGain, Strategy},
     wire::MAX_CHILDREN,
@@ -10,7 +10,7 @@ use super::{
 /// The aggregates of one slot, proved as the proof of the block body. It has
 /// no deadline: the proposer reads the best proof when it asks.
 pub(super) struct MergeAggregation {
-    /// The `AttestationPq` SSZ of each item, for the block body.
+    /// The `AttestationPq` SSZ of each aggregate, for the block body.
     attestations: Vec<Vec<u8>>,
     strategy: MarginalGain,
     pub(super) core: Aggregation,
@@ -29,7 +29,7 @@ impl MergeAggregation {
         let fits = self.strategy.arrived(self.attestations.len(), aggregate.positions);
         if fits {
             self.attestations.push(aggregate.attestation);
-            self.core.add(Item::Child(aggregate.claims, aggregate.proof));
+            self.core.add(VerifiedClaims::Proof(aggregate.claims, aggregate.proof));
         }
         fits
     }
@@ -45,8 +45,8 @@ impl MergeAggregation {
     /// best proof counts as one child.
     pub(super) fn next_batch(&mut self, now: Nanos) -> Option<Batch> {
         self.priority(now)?;
-        let limit = MAX_CHILDREN - usize::from(self.core.proof().is_some());
-        self.core.accept(self.strategy.next_batch(limit), limit)
+        let limit = MAX_CHILDREN - usize::from(self.core.best_proof().is_some());
+        self.core.check_batch(self.strategy.next_batch(limit), limit)
     }
 
     pub(super) fn next_request(
@@ -64,8 +64,9 @@ impl MergeAggregation {
     /// The `AttestationPq` SSZ of each aggregate the best proof covers, and
     /// the proof, for a block body. `None` without a best proof.
     pub(super) fn block_proof(&self) -> Option<(Vec<&[u8]>, &[u8])> {
-        let (_, proof) = self.core.proof()?;
-        let attestations = self.core.covered().iter().map(|&index| &self.attestations[index][..]);
+        let (_, proof) = self.core.best_proof()?;
+        let attestations =
+            self.core.covered_indices().iter().map(|&index| &self.attestations[index][..]);
         Some((attestations.collect(), proof))
     }
 }

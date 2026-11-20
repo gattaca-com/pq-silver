@@ -78,7 +78,7 @@ fn batches_take_the_waiting_votes_up_to_the_limit() {
     assert_eq!(first.len() / (64 + XMSS_SIGNATURE_SIZE), MAX_RECORDS - 2);
 
     aggregation.finish(batch, Some(&answer(0..first_votes))).unwrap();
-    assert_eq!(aggregation.core.covered().len(), MAX_RECORDS - 2);
+    assert_eq!(aggregation.core.covered_indices().len(), MAX_RECORDS - 2);
     assert!(aggregation.add(vote(first_votes)));
     assert!(aggregation.add(vote(first_votes + 1)));
     let batch = aggregation.next_batch(Nanos::ZERO).unwrap();
@@ -87,7 +87,7 @@ fn batches_take_the_waiting_votes_up_to_the_limit() {
     assert!(second.windows(5).any(|window| window == b"proof"), "the best proof is the child");
     aggregation.finish(batch, Some(&answer(0..MAX_RECORDS as u16))).unwrap();
     assert!(aggregation.next_batch(Nanos::ZERO).is_none(), "nothing waits");
-    assert_eq!(aggregation.core.covered().len(), MAX_RECORDS);
+    assert_eq!(aggregation.core.covered_indices().len(), MAX_RECORDS);
     assert_eq!(best_claims(&aggregation.core), MAX_RECORDS);
     assert!(!aggregation.add(vote(MAX_RECORDS as u16)), "a position beyond the largest committee");
 }
@@ -111,7 +111,7 @@ fn nothing_is_sent_at_the_deadline() {
     aggregation.finish(batch, Some(&answer([0]))).unwrap();
     assert!(aggregation.add(vote(1)));
     assert!(aggregation.next_batch(DEADLINE + Nanos(1)).is_none(), "the best proof stays past it");
-    assert!(aggregation.core.proof().is_some());
+    assert!(aggregation.core.best_proof().is_some());
 }
 
 #[test]
@@ -153,7 +153,7 @@ fn a_non_contiguous_batch_is_checked_against_exactly_its_claims() {
 
     let batch = merge.next_batch(Nanos::ZERO).unwrap();
     merge.finish(batch, Some(&answer([1, 2, 3, 4, 5]))).unwrap();
-    assert_eq!(merge.core.covered(), [0, 3]);
+    assert_eq!(merge.core.covered_indices(), [0, 3]);
     assert_eq!(best_claims(&merge.core), 5);
     assert!(merge.next_batch(Nanos::ZERO).is_none(), "the others add nothing");
 }

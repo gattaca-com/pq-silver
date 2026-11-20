@@ -7,7 +7,7 @@
 //!
 //! [`PqAggregator`] routes verified claims and responses, and keeps one
 //! request in flight. A leaf or a merge owns its strategy, which picks the
-//! next batch and never sees claim bytes. Its core owns the verified items,
+//! next batch and never sees claim bytes. Its core owns the verified claims,
 //! the best proof and every check on a response.
 
 mod aggregation;

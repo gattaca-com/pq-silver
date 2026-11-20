@@ -5,7 +5,7 @@ use silver_common::{
 };
 
 use super::{
-    aggregation::{Aggregation, Item, Priority},
+    aggregation::{Aggregation, Priority, VerifiedClaims},
     claims::{VerifiedVote, Vote},
     strategy::{ArrivalOrder, Batch, Strategy},
     wire::MAX_RECORDS,
@@ -33,7 +33,7 @@ impl LeafKey {
 pub(super) struct LeafAggregation {
     committee_len: usize,
     data: [u8; ATTESTATION_DATA_SIZE],
-    /// The committee position of each item.
+    /// The committee position of each vote.
     positions: Vec<usize>,
     strategy: ArrivalOrder,
     pub(super) core: Aggregation,
@@ -54,7 +54,7 @@ impl LeafAggregation {
         let fits = self.strategy.arrived(self.positions.len(), vote.committee_position);
         if fits {
             self.positions.push(vote.committee_position);
-            self.core.add(Item::Record(vote.claim, vote.signature));
+            self.core.add(VerifiedClaims::Signature(vote.claim, vote.signature));
         }
         fits
     }
@@ -69,7 +69,7 @@ impl LeafAggregation {
     /// `None` exactly when `priority` is, unless the strategy has a bug.
     pub(super) fn next_batch(&mut self, now: Nanos) -> Option<Batch> {
         self.priority(now)?;
-        self.core.accept(self.strategy.next_batch(MAX_RECORDS), MAX_RECORDS)
+        self.core.check_batch(self.strategy.next_batch(MAX_RECORDS), MAX_RECORDS)
     }
 
     pub(super) fn next_request(
@@ -87,8 +87,8 @@ impl LeafAggregation {
     /// The `AttestationPq` of the votes the best proof covers. `None` without
     /// a best proof.
     pub(super) fn attestation(&self, committee_index: u64) -> Option<Vec<u8>> {
-        self.core.proof()?;
-        let positions = self.core.covered().iter().map(|&index| self.positions[index]);
+        self.core.best_proof()?;
+        let positions = self.core.covered_indices().iter().map(|&index| self.positions[index]);
         AttestationPqView::encode_one_committee(
             &self.data,
             committee_index as usize,

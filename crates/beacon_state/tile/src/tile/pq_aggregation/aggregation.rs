@@ -8,7 +8,7 @@ use silver_common::{Nanos, TCacheProducer, TCacheRead, TProducer};
 use super::{
     claims::{Claim, VerifiedClaims},
     strategy::{Batch, Strategy},
-    wire::{AggregateRequest, decode_aggregate_response},
+    wire::{AggregateRequest, MAX_REQUEST_LEN, decode_aggregate_response},
 };
 
 const MAX_FAILURES: u8 = 3;
@@ -38,14 +38,6 @@ pub struct Priority {
     deadline: Reverse<Nanos>,
     /// Then the most waiting claims that add something.
     waiting: usize,
-}
-
-/// Why a request was not written to the tcache.
-pub enum Unwritten {
-    /// No room yet. Readers free it, so the batch waits.
-    Full,
-    /// Above the tcache's largest payload. It never fits.
-    TooLarge,
 }
 
 /// The aggregation of one key. It owns the verified claims, the best proof and
@@ -96,19 +88,18 @@ impl<C: VerifiedClaims> Aggregation<C> {
         sends.then_some(Priority { merge: C::MERGE, deadline: Reverse(self.deadline), waiting })
     }
 
-    /// The next batch, with its request written to `tcache`.
+    /// The next batch, with its request written to `tcache`. `None` for a
+    /// strategy bug, or a full tcache: the batch is dropped and its claims
+    /// still wait.
     pub fn next_request(
         &mut self,
         now: Nanos,
         tcache: &mut TProducer,
-    ) -> Option<(Batch, Result<TCacheRead, Unwritten>)> {
+    ) -> Option<(Batch, TCacheRead)> {
         let batch = self.next_batch(now)?;
         let request = self.request(&batch);
-        let body = if request.len() > tcache.cache_ref().max_payload_len() {
-            Err(Unwritten::TooLarge)
-        } else {
-            tcache.write_with(request.len(), |out| request.write(out)).ok_or(Unwritten::Full)
-        };
+        debug_assert!(request.len() <= MAX_REQUEST_LEN, "a request above the protocol bounds");
+        let body = tcache.write_with(request.len(), |out| request.write(out))?;
         Some((batch, body))
     }
 

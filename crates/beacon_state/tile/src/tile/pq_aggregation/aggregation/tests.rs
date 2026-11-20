@@ -1,6 +1,5 @@
-use silver_common::{
-    TCache, TCacheId,
-    ssz_view::{MAX_VALIDATORS_PER_COMMITTEE, XMSS_SIGNATURE_SIZE},
+use silver_common::ssz_view::{
+    MAX_STARK_PROOF_SIZE, MAX_VALIDATORS_PER_COMMITTEE, XMSS_SIGNATURE_SIZE,
 };
 
 use super::{
@@ -169,13 +168,12 @@ fn merge_batches_respect_the_child_limit_with_the_best_proof_as_one() {
 }
 
 #[test]
-fn a_request_above_the_tcache_payload_never_fits() {
-    let mut tcache = TCache::producer(TCacheId::BeaconStateHandoff, 1 << 16);
-    let (batch, body) = aggregation(30).next_request(Nanos::ZERO, &mut tcache).unwrap();
-    assert!(matches!(body, Err(Unwritten::TooLarge)), "30 votes take more than 64 KiB");
-    assert_eq!(batch.indices().len(), 30);
-    let (_, body) = aggregation(1).next_request(Nanos::ZERO, &mut tcache).unwrap();
-    assert!(body.is_ok());
+fn a_proof_above_1_mib_is_refused() {
+    let mut aggregation = aggregation(1);
+    let body = aggregate_response(&[claim(0)], &vec![0; MAX_STARK_PROOF_SIZE + 1]);
+    assert_eq!(settle(&mut aggregation, Some(&body)), Err("malformed response"));
+    let body = aggregate_response(&[claim(0)], &vec![0; MAX_STARK_PROOF_SIZE]);
+    settle(&mut aggregation, Some(&body)).unwrap();
 }
 
 #[test]

@@ -9,7 +9,7 @@ use super::{
 
 /// Most committees one merge tells apart. Honest aggregates of a slot name
 /// few attestation data.
-const MAX_GROUPS: usize = 4 * MAX_COMMITTEES_PER_SLOT_PQ;
+pub(in super::super) const MAX_GROUPS: usize = 4 * MAX_COMMITTEES_PER_SLOT_PQ;
 
 /// Marginal-gain greedy: the child that adds the most positions first, ties
 /// to the earlier arrival. Gain is monotone and submodular, so a batch gains

@@ -9,6 +9,13 @@ fn claim(tag: u8) -> Claim {
     [tag; 64]
 }
 
+/// Ascending in `index`.
+fn numbered(index: usize) -> Claim {
+    let mut claim = [0; 64];
+    claim[..8].copy_from_slice(&(index as u64).to_be_bytes());
+    claim
+}
+
 fn le(value: usize) -> [u8; 8] {
     (value as u64).to_le_bytes()
 }
@@ -60,6 +67,26 @@ fn the_length_is_exactly_the_bytes_written() {
 }
 
 #[test]
+fn the_longest_request_takes_exactly_the_bound() {
+    let signature = [5u8; XMSS_SIGNATURE_SIZE];
+    let claims: Vec<Claim> = (0..MAX_PROOF_CLAIMS).map(numbered).collect();
+    let proof = vec![3u8; MAX_STARK_PROOF_SIZE];
+    let best = (&claims[..], &proof[..]);
+    let child = (&claims[..MAX_VALIDATORS_PER_COMMITTEE], &proof[..]);
+    let merge = [vec![best], vec![child; MAX_CHILDREN - 1]].concat();
+    let shapes = [
+        (vec![best], vec![(&claims[0], &signature); MAX_RECORDS]),
+        (vec![child; MAX_CHILDREN], vec![]),
+        (merge, vec![]),
+    ];
+    let lens = shapes.map(|(children, records)| {
+        AggregateRequest { log_inv_rate: 2, children, records }.body().len()
+    });
+    assert!(lens.iter().all(|&len| len <= MAX_REQUEST_LEN), "{lens:?}");
+    assert_eq!(lens[2], MAX_REQUEST_LEN, "a merge on the largest best proof");
+}
+
+#[test]
 #[should_panic(expected = "shorter than its slice")]
 fn a_slice_longer_than_the_request_is_a_bug() {
     let request = AggregateRequest { log_inv_rate: 2, children: vec![], records: vec![] };
@@ -88,11 +115,9 @@ fn every_malformed_response_is_refused() {
         decode_aggregate_response(&aggregate_response(&[claim(1), claim(1)], b"p")).is_err(),
         "repeated"
     );
-    let big = vec![0; MAX_STARK_PROOF_SIZE + 1];
-    assert!(
-        decode_aggregate_response(&aggregate_response(&[claim(1)], &big)).is_err(),
-        "proof too large"
-    );
+    let many: Vec<Claim> = (0..=MAX_PROOF_CLAIMS).map(numbered).collect();
+    assert!(decode_aggregate_response(&aggregate_response(&many, b"p")).is_err(), "too many");
+    assert!(decode_aggregate_response(&aggregate_response(&many[1..], b"p")).is_ok());
 
     let mut sphincs = good.clone();
     sphincs[1 + 8 + 8 + 128] = 1;

@@ -43,7 +43,7 @@ use crate::{
         payload_attributes::PayloadAttributes,
         payload_execution_requests::PayloadExecutionRequests,
         pending_envelopes::{BLOCK_WAIT_SLOTS, PendingEnvelopes},
-        pq_aggregation::PqAggregator,
+        pq_aggregation::{PqAggregator, wire::MAX_REQUEST_LEN},
         precomputed_epochs::PrecomputedEpochs,
         proposer_preparations::ProposerPreparations,
         seen_aggregates::SeenAggregates,
@@ -1454,6 +1454,10 @@ impl Tile<SilverSpine> for BeaconStateTile {
 
     fn try_init(&mut self, adapter: &mut SpineAdapter<SilverSpine>) -> bool {
         self.open_tcaches().expect("tcache wiring");
+        assert!(
+            self.events_producer.cache_ref().max_payload_len() >= MAX_REQUEST_LEN,
+            "the beacon_state tcache must hold a leanVM request of {MAX_REQUEST_LEN} bytes"
+        );
         self.bls_change_pool.with_producer(&adapter.producers);
         self.exit_pool.with_producer(&adapter.producers);
         self.slashing_pool.with_producer(adapter.producers.beacon_events);

@@ -7849,7 +7849,7 @@ mod pq_aggregator {
     }
 
     #[test]
-    fn a_full_tcache_retries_without_a_failure_and_logs_once() {
+    fn a_full_tcache_retries_without_a_failure() {
         let mut rig = Rig::new();
         rig.ready();
         let pin = rig.fill_tcache();
@@ -7858,13 +7858,11 @@ mod pq_aggregator {
             rig.send_next();
         }
         assert!(rig.requests().is_empty(), "the tcache is full");
-        assert!(rig.tile.pq_aggregator.tcache_full(), "one error log for the stall");
 
         drop(pin);
         rig.send_next();
         let request = rig.request();
         assert!(rig.carries(&request, 9), "six misses did not stop the merge");
-        assert!(!rig.tile.pq_aggregator.tcache_full(), "the stall is over");
     }
 
     #[test]

@@ -6,16 +6,11 @@ use silver_common::ssz_view::{
 
 use super::{
     strategy::{ArrivalOrder, MarginalGain, Strategy},
-    wire::AggregateRequest,
+    wire::{AggregateRequest, MAX_CHILDREN, MAX_RECORDS},
 };
 
 /// `pubkey | message`, so byte order is the leanVM sidecar's claim order.
 pub type Claim = [u8; 64];
-
-/// Most leanXMSS records in one request.
-const MAX_RECORDS: usize = 2048;
-/// Most children in one request.
-const MAX_CHILDREN: usize = 16;
 
 /// A single attestation whose XMSS signature the tile has verified, with the
 /// facts only the tile has.

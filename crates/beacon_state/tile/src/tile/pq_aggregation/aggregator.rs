@@ -4,13 +4,12 @@ use flux::spine::SpineProducers;
 use rustc_hash::FxHashMap;
 use silver_beacon_state_data::{B256, Slot};
 use silver_common::{
-    LeanVmHealthEvent, LeanVmReq, LeanVmResp, Nanos, TCacheReader, TProducer,
+    LeanVmHealthEvent, LeanVmReq, LeanVmResp, Nanos, TCacheRead, TCacheReader, TProducer,
     ssz_view::MAX_VALIDATORS_PER_COMMITTEE, ticker::SlotTicker,
 };
 
 use super::{
     Aggregate, VerifiedVote,
-    aggregation::Unwritten,
     leaf::{LeafAggregation, LeafKey},
     merge::MergeAggregation,
     strategy::Batch,
@@ -47,6 +46,10 @@ enum LeanVm {
 }
 
 impl LeanVm {
+    fn is_idle(&self) -> bool {
+        matches!(self, Self::Idle)
+    }
+
     fn up(&mut self) {
         if let Self::Down = self {
             *self = Self::Idle;
@@ -84,8 +87,6 @@ pub struct PqAggregator {
     merges: FxHashMap<Slot, MergeAggregation>,
     /// An event changed state since `send_next` last found nothing to send.
     changed: bool,
-    /// The last write met a full tcache; its error is logged once.
-    tcache_full: bool,
     leanvm: LeanVm,
     next_request_id: u64,
 }
@@ -170,7 +171,7 @@ impl PqAggregator {
         tcache: &mut TProducer,
         producers: &mut Producers,
     ) {
-        if !(self.changed && matches!(self.leanvm, LeanVm::Idle)) {
+        if !self.changed || !self.leanvm.is_idle() {
             return;
         }
         let now = ticker.since_genesis();
@@ -178,35 +179,9 @@ impl PqAggregator {
             self.changed = false;
             return;
         };
-        let next = match key {
-            AggregationKey::Leaf(leaf) => {
-                self.leaves.get_mut(&leaf).and_then(|leaf| leaf.core.next_request(now, tcache))
-            }
-            AggregationKey::Merge(slot) => {
-                self.merges.get_mut(&slot).and_then(|merge| merge.core.next_request(now, tcache))
-            }
-        };
-        // `None` only for a strategy bug, which counts as a failure.
-        let Some((batch, body)) = next else { return };
-        let body = match body {
-            Ok(body) => body,
-            // Back-pressure: the batch is dropped and its claims still wait.
-            Err(Unwritten::Full) => {
-                if !mem::replace(&mut self.tcache_full, true) {
-                    silver_log::error!(slot = key.slot(), "beacon_state tcache full; batch waits");
-                }
-                return;
-            }
-            Err(Unwritten::TooLarge) => {
-                silver_log::error!(
-                    slot = key.slot(),
-                    "request larger than the beacon_state tcache"
-                );
-                self.finish(key, batch, None);
-                return;
-            }
-        };
-        self.tcache_full = false;
+        // `None`: the tcache is full, or a strategy bug counted a failure. The
+        // next loop retries.
+        let Some((batch, body)) = self.write_request(key, now, tcache) else { return };
         let request_id = self.next_request_id;
         self.next_request_id += 1;
         self.leanvm = LeanVm::Busy { request_id, key, batch };
@@ -242,9 +217,21 @@ impl PqAggregator {
         }
     }
 
-    #[cfg(test)]
-    pub(in crate::tile) fn tcache_full(&self) -> bool {
-        self.tcache_full
+    /// The next batch of `key`, with its request written to `tcache`.
+    fn write_request(
+        &mut self,
+        key: AggregationKey,
+        now: Nanos,
+        tcache: &mut TProducer,
+    ) -> Option<(Batch, TCacheRead)> {
+        match key {
+            AggregationKey::Leaf(leaf) => {
+                self.leaves.get_mut(&leaf)?.core.next_request(now, tcache)
+            }
+            AggregationKey::Merge(slot) => {
+                self.merges.get_mut(&slot)?.core.next_request(now, tcache)
+            }
+        }
     }
 
     /// Ties go to the lower key, so the order is total and deterministic.

@@ -1,9 +1,29 @@
-use silver_common::ssz_view::{MAX_STARK_PROOF_SIZE, XMSS_SIGNATURE_SIZE};
+use silver_common::ssz_view::{
+    MAX_STARK_PROOF_SIZE, MAX_VALIDATORS_PER_COMMITTEE, XMSS_SIGNATURE_SIZE,
+};
 
-use super::claims::Claim;
+use super::{claims::Claim, strategy::MAX_GROUPS};
 
 const OP_AGGREGATE: u8 = 1;
 const RECORD_SIZE: usize = 64 + XMSS_SIGNATURE_SIZE;
+
+/// Most leanXMSS records in one request.
+pub(super) const MAX_RECORDS: usize = 2048;
+/// Most children in one request.
+pub(super) const MAX_CHILDREN: usize = 16;
+/// Most claims one proof covers: every position of every committee a merge
+/// tells apart. A response with more is refused.
+const MAX_PROOF_CLAIMS: usize = MAX_GROUPS * MAX_VALIDATORS_PER_COMMITTEE;
+
+/// The longest `aggregate` request. The best proof, the longest child, comes
+/// first. A leaf adds records; a merge adds children of one committee each.
+pub(in crate::tile) const MAX_REQUEST_LEN: usize = {
+    let best = child_len(MAX_PROOF_CLAIMS, MAX_STARK_PROOF_SIZE);
+    let child = child_len(MAX_VALIDATORS_PER_COMMITTEE, MAX_STARK_PROOF_SIZE);
+    let leaf = request_len(best, MAX_RECORDS);
+    let merge = request_len(best + (MAX_CHILDREN - 1) * child, 0);
+    if leaf > merge { leaf } else { merge }
+};
 
 /// One `aggregate` request, borrowed from its aggregation: children (claims,
 /// proof) and leanXMSS records. No leanSPHINCS signatures, no blobs, every
@@ -16,9 +36,9 @@ pub(super) struct AggregateRequest<'a> {
 
 impl AggregateRequest<'_> {
     pub(super) fn len(&self) -> usize {
-        let child = |(claims, proof): &(&[Claim], &[u8])| 8 + claims_len(claims) + 8 + proof.len();
-        let children: usize = self.children.iter().map(child).sum();
-        2 + 8 + children + 8 + self.records.len() * RECORD_SIZE + 8 + 8 + 1
+        let children =
+            self.children.iter().map(|(claims, proof)| child_len(claims.len(), proof.len()));
+        request_len(children.sum(), self.records.len())
     }
 
     /// Fills `out`, which must be exactly `len()` bytes: a gap would send
@@ -65,12 +85,20 @@ fn put_bytes(out: &mut &mut [u8], bytes: &[u8]) {
     put(out, bytes);
 }
 
-fn claims_len(claims: &[Claim]) -> usize {
-    8 + claims.len() * 64 + 8 + 1
+const fn request_len(children_len: usize, records: usize) -> usize {
+    2 + 8 + children_len + 8 + records * RECORD_SIZE + 8 + 8 + 1
+}
+
+const fn child_len(claims: usize, proof: usize) -> usize {
+    8 + claims_len(claims) + 8 + proof
+}
+
+const fn claims_len(claims: usize) -> usize {
+    8 + claims * 64 + 8 + 1
 }
 
 fn put_claims(out: &mut &mut [u8], claims: &[Claim]) {
-    put_u64(out, claims_len(claims));
+    put_u64(out, claims_len(claims.len()));
     put_u64(out, claims.len());
     claims.iter().for_each(|claim| put(out, claim));
     put_u64(out, 0);
@@ -79,7 +107,7 @@ fn put_claims(out: &mut &mut [u8], claims: &[Claim]) {
 
 #[cfg(test)]
 pub(in crate::tile) fn aggregate_response(claims: &[Claim], proof: &[u8]) -> Vec<u8> {
-    let mut body = vec![0; 1 + 8 + claims_len(claims) + 8 + proof.len()];
+    let mut body = vec![0; 1 + child_len(claims.len(), proof.len())];
     let mut out = body.as_mut_slice();
     put(&mut out, &[0]);
     put_claims(&mut out, claims);
@@ -104,7 +132,7 @@ fn take_bytes<'a>(buf: &mut &'a [u8]) -> Option<&'a [u8]> {
 }
 
 fn parse_claims(mut bytes: &[u8]) -> Option<Vec<Claim>> {
-    let count = take_u64(&mut bytes)?;
+    let count = take_u64(&mut bytes).filter(|&count| count <= MAX_PROOF_CLAIMS)?;
     let records = take(&mut bytes, count.checked_mul(64)?)?;
     let claims: Vec<Claim> = records.chunks_exact(64).map(|c| c.try_into().unwrap()).collect();
     let sorted = claims.windows(2).all(|pair| pair[0] < pair[1]);

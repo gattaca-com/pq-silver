@@ -2,6 +2,7 @@ mod arrival_order;
 mod marginal_gain;
 
 pub use arrival_order::ArrivalOrder;
+pub(super) use marginal_gain::MAX_GROUPS;
 pub use marginal_gain::MarginalGain;
 
 const LOG_INV_RATE: u8 = 2;

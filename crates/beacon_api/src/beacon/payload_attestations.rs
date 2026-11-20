@@ -8,7 +8,7 @@ use silver_common::{
 use crate::{
     ctx::ApiCtx,
     http::{response::Response, router::Request},
-    submission::{SubmittedEntry, post_submission},
+    submission::{SubmittedEntry, post_ssz_submission, post_submission},
 };
 
 pub(crate) fn post_payload_attestation_messages(
@@ -19,6 +19,10 @@ pub(crate) fn post_payload_attestation_messages(
     if req.eth_consensus_version != Some("pq") {
         resp.error(400, "Eth-Consensus-Version must name pq");
         return;
+    }
+    if req.body_is_ssz() {
+        let topic = GossipTopic::PayloadAttestationMessage;
+        return post_ssz_submission(req, ctx, resp, topic, PAYLOAD_ATTESTATION_MESSAGE_PQ_SIZE);
     }
     post_submission::<SubmittedPayloadAttestationMessage>(req, ctx, resp);
 }
@@ -136,14 +140,61 @@ mod tests {
         }
     }
 
-    #[test]
-    fn an_ssz_body_is_a_415() {
-        let ctx = ctx();
-        let body = format!("[{}]", message(7));
-        let posted = ParsedRequest {
+    /// The SSZ of `message(validator_index)`.
+    fn message_ssz(validator_index: u64) -> Vec<u8> {
+        let mut ssz = vec![0x44; PAYLOAD_ATTESTATION_MESSAGE_PQ_SIZE];
+        ssz[0..8].copy_from_slice(&validator_index.to_le_bytes());
+        ssz[8..40].fill(0x11);
+        ssz[40..48].copy_from_slice(&40u64.to_le_bytes());
+        ssz[48..50].copy_from_slice(&[1, 0]);
+        ssz
+    }
+
+    fn ssz_posting(body: &[u8]) -> ParsedRequest<'_> {
+        ParsedRequest {
+            body,
             content_type: Some("application/octet-stream"),
-            ..versioned(&body, Some("pq"))
+            ..versioned("", Some("pq"))
+        }
+    }
+
+    #[test]
+    fn ssz_messages_are_published_as_sent() {
+        let body = [message_ssz(7), message_ssz(9)].concat();
+        let mut submissions = submissions();
+        let Outcome::AwaitingVerdicts(submission) =
+            dispatch_into(&ctx(), &ssz_posting(&body), &mut submissions).0
+        else {
+            panic!("the messages defer")
         };
-        assert_eq!(status_code(&dispatch(&ctx, &posted).1), "415");
+        let [first, second] = submission.accepted.as_slice() else { panic!("two accepted") };
+        assert_eq!((second.body_index, second.topic), (1, GossipTopic::PayloadAttestationMessage));
+        assert_eq!(submissions.read_buffer(first.ssz).unwrap(), message_ssz(7));
+        assert_eq!(submissions.read_buffer(second.ssz).unwrap(), message_ssz(9));
+    }
+
+    #[test]
+    fn malformed_ssz_is_refused() {
+        let mut not_a_bool = message_ssz(7);
+        not_a_bool[48] = 2;
+        let body = [message_ssz(7), not_a_bool].concat();
+        let Outcome::AwaitingVerdicts(submission) = dispatch(&ctx(), &ssz_posting(&body)).0 else {
+            panic!("the well-formed message defers")
+        };
+        assert_eq!(submission.accepted.len(), 1);
+        assert_eq!(submission.failures[0].body_index, 1);
+
+        let truncated = &body[..body.len() - 1];
+        for body in [&[][..], truncated] {
+            assert_eq!(status_code(&dispatch(&ctx(), &ssz_posting(body)).1), "400");
+        }
+    }
+
+    #[test]
+    fn another_media_type_is_a_415() {
+        let body = format!("[{}]", message(7));
+        let posted =
+            ParsedRequest { content_type: Some("text/plain"), ..versioned(&body, Some("pq")) };
+        assert_eq!(status_code(&dispatch(&ctx(), &posted).1), "415");
     }
 }

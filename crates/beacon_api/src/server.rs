@@ -1707,7 +1707,7 @@ mod tests {
             SIGNED_PQ_FIXED, SINGLE_ATT_PQ_SIZE, STATUS_V2_SIZE, SignedBeaconBlockPqView,
             VRF_PROOF_SIZE, XMSS_SIGNATURE_SIZE,
         },
-        test_util::{SynthBid, SynthBlock, empty_signed_envelope},
+        test_util::{SynthBid, SynthBlock, empty_signed_envelope_pq},
     };
     use silver_httpcore::Readiness;
 
@@ -3560,7 +3560,7 @@ mod tests {
             "aa".repeat(96),
         );
         let client = connect(tcp_addr(&server));
-        post_builder_preferences(&client, "application/json", "gloas", json.as_bytes());
+        post_builder_preferences(&client, "application/json", "pq", json.as_bytes());
         pump_until(&mut server, "preferences handed on", |server| !server.preferences.is_empty());
         let (_, sent) = server.preferences.remove(0);
         assert_eq!(sent, json.into_bytes());
@@ -3575,7 +3575,7 @@ mod tests {
             let mut server = server_with(4, Duration::from_secs(5));
             let body = builder_preferences_ssz("https://builder.example");
             let client = connect(tcp_addr(&server));
-            post_builder_preferences(&client, "application/octet-stream", "gloas", &body);
+            post_builder_preferences(&client, "application/octet-stream", "pq", &body);
             pump_until(&mut server, "preferences handed on", |server| {
                 !server.preferences.is_empty()
             });
@@ -3609,10 +3609,10 @@ mod tests {
     fn builder_preferences_refused_before_any_builder() {
         let ssz = builder_preferences_ssz("https://builder.example");
         let cases: [(&str, &str, &[u8], &str); 4] = [
-            ("text/plain", "gloas", b"[]", "HTTP/1.1 415"),
-            ("application/json", "gloas", b"[{}]", "HTTP/1.1 400"),
-            ("application/octet-stream", "fulu", &ssz, "HTTP/1.1 400"),
-            ("application/octet-stream", "gloas", &ssz[..ssz.len() - 120], "HTTP/1.1 400"),
+            ("text/plain", "pq", b"[]", "HTTP/1.1 415"),
+            ("application/json", "pq", b"[{}]", "HTTP/1.1 400"),
+            ("application/octet-stream", "gloas", &ssz, "HTTP/1.1 400"),
+            ("application/octet-stream", "pq", &ssz[..ssz.len() - 120], "HTTP/1.1 400"),
         ];
         for (content_type, version, body, expected) in cases {
             let mut server = server_with(4, Duration::from_secs(5));
@@ -4476,14 +4476,13 @@ mod tests {
             [(true, true), (true, false), (false, true), (false, false)]
         {
             let mut server = server_with(64, LONG_TIMEOUT);
-            server.api.ctx = submission::ctx();
-            server.api.ctx.spec.gloas_fork_epoch = 0;
-            let signed = empty_signed_envelope(submission::SLOT, [3; 32]);
+            server.api.ctx = submission::pq_ctx();
+            let signed = empty_signed_envelope_pq(submission::SLOT, [3; 32]);
             let mut client = connect(tcp_addr(&server));
             write!(
                 client,
                 "POST /eth/v1/beacon/execution_payload_envelopes HTTP/1.1\r\nHost: x\r\n\
-                Content-Type: application/octet-stream\r\nEth-Consensus-Version: gloas\r\n\
+                Content-Type: application/octet-stream\r\nEth-Consensus-Version: pq\r\n\
                 Eth-Blob-Data-Included: false\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
                 signed.len()
             )

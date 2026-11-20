@@ -8,13 +8,17 @@ use silver_common::{
 use crate::{
     ctx::ApiCtx,
     http::{response::Response, router::Request},
-    submission::{SubmittedEntry, post_submission},
+    submission::{SubmittedEntry, post_ssz_submission, post_submission},
 };
 
 pub(crate) fn post_proposer_preferences(req: &Request<'_>, ctx: &ApiCtx, resp: &mut Response<'_>) {
     if req.eth_consensus_version != Some("pq") {
         resp.error(400, "Eth-Consensus-Version must name pq");
         return;
+    }
+    if req.body_is_ssz() {
+        let topic = GossipTopic::ProposerPreferences;
+        return post_ssz_submission(req, ctx, resp, topic, SIGNED_PROPOSER_PREFERENCES_PQ_SIZE);
     }
     post_submission::<SubmittedProposerPreferences>(req, ctx, resp);
 }
@@ -133,5 +137,47 @@ mod tests {
             let response = dispatch(&ctx, &versioned(body, Some("pq"))).1;
             assert_eq!(status_code(&response), "400", "{body:?}");
         }
+    }
+
+    /// Lighthouse posts the SSZ list; it publishes what the JSON spelling
+    /// encodes to.
+    #[test]
+    fn ssz_preferences_are_published_as_sent() {
+        let json = format!("[{},{}]", preferences(40), preferences(41));
+        let mut submissions = submissions();
+        let Outcome::AwaitingVerdicts(from_json) =
+            dispatch_into(&ctx(), &versioned(&json, Some("pq")), &mut submissions).0
+        else {
+            panic!("the preferences defer")
+        };
+        let encoded: Vec<_> = from_json
+            .accepted
+            .iter()
+            .map(|accepted| submissions.read_buffer(accepted.ssz).unwrap().to_vec())
+            .collect();
+
+        let body = encoded.concat();
+        let posted = ParsedRequest {
+            body: &body,
+            content_type: Some("application/octet-stream"),
+            ..versioned("", Some("pq"))
+        };
+        let Outcome::AwaitingVerdicts(from_ssz) =
+            dispatch_into(&ctx(), &posted, &mut submissions).0
+        else {
+            panic!("the preferences defer")
+        };
+        let published: Vec<_> = from_ssz
+            .accepted
+            .iter()
+            .map(|accepted| (accepted.topic, submissions.read_buffer(accepted.ssz).unwrap()))
+            .collect();
+        assert_eq!(published, [
+            (GossipTopic::ProposerPreferences, &encoded[0][..]),
+            (GossipTopic::ProposerPreferences, &encoded[1][..]),
+        ]);
+
+        let truncated = ParsedRequest { body: &body[..body.len() - 1], ..posted };
+        assert_eq!(status_code(&dispatch(&ctx(), &truncated).1), "400");
     }
 }

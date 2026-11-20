@@ -1,5 +1,6 @@
 use crate::ssz_view::{
-    BYTES_PER_BLOB, BYTES_PER_KZG_PROOF, NUMBER_OF_COLUMNS, SignedExecutionPayloadEnvelopeView,
+    BYTES_PER_BLOB, BYTES_PER_KZG_PROOF, NUMBER_OF_COLUMNS, SignedExecutionPayloadEnvelopePqView,
+    SignedExecutionPayloadEnvelopeView,
 };
 
 pub struct SignedEnvelopeContents<'a> {
@@ -22,7 +23,10 @@ impl<'a> SignedEnvelopeContents<'a> {
             kzg_proofs: bytes.get(proofs_at..blobs_at)?,
             blobs: bytes.get(blobs_at..)?,
         };
-        (SignedExecutionPayloadEnvelopeView::check_canonical(contents.signed_envelope) &&
+        let envelope = contents.signed_envelope;
+        let canonical = SignedExecutionPayloadEnvelopePqView::check_canonical(envelope) ||
+            SignedExecutionPayloadEnvelopeView::check_canonical(envelope);
+        (canonical &&
             contents.blobs.len().is_multiple_of(BYTES_PER_BLOB) &&
             contents.kzg_proofs.len() ==
                 contents.blob_count() * NUMBER_OF_COLUMNS * BYTES_PER_KZG_PROOF)

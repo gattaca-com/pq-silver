@@ -3,9 +3,7 @@ use silver_common::{
     BeaconApiRequest, BeaconApiResponse, BeaconStateEvent, BroadcastValidation, GossipTopic,
     LocalGossipFailure, PayloadFrame, ProposedPayload, TCacheProducer, TCacheRead,
     envelope_contents::SignedEnvelopeContents,
-    ssz_view::{
-        ExecutionPayloadEnvelopeView, ExecutionPayloadView, SignedExecutionPayloadEnvelopeView,
-    },
+    ssz_view::{ExecutionPayloadEnvelopeView, ExecutionPayloadView},
 };
 
 use super::{BeaconStateTile, Producers, gossip::EnvelopeCheck};
@@ -54,10 +52,8 @@ impl BeaconStateTile {
             None
         };
         let signed = contents.as_ref().map_or(bytes, |contents| contents.signed_envelope);
-        if !SignedExecutionPayloadEnvelopeView::check_canonical(signed) {
-            return Err(LocalGossipFailure::Invalid);
-        }
-        let envelope = SignedExecutionPayloadEnvelopeView::message(signed);
+        let layout = stf::envelope_layout(signed).ok_or(LocalGossipFailure::Invalid)?;
+        let envelope = layout.envelope_message(signed).ok_or(LocalGossipFailure::Invalid)?;
         let payload_bytes = ExecutionPayloadEnvelopeView::payload(envelope);
         let slot = ExecutionPayloadView::slot_number(payload_bytes);
         if !self.spec.is_gloas_at_slot(slot) {

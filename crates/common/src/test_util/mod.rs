@@ -6,7 +6,10 @@ use flux::communication::cleanup_shmem;
 pub use synth_block::{SynthBid, SynthBlock};
 use tempfile::TempDir;
 
-use crate::{ssz_hash_gloas::EMPTY_EXECUTION_REQUESTS, ssz_view::EXECUTION_PAYLOAD_FIXED_GLOAS};
+use crate::{
+    ssz_hash_gloas::EMPTY_EXECUTION_REQUESTS,
+    ssz_view::{EXECUTION_PAYLOAD_FIXED_GLOAS, SIGNED_PQ_FIXED},
+};
 
 pub fn empty_signed_envelope(slot: u64, block_root: [u8; 32]) -> Vec<u8> {
     let mut signed = vec![0; 100 + 80 + EXECUTION_PAYLOAD_FIXED_GLOAS];
@@ -21,6 +24,18 @@ pub fn empty_signed_envelope(slot: u64, block_root: [u8; 32]) -> Vec<u8> {
     }
     payload[532..540].copy_from_slice(&slot.to_le_bytes());
     signed.extend_from_slice(&EMPTY_EXECUTION_REQUESTS);
+    signed
+}
+
+/// [`empty_signed_envelope`] in the PQ layout: an XMSS signature, and eight
+/// empty request lists.
+pub fn empty_signed_envelope_pq(slot: u64, block_root: [u8; 32]) -> Vec<u8> {
+    let gloas = empty_signed_envelope(slot, block_root);
+    let message = &gloas[100..gloas.len() - EMPTY_EXECUTION_REQUESTS.len()];
+    let mut signed = vec![0; SIGNED_PQ_FIXED];
+    signed[..4].copy_from_slice(&(SIGNED_PQ_FIXED as u32).to_le_bytes());
+    signed.extend_from_slice(message);
+    signed.extend((0..8).flat_map(|_| (8 * 4u32).to_le_bytes()));
     signed
 }
 

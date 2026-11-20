@@ -37,6 +37,50 @@ pub(crate) fn post_submission<'a, T: Deserialize<'a> + SubmittedEntry>(
     resp.fail_forged();
 }
 
+/// For endpoints whose SSZ body is a list of fixed-size containers, each
+/// published on `topic` as sent. `topic` checks each one's encoding.
+pub(crate) fn post_ssz_submission(
+    req: &Request<'_>,
+    ctx: &ApiCtx,
+    resp: &mut Response<'_>,
+    topic: GossipTopic,
+    entry_len: usize,
+) {
+    debug_assert!(req.body_is_ssz());
+    let body = req.body;
+    if body.is_empty() || !body.len().is_multiple_of(entry_len) {
+        return resp.error(400, "the body is not a list of whole entries");
+    }
+    let entries = body.chunks_exact(entry_len);
+    if entries.len() > MAX_SUBMISSION_ENTRIES {
+        return resp.error(400, "the body holds too many entries");
+    }
+    for (body_index, ssz) in entries.enumerate() {
+        submit(ctx, resp, body_index, SszEntry { ssz, topic });
+    }
+    resp.fail_forged();
+}
+
+struct SszEntry<'a> {
+    ssz: &'a [u8],
+    topic: GossipTopic,
+}
+
+impl SubmittedEntry for SszEntry<'_> {
+    fn accept(&self, _: &ApiCtx) -> Result<impl IntoIterator<Item = GossipTopic>, &'static str> {
+        self.topic.check_pq_signed_message(self.ssz)?;
+        Ok([self.topic])
+    }
+
+    fn ssz_len(&self) -> usize {
+        self.ssz.len()
+    }
+
+    fn encode(&self, out: &mut [u8]) {
+        out.copy_from_slice(self.ssz);
+    }
+}
+
 /// For endpoints whose body is one entry, not an array. It answers as entry 0
 /// of an array would; the indexed 400 still carries `ErrorMessage`'s fields.
 pub(crate) fn post_single_submission<'a, T: Deserialize<'a> + SubmittedEntry>(

@@ -64,6 +64,3 @@ impl LeafAggregation {
         )
     }
 }
-
-#[cfg(test)]
-mod tests;

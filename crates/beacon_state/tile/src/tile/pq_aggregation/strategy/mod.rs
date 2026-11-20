@@ -24,8 +24,8 @@ pub trait Strategy: Default {
     fn next_batch(&self, limit: usize) -> Option<Batch>;
 }
 
-/// VerifiedClaims indices to prove on top of the best proof: ascending, without
-/// repeats, never empty.
+/// Indices of verified claims to prove on top of the best proof: ascending,
+/// without repeats, never empty.
 #[derive(Debug)]
 pub struct Batch {
     indices: Vec<usize>,

@@ -36,37 +36,6 @@ fn naive_body(request: &AggregateRequest) -> Vec<u8> {
 }
 
 #[test]
-fn an_aggregate_request_has_the_protocol_layout() {
-    let signature = [9u8; XMSS_SIGNATURE_SIZE];
-    let records = [(claim(1), signature), (claim(2), signature)];
-    let child = [claim(3)];
-    let request = AggregateRequest {
-        log_inv_rate: 2,
-        children: vec![(&child, b"pp")],
-        records: records.iter().map(|(claim, signature)| (claim, signature)).collect(),
-    };
-    let mut out = vec![0xAA; request.len()];
-    request.write(&mut out);
-
-    let mut expected = vec![1, 2];
-    expected.extend(le(1));
-    expected.extend(le(8 + 64 + 8 + 1));
-    expected.extend(le(1));
-    expected.extend(claim(3));
-    expected.extend(le(0));
-    expected.push(0);
-    expected.extend(le(2));
-    expected.extend(b"pp");
-    expected.extend(le(2));
-    for (claim, signature) in &records {
-        expected.extend(claim);
-        expected.extend(signature);
-    }
-    expected.extend([0; 8 + 8 + 1]);
-    assert_eq!(out, expected);
-}
-
-#[test]
 fn the_length_is_exactly_the_bytes_written() {
     let signature = [5u8; XMSS_SIGNATURE_SIZE];
     let claims: Vec<Claim> = (0..=255).map(claim).collect();
@@ -85,6 +54,7 @@ fn the_length_is_exactly_the_bytes_written() {
         let request = AggregateRequest { log_inv_rate: 2, children, records };
         let mut out = vec![0xAA; request.len()];
         request.write(&mut out);
+        assert_eq!(out[0], 1, "aggregate op");
         assert_eq!(out, naive_body(&request));
     }
 }

@@ -31,7 +31,6 @@ pub struct VerifiedVote<'a> {
 
 /// What one aggregation proves: a vote for a leaf, an aggregate for a merge.
 pub trait VerifiedClaims {
-    /// Picks the batches of an aggregation of these.
     type Strategy: Strategy;
 
     /// Sorted and without repeats.

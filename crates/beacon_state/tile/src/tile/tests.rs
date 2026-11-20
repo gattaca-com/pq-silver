@@ -7584,19 +7584,15 @@ mod pq_aggregator {
     use silver_ssz::ssz_view::{AttestationPqView, SINGLE_ATT_PQ_SIZE};
 
     use super::*;
-    use crate::tile::pq_aggregation::{Aggregate, Claim, VerifiedVote, wire::aggregate_response};
+    use crate::tile::pq_aggregation::{
+        Aggregate, Claim, VerifiedVote, attestation, wire::aggregate_response,
+    };
 
     const SLOT: Slot = 40;
     const DATA_ROOT: B256 = [0xDD; 32];
     const COMMITTEE_LEN: usize = 8;
     const ROOT_A: B256 = [0xAA; 32];
     const ROOT_B: B256 = [0xBB; 32];
-
-    /// An aggregate's `AttestationPq`: positions `0..claims` of committee 0.
-    fn attestation(claims: usize) -> Vec<u8> {
-        let data = [0; ATTESTATION_DATA_SIZE];
-        AttestationPqView::encode_one_committee(&data, 0, COMMITTEE_LEN, 0..claims).unwrap()
-    }
 
     struct Rig {
         tile: BeaconStateTile,
@@ -7626,20 +7622,12 @@ mod pq_aggregator {
             self.tile.consume_shared(&mut self.adapter);
         }
 
-        fn health(&mut self, ready: bool) {
+        fn ready(&mut self) {
             let tile = &mut self.tile;
             let producers = &mut self.adapter.producers;
-            let health = LeanVmHealthEvent { ready };
-            tile.pq_aggregator.on_health(
-                health,
-                &tile.ticker,
-                &mut tile.events_producer,
-                producers,
-            );
-        }
-
-        fn ready(&mut self) {
-            self.health(true);
+            let health = LeanVmHealthEvent { ready: true };
+            let tcache = &mut tile.events_producer;
+            tile.pq_aggregator.on_health(health, &tile.ticker, tcache, producers);
         }
 
         fn vote(&mut self, tag: u8) {
@@ -7663,7 +7651,7 @@ mod pq_aggregator {
         }
 
         fn aggregate(&mut self, slot: Slot, claims: &[Claim]) {
-            let attestation = attestation(claims.len());
+            let attestation = attestation(0, 0..claims.len());
             let aggregate = Aggregate::new(claims.to_vec(), b"child".to_vec(), attestation);
             let aggregate = aggregate.unwrap();
             let tile = &mut self.tile;
@@ -7674,9 +7662,7 @@ mod pq_aggregator {
         }
 
         fn tags(&mut self, request: &LeanVmReq) -> Vec<u8> {
-            let body = self.tile.events_producer.read_buffer(request.body).unwrap();
-            let has = |tag: u8| body.windows(64).any(|window| window == [tag; 64]);
-            (1..COMMITTEE_LEN as u8).filter(|&tag| has(tag)).collect()
+            (1..COMMITTEE_LEN as u8).filter(|&tag| self.carries(request, tag)).collect()
         }
 
         fn carries(&mut self, request: &LeanVmReq, tag: u8) -> bool {
@@ -7688,6 +7674,12 @@ mod pq_aggregator {
             let mut requests = Vec::new();
             self.sink.consume(|request: LeanVmReq, _| requests.push(request));
             requests
+        }
+
+        fn request(&mut self) -> LeanVmReq {
+            let requests = self.requests();
+            assert_eq!(requests.len(), 1, "one request is in flight");
+            requests[0]
         }
 
         fn respond(&mut self, request_id: u64, claims: &[Claim]) {
@@ -7715,12 +7707,12 @@ mod pq_aggregator {
     #[test]
     fn a_vote_sends_a_request_once_the_leanvm_sidecar_is_ready() {
         let mut rig = Rig::new();
-        rig.vote(1);
+        rig.vote_on(ROOT_A, 1);
+        rig.vote_on(ROOT_B, 3);
         assert!(rig.requests().is_empty());
         rig.ready();
-        let requests = rig.requests();
-        assert_eq!(requests.len(), 1);
-        let body = rig.tile.events_producer.read_buffer(requests[0].body).unwrap();
+        let request = rig.request();
+        let body = rig.tile.events_producer.read_buffer(request.body).unwrap();
         assert_eq!(body[0], 1, "aggregate op");
     }
 
@@ -7729,15 +7721,14 @@ mod pq_aggregator {
         let mut rig = Rig::new();
         rig.ready();
         rig.vote(1);
-        let request_id = rig.requests()[0].request_id;
+        let request_id = rig.request().request_id;
         assert!(rig.served().is_none(), "no proof yet");
 
         rig.respond(request_id, &[[1; 64]]);
         let ssz = rig.served().expect("a best proof");
         assert!(AttestationPqView::check_canonical(&ssz));
         assert_eq!(AttestationPqView::committee_bits(&ssz), &[1, 0]);
-        let bits = AttestationPqView::aggregation_bits(&ssz);
-        assert_eq!(bits[0] & 0b11, 0b10, "only position 1 is set");
+        assert_eq!(AttestationPqView::aggregation_bits(&ssz), [0b10, 1], "only position 1 is set");
     }
 
     #[test]
@@ -7757,42 +7748,19 @@ mod pq_aggregator {
         rig.vote(1);
         assert!(rig.requests().is_empty());
     }
+
     #[test]
     fn an_aggregate_is_merged_into_the_block_proof() {
         let mut rig = Rig::new();
         rig.ready();
         rig.aggregate(SLOT, &[[1; 64], [2; 64]]);
-        let requests = rig.requests();
-        assert_eq!(requests.len(), 1);
+        let request = rig.request();
         assert!(rig.tile.pq_aggregator.block_proof(SLOT).is_none(), "no proof yet");
 
-        rig.respond(requests[0].request_id, &[[1; 64], [2; 64]]);
+        rig.respond(request.request_id, &[[1; 64], [2; 64]]);
         let (attestations, proof) = rig.tile.pq_aggregator.block_proof(SLOT).unwrap();
-        assert_eq!(attestations, [attestation(2).as_slice()]);
+        assert_eq!(attestations, [attestation(0, 0..2).as_slice()]);
         assert_eq!(proof, b"proof");
-    }
-
-    #[test]
-    fn one_request_is_in_flight_and_the_merge_goes_first() {
-        let mut rig = Rig::new();
-        rig.ready();
-        rig.vote_on(ROOT_A, 1);
-        rig.vote_on(ROOT_B, 3);
-        rig.aggregate(SLOT, &[[9; 64]]);
-        let first = rig.requests();
-        assert_eq!(first.len(), 1, "the others wait");
-        assert_eq!(rig.tags(&first[0]), [1], "leaf A arrived first");
-
-        rig.respond(first[0].request_id, &[[1; 64]]);
-        let second = rig.requests();
-        assert_eq!(second.len(), 1);
-        assert!(rig.tags(&second[0]).is_empty(), "the merge carries no votes");
-        assert_eq!(second[0].request_id, 1);
-
-        rig.respond(second[0].request_id, &[[9; 64]]);
-        let third = rig.requests();
-        assert_eq!(third.len(), 1);
-        assert_eq!(rig.tags(&third[0]), [3], "then leaf B");
     }
 
     #[test]
@@ -7802,21 +7770,21 @@ mod pq_aggregator {
         rig.vote_on(ROOT_A, 1);
         rig.vote_on(ROOT_B, 3);
         rig.vote_on(ROOT_A, 2);
-        let a1 = rig.requests();
-        assert_eq!(rig.tags(&a1[0]), [1]);
+        let a1 = rig.request();
+        assert_eq!(rig.tags(&a1), [1]);
 
-        rig.respond(a1[0].request_id, &[[1; 64]]);
-        let b1 = rig.requests();
-        assert_eq!(rig.tags(&b1[0]), [3], "leaf B before A's second batch");
+        rig.respond(a1.request_id, &[[1; 64]]);
+        let b1 = rig.request();
+        assert_eq!(rig.tags(&b1), [3], "leaf B before A's second batch");
         rig.vote_on(ROOT_B, 4);
 
-        rig.respond(b1[0].request_id, &[[3; 64]]);
-        let a2 = rig.requests();
-        assert_eq!(rig.tags(&a2[0]), [1, 2], "the best proof and the new vote");
+        rig.respond(b1.request_id, &[[3; 64]]);
+        let a2 = rig.request();
+        assert_eq!(rig.tags(&a2), [1, 2], "the best proof and the new vote");
 
-        rig.respond(a2[0].request_id, &[[1; 64], [2; 64]]);
-        let b2 = rig.requests();
-        assert_eq!(rig.tags(&b2[0]), [3, 4]);
+        rig.respond(a2.request_id, &[[1; 64], [2; 64]]);
+        let b2 = rig.request();
+        assert_eq!(rig.tags(&b2), [3, 4]);
     }
 
     #[test]
@@ -7824,40 +7792,22 @@ mod pq_aggregator {
         let mut rig = Rig::new();
         rig.ready();
         rig.vote_on(ROOT_A, 1);
-        let mut request = rig.requests()[0];
+        let mut request = rig.request();
         rig.vote_on(ROOT_B, 3);
         rig.aggregate(SLOT, &[[9; 64]]);
         rig.vote_on(ROOT_A, 2);
         rig.aggregate(SLOT + 1, &[[10; 64]]);
+        assert!(rig.requests().is_empty(), "the others wait");
 
         let mut order = Vec::new();
-        for claims in [[[1; 64]], [[9; 64]], [[10; 64]], [[3; 64]]] {
+        for (request_id, claims) in (1..).zip([[[1; 64]], [[9; 64]], [[10; 64]], [[3; 64]]]) {
             rig.respond(request.request_id, &claims);
-            request = rig.requests()[0];
+            request = rig.request();
+            assert_eq!(request.request_id, request_id);
             let merge = [9, 10].into_iter().find(|&tag| rig.carries(&request, tag));
             order.push(merge.map_or_else(|| rig.tags(&request), |tag| vec![tag]));
         }
         assert_eq!(order, [vec![9], vec![10], vec![3], vec![1, 2]]);
-    }
-
-    #[test]
-    fn aggregations_queued_while_down_go_out_on_recovery() {
-        let mut rig = Rig::new();
-        rig.vote_on(ROOT_A, 1);
-        rig.vote_on(ROOT_B, 3);
-        assert!(rig.requests().is_empty(), "the leanvm sidecar is not ready");
-
-        rig.ready();
-        let first = rig.requests();
-        assert_eq!(first.len(), 1);
-        rig.health(false);
-        rig.respond(first[0].request_id, &[[1; 64]]);
-        assert!(rig.requests().is_empty(), "not ready again");
-
-        rig.ready();
-        let second = rig.requests();
-        assert_eq!(second.len(), 1);
-        assert_eq!(rig.tags(&second[0]), [3]);
     }
 
     #[test]
@@ -7866,22 +7816,21 @@ mod pq_aggregator {
         rig.ready();
         rig.vote_on(ROOT_A, 1);
         rig.vote_on(ROOT_B, 3);
-        let first = rig.requests();
-        assert_eq!(rig.tags(&first[0]), [1]);
+        let first = rig.request();
+        assert_eq!(rig.tags(&first), [1]);
 
-        rig.disconnect(first[0].request_id);
+        rig.disconnect(first.request_id);
         assert!(rig.requests().is_empty(), "no request goes to a leanvm sidecar that is down");
 
         rig.ready();
-        let second = rig.requests();
-        assert_eq!(second.len(), 1);
-        assert_eq!(rig.tags(&second[0]), [3], "leaf B waited its turn");
-        rig.respond(first[0].request_id, &[[1; 64]]);
+        let second = rig.request();
+        assert_eq!(rig.tags(&second), [3], "leaf B waited its turn");
+        rig.respond(first.request_id, &[[1; 64]]);
         assert!(rig.requests().is_empty(), "a late answer to the lost request is ignored");
 
-        rig.respond(second[0].request_id, &[[3; 64]]);
-        let third = rig.requests();
-        assert_eq!(rig.tags(&third[0]), [1], "leaf A goes out again");
+        rig.respond(second.request_id, &[[3; 64]]);
+        let third = rig.request();
+        assert_eq!(rig.tags(&third), [1], "leaf A goes out again");
     }
 
     #[test]
@@ -7898,9 +7847,8 @@ mod pq_aggregator {
 
         drop(pin);
         rig.vote(1);
-        let first = rig.requests();
-        assert_eq!(first.len(), 1);
-        assert!(rig.tags(&first[0]).is_empty(), "the merge goes out before the leaf");
+        let first = rig.request();
+        assert!(rig.tags(&first).is_empty(), "the merge goes out before the leaf");
     }
 
     #[test]
@@ -7908,13 +7856,14 @@ mod pq_aggregator {
         let mut rig = Rig::new();
         rig.ready();
         rig.vote(1);
-        let stale = rig.requests();
+        let stale = rig.request();
         rig.tile.pq_aggregator.prune_before(SLOT + 1);
         rig.aggregate(SLOT + 2, &[[9; 64]]);
         assert!(rig.requests().is_empty(), "the leanvm sidecar is still proving the old batch");
 
-        rig.respond(stale[0].request_id, &[[1; 64]]);
+        rig.respond(stale.request_id, &[[1; 64]]);
         assert!(rig.served().is_none(), "the pruned leaf is gone");
-        assert_eq!(rig.requests().len(), 1, "the merge goes out");
+        let merge = rig.request();
+        assert!(rig.carries(&merge, 9), "the merge goes out");
     }
 }

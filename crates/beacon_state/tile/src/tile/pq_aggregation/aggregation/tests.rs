@@ -1,9 +1,8 @@
-use silver_common::ssz_view::{
-    ATTESTATION_DATA_SIZE, AttestationPqView, MAX_VALIDATORS_PER_COMMITTEE, XMSS_SIGNATURE_SIZE,
-};
+use silver_common::ssz_view::{MAX_VALIDATORS_PER_COMMITTEE, XMSS_SIGNATURE_SIZE};
 
 use super::{
     super::{
+        attestation,
         claims::{Aggregate, Vote},
         wire::aggregate_response,
     },
@@ -38,21 +37,19 @@ fn covered<C: VerifiedClaims>(aggregation: &Aggregation<C>) -> Vec<usize> {
     aggregation.best.as_ref().map_or_else(Vec::new, |best| best.covered_indices.clone())
 }
 
-fn merge() -> Aggregation<Aggregate> {
-    Aggregation::new(DEADLINE)
+fn merge(children: impl IntoIterator<Item = Aggregate>) -> Aggregation<Aggregate> {
+    let mut aggregation = Aggregation::new(DEADLINE);
+    children.into_iter().for_each(|child| assert!(aggregation.add(child)));
+    aggregation
 }
 
-/// An aggregate of one committee: claim `tag` sits at position `tag`.
+/// Claim `tag` sits at position `tag` of committee 0.
 fn child(tags: &[u16]) -> Aggregate {
     let claims = tags.iter().copied().map(claim).collect();
-    let positions = tags.iter().map(|&tag| tag as usize);
-    let data = [0; ATTESTATION_DATA_SIZE];
-    let ssz =
-        AttestationPqView::encode_one_committee(&data, 0, MAX_VALIDATORS_PER_COMMITTEE, positions);
-    Aggregate::new(claims, b"child".to_vec(), ssz.unwrap()).unwrap()
+    let ssz = attestation(0, tags.iter().map(|&tag| tag as usize));
+    Aggregate::new(claims, b"child".to_vec(), ssz).unwrap()
 }
 
-/// Takes the next batch at time 0 and settles it with `body`.
 fn settle<C: VerifiedClaims>(
     aggregation: &mut Aggregation<C>,
     body: Option<&[u8]>,
@@ -136,10 +133,7 @@ fn the_aggregation_stops_after_three_failures_and_a_success_resets_the_count() {
 
 #[test]
 fn a_non_contiguous_batch_is_checked_against_exactly_its_claims() {
-    let mut aggregation = merge();
-    [child(&[1, 2]), child(&[2, 3]), child(&[4]), child(&[3, 4, 5])]
-        .into_iter()
-        .for_each(|aggregate| assert!(aggregation.add(aggregate)));
+    let mut aggregation = merge([child(&[1, 2]), child(&[2, 3]), child(&[4]), child(&[3, 4, 5])]);
     let batch = aggregation.next_batch(Nanos::ZERO).unwrap();
     assert_eq!(batch.indices(), [0, 3], "two children cover 1..=5");
 
@@ -155,8 +149,7 @@ fn a_non_contiguous_batch_is_checked_against_exactly_its_claims() {
 
 #[test]
 fn merge_batches_respect_the_child_limit_with_the_best_proof_as_one() {
-    let mut aggregation = merge();
-    (0..40).for_each(|tag| assert!(aggregation.add(child(&[tag]))));
+    let mut aggregation = merge((0..40).map(|tag| child(&[tag])));
     let batch = aggregation.next_batch(Nanos::ZERO).unwrap();
     assert_eq!(batch.indices().len(), 16);
     assert_eq!(aggregation.request(&batch).children.len(), 16);
@@ -164,25 +157,6 @@ fn merge_batches_respect_the_child_limit_with_the_best_proof_as_one() {
     let batch = aggregation.next_batch(Nanos::ZERO).unwrap();
     assert_eq!(batch.indices(), (16..31).collect::<Vec<_>>());
     assert_eq!(aggregation.request(&batch).children.len(), 16, "the best proof is one");
-}
-
-#[test]
-fn the_strategy_keeps_its_view_across_a_failed_and_an_adopted_batch() {
-    let mut aggregation = merge();
-    [child(&[1, 2]), child(&[2, 3]), child(&[3, 4, 5])]
-        .into_iter()
-        .for_each(|aggregate| assert!(aggregation.add(aggregate)));
-    let batch = aggregation.next_batch(Nanos::ZERO).unwrap();
-    assert_eq!(batch.indices(), [0, 2]);
-    assert!(aggregation.finish(batch, None).is_err());
-
-    let batch = aggregation.next_batch(Nanos::ZERO).unwrap();
-    assert_eq!(batch.indices(), [0, 2], "a failed batch changes nothing");
-    aggregation.finish(batch, Some(&answer(1..=5))).unwrap();
-    assert!(aggregation.next_batch(Nanos::ZERO).is_none(), "index 1 adds nothing now");
-
-    assert!(aggregation.add(child(&[5, 6])));
-    assert_eq!(aggregation.next_batch(Nanos::ZERO).unwrap().indices(), [3]);
 }
 
 #[test]

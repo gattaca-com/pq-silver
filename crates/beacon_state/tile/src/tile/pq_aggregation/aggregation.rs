@@ -13,8 +13,7 @@ use super::{
 
 const MAX_FAILURES: u8 = 3;
 
-/// The proof an aggregation holds. `claims` is exactly the union of the
-/// claims of the verified claims at `covered_indices`.
+/// `claims` is exactly the union of the verified claims at `covered_indices`.
 struct BestProof {
     /// Sorted, without repeats.
     claims: Vec<Claim>,
@@ -29,9 +28,8 @@ impl BestProof {
     }
 }
 
-/// The aggregation of one key: it owns the verified claims, the best proof and
-/// every check, and never decides what to prove. Its strategy decides, from
-/// the events the aggregation tells it.
+/// The aggregation of one key. It owns the verified claims, the best proof and
+/// every check. Its strategy decides what to prove.
 pub struct Aggregation<C: VerifiedClaims> {
     strategy: C::Strategy,
     deadline: Nanos,
@@ -62,7 +60,6 @@ impl<C: VerifiedClaims> Aggregation<C> {
         best.map(|&index| &self.verified[index])
     }
 
-    /// The claims of the best proof, and the proof.
     pub fn proof(&self) -> Option<(&[Claim], &[u8])> {
         self.best.as_ref().map(|best| (best.claims.as_slice(), best.proof.as_slice()))
     }
@@ -71,8 +68,6 @@ impl<C: VerifiedClaims> Aggregation<C> {
         self.failures >= MAX_FAILURES
     }
 
-    /// `None` at or past the deadline, once stopped, or when the strategy
-    /// picks nothing.
     pub fn next_batch(&mut self, now: Nanos) -> Option<Batch> {
         if now >= self.deadline || self.is_stopped() {
             return None;

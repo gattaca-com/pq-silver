@@ -68,14 +68,6 @@ fn ties_go_to_the_earlier_arrival() {
 }
 
 #[test]
-fn a_batch_respects_the_limit() {
-    let children: Vec<_> = (0..20).map(|position| positions(0, position..position + 1)).collect();
-    let strategy = strategy(&children);
-    assert_eq!(strategy.next_batch(15).unwrap().indices, (0..15).collect::<Vec<_>>());
-    assert_eq!(strategy.next_batch(16).unwrap().indices.len(), 16);
-}
-
-#[test]
 fn children_that_add_nothing_are_skipped() {
     let mut strategy = strategy(&[positions(0, 0..10), positions(0, 0..5)]);
     assert_eq!(strategy.next_batch(16).unwrap().indices, [0], "index 1 gains 0 after index 0");

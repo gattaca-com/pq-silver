@@ -16,21 +16,9 @@ mod claims;
 mod leaf;
 mod merge;
 mod strategy;
+#[cfg(test)]
+pub(super) mod test_util;
 pub(super) mod wire;
 
 pub use aggregator::PqAggregator;
 pub use claims::{Aggregate, Claim, VerifiedVote};
-
-/// An `AttestationPq` of committee `index`, in the largest committee.
-#[cfg(test)]
-pub(in crate::tile) fn attestation(
-    index: usize,
-    positions: impl IntoIterator<Item = usize>,
-) -> Vec<u8> {
-    use silver_common::ssz_view::{
-        ATTESTATION_DATA_SIZE, AttestationPqView, MAX_VALIDATORS_PER_COMMITTEE,
-    };
-    let data = [3; ATTESTATION_DATA_SIZE];
-    AttestationPqView::encode_one_committee(&data, index, MAX_VALIDATORS_PER_COMMITTEE, positions)
-        .unwrap()
-}

@@ -7585,7 +7585,7 @@ mod pq_aggregator {
 
     use super::*;
     use crate::tile::pq_aggregation::{
-        Aggregate, Claim, VerifiedVote, attestation, wire::AggregateResponse,
+        Aggregate, Claim, VerifiedVote, test_util::attestation, wire::AggregateResponse,
     };
 
     const SLOT: Slot = 40;

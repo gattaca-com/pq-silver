@@ -1,7 +1,7 @@
 use silver_common::ssz_view::ATTESTATION_DATA_SIZE;
 
 use super::{
-    super::{attestation, strategy::Bits},
+    super::{strategy::Bits, test_util::attestation},
     *,
 };
 

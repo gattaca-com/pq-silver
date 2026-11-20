@@ -4,10 +4,10 @@ use silver_common::ssz_view::{
 
 use super::{
     super::{
-        attestation,
         claims::{Aggregate, Vote},
         leaf::LeafAggregation,
         merge::MergeAggregation,
+        test_util::attestation,
         wire::{AggregateResponse, MAX_SIGNATURES},
     },
     *,

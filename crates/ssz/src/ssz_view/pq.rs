@@ -170,6 +170,34 @@ impl AttestationPqView {
     }
 }
 
+// -- ProvedAttestation: an aggregate with its proof -------------------
+//
+// Not a spec container; what an aggregator signs over, less its index.
+//   [0..4)  offset: attestation (== 8)
+//   [4..8)  offset: proof
+//   [8..)   attestation | proof
+
+pub struct ProvedAttestationView;
+
+impl ProvedAttestationView {
+    pub const FIXED: usize = 4 + 4;
+
+    pub fn write_offsets(out: &mut [u8], attestation_len: usize) {
+        out[..4].copy_from_slice(&(Self::FIXED as u32).to_le_bytes());
+        out[4..8].copy_from_slice(&((Self::FIXED + attestation_len) as u32).to_le_bytes());
+    }
+
+    #[inline]
+    pub fn attestation(buf: &[u8]) -> &[u8] {
+        &buf[Self::FIXED..u32_le(buf, 4) as usize]
+    }
+
+    #[inline]
+    pub fn proof(buf: &[u8]) -> &[u8] {
+        &buf[u32_le(buf, 4) as usize..]
+    }
+}
+
 // -- IndexedAttestation (inside AttesterSlashing) ---------------------
 //
 // Variable, fixed part 136B. `proof` takes `signature`'s place.

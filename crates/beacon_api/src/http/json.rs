@@ -5,19 +5,18 @@
 use std::io::Write;
 
 use silver_beacon_state_data::{
-    B256, BLSPubkey, BeaconBlockHeader, Builder, Checkpoint, FAR_FUTURE_EPOCH, Fork, ForkName,
-    SpecConfig, Version,
+    B256, BeaconBlockHeader, Builder, Checkpoint, FAR_FUTURE_EPOCH, Fork, ForkName, SpecConfig,
+    Version, pq::KeyScheme,
 };
 use silver_common::{
     AGENT_VERSION, PreparedPayloadAttributes,
     ssz_view::{
-        AttestationView, BEACON_BLOCK_HEADER_SIZE, BYTES_PER_KZG_COMMITMENT, BeaconBlockHeaderView,
-        IndexedAttestationView, PAYLOAD_ATTESTATION_DATA_SIZE, PROPOSER_SLASHING_SIZE,
-        PayloadAttestationDataView, ProposerPreferencesView, SIGNED_BLS_CHANGE_SIZE,
-        SIGNED_PROPOSER_PREFERENCES_SIZE, SIGNED_VOLUNTARY_EXIT_SIZE, SINGLE_ATT_SIZE,
-        SYNC_COMMITTEE_CONTRIBUTION_SIZE, SignedBlsToExecutionChangeView,
-        SignedProposerPreferencesView, SignedVoluntaryExitView, SingleAttestationView,
-        SyncCommitteeContributionView, WITHDRAWAL_SIZE, WithdrawalView,
+        AttestationPqView, BEACON_BLOCK_HEADER_SIZE, BYTES_PER_KZG_COMMITMENT,
+        BeaconBlockHeaderView, IndexedAttestationPqView, PAYLOAD_ATTESTATION_DATA_SIZE,
+        PROPOSER_SLASHING_PQ_SIZE, PayloadAttestationDataView, ProposerPreferencesView,
+        ProvedAttestationView, SIGNED_PROPOSER_PREFERENCES_PQ_SIZE, SINGLE_ATT_PQ_SIZE,
+        SignedProposerPreferencesPqView, SingleAttestationPqView, WITHDRAWAL_SIZE, WithdrawalView,
+        XMSSSignature,
     },
 };
 
@@ -27,7 +26,7 @@ use crate::{
     node::peers::Peer,
     validator::{
         attestation_data::AttestationData, attester_duties::AttesterDuty,
-        proposer_duties::ProposerDuty, ptc_duties::PtcDuty, sync_duties::SyncDuty,
+        proposer_duties::ProposerDuties, ptc_duties::PtcDuty,
     },
 };
 
@@ -204,11 +203,11 @@ pub(crate) struct ReadFlags {
     pub(crate) finalized: bool,
 }
 
-pub(crate) struct SignedHeader {
+pub(crate) struct SignedHeader<'a> {
     pub(crate) root: B256,
     pub(crate) canonical: bool,
     pub(crate) header: BeaconBlockHeader,
-    pub(crate) signature: [u8; 96],
+    pub(crate) signature: &'a XMSSSignature,
 }
 
 /// Containers, in the field order the beacon-API schemas declare.
@@ -315,7 +314,7 @@ impl Json<'_> {
         self.end_object();
     }
 
-    pub(crate) fn signed_headers(&mut self, headers: &[SignedHeader]) {
+    pub(crate) fn signed_headers(&mut self, headers: &[SignedHeader<'_>]) {
         self.begin_array();
         for signed in headers {
             self.signed_header(signed);
@@ -323,7 +322,7 @@ impl Json<'_> {
         self.end_array();
     }
 
-    pub(crate) fn signed_header(&mut self, signed: &SignedHeader) {
+    pub(crate) fn signed_header(&mut self, signed: &SignedHeader<'_>) {
         self.begin_object();
         self.key("root");
         self.hex(&signed.root);
@@ -345,7 +344,7 @@ impl Json<'_> {
         self.hex(&signed.header.body_root);
         self.end_object();
         self.key("signature");
-        self.hex(&signed.signature);
+        self.hex(signed.signature);
         self.end_object();
         self.end_object();
     }
@@ -398,34 +397,21 @@ impl Json<'_> {
         self.end_object();
     }
 
-    pub(crate) fn attestation(&mut self, ssz: &[u8]) {
+    /// `ssz` is a `ProvedAttestationView`.
+    pub(crate) fn proved_attestation(&mut self, ssz: &[u8]) {
+        let attestation = ProvedAttestationView::attestation(ssz);
+        self.begin_object();
+        self.key("aggregate");
         self.begin_object();
         self.key("aggregation_bits");
-        self.hex(AttestationView::aggregation_bits(ssz));
+        self.hex(AttestationPqView::aggregation_bits(attestation));
         self.key("data");
-        self.attestation_data(&AttestationView::data(ssz).into());
-        self.key("signature");
-        self.hex(AttestationView::signature(ssz));
+        self.attestation_data(&AttestationPqView::data(attestation).into());
         self.key("committee_bits");
-        self.hex(AttestationView::committee_bits(ssz));
+        self.hex(AttestationPqView::committee_bits(attestation));
         self.end_object();
-    }
-
-    pub(crate) fn sync_committee_contribution(
-        &mut self,
-        ssz: &[u8; SYNC_COMMITTEE_CONTRIBUTION_SIZE],
-    ) {
-        self.begin_object();
-        self.key("slot");
-        self.quoted_u64(SyncCommitteeContributionView::slot(ssz));
-        self.key("beacon_block_root");
-        self.hex(SyncCommitteeContributionView::beacon_block_root(ssz));
-        self.key("subcommittee_index");
-        self.quoted_u64(SyncCommitteeContributionView::subcommittee_index(ssz));
-        self.key("aggregation_bits");
-        self.hex(SyncCommitteeContributionView::aggregation_bits(ssz));
-        self.key("signature");
-        self.hex(SyncCommitteeContributionView::signature(ssz));
+        self.key("proof");
+        self.hex(ProvedAttestationView::proof(ssz));
         self.end_object();
     }
 
@@ -574,41 +560,11 @@ impl Json<'_> {
         self.end_object();
     }
 
-    pub(crate) fn voluntary_exit(&mut self, ssz: &[u8; SIGNED_VOLUNTARY_EXIT_SIZE]) {
-        self.begin_object();
-        self.key("message");
-        self.begin_object();
-        self.key("epoch");
-        self.quoted_u64(SignedVoluntaryExitView::epoch(ssz));
-        self.key("validator_index");
-        self.quoted_u64(SignedVoluntaryExitView::validator_index(ssz));
-        self.end_object();
-        self.key("signature");
-        self.hex(SignedVoluntaryExitView::signature(ssz));
-        self.end_object();
-    }
-
-    pub(crate) fn bls_to_execution_change(&mut self, ssz: &[u8; SIGNED_BLS_CHANGE_SIZE]) {
-        self.begin_object();
-        self.key("message");
-        self.begin_object();
-        self.key("validator_index");
-        self.quoted_u64(SignedBlsToExecutionChangeView::validator_index(ssz));
-        self.key("from_bls_pubkey");
-        self.hex(SignedBlsToExecutionChangeView::from_bls_pubkey(ssz));
-        self.key("to_execution_address");
-        self.hex(SignedBlsToExecutionChangeView::to_execution_address(ssz));
-        self.end_object();
-        self.key("signature");
-        self.hex(SignedBlsToExecutionChangeView::signature(ssz));
-        self.end_object();
-    }
-
     pub(crate) fn signed_proposer_preferences(
         &mut self,
-        ssz: &[u8; SIGNED_PROPOSER_PREFERENCES_SIZE],
+        ssz: &[u8; SIGNED_PROPOSER_PREFERENCES_PQ_SIZE],
     ) {
-        let message = SignedProposerPreferencesView::message(ssz);
+        let message = SignedProposerPreferencesPqView::message(ssz);
         self.begin_object();
         self.key("message");
         self.begin_object();
@@ -624,12 +580,12 @@ impl Json<'_> {
         self.quoted_u64(ProposerPreferencesView::target_gas_limit(message));
         self.end_object();
         self.key("signature");
-        self.hex(SignedProposerPreferencesView::signature(ssz));
+        self.hex(SignedProposerPreferencesPqView::signature(ssz));
         self.end_object();
     }
 
-    pub(crate) fn proposer_slashing(&mut self, ssz: &[u8; PROPOSER_SLASHING_SIZE]) {
-        let (first, second) = ssz.split_at(PROPOSER_SLASHING_SIZE / 2);
+    pub(crate) fn proposer_slashing(&mut self, ssz: &[u8; PROPOSER_SLASHING_PQ_SIZE]) {
+        let (first, second) = ssz.split_at(PROPOSER_SLASHING_PQ_SIZE / 2);
         self.begin_object();
         self.key("signed_header_1");
         self.signed_block_header(first);
@@ -676,27 +632,27 @@ impl Json<'_> {
         self.begin_object();
         self.key("attesting_indices");
         self.begin_array();
-        for index in IndexedAttestationView::attesting_indices(ssz).chunks_exact(8) {
+        for index in IndexedAttestationPqView::attesting_indices(ssz).chunks_exact(8) {
             self.quoted_u64(u64::from_le_bytes(index.try_into().unwrap()));
         }
         self.end_array();
         self.key("data");
-        self.attestation_data(&IndexedAttestationView::data(ssz).into());
-        self.key("signature");
-        self.hex(IndexedAttestationView::signature(ssz));
+        self.attestation_data(&IndexedAttestationPqView::data(ssz).into());
+        self.key("proof");
+        self.hex(IndexedAttestationPqView::proof(ssz));
         self.end_object();
     }
 
-    pub(crate) fn single_attestation_event(&mut self, ssz: &[u8; SINGLE_ATT_SIZE]) {
+    pub(crate) fn single_attestation_event(&mut self, ssz: &[u8; SINGLE_ATT_PQ_SIZE]) {
         self.begin_object();
         self.key("committee_index");
-        self.quoted_u64(SingleAttestationView::committee_index(ssz));
+        self.quoted_u64(SingleAttestationPqView::committee_index(ssz));
         self.key("attester_index");
-        self.quoted_u64(SingleAttestationView::attester_index(ssz));
+        self.quoted_u64(SingleAttestationPqView::attester_index(ssz));
         self.key("data");
-        self.attestation_data(&SingleAttestationView::data(ssz).into());
+        self.attestation_data(&SingleAttestationPqView::data(ssz).into());
         self.key("signature");
-        self.hex(SingleAttestationView::signature(ssz));
+        self.hex(SingleAttestationPqView::signature(ssz));
         self.end_object();
     }
 
@@ -727,15 +683,11 @@ impl Json<'_> {
     }
 
     /// `GetProposerDutiesResponse` (`apis/validator/duties/proposer.yaml`).
-    pub(crate) fn proposer_duties<'a>(
-        &mut self,
-        dependent_root: B256,
-        execution_optimistic: bool,
-        duties: impl Iterator<Item = &'a ProposerDuty>,
-    ) {
-        self.duties_envelope(Some(dependent_root), execution_optimistic, |json| {
-            for duty in duties {
-                json.duty(&duty.pubkey, duty.validator_index, |json| {
+    pub(crate) fn proposer_duties(&mut self, duties: &ProposerDuties, execution_optimistic: bool) {
+        self.duties_envelope(Some(duties.dependent_root), execution_optimistic, |json| {
+            for duty in &duties.duties {
+                let pubkey = duties.scheme.public_key(&duty.pubkey);
+                json.duty(pubkey, duty.validator_index, |json| {
                     json.key("slot");
                     json.quoted_u64(duty.slot);
                 });
@@ -744,15 +696,15 @@ impl Json<'_> {
     }
 
     /// `GetAttesterDutiesResponse` (`apis/validator/duties/attester.yaml`).
-    pub(crate) fn attester_duties(
+    pub(crate) fn attester_duties<'a>(
         &mut self,
         dependent_root: B256,
         execution_optimistic: bool,
-        duties: impl Iterator<Item = AttesterDuty>,
+        duties: impl Iterator<Item = AttesterDuty<'a>>,
     ) {
         self.duties_envelope(Some(dependent_root), execution_optimistic, |json| {
             for duty in duties {
-                json.duty(&duty.pubkey, duty.validator_index, |json| {
+                json.duty(duty.pubkey, duty.validator_index, |json| {
                     json.key("committee_index");
                     json.quoted_u64(duty.committee_index);
                     json.key("committee_length");
@@ -763,20 +715,26 @@ impl Json<'_> {
                     json.quoted_u64(duty.validator_committee_index);
                     json.key("slot");
                     json.quoted_u64(duty.slot);
+                    json.key("is_aggregator");
+                    json.bool(duty.aggregator_position.is_some());
+                    if let Some(position) = duty.aggregator_position {
+                        json.key("aggregator_position");
+                        json.quoted_u64(position);
+                    }
                 });
             }
         });
     }
 
-    pub(crate) fn ptc_duties(
+    pub(crate) fn ptc_duties<'a>(
         &mut self,
         dependent_root: B256,
         execution_optimistic: bool,
-        duties: impl Iterator<Item = PtcDuty>,
+        duties: impl Iterator<Item = PtcDuty<'a>>,
     ) {
         self.duties_envelope(Some(dependent_root), execution_optimistic, |json| {
             for duty in duties {
-                json.duty(&duty.pubkey, duty.validator_index, |json| {
+                json.duty(duty.pubkey, duty.validator_index, |json| {
                     json.key("slot");
                     json.quoted_u64(duty.slot);
                 });
@@ -797,25 +755,6 @@ impl Json<'_> {
         self.end_object();
     }
 
-    pub(crate) fn sync_duties<'a>(
-        &mut self,
-        execution_optimistic: bool,
-        duties: impl Iterator<Item = SyncDuty<'a>>,
-    ) {
-        self.duties_envelope(None, execution_optimistic, |json| {
-            for duty in duties {
-                json.duty(&duty.pubkey, duty.validator_index, |json| {
-                    json.key("validator_sync_committee_indices");
-                    json.begin_array();
-                    for position in duty.positions() {
-                        json.quoted_u64(position);
-                    }
-                    json.end_array();
-                });
-            }
-        });
-    }
-
     pub(crate) fn liveness(&mut self, entries: impl Iterator<Item = (u64, bool)>) {
         self.data_envelope(|json| {
             json.begin_array();
@@ -831,7 +770,7 @@ impl Json<'_> {
         });
     }
 
-    fn duty(&mut self, pubkey: &BLSPubkey, validator_index: u64, rest: impl FnOnce(&mut Self)) {
+    fn duty(&mut self, pubkey: &[u8], validator_index: u64, rest: impl FnOnce(&mut Self)) {
         self.begin_object();
         self.key("pubkey");
         self.hex(pubkey);
@@ -873,7 +812,11 @@ impl Json<'_> {
         self.out.extend_from_slice(b",\"status\":\"");
         self.out.extend_from_slice(record.status.name().as_bytes());
         self.out.extend_from_slice(b"\",\"validator\":{\"pubkey\":");
-        self.unseparated_hex(&record.pubkey);
+        self.unseparated_hex(record.scheme.public_key(&record.pubkey));
+        if let Some(vrf_root) = &record.vrf_root {
+            self.out.extend_from_slice(b",\"vrf_root\":");
+            self.unseparated_hex(vrf_root);
+        }
         self.out.extend_from_slice(b",\"withdrawal_credentials\":");
         self.unseparated_hex(&record.withdrawal_credentials.0);
         self.out.extend_from_slice(b",\"effective_balance\":");
@@ -893,7 +836,13 @@ impl Json<'_> {
         self.out.extend_from_slice(b"}}");
     }
 
-    pub(crate) fn builder(&mut self, index: u64, status: &str, builder: &Builder) {
+    pub(crate) fn builder(
+        &mut self,
+        index: u64,
+        status: &str,
+        builder: &Builder,
+        scheme: KeyScheme,
+    ) {
         self.begin_object();
         self.key("index");
         self.quoted_u64(index);
@@ -902,7 +851,7 @@ impl Json<'_> {
         self.key("builder");
         self.begin_object();
         self.key("pubkey");
-        self.hex(&builder.pubkey);
+        self.hex(scheme.public_key(&builder.pubkey));
         self.key("version");
         self.quoted_u64(builder.version.into());
         self.key("execution_address");

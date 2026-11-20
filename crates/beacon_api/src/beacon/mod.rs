@@ -8,5 +8,4 @@ pub(crate) mod payload_submission;
 pub(crate) mod pools;
 pub(crate) mod proposer_preferences;
 pub(crate) mod states;
-pub(crate) mod sync_committees;
 pub(crate) mod validators;

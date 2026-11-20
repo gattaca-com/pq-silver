@@ -192,7 +192,7 @@ impl ApplicationBoundaryTile {
     }
 
     fn consume_spine_events(&mut self, adapter: &mut SpineAdapter<SilverSpine>) {
-        let Self { beacon, engine, pbs, builder_bids, processing, .. } = self;
+        let Self { beacon, engine, pbs, processing, .. } = self;
 
         adapter.consume(|event: BeaconStateEvent, _| beacon.handle_beacon_state_event(event));
         adapter.consume(|request: SidecarBidRequest, producers| {
@@ -201,30 +201,20 @@ impl ApplicationBoundaryTile {
                 producers.produce(SidecarBidResponse { slot, parent_hash, signed_bid: None });
             }
         });
+        // PQ blocks are built locally, so no block request names a builder.
         adapter.consume(|request: BuilderBidsRequest, producers| {
-            match beacon.builder_config(request.request_id) {
-                Some(config) => builder_bids.request(&request, config),
-                None => {
-                    let request_id = request.request_id;
-                    producers.produce(BuilderBidsResponse { request_id, bids: None });
-                }
-            }
+            producers.produce(BuilderBidsResponse { request_id: request.request_id, bids: None });
         });
         adapter.consume(|response: EngineResp, _| beacon.handle_engine_resp(response));
         adapter.consume(|event: PeerEvent, _| beacon.handle_peer_event(event));
         adapter.consume(|event: DataColumnsEvent, _| beacon.handle_data_columns_event(event));
         adapter.consume(|update: SyncUpdate, _| beacon.handle_sync_update(update));
         adapter.consume(|response: BeaconApiResponse, _| {
-            beacon.handle_response(
-                response,
-                processing,
-                &mut |request_id, call_path, body| {
-                    pbs.as_mut()
-                        .expect("a sidecar request needs a pbs.endpoint")
-                        .send(request_id, call_path, body)
-                },
-                &mut |url, signed_block| builder_bids.submit_block(url, signed_block),
-            )
+            beacon.handle_response(response, processing, &mut |request_id, call_path, body| {
+                pbs.as_mut()
+                    .expect("a sidecar request needs a pbs.endpoint")
+                    .send(request_id, call_path, body)
+            })
         });
 
         beacon.set_el_sync_status(engine.sync_status());

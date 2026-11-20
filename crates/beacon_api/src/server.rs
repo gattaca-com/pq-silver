@@ -20,7 +20,7 @@ use silver_httpcore::{
     AfterResponse, Bind, ChunkedResponse, ClientResponse, Closed, Listener, ParsedRequest,
     ServerConnection, Stream, TokenRange,
 };
-use silver_pbs::{BuilderConfig, PreferenceFailures, PreferencesBody, SidecarCall};
+use silver_pbs::{PreferenceFailures, PreferencesBody, SidecarCall};
 
 use crate::{
     HeadStatus, NodeStatus,
@@ -40,12 +40,12 @@ use crate::{
     node::peers::Peer,
     routes::{ROUTES, SERVED_WHILE_SYNCING},
     submission::{
-        AcceptedEntry, BuilderForward, Integration, MAX_SUBMISSION_ENTRIES, RecentImports,
-        Submission, SubmissionFailure, failure_message,
+        AcceptedEntry, Integration, MAX_SUBMISSION_ENTRIES, RecentImports, Submission,
+        SubmissionFailure, failure_message,
     },
     validator::{
         aggregate_attestation::AggregateRequest, execution_payload_envelope::EnvelopeRequest,
-        produce_block::ProduceBlockRequest, sync_contribution::SyncCommitteeContributionRequest,
+        produce_block::ProduceBlockRequest,
     },
 };
 
@@ -108,7 +108,6 @@ struct Requests {
 enum Pending {
     Block { request_id: u64, kind: Kind },
     Aggregate { request_id: u64, request: AggregateRequest },
-    Contribution { request_id: u64, request: SyncCommitteeContributionRequest },
     ProducedBlock { request_id: u64, request: Box<ProduceBlockRequest> },
     Envelope { request_id: u64, request: EnvelopeRequest },
     Submission(PendingSubmission),
@@ -125,7 +124,6 @@ struct PendingSubmission {
     body_len: usize,
     unanswered: usize,
     failures: Vec<SubmissionFailure>,
-    forward: Option<BuilderForward>,
     integration: Integration,
 }
 
@@ -139,15 +137,13 @@ impl PendingSubmission {
         self.body_index(request_id).is_some()
     }
 
-    /// Returns the builder forward once every entry is broadcast: the builder
-    /// releases the payload on the block, not on its import.
     fn record(
         &mut self,
         request_id: u64,
         result: LocalGossipResult,
         block_root: Option<B256>,
         imports: &RecentImports,
-    ) -> Option<BuilderForward> {
+    ) {
         let body_index = self.body_index(request_id).expect("awaited");
         self.unanswered -= 1;
         match result {
@@ -163,8 +159,6 @@ impl PendingSubmission {
                 }
             }
         }
-        let published = self.unanswered == 0 && self.failures.is_empty();
-        if published { self.forward.take() } else { None }
     }
 
     fn settled(&self) -> bool {
@@ -201,10 +195,6 @@ impl Pending {
                 emit(request.state_request(first_id));
                 (Self::Aggregate { request_id: first_id, request }, 1)
             }
-            Outcome::AwaitingContribution(request) => {
-                emit(request.state_request(first_id));
-                (Self::Contribution { request_id: first_id, request }, 1)
-            }
             Outcome::AwaitingProducedBlock(request) => {
                 emit(request.state_request(first_id));
                 (Self::ProducedBlock { request_id: first_id, request: Box::new(request) }, 1)
@@ -239,7 +229,6 @@ impl Pending {
                     body_len,
                     unanswered: submission.accepted.len(),
                     failures: submission.failures,
-                    forward: submission.forward,
                     integration: submission.integration,
                 };
                 (Self::Submission(pending), body_len as u64)
@@ -264,7 +253,6 @@ impl Pending {
         match self {
             Self::Block { request_id: awaited, .. } |
             Self::Aggregate { request_id: awaited, .. } |
-            Self::Contribution { request_id: awaited, .. } |
             Self::ProducedBlock { request_id: awaited, .. } |
             Self::Envelope { request_id: awaited, .. } |
             Self::BlindedBlockLock { request_id: awaited, .. } |
@@ -1036,7 +1024,7 @@ impl BeaconApi {
                             Channel::ProposerPreferences,
                             "proposer_preferences",
                             |json| {
-                                json.versioned_envelope("gloas", |json| {
+                                json.versioned_envelope("pq", |json| {
                                     json.signed_proposer_preferences(buf)
                                 })
                             },
@@ -1172,14 +1160,11 @@ impl BeaconApi {
     /// publishes nothing.
     /// A blinded block whose lock is held goes to the sidecar through
     /// `to_sidecar`, and its request waits on the sidecar's answer.
-    /// `to_builder` gets a published block and the URL of the builder whose
-    /// bid it commits to.
     pub fn handle_response(
         &mut self,
         response: BeaconApiResponse,
         submissions: &mut TProducer,
         to_sidecar: &mut impl FnMut(u64, SidecarCall, &[u8]),
-        to_builder: &mut impl FnMut(&str, &[u8]),
     ) {
         let request_id = response.request_id();
         let Some(token) = self.token_awaiting(request_id) else {
@@ -1207,7 +1192,6 @@ impl BeaconApi {
             return;
         }
 
-        let mut forward = None;
         let mut resp = Response::new(requests.http.write_buf_mut(), submissions);
         let settled = match (response, requests.pending.as_mut().expect("found awaiting above")) {
             (BeaconApiResponse::Block { block, .. }, Pending::Block { kind, .. }) => {
@@ -1219,13 +1203,6 @@ impl BeaconApi {
                 Pending::Aggregate { request, .. },
             ) => {
                 request.respond(&mut resp, ssz, reader, &ctx.spec);
-                true
-            }
-            (
-                BeaconApiResponse::SyncCommitteeContribution { ssz, .. },
-                Pending::Contribution { request, .. },
-            ) => {
-                request.respond(&mut resp, ssz, reader);
                 true
             }
             (
@@ -1277,7 +1254,7 @@ impl BeaconApi {
                 BeaconApiResponse::LocalGossipResponse { response, block_root, .. },
                 Pending::Submission(pending),
             ) => {
-                forward = pending.record(request_id, response, block_root, recent_imports);
+                pending.record(request_id, response, block_root, recent_imports);
                 let settled = pending.settled();
                 if settled {
                     pending.respond(&mut resp);
@@ -1286,15 +1263,6 @@ impl BeaconApi {
             }
             _ => unreachable!("a request id is answered by the tile it was sent to"),
         };
-        // Read once `resp` releases `submissions`.
-        if let Some(BuilderForward { url, ssz }) = forward {
-            match submissions.read_buffer(ssz) {
-                Ok(block) => to_builder(&url, block),
-                Err(error) => {
-                    silver_log::warn!(?error, url = &*url, "published block gone; not forwarded")
-                }
-            }
-        }
         if settled {
             requests.pending = None;
             self.resume_writing(token);
@@ -1352,16 +1320,6 @@ impl BeaconApi {
         answer(pending, &mut Response::new(requests.http.write_buf_mut(), submissions));
         self.resume_writing(token);
         true
-    }
-
-    /// The builders a block request still waiting on `request_id` names.
-    pub fn builder_config(&self, request_id: u64) -> Option<BuilderConfig<'_>> {
-        self.connections.values().find_map(|conn| match conn.pending()? {
-            Pending::ProducedBlock { request_id: awaited, request } if *awaited == request_id => {
-                request.builder_config()
-            }
-            _ => None,
-        })
     }
 
     fn token_awaiting(&self, request_id: u64) -> Option<Token> {
@@ -1742,21 +1700,22 @@ mod tests {
         BlockLookup, BlockSource, ColumnOrigin, EngineNewPayloadResp, ForkName, GossipDomain,
         HeadRoots, LOCAL_GOSSIP_STREAM_ID, LocalGossipFailure, MessageId, Nanos, P2pStreamId,
         PayloadFrame, PayloadResolution, ProduceBlockFailure, ProducedBlock, ServedBlock, SszCache,
-        StreamProtocol, TCache, TCacheId, TCacheProducer, TProducer, body_root,
+        StreamProtocol, TCache, TCacheId, TCacheProducer, TProducer, block_root_pq,
         ssz_view::{
-            ATTESTATION_FIXED, BEACON_BLOCK_BODY_FIXED, BYTES_PER_BLOB, BYTES_PER_KZG_COMMITMENT,
-            DATA_COLUMN_SIDECAR_GLOAS_MIN, DATA_COLUMN_SIDECAR_MIN, SIGNED_BEACON_BLOCK_MIN,
-            SINGLE_ATT_SIZE, STATUS_V2_SIZE, SYNC_COMMITTEE_CONTRIBUTION_SIZE,
+            ATTESTATION_PQ_FIXED, BYTES_PER_BLOB, BYTES_PER_KZG_COMMITMENT, BeaconBlockBodyPqView,
+            DATA_COLUMN_SIDECAR_GLOAS_MIN, DATA_COLUMN_SIDECAR_MIN, ProvedAttestationView,
+            SIGNED_PQ_FIXED, SINGLE_ATT_PQ_SIZE, STATUS_V2_SIZE, SignedBeaconBlockPqView,
+            VRF_PROOF_SIZE, XMSS_SIGNATURE_SIZE,
         },
-        test_util::empty_signed_envelope,
+        test_util::{SynthBid, SynthBlock, empty_signed_envelope},
     };
     use silver_httpcore::Readiness;
 
     use super::*;
     use crate::{
         beacon::{
-            block_submission::tests::{blinded_block, gloas_block},
-            operations::tests::{entry, entry_targeting, signature as attestation_signature},
+            block_submission::tests::{blinded_block, gloas_block, pq_block},
+            operations::tests::{entry, signature as attestation_signature},
             proposer_preferences::tests as preferences,
         },
         submission::{Submission, tests as submission},
@@ -1780,8 +1739,6 @@ mod tests {
         /// Stands in for the PBS client: each request id, path and body
         /// handed to it.
         sidecar: Vec<(u64, SidecarCall, Vec<u8>)>,
-        /// Each builder url and the block forwarded to it.
-        forwarded: Vec<(String, Vec<u8>)>,
         /// Each `builder_preferences` request id and its body.
         preferences: Vec<(u64, Vec<u8>)>,
     }
@@ -1833,7 +1790,6 @@ mod tests {
                 requests: Vec::new(),
                 submissions,
                 sidecar: Vec::new(),
-                forwarded: Vec::new(),
                 preferences: Vec::new(),
             }
         }
@@ -1846,15 +1802,10 @@ mod tests {
         }
 
         fn answer(&mut self, response: BeaconApiResponse) {
-            let Self { api, submissions, sidecar, forwarded, .. } = self;
-            api.handle_response(
-                response,
-                submissions,
-                &mut |request_id, call_path, body| {
-                    sidecar.push((request_id, call_path, body.to_vec()))
-                },
-                &mut |url, block| forwarded.push((url.to_owned(), block.to_vec())),
-            );
+            let Self { api, submissions, sidecar, .. } = self;
+            api.handle_response(response, submissions, &mut |request_id, call_path, body| {
+                sidecar.push((request_id, call_path, body.to_vec()))
+            });
         }
 
         fn serve_bytes(&mut self, bytes: &[u8]) -> TCacheRead {
@@ -2836,8 +2787,11 @@ mod tests {
         }
     }
 
-    fn single_attestation_ssz(attester_index: u64, committee_index: u64) -> [u8; SINGLE_ATT_SIZE] {
-        let mut ssz = [0; SINGLE_ATT_SIZE];
+    fn single_attestation_ssz(
+        attester_index: u64,
+        committee_index: u64,
+    ) -> [u8; SINGLE_ATT_PQ_SIZE] {
+        let mut ssz = [0; SINGLE_ATT_PQ_SIZE];
         ssz[0..8].copy_from_slice(&committee_index.to_le_bytes());
         ssz[8..16].copy_from_slice(&attester_index.to_le_bytes());
         ssz[16..24].copy_from_slice(&submission::SLOT.to_le_bytes());
@@ -2846,7 +2800,7 @@ mod tests {
         ssz[72..104].fill(0x22);
         ssz[104..112].copy_from_slice(&300u64.to_le_bytes());
         ssz[112..144].fill(0x33);
-        ssz[144..240].copy_from_slice(&attestation_signature(attester_index));
+        ssz[144..].copy_from_slice(&attestation_signature());
         ssz
     }
 
@@ -3196,7 +3150,7 @@ mod tests {
             let events = serve(&mut server, reader, "preferences event and marker");
             assert_eq!(events.len(), 1, "{cache:?}");
             assert_eq!(events[0].topic, "proposer_preferences");
-            assert_eq!(events[0].data, serde_json::json!({ "version": "gloas", "data": expected }));
+            assert_eq!(events[0].data, serde_json::json!({ "version": "pq", "data": expected }));
 
             server.api.handle_beacon_state_event(status(34, 0xab, false));
             assert_eq!(json(&answer(&server.api.ctx, &get))["data"], serde_json::json!([]));
@@ -3221,7 +3175,7 @@ mod tests {
         let expected = preferences::preferences_json(32, 0x11);
         let body = serde_json::json!([expected]).to_string();
         let posted = ParsedRequest {
-            eth_consensus_version: Some("gloas"),
+            eth_consensus_version: Some("pq"),
             ..posting("/eth/v1/validator/proposer_preferences", &body)
         };
         let Outcome::AwaitingVerdicts(submission) =
@@ -3241,7 +3195,7 @@ mod tests {
         let events = serve(&mut server, reader, "local preferences event");
         assert_eq!(events.len(), 1);
         assert_eq!(events[0].topic, "proposer_preferences");
-        assert_eq!(events[0].data, serde_json::json!({ "version": "gloas", "data": expected }));
+        assert_eq!(events[0].data, serde_json::json!({ "version": "pq", "data": expected }));
     }
 
     #[test]
@@ -3526,15 +3480,11 @@ mod tests {
         format!("0x{}", hex::encode([byte; 32]))
     }
 
-    /// Passes the layout check; `byte` fills the state root.
+    /// A PQ block of proposer 7 whose state root is all `byte`.
     fn block_bytes(slot: u64, byte: u8) -> Vec<u8> {
-        let mut block = vec![0u8; SIGNED_BEACON_BLOCK_MIN];
-        block[0..4].copy_from_slice(&100u32.to_le_bytes());
-        block[100..108].copy_from_slice(&slot.to_le_bytes());
-        block[108..116].copy_from_slice(&7u64.to_le_bytes());
-        block[148..180].copy_from_slice(&[byte; 32]);
-        block[180..184].copy_from_slice(&84u32.to_le_bytes());
-        block.extend_from_slice(&[0u8; BEACON_BLOCK_BODY_FIXED]);
+        let mut block = SynthBlock::pq(slot, SynthBid::new(&[])).into_bytes();
+        block[SIGNED_PQ_FIXED + 8..SIGNED_PQ_FIXED + 16].copy_from_slice(&7u64.to_le_bytes());
+        block[SIGNED_PQ_FIXED + 48..SIGNED_PQ_FIXED + 80].fill(byte);
         block
     }
 
@@ -3733,15 +3683,14 @@ mod tests {
         client
     }
 
-    /// The builder gets the block at its verdict, and not when it is refused.
     /// The answer waits on the import the verdict names, which may come first:
     /// 200 once imported, 202 once broadcast but not integrated.
     #[test]
-    fn published_gloas_block_is_forwarded_to_its_builder() {
-        let block = gloas_block();
-        let root = block_root(&block, true);
+    fn published_block_is_answered_by_its_import() {
+        let block = pq_block();
+        let root = block_root_pq(&block);
         let received = BeaconStateEvent::BlockReceived {
-            slot: SignedBeaconBlockView::slot(&block),
+            slot: SignedBeaconBlockPqView::slot(&block),
             block_root: root,
             stage: BlockStage::Applied,
             source: BlockSource::Gossip,
@@ -3765,14 +3714,12 @@ mod tests {
             (refused, None, None, false, "400 Bad Request"),
         ] {
             let mut server = server_with(64, LONG_TIMEOUT);
-            server.api.ctx = submission::ctx();
-            server.api.ctx.spec.gloas_fork_epoch = 0;
+            server.api.ctx = submission::pq_ctx();
             let mut client = connect(tcp_addr(&server));
             write!(
                 client,
                 "POST /eth/v2/beacon/blocks HTTP/1.1\r\nHost: x\r\n\
-                 Content-Type: application/octet-stream\r\nEth-Consensus-Version: gloas\r\n\
-                 Eth-Builder-Url: http://b:18550\r\n\
+                 Content-Type: application/octet-stream\r\nEth-Consensus-Version: pq\r\n\
                  Content-Length: {}\r\nConnection: close\r\n\r\n",
                 block.len()
             )
@@ -3792,14 +3739,11 @@ mod tests {
             if import_first {
                 deliver(&mut server);
             }
-            assert!(server.forwarded.is_empty(), "nothing is forwarded before the verdict");
             server.answer(BeaconApiResponse::LocalGossipResponse {
                 request_id,
                 response: verdict,
                 block_root,
             });
-            let expected = verdict.is_ok().then(|| ("http://b:18550".to_owned(), block.clone()));
-            assert_eq!(server.forwarded, Vec::from_iter(expected), "{verdict:?}");
             if import.is_some() && !import_first {
                 server.pump();
                 let token = server.api.awaiting_import[0];
@@ -3893,7 +3837,7 @@ mod tests {
     /// Every attestation of one submission is locked and validated on its own,
     /// and the body is answered once the last of them has been.
     fn submit_two(server: &mut Server, results: [LocalGossipResult; 2]) -> Vec<u8> {
-        server.api.ctx = submission::ctx();
+        server.api.ctx = submission::pq_ctx();
         let client = connect(tcp_addr(server));
         let body = format!("[{},{}]", entry(1, 0), entry(2, 0));
         post(&client, "/eth/v2/beacon/pool/attestations", &body);
@@ -3937,11 +3881,11 @@ mod tests {
 
     const ATTESTATIONS: &str = "/eth/v2/beacon/pool/attestations";
 
-    /// A body holds one entry per validator and epoch, and the test state has
-    /// few validators, so the entries differ by target epoch.
-    static DISTINCT_ATTESTATIONS: LazyLock<Vec<String>> = LazyLock::new(|| {
-        (0..MAX_SUBMISSION_ENTRIES as u64).map(|i| entry_targeting(300 + i, 1, 0, 1)).collect()
-    });
+    /// A body holds one entry per validator and epoch.
+    static DISTINCT_ATTESTATIONS: LazyLock<Vec<String>> =
+        LazyLock::new(|| (0..submission::PQ_ACTIVE as u64).map(|i| entry(i, 0)).collect());
+
+    const LARGEST_BODY: usize = MAX_SUBMISSION_ENTRIES;
 
     fn post_attestations(server: &mut Server, count: usize) -> TcpStream {
         let client = connect(tcp_addr(server));
@@ -3967,13 +3911,16 @@ mod tests {
     #[test]
     fn submissions_past_the_outstanding_budget_are_answered_503() {
         let mut server = server_with(64, LONG_TIMEOUT);
-        server.api.ctx = submission::ctx();
-        server.submissions = TCache::producer(TCacheId::BoundaryProcessing, 1 << 24);
+        server.api.ctx = submission::pq_ctx();
+        server.submissions = TCache::producer(TCacheId::BoundaryProcessing, 1 << 26);
 
-        let first = post_attestations(&mut server, MAX_SUBMISSION_ENTRIES);
-        submitted_after(&mut server, MAX_SUBMISSION_ENTRIES, "the first body");
-        let second = post_attestations(&mut server, MAX_SUBMISSION_ENTRIES);
-        submitted_after(&mut server, MAX_OUTSTANDING_SUBMISSIONS, "the second body");
+        let first = post_attestations(&mut server, LARGEST_BODY);
+        submitted_after(&mut server, LARGEST_BODY, "the first body");
+        let mut others = Vec::new();
+        for filled in (2 * LARGEST_BODY..=MAX_OUTSTANDING_SUBMISSIONS).step_by(LARGEST_BODY) {
+            others.push(post_attestations(&mut server, LARGEST_BODY));
+            submitted_after(&mut server, filled, "a body within the budget");
+        }
 
         let response = refused(&mut server, 2);
         assert!(body(&response).starts_with(b"{\"code\":503,"));
@@ -3983,7 +3930,7 @@ mod tests {
         submitted_after(&mut server, MAX_OUTSTANDING_SUBMISSIONS + 1, "a body of one entry");
 
         let first_ids: Vec<_> =
-            server.requests.drain(..MAX_SUBMISSION_ENTRIES).map(|r| request_id(&r)).collect();
+            server.requests.drain(..LARGEST_BODY).map(|r| request_id(&r)).collect();
         for request_id in first_ids {
             server.answer(BeaconApiResponse::LocalGossipResponse {
                 request_id,
@@ -3993,16 +3940,17 @@ mod tests {
         }
         let response = serve(&mut server, std::thread::spawn(move || read_to_eof(first)), "200");
         assert!(response.starts_with(b"HTTP/1.1 200 OK\r\n"), "{response:?}");
+        let admitted = MAX_OUTSTANDING_SUBMISSIONS - LARGEST_BODY + 3;
         let _admitted = post_attestations(&mut server, 2);
-        submitted_after(&mut server, MAX_SUBMISSION_ENTRIES + 3, "a body within the budget");
+        submitted_after(&mut server, admitted, "a body within the budget");
 
-        refused(&mut server, MAX_SUBMISSION_ENTRIES);
-        drop(second);
+        refused(&mut server, LARGEST_BODY);
+        drop(others);
         server.api.idle.timeout = Duration::ZERO;
         pump_until(&mut server, "idle connections reaped", |s| s.api.connections.is_empty());
         server.api.idle.timeout = LONG_TIMEOUT;
-        let _largest = post_attestations(&mut server, MAX_SUBMISSION_ENTRIES);
-        submitted_after(&mut server, 2 * MAX_SUBMISSION_ENTRIES + 3, "the largest body");
+        let _largest = post_attestations(&mut server, LARGEST_BODY);
+        submitted_after(&mut server, admitted + LARGEST_BODY, "the largest body");
     }
 
     #[test]
@@ -4098,7 +4046,9 @@ mod tests {
         assert!(
             header_response.starts_with(b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n")
         );
-        let body_root = hex::encode(body_root(&block[SIGNED_BEACON_BLOCK_MIN..]));
+        let body_root =
+            BeaconBlockBodyPqView::hash_tree_root(SignedBeaconBlockPqView::body(&block));
+        let body_root = hex::encode(body_root);
         assert_eq!(
             std::str::from_utf8(body(&header_response)).unwrap(),
             format!(
@@ -4109,7 +4059,7 @@ mod tests {
                 root_hex(0xcd),
                 root_hex(0x00),
                 root_hex(0xef),
-                "00".repeat(96)
+                "00".repeat(XMSS_SIGNATURE_SIZE)
             )
         );
     }
@@ -4186,14 +4136,18 @@ mod tests {
         assert!(response.starts_with(b"HTTP/1.1 404 Not Found\r\n"), "{response:?}");
     }
 
-    /// An Electra `Attestation` over one committee, as the pool serializes it.
+    /// A PQ `Attestation` over one committee beside its proof, as the
+    /// aggregator serves it.
     fn aggregate_bytes(slot: u64) -> Vec<u8> {
-        let mut aggregate = vec![0u8; ATTESTATION_FIXED + 1];
-        aggregate[0..4].copy_from_slice(&(ATTESTATION_FIXED as u32).to_le_bytes());
-        aggregate[4..12].copy_from_slice(&slot.to_le_bytes());
-        aggregate[132..228].fill(0x44);
-        aggregate[228] = 0b0000_0100;
-        aggregate[ATTESTATION_FIXED] = 0b0001_1010;
+        let attestation_len = ATTESTATION_PQ_FIXED + 1;
+        let mut aggregate = vec![0u8; ProvedAttestationView::FIXED + attestation_len];
+        ProvedAttestationView::write_offsets(&mut aggregate, attestation_len);
+        let attestation = &mut aggregate[ProvedAttestationView::FIXED..];
+        attestation[0..4].copy_from_slice(&(ATTESTATION_PQ_FIXED as u32).to_le_bytes());
+        attestation[4..12].copy_from_slice(&slot.to_le_bytes());
+        attestation[132] = 0b0000_0100;
+        attestation[ATTESTATION_PQ_FIXED] = 0b0001_1010;
+        aggregate.extend_from_slice(&[0x55; 3]);
         aggregate
     }
 
@@ -4222,101 +4176,56 @@ mod tests {
         let mut server = server_with(64, LONG_TIMEOUT);
         let client = connect(tcp_addr(&server));
         let request_id = get_aggregate(&mut server, &client);
-        server.api.ctx.spec = SpecConfig { electra_fork_epoch: 0, ..SpecConfig::mainnet() };
+        server.api.ctx.spec = SpecConfig { pq_fork_epoch: 0, ..SpecConfig::mainnet() };
 
         let ssz = server.serve_bytes(&aggregate_bytes(submission::SLOT));
         server.answer(BeaconApiResponse::AggregateAttestation { request_id, ssz: Some(ssz) });
         let reader = std::thread::spawn(move || read_to_eof(client));
         let response = serve(&mut server, reader, "aggregate response");
         let head = "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n\
-                    Eth-Consensus-Version: electra\r\n";
+                    Eth-Consensus-Version: pq\r\n";
         assert!(response.starts_with(head.as_bytes()), "{}", String::from_utf8_lossy(&response));
         let parsed: serde_json::Value = serde_json::from_slice(body(&response)).unwrap();
-        assert_eq!(parsed["version"], "electra");
-        let data = &parsed["data"];
-        assert_eq!(data["aggregation_bits"], "0x1a");
-        assert_eq!(data["committee_bits"], "0x0400000000000000");
-        assert_eq!(data["signature"], format!("0x{}", "44".repeat(96)));
-        assert_eq!(data["data"]["slot"], submission::SLOT.to_string());
+        assert_eq!(parsed["version"], "pq");
+        let aggregate = &parsed["data"]["aggregate"];
+        assert_eq!(aggregate["aggregation_bits"], "0x1a");
+        assert_eq!(aggregate["committee_bits"], "0x0400");
+        assert_eq!(aggregate["data"]["slot"], submission::SLOT.to_string());
+        assert_eq!(parsed["data"]["proof"], "0x555555");
     }
 
-    fn get_produced_block(server: &mut Server, client: &TcpStream) -> u64 {
-        server.api.ctx = submission::ctx();
-        server.api.ctx.spec = SpecConfig { fulu_fork_epoch: 0, ..SpecConfig::mainnet() };
+    /// A PQ produceBlockV4 request, deferred to the state tile.
+    fn request_produced_block(server: &mut Server, include_payload: bool) -> (TcpStream, u64) {
+        server.api.ctx = submission::pq_ctx();
+        let mut client = connect(tcp_addr(server));
         let slot = submission::SLOT + 1;
-        get(
+        let config =
+            [&0u64.to_le_bytes()[..], &100u64.to_le_bytes(), &20u32.to_le_bytes()].concat();
+        write!(
             client,
-            &format!("/eth/v3/validator/blocks/{slot}?randao_reveal=0x{}", "11".repeat(96)),
-        );
+            "POST /eth/v4/validator/blocks/{slot}?randao_reveal=0x{}&include_payload={include_payload} \
+             HTTP/1.1\r\nHost: localhost\r\nAccept: application/octet-stream\r\n\
+             Content-Type: application/octet-stream\r\nEth-Consensus-Version: pq\r\n\
+             Content-Length: {}\r\nConnection: close\r\n\r\n",
+            "11".repeat(VRF_PROOF_SIZE),
+            config.len()
+        )
+        .unwrap();
+        client.write_all(&config).unwrap();
         let BeaconApiRequest::ProduceBlock { request_id, slot: asked, .. } =
             deferred_request(server)
         else {
             panic!("the block is asked of the state tile")
         };
         assert_eq!(asked, slot);
-        request_id
+        (client, request_id)
     }
 
     #[test]
-    fn produced_block_is_served_as_ssz_with_the_v3_headers() {
-        let mut server = server_with(64, LONG_TIMEOUT);
-        let client = connect(tcp_addr(&server));
-        let request_id = get_produced_block(&mut server, &client);
-
-        let header = server.serve_bytes(b"up to the payload|bls changes");
-        let after_payload = [
-            [0x33; BYTES_PER_KZG_COMMITMENT].as_slice(),
-            &[0x11; PayloadFrame::CELL_PROOFS_PER_BLOB_LEN],
-            &[0x22; BYTES_PER_BLOB],
-        ]
-        .concat();
-        let mut frame = vec![0; PayloadFrame::HEADER_LEN];
-        PayloadFrame::write_header(&mut frame, b"payload|".len(), 0, 1, false, &[0; 32]);
-        frame.extend_from_slice(b"payload|");
-        frame.extend_from_slice(&after_payload);
-        let payload = server.submissions.write_with(frame.len(), |out| out.copy_from_slice(&frame));
-        let mut execution_payload_value = [0; 32];
-        execution_payload_value[0] = 7;
-        let mut consensus_block_value = [0; 32];
-        consensus_block_value[0] = 9;
-        server.answer(BeaconApiResponse::ProducedBlock {
-            request_id,
-            block: Ok(ProducedBlock {
-                header,
-                payload_at: b"up to the payload|".len() as u32,
-                payload: Some(payload.unwrap()),
-                envelope_header: None,
-                execution_payload_value,
-                consensus_block_value,
-                builder_entry: None,
-                body_root: [0; 32],
-            }),
-        });
-        let reader = std::thread::spawn(move || read_to_eof(client));
-        let response = serve(&mut server, reader, "produced block");
-        let head = "HTTP/1.1 200 OK\r\nContent-Type: application/octet-stream\r\n\
-                    Eth-Consensus-Version: fulu\r\nEth-Execution-Payload-Blinded: false\r\n\
-                    Eth-Execution-Payload-Value: 7\r\nEth-Consensus-Block-Value: 9\r\n";
-        assert!(response.starts_with(head.as_bytes()), "{}", String::from_utf8_lossy(&response));
-        let spliced =
-            [b"up to the payload|payload|bls changes".as_slice(), &after_payload].concat();
-        assert_eq!(body(&response), spliced, "the payload goes before the bls changes");
-    }
-
-    #[test]
-    fn gloas_include_payload_selects_contents_or_the_bare_block() {
+    fn include_payload_selects_contents_or_the_bare_block() {
         for include_payload in [false, true] {
             let mut server = server_with(64, LONG_TIMEOUT);
-            server.api.ctx = submission::ctx();
-            server.api.ctx.spec =
-                SpecConfig { fulu_fork_epoch: 0, gloas_fork_epoch: 0, ..SpecConfig::mainnet() };
-            let mut client = connect(tcp_addr(&server));
-            let slot = submission::SLOT + 1;
-            let config =
-                [&0u64.to_le_bytes()[..], &100u64.to_le_bytes(), &20u32.to_le_bytes()].concat();
-            write!(client, "POST /eth/v4/validator/blocks/{slot}?randao_reveal=0x{}&include_payload={include_payload} HTTP/1.1\r\nHost: localhost\r\nAccept: application/octet-stream\r\nContent-Type: application/octet-stream\r\nEth-Consensus-Version: gloas\r\nContent-Length: {}\r\nConnection: close\r\n\r\n", "11".repeat(96), config.len()).unwrap();
-            client.write_all(&config).unwrap();
-            let request_id = request_id(&deferred_request(&mut server));
+            let (client, request_id) = request_produced_block(&mut server, include_payload);
             let block = b"beacon block";
             let payload = b"execution payload";
             let requests = b"execution requests";
@@ -4355,14 +4264,13 @@ mod tests {
                 }),
             });
             let reader = std::thread::spawn(move || read_to_eof(client));
-            let response = serve(&mut server, reader, "Gloas block response");
+            let response = serve(&mut server, reader, "PQ block response");
             let text = String::from_utf8_lossy(&response);
             assert!(text.starts_with("HTTP/1.1 200 OK"));
+            assert!(text.contains("Eth-Consensus-Version: pq\r\n"));
             assert!(
                 text.contains(&format!("Eth-Execution-Payload-Included: {include_payload}\r\n"))
             );
-            assert!(!text.contains("Eth-Execution-Payload-Blinded"));
-            assert!(!text.contains("Eth-Builder-Url"));
             if !include_payload {
                 assert_eq!(body(&response), block);
                 continue;
@@ -4437,60 +4345,44 @@ mod tests {
         }
     }
 
-    /// A block without a payload is the whole SSZ block: blinded on Fulu, a
-    /// bid-committing `BeaconBlock` from Gloas. The slot's fork picks the
-    /// header that says which.
+    /// A block whose bid commits to an external payload is the whole SSZ
+    /// block, even when the payload was asked for.
     #[test]
     fn produced_block_without_a_payload_is_served_whole() {
-        for (gloas_fork_epoch, fork, payload_header) in [
-            (u64::MAX, "fulu", "Eth-Execution-Payload-Blinded: true"),
-            (0, "gloas", "Eth-Execution-Payload-Included: false"),
-        ] {
-            let mut server = server_with(64, LONG_TIMEOUT);
-            let client = connect(tcp_addr(&server));
-            let request_id = get_produced_block(&mut server, &client);
-            server.api.ctx.spec.gloas_fork_epoch = gloas_fork_epoch;
-
-            let beacon_block = b"a whole beacon block";
-            let header = server.serve_bytes(beacon_block);
-            let mut execution_payload_value = [0; 32];
-            execution_payload_value[0] = 7;
-            let mut consensus_block_value = [0; 32];
-            consensus_block_value[0] = 9;
-            server.answer(BeaconApiResponse::ProducedBlock {
-                request_id,
-                block: Ok(ProducedBlock {
-                    header,
-                    payload_at: beacon_block.len() as u32,
-                    payload: None,
-                    envelope_header: None,
-                    execution_payload_value,
-                    consensus_block_value,
-                    builder_entry: None,
-                    body_root: [0; 32],
-                }),
-            });
-            let reader = std::thread::spawn(move || read_to_eof(client));
-            let response = serve(&mut server, reader, "produced block");
-            let head = format!(
-                "HTTP/1.1 200 OK\r\nContent-Type: application/octet-stream\r\n\
-                 Eth-Consensus-Version: {fork}\r\n{payload_header}\r\n\
-                 Eth-Execution-Payload-Value: 7\r\nEth-Consensus-Block-Value: 9\r\n"
-            );
-            assert!(
-                response.starts_with(head.as_bytes()),
-                "{}",
-                String::from_utf8_lossy(&response)
-            );
-            assert_eq!(body(&response), beacon_block);
-        }
+        let mut server = server_with(64, LONG_TIMEOUT);
+        let (client, request_id) = request_produced_block(&mut server, true);
+        let beacon_block = b"a whole beacon block";
+        let header = server.serve_bytes(beacon_block);
+        let mut execution_payload_value = [0; 32];
+        execution_payload_value[0] = 7;
+        let mut consensus_block_value = [0; 32];
+        consensus_block_value[0] = 9;
+        server.answer(BeaconApiResponse::ProducedBlock {
+            request_id,
+            block: Ok(ProducedBlock {
+                header,
+                payload_at: beacon_block.len() as u32,
+                payload: None,
+                envelope_header: None,
+                execution_payload_value,
+                consensus_block_value,
+                builder_entry: None,
+                body_root: [0; 32],
+            }),
+        });
+        let reader = std::thread::spawn(move || read_to_eof(client));
+        let response = serve(&mut server, reader, "produced block");
+        let head = "HTTP/1.1 200 OK\r\nContent-Type: application/octet-stream\r\n\
+                    Eth-Consensus-Version: pq\r\nEth-Execution-Payload-Included: false\r\n\
+                    Eth-Execution-Payload-Value: 7\r\nEth-Consensus-Block-Value: 9\r\n";
+        assert!(response.starts_with(head.as_bytes()), "{}", String::from_utf8_lossy(&response));
+        assert_eq!(body(&response), beacon_block);
     }
 
     #[test]
     fn block_for_an_unprepared_proposer_is_a_400() {
         let mut server = server_with(64, LONG_TIMEOUT);
-        let client = connect(tcp_addr(&server));
-        let request_id = get_produced_block(&mut server, &client);
+        let (client, request_id) = request_produced_block(&mut server, false);
         server.answer(BeaconApiResponse::ProducedBlock {
             request_id,
             block: Err(ProduceBlockFailure::NoFeeRecipient),
@@ -4506,74 +4398,6 @@ mod tests {
         let client = connect(tcp_addr(&server));
         let request_id = get_aggregate(&mut server, &client);
         server.answer(BeaconApiResponse::AggregateAttestation { request_id, ssz: None });
-        let reader = std::thread::spawn(move || read_to_eof(client));
-        let response = serve(&mut server, reader, "404 response");
-        assert!(response.starts_with(b"HTTP/1.1 404 Not Found\r\n"), "{response:?}");
-    }
-
-    fn get_contribution(server: &mut Server, client: &TcpStream) -> u64 {
-        server.api.ctx = submission::ctx();
-        get(
-            client,
-            &format!(
-                "/eth/v1/validator/sync_committee_contribution?slot={}&subcommittee_index=1\
-                 &beacon_block_root={}",
-                submission::SLOT,
-                root_hex(0xab)
-            ),
-        );
-        let BeaconApiRequest::SyncCommitteeContribution {
-            request_id,
-            slot,
-            subcommittee_index,
-            beacon_block_root,
-        } = deferred_request(server)
-        else {
-            panic!("the contribution is asked of the state tile")
-        };
-        assert_eq!(
-            (slot, subcommittee_index, beacon_block_root),
-            (submission::SLOT, 1, [0xab; 32])
-        );
-        request_id
-    }
-
-    #[test]
-    fn contribution_waits_for_the_state_tile_then_answers_json() {
-        let mut server = server_with(64, LONG_TIMEOUT);
-        let client = connect(tcp_addr(&server));
-        let request_id = get_contribution(&mut server, &client);
-
-        let mut contribution = [0u8; SYNC_COMMITTEE_CONTRIBUTION_SIZE];
-        contribution[0..8].copy_from_slice(&submission::SLOT.to_le_bytes());
-        contribution[8..40].fill(0xab);
-        contribution[40..48].copy_from_slice(&1u64.to_le_bytes());
-        contribution[48] = 0b0000_0101;
-        contribution[64..].fill(0x44);
-        let ssz = server.serve_bytes(&contribution);
-        server.answer(BeaconApiResponse::SyncCommitteeContribution { request_id, ssz: Some(ssz) });
-        let reader = std::thread::spawn(move || read_to_eof(client));
-        let response = serve(&mut server, reader, "contribution response");
-        assert!(
-            response.starts_with(b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n"),
-            "{}",
-            String::from_utf8_lossy(&response)
-        );
-        let parsed: serde_json::Value = serde_json::from_slice(body(&response)).unwrap();
-        let data = &parsed["data"];
-        assert_eq!(data["slot"], submission::SLOT.to_string());
-        assert_eq!(data["beacon_block_root"], root_hex(0xab));
-        assert_eq!(data["subcommittee_index"], "1");
-        assert_eq!(data["aggregation_bits"], format!("0x05{}", "00".repeat(15)));
-        assert_eq!(data["signature"], format!("0x{}", "44".repeat(96)));
-    }
-
-    #[test]
-    fn contribution_the_pool_does_not_hold_is_a_404() {
-        let mut server = server_with(64, LONG_TIMEOUT);
-        let client = connect(tcp_addr(&server));
-        let request_id = get_contribution(&mut server, &client);
-        server.answer(BeaconApiResponse::SyncCommitteeContribution { request_id, ssz: None });
         let reader = std::thread::spawn(move || read_to_eof(client));
         let response = serve(&mut server, reader, "404 response");
         assert!(response.starts_with(b"HTTP/1.1 404 Not Found\r\n"), "{response:?}");

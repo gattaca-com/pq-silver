@@ -1,17 +1,19 @@
-use serde::{Deserialize, Deserializer, de};
+use serde::Deserialize;
 use silver_beacon_state_data::{SLOTS_PER_EPOCH, bls};
 use silver_common::{
-    ForkName, GossipTopic, compute_subnet_for_attestation,
-    json_fields::{bytes, parse_hex, uint64},
+    GossipTopic, compute_subnet_for_attestation,
+    json_fields::{HexBytes, bytes, uint64},
     ssz_view::{
-        ATTESTATION_DATA_SIZE, MAX_ATTESTING_INDICES, PROPOSER_SLASHING_SIZE,
-        SIGNED_BLS_CHANGE_SIZE, SIGNED_VOLUNTARY_EXIT_SIZE, XMSSSignature,
+        ATTESTATION_DATA_SIZE, INDEXED_ATTESTATION_PQ_FIXED, MAX_ATTESTING_INDICES_PQ,
+        MAX_STARK_PROOF_SIZE, PROPOSER_SLASHING_PQ_SIZE, SINGLE_ATT_PQ_SIZE, XMSSSignature,
     },
+    xmss::attestation_leaf,
 };
+use silver_crypto_simd::xmss::leaf_index;
 
 use crate::{
     ctx::ApiCtx,
-    entry_signatures::{SignatureCheck, signing_key},
+    entry_signatures::{SignatureCheck, xmss_signing_key},
     http::{ids::uint64_list, response::Response, router::Request},
     submission::{SubmittedEntry, post_single_submission, post_submission},
     validator::attestation_data::AttestationData,
@@ -28,35 +30,8 @@ struct SubmittedAttestation {
     #[serde(deserialize_with = "uint64")]
     attester_index: u64,
     data: AttestationData,
-    signature: AttesterSignature,
-}
-
-enum AttesterSignature {
-    Bls([u8; 96]),
-    Xmss(Box<XMSSSignature>),
-}
-
-impl<'de> Deserialize<'de> for AttesterSignature {
-    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
-        let text = <&str>::deserialize(deserializer)?;
-        match text.len() {
-            194 => parse_hex(text).map(Self::Bls),
-            n if n == 2 + 2 * size_of::<XMSSSignature>() => {
-                parse_hex(text).map(|sig| Self::Xmss(Box::new(sig)))
-            }
-            _ => None,
-        }
-        .ok_or_else(|| de::Error::custom("invalid attester signature encoding"))
-    }
-}
-
-impl AttesterSignature {
-    fn bytes(&self) -> &[u8] {
-        match self {
-            Self::Bls(sig) => sig,
-            Self::Xmss(sig) => sig.as_slice(),
-        }
-    }
+    #[serde(deserialize_with = "bytes")]
+    signature: XMSSSignature,
 }
 
 impl SubmittedEntry for SubmittedAttestation {
@@ -78,35 +53,27 @@ impl SubmittedEntry for SubmittedAttestation {
     }
 
     fn signature_check(&self, ctx: &ApiCtx) -> Result<Option<SignatureCheck>, &'static str> {
-        let signature = match (&self.signature, ctx.spec.fork_at_slot(self.data.slot)) {
-            (AttesterSignature::Xmss(sig), ForkName::Pq) => {
-                if silver_common::xmss::attestation_leaf(self.data.target.epoch) !=
-                    Some(silver_crypto_simd::xmss::leaf_index(sig))
-                {
-                    return Err("incorrect XMSS attestation leaf");
-                }
-                return Err("PQ validator state unavailable");
-            }
-            (AttesterSignature::Bls(_), ForkName::Pq) | (AttesterSignature::Xmss(_), _) => {
-                return Err("signature encoding does not match attestation fork")
-            }
-            (AttesterSignature::Bls(signature), _) => *signature,
-        };
+        let epoch = self.data.target.epoch;
+        let leaf_index = leaf_index(&self.signature);
+        if attestation_leaf(epoch) != Some(leaf_index) {
+            return Err("incorrect XMSS attestation leaf");
+        }
         let pubkey = ctx
-            .read_state(|view| signing_key(&view, self.attester_index))
-            .ok_or("attester_index is past the validator count")?;
-        let domain = ctx.domain(bls::DOMAIN_BEACON_ATTESTER, self.data.target.epoch);
+            .read_state(|view| xmss_signing_key(&view, self.attester_index))
+            .ok_or("attester_index names no XMSS validator")?;
+        let domain = ctx.domain(bls::DOMAIN_BEACON_ATTESTER, epoch);
         Ok(Some(SignatureCheck {
             validator: self.attester_index,
-            epoch: self.data.target.epoch,
+            epoch,
+            leaf_index,
             pubkey,
-            signature,
             signing_root: bls::compute_signing_root(&self.data.hash_tree_root(), &domain),
+            signature: self.signature,
         }))
     }
 
     fn ssz_len(&self) -> usize {
-        16 + ATTESTATION_DATA_SIZE + self.signature.bytes().len()
+        SINGLE_ATT_PQ_SIZE
     }
 
     fn encode(&self, ssz: &mut [u8]) {
@@ -114,89 +81,7 @@ impl SubmittedEntry for SubmittedAttestation {
         ssz[0..8].copy_from_slice(&self.committee_index.to_le_bytes());
         ssz[8..16].copy_from_slice(&self.attester_index.to_le_bytes());
         self.data.encode((&mut ssz[16..144]).try_into().expect("128 bytes"));
-        ssz[144..].copy_from_slice(self.signature.bytes());
-    }
-}
-
-pub(crate) fn post_voluntary_exit(req: &Request<'_>, ctx: &ApiCtx, resp: &mut Response<'_>) {
-    post_single_submission::<SubmittedVoluntaryExit>(req, ctx, resp);
-}
-
-pub(crate) fn post_bls_to_execution_changes(
-    req: &Request<'_>,
-    ctx: &ApiCtx,
-    resp: &mut Response<'_>,
-) {
-    post_submission::<SubmittedBlsChange>(req, ctx, resp);
-}
-
-#[derive(Deserialize)]
-struct SubmittedVoluntaryExit {
-    message: VoluntaryExit,
-    #[serde(deserialize_with = "bytes")]
-    signature: [u8; 96],
-}
-
-#[derive(Deserialize)]
-struct VoluntaryExit {
-    #[serde(deserialize_with = "uint64")]
-    epoch: u64,
-    #[serde(deserialize_with = "uint64")]
-    validator_index: u64,
-}
-
-impl SubmittedEntry for SubmittedVoluntaryExit {
-    fn accept(&self, _: &ApiCtx) -> Result<impl IntoIterator<Item = GossipTopic>, &'static str> {
-        Ok([GossipTopic::VoluntaryExit])
-    }
-
-    fn ssz_len(&self) -> usize {
-        SIGNED_VOLUNTARY_EXIT_SIZE
-    }
-
-    fn encode(&self, ssz: &mut [u8]) {
-        debug_assert_eq!(ssz.len(), self.ssz_len());
-        ssz[0..8].copy_from_slice(&self.message.epoch.to_le_bytes());
-        ssz[8..16].copy_from_slice(&self.message.validator_index.to_le_bytes());
-        ssz[16..112].copy_from_slice(&self.signature);
-    }
-}
-
-#[derive(Deserialize)]
-struct SubmittedBlsChange {
-    message: BlsChange,
-    #[serde(deserialize_with = "bytes")]
-    signature: [u8; 96],
-}
-
-#[derive(Deserialize)]
-struct BlsChange {
-    #[serde(deserialize_with = "uint64")]
-    validator_index: u64,
-    #[serde(deserialize_with = "bytes")]
-    from_bls_pubkey: [u8; 48],
-    #[serde(deserialize_with = "bytes")]
-    to_execution_address: [u8; 20],
-}
-
-impl SubmittedEntry for SubmittedBlsChange {
-    fn accept(&self, ctx: &ApiCtx) -> Result<impl IntoIterator<Item = GossipTopic>, &'static str> {
-        if ctx.spec.is_pq_at_slot(ctx.node_status.wall_slot) {
-            return Err("bls_to_execution_changes are disabled from PQ");
-        }
-        Ok([GossipTopic::BlsToExecutionChange])
-    }
-
-    fn ssz_len(&self) -> usize {
-        SIGNED_BLS_CHANGE_SIZE
-    }
-
-    fn encode(&self, ssz: &mut [u8]) {
-        debug_assert_eq!(ssz.len(), self.ssz_len());
-        ssz[0..8].copy_from_slice(&self.message.validator_index.to_le_bytes());
-        ssz[8..56].copy_from_slice(&self.message.from_bls_pubkey);
-        ssz[56..76].copy_from_slice(&self.message.to_execution_address);
-        ssz[76..172].copy_from_slice(&self.signature);
+        ssz[144..].copy_from_slice(&self.signature);
     }
 }
 
@@ -205,9 +90,8 @@ pub(crate) fn post_proposer_slashing(req: &Request<'_>, ctx: &ApiCtx, resp: &mut
 }
 
 pub(crate) fn post_attester_slashing(req: &Request<'_>, ctx: &ApiCtx, resp: &mut Response<'_>) {
-    // Electra onward shares one SSZ layout; Silver runs Fulu and Gloas.
-    if !matches!(req.eth_consensus_version, Some("fulu" | "gloas")) {
-        resp.error(400, "Eth-Consensus-Version must name fulu or gloas");
+    if req.eth_consensus_version != Some("pq") {
+        resp.error(400, "Eth-Consensus-Version must name pq");
         return;
     }
     post_single_submission::<SubmittedAttesterSlashing>(req, ctx, resp);
@@ -223,7 +107,7 @@ struct SubmittedProposerSlashing {
 struct SubmittedSignedHeader {
     message: SubmittedHeader,
     #[serde(deserialize_with = "bytes")]
-    signature: [u8; 96],
+    signature: XMSSSignature,
 }
 
 #[derive(Deserialize)]
@@ -241,7 +125,7 @@ struct SubmittedHeader {
 }
 
 impl SubmittedSignedHeader {
-    const SIZE: usize = PROPOSER_SLASHING_SIZE / 2;
+    const SIZE: usize = PROPOSER_SLASHING_PQ_SIZE / 2;
 
     fn encode(&self, ssz: &mut [u8]) {
         let header = &self.message;
@@ -260,7 +144,7 @@ impl SubmittedEntry for SubmittedProposerSlashing {
     }
 
     fn ssz_len(&self) -> usize {
-        PROPOSER_SLASHING_SIZE
+        PROPOSER_SLASHING_PQ_SIZE
     }
 
     fn encode(&self, ssz: &mut [u8]) {
@@ -272,44 +156,51 @@ impl SubmittedEntry for SubmittedProposerSlashing {
 }
 
 #[derive(Deserialize)]
-struct SubmittedAttesterSlashing {
-    attestation_1: IndexedAttestation,
-    attestation_2: IndexedAttestation,
+struct SubmittedAttesterSlashing<'a> {
+    #[serde(borrow)]
+    attestation_1: IndexedAttestation<'a>,
+    #[serde(borrow)]
+    attestation_2: IndexedAttestation<'a>,
 }
 
 #[derive(Deserialize)]
-struct IndexedAttestation {
+struct IndexedAttestation<'a> {
     #[serde(deserialize_with = "uint64_list")]
     attesting_indices: Vec<u64>,
     data: AttestationData,
-    #[serde(deserialize_with = "bytes")]
-    signature: [u8; 96],
+    #[serde(borrow)]
+    proof: HexBytes<'a, MAX_STARK_PROOF_SIZE>,
 }
 
-impl IndexedAttestation {
-    const FIXED: usize = 4 + ATTESTATION_DATA_SIZE + 96;
+impl IndexedAttestation<'_> {
+    fn proof_at(&self) -> usize {
+        INDEXED_ATTESTATION_PQ_FIXED + 8 * self.attesting_indices.len()
+    }
 
     fn ssz_len(&self) -> usize {
-        Self::FIXED + 8 * self.attesting_indices.len()
+        self.proof_at() + self.proof.byte_len()
     }
 
     fn encode(&self, ssz: &mut [u8]) {
-        ssz[0..4].copy_from_slice(&(Self::FIXED as u32).to_le_bytes());
+        let proof_at = self.proof_at();
+        ssz[0..4].copy_from_slice(&(INDEXED_ATTESTATION_PQ_FIXED as u32).to_le_bytes());
         let data = &mut ssz[4..4 + ATTESTATION_DATA_SIZE];
         self.data.encode(data.try_into().expect("ATTESTATION_DATA_SIZE bytes"));
-        ssz[4 + ATTESTATION_DATA_SIZE..Self::FIXED].copy_from_slice(&self.signature);
-        let indices = ssz[Self::FIXED..].chunks_exact_mut(8);
+        ssz[4 + ATTESTATION_DATA_SIZE..INDEXED_ATTESTATION_PQ_FIXED]
+            .copy_from_slice(&(proof_at as u32).to_le_bytes());
+        let indices = ssz[INDEXED_ATTESTATION_PQ_FIXED..proof_at].chunks_exact_mut(8);
         for (chunk, index) in indices.zip(&self.attesting_indices) {
             chunk.copy_from_slice(&index.to_le_bytes());
         }
+        self.proof.decode_into(&mut ssz[proof_at..]);
     }
 }
 
-impl SubmittedEntry for SubmittedAttesterSlashing {
+impl SubmittedEntry for SubmittedAttesterSlashing<'_> {
     fn accept(&self, _: &ApiCtx) -> Result<impl IntoIterator<Item = GossipTopic>, &'static str> {
         let attestations = [&self.attestation_1, &self.attestation_2];
-        if attestations.iter().any(|a| a.attesting_indices.len() > MAX_ATTESTING_INDICES) {
-            return Err("attesting_indices exceeds MAX_ATTESTING_INDICES");
+        if attestations.iter().any(|a| a.attesting_indices.len() > MAX_ATTESTING_INDICES_PQ) {
+            return Err("attesting_indices exceeds MAX_ATTESTING_INDICES_PQ");
         }
         Ok([GossipTopic::AttesterSlashing])
     }
@@ -330,13 +221,15 @@ impl SubmittedEntry for SubmittedAttesterSlashing {
 
 #[cfg(test)]
 pub(crate) mod tests {
-    use silver_beacon_state_data::SpecConfig;
+    use std::sync::LazyLock;
+
+    use silver_beacon_state_data::xmss::compute_xmss_attestation_leaf_index;
     use silver_common::{
         TCacheProducer,
         ssz_hash::hash_attestation_data,
         ssz_view::{
-            AttesterSlashingView, ProposerSlashingView, SINGLE_ATT_SIZE,
-            SignedBlsToExecutionChangeView, SignedVoluntaryExitView, SingleAttestationView,
+            AttesterSlashingPqView, BEACON_BLOCK_HEADER_SIZE, BeaconBlockHeaderView,
+            IndexedAttestationPqView, ProposerSlashingPqView, SingleAttestationPqView,
         },
     };
     use silver_httpcore::ParsedRequest;
@@ -346,29 +239,33 @@ pub(crate) mod tests {
         http::router::Outcome,
         submission::{
             MAX_SUBMISSION_ENTRIES, SubmissionFailure,
-            tests::{SLOT, ctx, posted_committees, validator_signature},
+            tests::{PQ_ACTIVE, SLOT, ctx, posted_committees, pq_ctx, xmss_signature},
         },
         testing::{body, dispatch, dispatch_into, posting, status_code, submissions},
     };
 
     const TARGET_EPOCH: u64 = 300;
 
+    /// Every validator's, as they share one key and attest to the same data.
+    static SIGNATURE: LazyLock<XMSSSignature> = LazyLock::new(|| signature_targeting(TARGET_EPOCH));
+
     /// One entry of the array a validator client posts, spelled as the
     /// schemas do.
     pub(crate) fn entry(attester_index: u64, committee_index: u64) -> String {
-        entry_signed_by(attester_index, committee_index, attester_index)
+        entry_signed(TARGET_EPOCH, attester_index, committee_index, &SIGNATURE)
     }
 
-    fn entry_signed_by(attester_index: u64, committee_index: u64, signer: u64) -> String {
-        entry_targeting(TARGET_EPOCH, attester_index, committee_index, signer)
+    fn forged_entry(attester_index: u64, committee_index: u64) -> String {
+        let mut signature = *SIGNATURE;
+        signature[100] ^= 1;
+        entry_signed(TARGET_EPOCH, attester_index, committee_index, &signature)
     }
 
-    /// Distinct target epochs give one validator distinct entries in a body.
-    pub(crate) fn entry_targeting(
+    fn entry_signed(
         target_epoch: u64,
         attester_index: u64,
         committee_index: u64,
-        signer: u64,
+        signature: &XMSSSignature,
     ) -> String {
         format!(
             "{{\"committee_index\":\"{committee_index}\",\"attester_index\":\"{attester_index}\",\
@@ -380,15 +277,15 @@ pub(crate) mod tests {
             "11".repeat(32),
             "22".repeat(32),
             "33".repeat(32),
-            hex::encode(signature_targeting(target_epoch, signer)),
+            hex::encode(signature),
         )
     }
 
-    pub(crate) fn signature(signer: u64) -> [u8; 96] {
-        signature_targeting(TARGET_EPOCH, signer)
+    pub(crate) fn signature() -> XMSSSignature {
+        *SIGNATURE
     }
 
-    fn signature_targeting(target_epoch: u64, signer: u64) -> [u8; 96] {
+    fn signature_targeting(target_epoch: u64) -> XMSSSignature {
         let mut data = [0; ATTESTATION_DATA_SIZE];
         data[0..8].copy_from_slice(&SLOT.to_le_bytes());
         data[16..48].copy_from_slice(&[0x11; 32]);
@@ -396,9 +293,8 @@ pub(crate) mod tests {
         data[56..88].copy_from_slice(&[0x22; 32]);
         data[88..96].copy_from_slice(&target_epoch.to_le_bytes());
         data[96..128].copy_from_slice(&[0x33; 32]);
-        let data_root = hash_attestation_data(&data);
-        let spec = SpecConfig::mainnet();
-        validator_signature(&spec, signer, bls::DOMAIN_BEACON_ATTESTER, target_epoch, &data_root)
+        let leaf = compute_xmss_attestation_leaf_index(target_epoch);
+        xmss_signature(bls::DOMAIN_BEACON_ATTESTER, &hash_attestation_data(&data), leaf)
     }
 
     fn submit(ctx: &ApiCtx, body: &str) -> (Outcome, Vec<u8>) {
@@ -413,7 +309,7 @@ pub(crate) mod tests {
 
     #[test]
     fn accepted_attestation_carries_its_subnet_and_the_ssz() {
-        let ctx = ctx();
+        let ctx = pq_ctx();
         let body = format!("[{}]", entry(2, 0));
         let mut submissions = submissions();
         let posted = posting("/eth/v2/beacon/pool/attestations", &body);
@@ -433,26 +329,26 @@ pub(crate) mod tests {
         );
         assert_eq!(attestation.topic, GossipTopic::BeaconAttestation(subnet));
 
-        let ssz: &[u8; SINGLE_ATT_SIZE] =
+        let ssz: &[u8; SINGLE_ATT_PQ_SIZE] =
             submissions.read_buffer(attestation.ssz).unwrap().try_into().unwrap();
-        assert_eq!(SingleAttestationView::committee_index(ssz), 0);
-        assert_eq!(SingleAttestationView::attester_index(ssz), 2);
-        assert_eq!(SingleAttestationView::slot(ssz), SLOT);
-        assert_eq!(SingleAttestationView::data_index(ssz), 0);
-        assert_eq!(SingleAttestationView::beacon_block_root(ssz), &[0x11; 32]);
-        assert_eq!(SingleAttestationView::source_epoch(ssz), 298);
-        assert_eq!(SingleAttestationView::source_root(ssz), &[0x22; 32]);
-        assert_eq!(SingleAttestationView::target_epoch(ssz), 300);
-        assert_eq!(SingleAttestationView::target_root(ssz), &[0x33; 32]);
-        assert_eq!(SingleAttestationView::signature(ssz), &signature(2));
+        assert_eq!(SingleAttestationPqView::committee_index(ssz), 0);
+        assert_eq!(SingleAttestationPqView::attester_index(ssz), 2);
+        let data = SingleAttestationPqView::data(ssz);
+        assert_eq!(data.slot(), SLOT);
+        assert_eq!(data.beacon_block_root(), &[0x11; 32]);
+        assert_eq!(data.source_epoch(), 298);
+        assert_eq!(data.source_root(), &[0x22; 32]);
+        assert_eq!(data.target_epoch(), 300);
+        assert_eq!(data.target_root(), &[0x33; 32]);
+        assert_eq!(SingleAttestationPqView::signature(ssz), &signature());
     }
 
     /// A forged signature fails its entry alone, before it can take the
     /// attester's lock.
     #[test]
     fn forged_signature_fails_its_entry_while_the_others_are_published() {
-        let ctx = ctx();
-        let body = format!("[{},{},{}]", entry(1, 0), entry_signed_by(2, 0, 3), entry(3, 0));
+        let ctx = pq_ctx();
+        let body = format!("[{},{},{}]", entry(1, 0), forged_entry(2, 0), entry(3, 0));
         let Outcome::AwaitingVerdicts(submission) = submit(&ctx, &body).0 else {
             panic!("the genuine entries defer")
         };
@@ -466,36 +362,23 @@ pub(crate) mod tests {
 
     #[test]
     fn unknown_attester_fails_its_entry() {
-        let ctx = ctx();
-        let body = format!("[{}]", entry_signed_by(4, 0, 0));
-        let response = submit(&ctx, &body).1;
+        let response = submit(&pq_ctx(), &format!("[{}]", entry(PQ_ACTIVE as u64, 0))).1;
         let failures = json_failures(&response);
-        assert_eq!(failures[0]["message"], "attester_index is past the validator count");
+        assert_eq!(failures[0]["message"], "attester_index names no XMSS validator");
     }
 
+    /// The leaf is checked before the registry is read or the signature
+    /// verified.
     #[test]
-    fn pq_attestation_submission_checks_encoding_and_leaf_before_taking_a_lock() {
-        let mut ctx = ctx();
-        ctx.spec.pq_fork_epoch = TARGET_EPOCH;
-        let mut entry: serde_json::Value = serde_json::from_str(&entry(2, 0)).unwrap();
-        let mut xmss = [0u8; size_of::<XMSSSignature>()];
-        let mut check = |sig: &[u8], expected| {
-            entry["signature"] = serde_json::Value::String(format!("0x{}", hex::encode(sig)));
-            let (outcome, response) = submit(&ctx, &format!("[{entry}]"));
-            assert_eq!(outcome, Outcome::Response(None));
-            assert_eq!(json_failures(&response)[0]["message"], expected);
-        };
-        check(&[0u8; 96], "signature encoding does not match attestation fork");
-        check(&xmss, "incorrect XMSS attestation leaf");
-        xmss[..4].copy_from_slice(
-            &silver_common::xmss::attestation_leaf(TARGET_EPOCH).unwrap().to_le_bytes(),
-        );
-        check(&xmss, "PQ validator state unavailable");
+    fn signature_at_another_epoch_s_leaf_fails_its_entry() {
+        let body = format!("[{}]", entry_signed(TARGET_EPOCH, 1, 0, &signature_targeting(299)));
+        let response = submit(&pq_ctx(), &body).1;
+        assert_eq!(json_failures(&response)[0]["message"], "incorrect XMSS attestation leaf");
     }
 
     #[test]
     fn body_past_the_submission_entry_cap_is_a_400() {
-        let ctx = ctx();
+        let ctx = pq_ctx();
         let at_cap = format!("[{}]", vec![entry(1, 0); MAX_SUBMISSION_ENTRIES].join(","));
         assert!(matches!(submit(&ctx, &at_cap).0, Outcome::AwaitingVerdicts(_)));
 
@@ -513,7 +396,7 @@ pub(crate) mod tests {
     /// in the body, and the rest of the submission still goes out.
     #[test]
     fn unresolvable_entries_fail_by_index_while_the_others_are_published() {
-        let ctx = ctx();
+        let ctx = pq_ctx();
         let past_the_count = posted_committees(&ctx);
         let body =
             format!("[{},{},{}]", entry(1, past_the_count), entry(1, 0), entry(2, past_the_count),);
@@ -533,7 +416,7 @@ pub(crate) mod tests {
     /// every entry and why it failed.
     #[test]
     fn submission_that_resolves_nothing_is_an_indexed_400() {
-        let ctx = ctx();
+        let ctx = pq_ctx();
         let body = format!("[{}]", entry(1, posted_committees(&ctx)));
         let (outcome, response) = submit(&ctx, &body);
         assert_eq!(outcome, Outcome::Response(None));
@@ -546,84 +429,11 @@ pub(crate) mod tests {
 
     #[test]
     fn attestations_for_an_unposted_epoch_fail_by_index() {
-        let mut ctx = ctx();
+        let mut ctx = pq_ctx();
         ctx.shufflings = Default::default();
         let response = submit(&ctx, &format!("[{}]", entry(1, 0))).1;
         let failures = json_failures(&response);
         assert_eq!(failures[0]["message"], "no committee shuffling for the attestation's epoch");
-    }
-
-    const EXITS: &str = "/eth/v1/beacon/pool/voluntary_exits";
-    const BLS_CHANGES: &str = "/eth/v1/beacon/pool/bls_to_execution_changes";
-
-    fn exit_body(validator_index: u64) -> String {
-        format!(
-            "{{\"message\":{{\"epoch\":\"7\",\"validator_index\":\"{validator_index}\"}},\
-             \"signature\":\"0x{}\"}}",
-            "44".repeat(96),
-        )
-    }
-
-    fn bls_change(validator_index: u64) -> String {
-        format!(
-            "{{\"message\":{{\"validator_index\":\"{validator_index}\",\
-             \"from_bls_pubkey\":\"0x{}\",\"to_execution_address\":\"0x{}\"}},\
-             \"signature\":\"0x{}\"}}",
-            "55".repeat(48),
-            "66".repeat(20),
-            "44".repeat(96),
-        )
-    }
-
-    #[test]
-    fn accepted_exit_carries_its_topic_and_the_ssz() {
-        let ctx = ctx();
-        let mut submissions = submissions();
-        let body = exit_body(3);
-        let posted = posting(EXITS, &body);
-        let Outcome::AwaitingVerdicts(submission) =
-            dispatch_into(&ctx, &posted, &mut submissions).0
-        else {
-            panic!("the exit defers")
-        };
-        let [exit] = submission.accepted.as_slice() else { panic!("one accepted") };
-        assert_eq!((exit.body_index, exit.topic), (0, GossipTopic::VoluntaryExit));
-
-        let ssz: &[u8; SIGNED_VOLUNTARY_EXIT_SIZE] =
-            submissions.read_buffer(exit.ssz).unwrap().try_into().unwrap();
-        assert_eq!(SignedVoluntaryExitView::epoch(ssz), 7);
-        assert_eq!(SignedVoluntaryExitView::validator_index(ssz), 3);
-        assert_eq!(SignedVoluntaryExitView::signature(ssz), &[0x44; 96]);
-    }
-
-    #[test]
-    fn an_exit_is_posted_as_one_object() {
-        let ctx = ctx();
-        for body in ["", "[]", "{}", &format!("[{}]", exit_body(3))] {
-            assert_eq!(status_code(&dispatch(&ctx, &posting(EXITS, body)).1), "400", "{body:?}");
-        }
-    }
-
-    #[test]
-    fn accepted_bls_changes_carry_their_index_topic_and_ssz() {
-        let ctx = ctx();
-        let mut submissions = submissions();
-        let body = format!("[{},{}]", bls_change(1), bls_change(2));
-        let posted = posting(BLS_CHANGES, &body);
-        let Outcome::AwaitingVerdicts(submission) =
-            dispatch_into(&ctx, &posted, &mut submissions).0
-        else {
-            panic!("the changes defer")
-        };
-        let [_, second] = submission.accepted.as_slice() else { panic!("two accepted") };
-        assert_eq!((second.body_index, second.topic), (1, GossipTopic::BlsToExecutionChange));
-
-        let ssz: &[u8; SIGNED_BLS_CHANGE_SIZE] =
-            submissions.read_buffer(second.ssz).unwrap().try_into().unwrap();
-        assert_eq!(SignedBlsToExecutionChangeView::validator_index(ssz), 2);
-        assert_eq!(SignedBlsToExecutionChangeView::from_bls_pubkey(ssz), &[0x55; 48]);
-        assert_eq!(SignedBlsToExecutionChangeView::to_execution_address(ssz), &[0x66; 20]);
-        assert_eq!(SignedBlsToExecutionChangeView::signature(ssz), &[0x44; 96]);
     }
 
     const PROPOSER_SLASHINGS: &str = "/eth/v1/beacon/pool/proposer_slashings";
@@ -636,7 +446,7 @@ pub(crate) mod tests {
              \"signature\":\"0x{}\"}}",
             "11".repeat(32),
             "22".repeat(32),
-            "44".repeat(96),
+            "44".repeat(size_of::<XMSSSignature>()),
         )
     }
 
@@ -647,11 +457,11 @@ pub(crate) mod tests {
              \"data\":{{\"slot\":\"{SLOT}\",\"index\":\"0\",\"beacon_block_root\":\"0x{}\",\
              \"source\":{{\"epoch\":\"298\",\"root\":\"0x{}\"}},\
              \"target\":{{\"epoch\":\"300\",\"root\":\"0x{target_root}\"}}}},\
-             \"signature\":\"0x{}\"}}",
+             \"proof\":\"0x{}\"}}",
             indices.join(","),
             "11".repeat(32),
             "22".repeat(32),
-            "44".repeat(96),
+            "44".repeat(indices.len()),
         )
     }
 
@@ -685,16 +495,23 @@ pub(crate) mod tests {
         let [slashing] = submission.accepted.as_slice() else { panic!("one accepted") };
         assert_eq!((slashing.body_index, slashing.topic), (0, GossipTopic::ProposerSlashing));
 
-        let ssz: &[u8; PROPOSER_SLASHING_SIZE] =
+        let ssz: &[u8; PROPOSER_SLASHING_PQ_SIZE] =
             submissions.read_buffer(slashing.ssz).unwrap().try_into().unwrap();
-        assert_eq!(ProposerSlashingView::h1_slot(ssz), SLOT);
-        assert_eq!(ProposerSlashingView::h1_proposer_index(ssz), 3);
-        assert_eq!(ProposerSlashingView::h1_parent_root(ssz), &[0x11; 32]);
-        assert_eq!(ProposerSlashingView::h1_state_root(ssz), &[0x22; 32]);
-        assert_eq!(ProposerSlashingView::h1_body_root(ssz), &[0x33; 32]);
-        assert_eq!(ProposerSlashingView::h1_signature(ssz), &[0x44; 96]);
-        assert_eq!(ProposerSlashingView::h2_body_root(ssz), &[0x55; 32]);
-        assert_eq!(ProposerSlashingView::h2_signature(ssz), &[0x44; 96]);
+        let header: &[u8; BEACON_BLOCK_HEADER_SIZE] = ProposerSlashingPqView::header_1(ssz);
+        assert_eq!(BeaconBlockHeaderView::slot(header), SLOT);
+        assert_eq!(BeaconBlockHeaderView::proposer_index(header), 3);
+        assert_eq!(BeaconBlockHeaderView::parent_root(header), &[0x11; 32]);
+        assert_eq!(BeaconBlockHeaderView::state_root(header), &[0x22; 32]);
+        assert_eq!(BeaconBlockHeaderView::body_root(header), &[0x33; 32]);
+        assert_eq!(
+            BeaconBlockHeaderView::body_root(ProposerSlashingPqView::header_2(ssz)),
+            &[0x55; 32]
+        );
+        for signature in
+            [ProposerSlashingPqView::signature_1(ssz), ProposerSlashingPqView::signature_2(ssz)]
+        {
+            assert_eq!(signature, &[0x44; size_of::<XMSSSignature>()]);
+        }
     }
 
     #[test]
@@ -702,7 +519,7 @@ pub(crate) mod tests {
         let ctx = ctx();
         let mut submissions = submissions();
         let body = attester_slashing();
-        let posted = versioned(ATTESTER_SLASHINGS, &body, Some("fulu"));
+        let posted = versioned(ATTESTER_SLASHINGS, &body, Some("pq"));
         let Outcome::AwaitingVerdicts(submission) =
             dispatch_into(&ctx, &posted, &mut submissions).0
         else {
@@ -712,29 +529,27 @@ pub(crate) mod tests {
         assert_eq!((slashing.body_index, slashing.topic), (0, GossipTopic::AttesterSlashing));
 
         let ssz = submissions.read_buffer(slashing.ssz).unwrap();
-        assert!(AttesterSlashingView::check_size(ssz), "gossip framing accepts it");
+        assert!(AttesterSlashingPqView::check_size(ssz), "gossip framing accepts it");
         let indices = |bytes: &[u8]| -> Vec<u64> {
             bytes.chunks_exact(8).map(|c| u64::from_le_bytes(c.try_into().unwrap())).collect()
         };
-        assert_eq!(indices(AttesterSlashingView::att1_attesting_indices(ssz)), [1, 4, 9]);
-        assert_eq!(indices(AttesterSlashingView::att2_attesting_indices(ssz)), [4]);
-        assert_eq!(AttesterSlashingView::att1_target_root(ssz), &[0x33; 32]);
-        assert_eq!(AttesterSlashingView::att2_slot(ssz), SLOT);
-        assert_eq!(AttesterSlashingView::att2_target_epoch(ssz), 300);
+        let (first, second) = (
+            AttesterSlashingPqView::attestation_1(ssz),
+            AttesterSlashingPqView::attestation_2(ssz),
+        );
+        assert_eq!(indices(IndexedAttestationPqView::attesting_indices(first)), [1, 4, 9]);
+        assert_eq!(indices(IndexedAttestationPqView::attesting_indices(second)), [4]);
+        assert_eq!(IndexedAttestationPqView::data(first).target_root(), &[0x33; 32]);
+        assert_eq!(IndexedAttestationPqView::data(second).slot(), SLOT);
+        assert_eq!(IndexedAttestationPqView::proof(first), &[0x44; 3]);
+        assert_eq!(IndexedAttestationPqView::proof(second), &[0x44; 1]);
     }
 
     #[test]
-    fn attester_slashings_name_fulu_or_gloas() {
+    fn attester_slashings_name_pq() {
         let ctx = ctx();
         let body = attester_slashing();
-        for version in [Some("fulu"), Some("gloas")] {
-            let posted = versioned(ATTESTER_SLASHINGS, &body, version);
-            assert!(
-                matches!(dispatch(&ctx, &posted).0, Outcome::AwaitingVerdicts(_)),
-                "{version:?}"
-            );
-        }
-        for version in [None, Some("electra"), Some("phase0")] {
+        for version in [None, Some("fulu"), Some("gloas")] {
             let posted = versioned(ATTESTER_SLASHINGS, &body, version);
             assert_eq!(status_code(&dispatch(&ctx, &posted).1), "400", "{version:?}");
         }
@@ -747,13 +562,13 @@ pub(crate) mod tests {
         let proposer = format!("[{{\"signed_header_1\":{header},\"signed_header_2\":{header}}}]");
         assert_eq!(status_code(&dispatch(&ctx, &posting(PROPOSER_SLASHINGS, &proposer)).1), "400");
         let attester = format!("[{}]", attester_slashing());
-        let posted = versioned(ATTESTER_SLASHINGS, &attester, Some("fulu"));
+        let posted = versioned(ATTESTER_SLASHINGS, &attester, Some("pq"));
         assert_eq!(status_code(&dispatch(&ctx, &posted).1), "400");
     }
 
     #[test]
     fn malformed_empty_and_non_json_bodies_are_rejected() {
-        let ctx = ctx();
+        let ctx = pq_ctx();
         for body in ["", "{}", "[]", "[0]", &entry(1, 0)] {
             assert_eq!(status_code(&submit(&ctx, body).1), "400", "{body:?}");
         }

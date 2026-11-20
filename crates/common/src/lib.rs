@@ -43,9 +43,7 @@ mod identity;
 pub mod json_fields;
 mod node_chain;
 mod spine;
-pub use block_root::{
-    block_root, block_root_fulu, block_root_gloas, block_root_pq, body_root, body_root_at,
-};
+pub use block_root::{block_root, block_root_fulu, block_root_gloas, block_root_pq, body_root};
 pub use builder_bid::{BuilderBid, BuilderTerms};
 pub use node_chain::NodeChain;
 pub use payload_frame::PayloadFrame;

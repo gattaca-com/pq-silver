@@ -1537,8 +1537,6 @@ impl Tile<SilverSpine> for BeaconStateTile {
             self.events_producer.cache_ref().max_payload_len() >= MAX_REQUEST_LEN,
             "the beacon_state tcache must hold a leanVM request of {MAX_REQUEST_LEN} bytes"
         );
-        self.bls_change_pool.with_producer(&adapter.producers);
-        self.exit_pool.with_producer(&adapter.producers);
         self.slashing_pool.with_producer(adapter.producers.beacon_events);
         true
     }

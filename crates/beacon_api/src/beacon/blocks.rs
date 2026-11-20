@@ -2,8 +2,9 @@ use std::slice;
 
 use silver_beacon_state_data::BeaconBlockHeader;
 use silver_common::{
-    BeaconApiRequest, BlockLookup, ServedBlock, TCacheReader, body_root_at,
-    json_fields::parse_uint64, ssz_view::SignedBeaconBlockView,
+    BeaconApiRequest, BlockLookup, ServedBlock, TCacheReader,
+    json_fields::parse_uint64,
+    ssz_view::{BeaconBlockBodyPqView, SignedBeaconBlockPqView},
 };
 
 use crate::{
@@ -120,10 +121,10 @@ impl Kind {
                     bytes,
                 ]);
             }),
-            Self::Header => with_header(resp, &block, reader, ctx, |json, signed| {
+            Self::Header => with_header(resp, &block, reader, |json, signed| {
                 json.flagged_envelope(flags, |json| json.signed_header(signed))
             }),
-            Self::HeaderList => with_header(resp, &block, reader, ctx, |json, signed| {
+            Self::HeaderList => with_header(resp, &block, reader, |json, signed| {
                 json.flagged_envelope(flags, |json| json.signed_headers(slice::from_ref(signed)))
             }),
         }
@@ -134,11 +135,10 @@ fn with_header(
     resp: &mut Response<'_>,
     block: &ServedBlock,
     reader: &mut TCacheReader,
-    ctx: &ApiCtx,
-    render: impl FnOnce(&mut Json<'_>, &SignedHeader),
+    render: impl FnOnce(&mut Json<'_>, &SignedHeader<'_>),
 ) {
     with_bytes(resp, block, reader, |resp, bytes| {
-        let signed = SignedHeader::read(block, bytes, ctx.spec.is_gloas_at_slot(block.slot));
+        let signed = SignedHeader::read(block, bytes);
         resp.json_body(|json| render(json, &signed));
     });
 }
@@ -155,7 +155,7 @@ fn with_bytes(
     };
     let ssz = reader.acquire(ssz);
     match ssz.buffer() {
-        Ok((bytes, _)) if SignedBeaconBlockView::check_size(bytes) => respond(resp, bytes),
+        Ok((bytes, _)) if SignedBeaconBlockPqView::check_size(bytes) => respond(resp, bytes),
         Ok(_) => {
             silver_log::error!(block.slot, "stored block fits no SignedBeaconBlock layout");
             resp.error(500, "stored block is malformed");
@@ -167,19 +167,21 @@ fn with_bytes(
     }
 }
 
-impl SignedHeader {
-    fn read(block: &ServedBlock, bytes: &[u8], is_gloas: bool) -> Self {
+impl<'a> SignedHeader<'a> {
+    fn read(block: &ServedBlock, bytes: &'a [u8]) -> Self {
         Self {
             root: block.root,
             canonical: block.canonical,
             header: BeaconBlockHeader {
                 slot: block.slot,
-                proposer_index: SignedBeaconBlockView::proposer_index(bytes),
-                parent_root: *SignedBeaconBlockView::parent_root(bytes),
-                state_root: *SignedBeaconBlockView::state_root(bytes),
-                body_root: body_root_at(SignedBeaconBlockView::body(bytes), is_gloas),
+                proposer_index: SignedBeaconBlockPqView::proposer_index(bytes),
+                parent_root: *SignedBeaconBlockPqView::parent_root(bytes),
+                state_root: *SignedBeaconBlockPqView::state_root(bytes),
+                body_root: BeaconBlockBodyPqView::hash_tree_root(SignedBeaconBlockPqView::body(
+                    bytes,
+                )),
             },
-            signature: *SignedBeaconBlockView::signature(bytes),
+            signature: SignedBeaconBlockPqView::signature(bytes),
         }
     }
 }

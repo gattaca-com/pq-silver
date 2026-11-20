@@ -14,8 +14,8 @@ use crate::{
     events::ChannelSet,
     http::{json::Json, router::Outcome},
     submission::{
-        AcceptedEntry, BuilderForward, EnvelopePublication, Integration, Submission,
-        SubmissionFailure, failure_message,
+        AcceptedEntry, EnvelopePublication, Integration, Submission, SubmissionFailure,
+        failure_message,
     },
 };
 
@@ -74,25 +74,14 @@ impl<'a> Response<'a> {
 
     pub(crate) fn fail_forged(&mut self) {
         let signatures = self.signatures.as_deref_mut().expect("only a handler publishes entries");
-        let Refused { repeated, forged, unchecked } = signatures.verify();
+        let Refused { repeated, forged } = signatures.verify();
         if let Outcome::AwaitingVerdicts(submission) = &mut self.outcome {
             submission.fail_accepted(
                 repeated,
                 "an earlier entry of the body has the same validator and epoch",
             );
             submission.fail_accepted(forged, "invalid signature");
-            submission.fail_accepted(
-                unchecked,
-                "signature not checked: the body holds too many invalid signatures",
-            );
         }
-    }
-
-    /// The block the last [`Self::await_verdicts`] wrote also goes to `url`.
-    pub(crate) fn forward_to_builder(&mut self, url: &str) {
-        let Outcome::AwaitingVerdicts(submission) = &mut self.outcome else { return };
-        let Some(entry) = submission.accepted.last() else { return };
-        submission.forward = Some(BuilderForward { url: url.into(), ssz: entry.ssz });
     }
 
     pub(crate) fn await_payload_envelope(

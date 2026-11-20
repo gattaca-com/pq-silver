@@ -1,10 +1,9 @@
 use flux_profiler::timed;
 use silver_beacon_state_data::{Slot, SpecConfig};
 use silver_common::{
-    BeaconApiRequest, BidPolicy, PayloadFrame, ProduceBlockFailure, ProducedBlock, RandaoReveal,
-    TCacheReader,
+    BeaconApiRequest, BidPolicy, ForkName, PayloadFrame, ProduceBlockFailure, ProducedBlock,
+    RandaoReveal, TCacheReader,
     json_fields::{parse_hex, parse_uint64},
-    merkle::sha256,
     ssz_view::VRF_PROOF_SIZE,
 };
 use silver_pbs::BuilderConfig;
@@ -17,52 +16,20 @@ use crate::{
     },
 };
 
-pub(crate) fn produce_block_v3(req: &Request<'_>, ctx: &ApiCtx, resp: &mut Response<'_>) {
-    let Some(slot) = proposal_slot(req, resp) else {
-        return;
-    };
-    if ctx.spec.is_gloas_at_slot(slot) {
-        return resp.error(400, "produceBlockV3 serves forks through Fulu; use produceBlockV4");
-    }
-    let Some((randao_reveal, graffiti)) = proposal_query(req, resp, false) else {
-        return;
-    };
-    let builder_boost_factor = match req.query_value("builder_boost_factor") {
-        None => BidPolicy::default().builder_boost_factor,
-        Some(text) => match parse_uint64(&text) {
-            Some(factor) => factor,
-            None => return resp.error(400, "builder_boost_factor is a uint64 query parameter"),
-        },
-    };
-    let bid_policy = BidPolicy { builder_boost_factor, ..BidPolicy::default() };
-    resp.defer(Outcome::AwaitingProducedBlock(ProduceBlockRequest {
-        slot,
-        randao_reveal,
-        graffiti,
-        bid_policy,
-        builder_config: None,
-        include_payload: true,
-    }));
-}
-
 pub(crate) fn produce_block_v4(req: &Request<'_>, ctx: &ApiCtx, resp: &mut Response<'_>) {
     let Some(slot) = proposal_slot(req, resp) else {
         return;
     };
-    if !ctx.spec.is_gloas_at_slot(slot) {
-        return resp.error(400, "produceBlockV4 serves Gloas onward; use produceBlockV3");
+    if !ctx.spec.is_pq_at_slot(slot) {
+        return resp.error(400, "produceBlockV4 serves PQ slots only");
     }
-    if req.eth_consensus_version != Some(ctx.spec.fork_at_slot(slot).name()) {
-        return resp.error(400, "Eth-Consensus-Version must name the slot's fork");
+    if req.eth_consensus_version != Some(ForkName::Pq.name()) {
+        return resp.error(400, "Eth-Consensus-Version must name pq");
     }
     let include_payload = match req.query_value("include_payload").as_deref() {
         Some("true") => true,
         Some("false") => false,
         _ => return resp.error(400, "include_payload is a required boolean query parameter"),
-    };
-    let is_pq = ctx.spec.is_pq_at_slot(slot);
-    let Some((randao_reveal, graffiti)) = proposal_query(req, resp, is_pq) else {
-        return;
     };
     if !req.body_is_ssz() {
         return resp.error(415, "only an SSZ BuilderConfig body is read");
@@ -70,18 +37,21 @@ pub(crate) fn produce_block_v4(req: &Request<'_>, ctx: &ApiCtx, resp: &mut Respo
     let Some(builder_config) = BuilderConfig::parse(req.body) else {
         return resp.error(400, "invalid BuilderConfig");
     };
+    if builder_config.entries().next().is_some() {
+        return resp.error(400, "PQ blocks are built locally; the BuilderConfig names builders");
+    }
+    let Some((randao_reveal, graffiti)) = proposal_query(req, resp) else {
+        return;
+    };
     let bid_policy = BidPolicy {
         min_bid: builder_config.min_bid(),
         builder_boost_factor: builder_config.builder_boost_factor(),
     };
-    // Held for the boundary tile's bid requests and the winner's URL.
-    let builder_config = builder_config.entries().next().is_some().then(|| req.body.into());
     resp.defer(Outcome::AwaitingProducedBlock(ProduceBlockRequest {
         slot,
         randao_reveal,
         graffiti,
         bid_policy,
-        builder_config,
         include_payload,
     }));
 }
@@ -99,25 +69,9 @@ fn proposal_slot(req: &Request<'_>, resp: &mut Response<'_>) -> Option<Slot> {
     slot
 }
 
-fn proposal_query(
-    req: &Request<'_>,
-    resp: &mut Response<'_>,
-    is_pq: bool,
-) -> Option<(RandaoReveal, [u8; 32])> {
-    let text = req.query_value("randao_reveal");
-    let randao_reveal = if is_pq {
-        let Some(proof) = text.and_then(|text| parse_hex::<VRF_PROOF_SIZE>(&text)) else {
-            resp.error(400, "randao_reveal is a required VRFProof query parameter");
-            return None;
-        };
-        RandaoReveal::Vrf(resp.hold(&proof)?)
-    } else {
-        let Some(signature) = text.and_then(|text| parse_hex(&text)) else {
-            resp.error(400, "randao_reveal is a required BLSSignature query parameter");
-            return None;
-        };
-        RandaoReveal::Bls(signature)
-    };
+/// The reveal, a `VRFProof` too wide for a spine message, is held in the
+/// submissions tcache.
+fn proposal_query(req: &Request<'_>, resp: &mut Response<'_>) -> Option<(RandaoReveal, [u8; 32])> {
     let graffiti = match req.query_value("graffiti") {
         None => [0; 32],
         Some(text) => match parse_graffiti(&text) {
@@ -128,7 +82,13 @@ fn proposal_query(
             }
         },
     };
-    Some((randao_reveal, graffiti))
+    let Some(proof) =
+        req.query_value("randao_reveal").and_then(|text| parse_hex::<VRF_PROOF_SIZE>(&text))
+    else {
+        resp.error(400, "randao_reveal is a required VRFProof query parameter");
+        return None;
+    };
+    Some((RandaoReveal::Vrf(resp.hold(&proof)?), graffiti))
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -137,8 +97,6 @@ pub(crate) struct ProduceBlockRequest {
     randao_reveal: RandaoReveal,
     graffiti: [u8; 32],
     bid_policy: BidPolicy,
-    /// The SSZ `BuilderConfig`, when it names a builder.
-    builder_config: Option<Box<[u8]>>,
     include_payload: bool,
 }
 
@@ -150,18 +108,8 @@ impl ProduceBlockRequest {
             randao_reveal: self.randao_reveal,
             graffiti: self.graffiti,
             bid_policy: self.bid_policy,
-            builder_config_hash: self.builder_config.as_deref().map(sha256),
+            builder_config_hash: None,
         }
-    }
-
-    pub(crate) fn builder_config(&self) -> Option<BuilderConfig<'_>> {
-        BuilderConfig::parse(self.builder_config.as_deref()?)
-    }
-
-    /// Only a URL that is a valid header value is echoed.
-    fn builder_url(&self, entry: u32) -> Option<&str> {
-        let url = self.builder_config()?.entries().nth(entry as usize)?.url();
-        url.iter().all(u8::is_ascii_graphic).then(|| str::from_utf8(url).expect("ascii"))
     }
 
     #[timed]
@@ -190,10 +138,8 @@ impl ProduceBlockRequest {
                 return resp.error(500, "the block could not be produced");
             }
         };
-        if spec.is_gloas_at_slot(self.slot) && !self.include_payload {
-            return self.respond_without_payload(resp, &block, reader, spec);
-        }
-        let Some(payload) = block.payload else {
+        let payload = block.payload.filter(|_| self.include_payload);
+        let Some(payload) = payload else {
             return self.respond_without_payload(resp, &block, reader, spec);
         };
         let header = reader.acquire(block.header);
@@ -206,61 +152,39 @@ impl ProduceBlockRequest {
             silver_log::error!(slot = self.slot, "produced block's payload frame is misframed");
             return resp.error(500, "the block could not be read");
         };
-        if spec.is_gloas_at_slot(self.slot) {
-            let Some(envelope) = &block.envelope_header else {
-                return resp.error(500, "the local envelope is unavailable");
-            };
-            let envelope_at = 4 * 4 + head.len();
-            let proofs_at = envelope_at +
-                envelope.len() +
-                payload.execution_payload.len() +
-                payload.execution_requests.len();
-            let blobs_at = proofs_at + payload.cell_proofs.len();
-            let offsets = [16u32, envelope_at as u32, proofs_at as u32, blobs_at as u32]
-                .map(u32::to_le_bytes)
-                .concat();
-            let payload_value = wei_decimal(&block.execution_payload_value);
-            let block_value = wei_decimal(&block.consensus_block_value);
-            let headers = [
-                ("Eth-Consensus-Version", spec.fork_at_slot(self.slot).name()),
-                ("Eth-Execution-Payload-Included", "true"),
-                ("Eth-Execution-Payload-Value", payload_value.as_str()),
-                ("Eth-Consensus-Block-Value", block_value.as_str()),
-            ];
-            return resp.send(200, Some(SSZ_MEDIA_TYPE), &headers, &[
-                &offsets,
-                head,
-                envelope,
-                payload.execution_payload,
-                payload.execution_requests,
-                payload.cell_proofs,
-                payload.blobs,
-            ]);
-        }
-        let Some((before_payload, bls_changes)) = head.split_at_checked(block.payload_at as usize)
-        else {
-            silver_log::error!(
-                slot = self.slot,
-                "produced block is shorter than its payload offset"
-            );
-            return resp.error(500, "the block could not be read");
+        let Some(envelope) = &block.envelope_header else {
+            return resp.error(500, "the local envelope is unavailable");
         };
+        let envelope_at = 4 * 4 + head.len();
+        let proofs_at = envelope_at +
+            envelope.len() +
+            payload.execution_payload.len() +
+            payload.execution_requests.len();
+        let blobs_at = proofs_at + payload.cell_proofs.len();
+        let offsets = [16u32, envelope_at as u32, proofs_at as u32, blobs_at as u32]
+            .map(u32::to_le_bytes)
+            .concat();
         let payload_value = wei_decimal(&block.execution_payload_value);
         let block_value = wei_decimal(&block.consensus_block_value);
         let headers = [
             ("Eth-Consensus-Version", spec.fork_at_slot(self.slot).name()),
-            ("Eth-Execution-Payload-Blinded", "false"),
+            ("Eth-Execution-Payload-Included", "true"),
             ("Eth-Execution-Payload-Value", payload_value.as_str()),
             ("Eth-Consensus-Block-Value", block_value.as_str()),
         ];
-        let parts = [before_payload, payload.execution_payload, bls_changes, payload.after_payload];
-        resp.send(200, Some(SSZ_MEDIA_TYPE), &headers, &parts);
+        resp.send(200, Some(SSZ_MEDIA_TYPE), &headers, &[
+            &offsets,
+            head,
+            envelope,
+            payload.execution_payload,
+            payload.execution_requests,
+            payload.cell_proofs,
+            payload.blobs,
+        ]);
     }
-}
 
-impl ProduceBlockRequest {
-    /// A Fulu `BlindedBeaconBlock` or a Gloas `BeaconBlock`: a bid commits to
-    /// the payload, which is not included.
+    /// A `BeaconBlock` whose bid commits to the payload, which is not
+    /// included.
     fn respond_without_payload(
         &self,
         resp: &mut Response<'_>,
@@ -275,21 +199,13 @@ impl ProduceBlockRequest {
         };
         let payload_value = wei_decimal(&block.execution_payload_value);
         let block_value = wei_decimal(&block.consensus_block_value);
-        let payload_header = if spec.is_gloas_at_slot(self.slot) {
-            ("Eth-Execution-Payload-Included", "false")
-        } else {
-            ("Eth-Execution-Payload-Blinded", "true")
-        };
-        let builder_url = block.builder_entry.and_then(|entry| self.builder_url(entry));
         let headers = [
             ("Eth-Consensus-Version", spec.fork_at_slot(self.slot).name()),
-            payload_header,
+            ("Eth-Execution-Payload-Included", "false"),
             ("Eth-Execution-Payload-Value", payload_value.as_str()),
             ("Eth-Consensus-Block-Value", block_value.as_str()),
-            ("Eth-Builder-Url", builder_url.unwrap_or_default()),
         ];
-        let headers = if builder_url.is_some() { &headers[..] } else { &headers[..4] };
-        resp.send(200, Some(SSZ_MEDIA_TYPE), headers, &[beacon_block]);
+        resp.send(200, Some(SSZ_MEDIA_TYPE), &headers, &[beacon_block]);
     }
 }
 
@@ -326,108 +242,24 @@ fn wei_decimal(little_endian: &[u8; 32]) -> String {
 
 #[cfg(test)]
 mod tests {
+    use silver_common::{TCacheProducer, TProducer};
     use silver_httpcore::ParsedRequest;
 
     use super::*;
     use crate::{
         http::router::Outcome,
-        submission::tests::{SLOT, ctx},
-        testing::{dispatch, request, status_code},
+        submission::tests::{SLOT, pq_ctx},
+        testing::{dispatch, dispatch_into, request, status_code, submissions},
     };
-
-    fn get(query: &str, accept: Option<&str>) -> (Outcome, Vec<u8>) {
-        let path = format!("/eth/v3/validator/blocks/{}", SLOT + 1);
-        dispatch(&ctx(), &ParsedRequest { query, accept, ..request("GET", &path) })
-    }
-
-    fn randao() -> String {
-        format!("randao_reveal=0x{}", "11".repeat(96))
-    }
-
-    #[test]
-    fn request_defers_to_the_state_tile_with_the_query() {
-        let query = format!("{}&graffiti=0x{}", randao(), "22".repeat(32));
-        let (outcome, out) = get(&query, Some(SSZ_MEDIA_TYPE));
-        assert!(out.is_empty());
-        assert_eq!(
-            outcome,
-            Outcome::AwaitingProducedBlock(ProduceBlockRequest {
-                slot: SLOT + 1,
-                randao_reveal: RandaoReveal::Bls([0x11; 96]),
-                graffiti: [0x22; 32],
-                bid_policy: BidPolicy::default(),
-                builder_config: None,
-                include_payload: true,
-            })
-        );
-    }
-
-    #[test]
-    fn builder_boost_factor_weights_the_bid() {
-        let (outcome, _) =
-            get(&format!("{}&builder_boost_factor=0", randao()), Some(SSZ_MEDIA_TYPE));
-        let Outcome::AwaitingProducedBlock(request) = outcome else { panic!("{outcome:?}") };
-        assert_eq!(request.bid_policy, BidPolicy { builder_boost_factor: 0, min_bid: 0 });
-
-        let (outcome, out) =
-            get(&format!("{}&builder_boost_factor=-1", randao()), Some(SSZ_MEDIA_TYPE));
-        assert_eq!(outcome, Outcome::Response(None));
-        assert_eq!(status_code(&out), "400");
-    }
-
-    #[test]
-    fn graffiti_defaults_to_zero() {
-        let (outcome, _) = get(&randao(), Some(SSZ_MEDIA_TYPE));
-        let Outcome::AwaitingProducedBlock(request) = outcome else { panic!("{outcome:?}") };
-        assert_eq!(request.graffiti, [0; 32]);
-    }
-
-    #[test]
-    fn json_only_client_is_a_406() {
-        let (outcome, out) = get(&randao(), Some("application/json"));
-        assert_eq!(outcome, Outcome::Response(None));
-        assert_eq!(status_code(&out), "406");
-    }
-
-    #[test]
-    fn short_graffiti_is_zero_padded() {
-        let (outcome, _) = get(&format!("{}&graffiti=0x6869", randao()), Some(SSZ_MEDIA_TYPE));
-        let Outcome::AwaitingProducedBlock(request) = outcome else { panic!("{outcome:?}") };
-        let mut expected = [0; 32];
-        expected[..2].copy_from_slice(b"hi");
-        assert_eq!(request.graffiti, expected);
-    }
-
-    #[test]
-    fn missing_or_malformed_parameters_are_400() {
-        for query in [
-            String::new(),
-            "randao_reveal=0x11".to_owned(),
-            format!("{}&graffiti=0x222", randao()),
-            format!("{}&graffiti=0x{}", randao(), "22".repeat(33)),
-        ] {
-            let (outcome, out) = get(&query, Some(SSZ_MEDIA_TYPE));
-            assert_eq!(outcome, Outcome::Response(None), "{query}");
-            assert_eq!(status_code(&out), "400", "{query}");
-        }
-    }
-
-    /// A Gloas node: the submission fixture's slot, with Gloas active.
-    fn gloas_ctx() -> ApiCtx {
-        let mut ctx = ctx();
-        ctx.spec.gloas_fork_epoch = 0;
-        ctx
-    }
 
     const BUILDER_CONFIG_FIXED: usize = 8 + 8 + 4;
 
     /// A framed `BuilderEntry` with an empty URL and auth data.
-    fn builder_entry(url: &[u8]) -> Vec<u8> {
+    fn builder_entry() -> Vec<u8> {
         let message = [12u32.to_le_bytes().as_slice(), &(SLOT + 1).to_le_bytes()].concat();
         let auth = [100u32.to_le_bytes().as_slice(), &[0; 96], &message].concat();
-        let auth_at = 36 + url.len() as u32;
-        let offsets = [36, auth_at, auth_at + auth.len() as u32].map(u32::to_le_bytes).concat();
-        [offsets, vec![0; 24], url.to_vec(), auth].concat()
+        let offsets = [36, 36, 36 + auth.len() as u32].map(u32::to_le_bytes).concat();
+        [offsets, vec![0; 24], auth].concat()
     }
 
     fn builder_config(min_bid: u64, boost: u64, builders: &[u8]) -> Vec<u8> {
@@ -438,12 +270,21 @@ mod tests {
         ssz
     }
 
+    fn randao() -> String {
+        format!("randao_reveal=0x{}", "11".repeat(VRF_PROOF_SIZE))
+    }
+
+    fn query() -> String {
+        format!("{}&include_payload=false", randao())
+    }
+
     fn post_v4(
         ctx: &ApiCtx,
         query: &str,
         version: Option<&str>,
         content_type: Option<&str>,
         body: &[u8],
+        submissions: &mut TProducer,
     ) -> (Outcome, Vec<u8>) {
         let path = format!("/eth/v4/validator/blocks/{}", SLOT + 1);
         let req = ParsedRequest {
@@ -454,119 +295,87 @@ mod tests {
             body,
             ..request("POST", &path)
         };
-        dispatch(ctx, &req)
+        dispatch_into(ctx, &req, submissions)
     }
 
-    fn v4_query() -> String {
-        format!("{}&include_payload=false", randao())
-    }
-
-    #[test]
-    fn v4_defers_with_the_p2p_terms_of_the_builder_config() {
-        let entry = builder_entry(b"");
-        let offsets = [8u32, 8 + entry.len() as u32].map(u32::to_le_bytes).concat();
-        let body = builder_config(7, 150, &[offsets, entry.clone(), entry].concat());
-        let ctx = gloas_ctx();
-        let (outcome, _) = post_v4(&ctx, &v4_query(), Some("gloas"), Some(SSZ_MEDIA_TYPE), &body);
-        let Outcome::AwaitingProducedBlock(request) = outcome else { panic!("{outcome:?}") };
-        assert_eq!(request.bid_policy, BidPolicy { min_bid: 7, builder_boost_factor: 150 });
-        assert_eq!(request.slot, SLOT + 1);
-        assert_eq!(request.builder_config.as_deref(), Some(&body[..]), "held for the bid requests");
-        let BeaconApiRequest::ProduceBlock { builder_config_hash, .. } = request.state_request(1)
-        else {
-            unreachable!()
-        };
-        assert_eq!(builder_config_hash, Some(sha256(&body)));
-
-        let body = builder_config(7, 150, &[]);
-        let (outcome, _) = post_v4(&ctx, &v4_query(), Some("gloas"), Some(SSZ_MEDIA_TYPE), &body);
-        let Outcome::AwaitingProducedBlock(request) = outcome else { panic!("{outcome:?}") };
-        assert_eq!(request.builder_config, None, "no builder to ask");
-    }
-
-    #[test]
-    fn only_a_header_safe_builder_url_is_echoed() {
-        let [safe, unsafe_] = [&b"http://b:18550"[..], b"http://b\r\nX: 1"].map(builder_entry);
-        let offsets = [8u32, 8 + safe.len() as u32].map(u32::to_le_bytes).concat();
-        let body = builder_config(0, 100, &[offsets, safe, unsafe_].concat());
-        let (outcome, _) =
-            post_v4(&gloas_ctx(), &v4_query(), Some("gloas"), Some(SSZ_MEDIA_TYPE), &body);
-        let Outcome::AwaitingProducedBlock(request) = outcome else { panic!("{outcome:?}") };
-        assert_eq!(request.builder_url(0), Some("http://b:18550"));
-        assert_eq!(request.builder_url(1), None, "a header break is not echoed");
-        assert_eq!(request.builder_url(2), None, "no such entry");
-    }
-
-    #[test]
-    fn proposal_cache_identity_covers_every_builder_setting() {
-        let entries = [builder_entry(b"http://a"), builder_entry(b"http://b")];
-        let identity = |entries: &[Vec<u8>; 2], id| {
-            let offsets = [8u32, 8 + entries[0].len() as u32].map(u32::to_le_bytes).concat();
-            let body = builder_config(0, 100, &[offsets, entries.concat()].concat());
-            let (outcome, _) =
-                post_v4(&gloas_ctx(), &v4_query(), Some("gloas"), Some(SSZ_MEDIA_TYPE), &body);
-            let Outcome::AwaitingProducedBlock(request) = outcome else { panic!("{outcome:?}") };
-            let BeaconApiRequest::ProduceBlock { builder_config_hash, .. } =
-                request.state_request(id)
-            else {
-                unreachable!()
-            };
-            builder_config_hash.unwrap()
-        };
-        let original = identity(&entries, 1);
-        assert_eq!(original, identity(&entries, 2));
-        assert_ne!(original, identity(&[entries[1].clone(), entries[0].clone()], 1));
-        assert_ne!(original, identity(&[builder_entry(b"http://c"), entries[1].clone()], 1));
-        for offset in [12, 20, 28] {
-            let mut changed = entries.clone();
-            changed[0][offset..offset + 8].copy_from_slice(&7u64.to_le_bytes());
-            assert_ne!(original, identity(&changed, 1));
-        }
-        let mut changed = entries.clone();
-        changed[0].extend_from_slice(&[3; 48]);
-        assert_ne!(original, identity(&changed, 1));
-    }
-
-    #[test]
-    fn v4_refuses_what_it_cannot_read() {
-        let ctx = gloas_ctx();
+    fn refused(ctx: &ApiCtx, query: &str, version: Option<&str>, body: &[u8]) -> String {
         let ssz = Some(SSZ_MEDIA_TYPE);
+        let (outcome, out) = post_v4(ctx, query, version, ssz, body, &mut submissions());
+        assert_eq!(outcome, Outcome::Response(None), "{query} {version:?}");
+        status_code(&out).to_owned()
+    }
+
+    #[test]
+    fn request_defers_with_the_query_and_the_bid_terms() {
+        let query = format!("{}&graffiti=0x6869", query());
+        let body = builder_config(7, 150, &[]);
+        let mut submissions = submissions();
+        let ssz = Some(SSZ_MEDIA_TYPE);
+        let (outcome, out) = post_v4(&pq_ctx(), &query, Some("pq"), ssz, &body, &mut submissions);
+        assert!(out.is_empty());
+        let Outcome::AwaitingProducedBlock(request) = outcome else { panic!("{outcome:?}") };
+        let RandaoReveal::Vrf(reveal) = request.randao_reveal else { panic!("a PQ reveal") };
+        let reveal = submissions.read_buffer(reveal).unwrap();
+        assert_eq!(reveal, &[0x11; VRF_PROOF_SIZE]);
+        let mut graffiti = [0; 32];
+        graffiti[..2].copy_from_slice(b"hi");
+        assert_eq!(request, ProduceBlockRequest {
+            slot: SLOT + 1,
+            randao_reveal: request.randao_reveal,
+            graffiti,
+            bid_policy: BidPolicy { min_bid: 7, builder_boost_factor: 150 },
+            include_payload: false,
+        });
+    }
+
+    #[test]
+    fn proposals_name_no_builder() {
+        let entry = builder_entry();
+        let body = builder_config(0, 100, &[8u32.to_le_bytes().as_slice(), &entry].concat());
+        assert_eq!(refused(&pq_ctx(), &query(), Some("pq"), &body), "400");
+    }
+
+    #[test]
+    fn refuses_what_it_cannot_read() {
+        let ctx = pq_ctx();
         let body = builder_config(0, 100, &[]);
         let short = &body[..BUILDER_CONFIG_FIXED - 1];
         let misplaced = [&body[..16], &21u32.to_le_bytes()].concat();
-        let unordered = builder_config(0, 100, &[8u32.to_le_bytes(), 4u32.to_le_bytes()].concat());
-        let opaque_entry = builder_config(0, 100, &[&4u32.to_le_bytes()[..], &[0xAB; 4]].concat());
-        let cases: [(&str, Option<&str>, Option<&str>, &[u8], &str); 9] = [
-            (&v4_query(), Some("gloas"), ssz, short, "400"),
-            (&v4_query(), Some("gloas"), ssz, &misplaced, "400"),
-            (&v4_query(), Some("gloas"), ssz, &unordered, "400"),
-            (&v4_query(), Some("gloas"), ssz, &opaque_entry, "400"),
-            (&v4_query(), Some("gloas"), Some("application/json"), &body, "415"),
-            (&v4_query(), None, ssz, &body, "400"),
-            (&v4_query(), Some("fulu"), ssz, &body, "400"),
-            (&randao(), Some("gloas"), ssz, &body, "400"),
-            (&format!("{}&include_payload=yes", randao()), Some("gloas"), ssz, &body, "400"),
-        ];
-        for (query, version, content_type, body, code) in cases {
-            let (outcome, out) = post_v4(&ctx, query, version, content_type, body);
-            assert_eq!(outcome, Outcome::Response(None), "{query} {version:?} {content_type:?}");
-            assert_eq!(status_code(&out), code, "{query} {version:?} {content_type:?}");
+        let pq = Some("pq");
+        for (query, version, body) in [
+            (query(), pq, short),
+            (query(), pq, &misplaced[..]),
+            (query(), None, &body[..]),
+            (query(), Some("gloas"), &body[..]),
+            (format!("randao_reveal=0x{}&include_payload=false", "11".repeat(96)), pq, &body),
+            (randao(), pq, &body),
+            (format!("{}&include_payload=yes", randao()), pq, &body),
+            (format!("{}&graffiti=0x{}", query(), "22".repeat(33)), pq, &body),
+        ] {
+            assert_eq!(refused(&ctx, &query, version, body), "400", "{query} {version:?}");
         }
+
+        let json = Some("application/json");
+        let (_, out) = post_v4(&ctx, &query(), pq, json, &body, &mut submissions());
+        assert_eq!(status_code(&out), "415");
     }
 
     #[test]
-    fn each_version_serves_only_its_forks() {
-        let body = builder_config(0, 100, &[]);
-        let (_, out) = post_v4(&ctx(), &v4_query(), Some("fulu"), Some(SSZ_MEDIA_TYPE), &body);
-        assert_eq!(status_code(&out), "400", "v4 before Gloas");
-
-        let path = format!("/eth/v3/validator/blocks/{}", SLOT + 1);
+    fn json_only_client_is_a_406() {
+        let path = format!("/eth/v4/validator/blocks/{}", SLOT + 1);
         let req = ParsedRequest {
-            query: &randao(),
-            accept: Some(SSZ_MEDIA_TYPE),
-            ..request("GET", &path)
+            query: &query(),
+            accept: Some("application/json"),
+            ..request("POST", &path)
         };
-        assert_eq!(status_code(&dispatch(&gloas_ctx(), &req).1), "400", "v3 at Gloas");
+        assert_eq!(status_code(&dispatch(&pq_ctx(), &req).1), "406");
+    }
+
+    #[test]
+    fn slots_before_pq_are_a_400() {
+        let mut ctx = pq_ctx();
+        ctx.spec.pq_fork_epoch = u64::MAX;
+        assert_eq!(refused(&ctx, &query(), Some("pq"), &builder_config(0, 100, &[])), "400");
     }
 
     #[test]

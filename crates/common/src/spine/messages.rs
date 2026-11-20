@@ -20,9 +20,8 @@ use crate::{
     ssz_view::{
         BEACON_BLOCK_FIXED, BLOCKS_BY_RANGE_REQ_SIZE, DC_BY_RANGE_REQ_MAX,
         EXECUTION_PAYLOAD_ENVELOPE_MIN, EXECUTION_PAYLOAD_ENVELOPES_BY_RANGE_REQ_SIZE,
-        GOODBYE_SIZE, METADATA_SIZE, PING_SIZE, SIGNED_BLS_CHANGE_SIZE, SIGNED_VOLUNTARY_EXIT_SIZE,
-        STATUS_V1_SIZE, STATUS_V2_SIZE, SignedBeaconBlockView, SignedExecutionPayloadEnvelopeView,
-        SszView, StatusView,
+        GOODBYE_SIZE, METADATA_SIZE, PING_SIZE, STATUS_V1_SIZE, STATUS_V2_SIZE,
+        SignedBeaconBlockView, SignedExecutionPayloadEnvelopeView, SszView, StatusView,
     },
 };
 
@@ -1447,15 +1446,10 @@ pub struct PreparedPayloadAttributes {
     pub withdrawals: Option<TCacheRead>,
 }
 
-/// A membership change in Beacon State's operation pools. Exits and BLS
-/// changes are keyed by validator; slashings by an id the pool assigns in
-/// admission order, with their SSZ in the handoff tcache.
+/// A membership change in Beacon State's slashing pools, keyed by an id the
+/// pool assigns in admission order, with the SSZ in the handoff tcache.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, TypeHash)]
 pub enum PoolChange {
-    ExitAdded([u8; SIGNED_VOLUNTARY_EXIT_SIZE]),
-    ExitRemoved { validator_index: u32 },
-    BlsChangeAdded([u8; SIGNED_BLS_CHANGE_SIZE]),
-    BlsChangeRemoved { validator_index: u32 },
     ProposerSlashingAdded { id: u64, ssz: TCacheRead },
     ProposerSlashingRemoved { id: u64 },
     AttesterSlashingAdded { id: u64, ssz: TCacheRead },

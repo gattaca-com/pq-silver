@@ -55,7 +55,7 @@ impl AggregateRequest {
         match posted.buffer() {
             Ok((bytes, _)) => {
                 let version = spec.fork_at_slot(self.committee.slot).name();
-                resp.versioned_json(version, |json| json.attestation(bytes));
+                resp.versioned_json(version, |json| json.proved_attestation(bytes));
             }
             Err(e) => {
                 silver_log::warn!(?e, slot = self.committee.slot, "served aggregate unavailable");

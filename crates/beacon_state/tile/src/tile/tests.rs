@@ -7778,7 +7778,7 @@ mod leanvm_verifier {
 
 mod pq_aggregator {
     use silver_common::{LeanVmHealthEvent, LeanVmReq, LeanVmResp, TReservation};
-    use silver_ssz::ssz_view::{AttestationPqView, SINGLE_ATT_PQ_SIZE};
+    use silver_ssz::ssz_view::{AttestationPqView, ProvedAttestationView, SINGLE_ATT_PQ_SIZE};
 
     use super::*;
     use crate::tile::pq_aggregation::{
@@ -7928,7 +7928,7 @@ mod pq_aggregator {
     }
 
     #[test]
-    fn a_response_is_served_as_a_canonical_attestation() {
+    fn a_response_is_served_as_a_canonical_attestation_with_its_proof() {
         let mut rig = Rig::new();
         rig.ready();
         rig.vote(1);
@@ -7937,9 +7937,12 @@ mod pq_aggregator {
 
         rig.respond(request_id, &[[1; 64]]);
         let ssz = rig.served().expect("a best proof");
-        assert!(AttestationPqView::check_canonical(&ssz));
-        assert_eq!(AttestationPqView::committee_bits(&ssz), &[1, 0]);
-        assert_eq!(AttestationPqView::aggregation_bits(&ssz), [0b10, 1], "only position 1 is set");
+        let attestation = ProvedAttestationView::attestation(&ssz);
+        assert!(AttestationPqView::check_canonical(attestation));
+        assert_eq!(AttestationPqView::committee_bits(attestation), &[1, 0]);
+        let bits = AttestationPqView::aggregation_bits(attestation);
+        assert_eq!(bits, [0b10, 1], "only position 1 is set");
+        assert!(!ProvedAttestationView::proof(&ssz).is_empty());
     }
 
     #[test]

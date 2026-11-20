@@ -1,14 +1,12 @@
 use std::collections::hash_map::Entry;
 
-use flux::spine::SpineProducer;
 use rustc_hash::FxHashMap;
 use silver_beacon_state_data::{SpecConfig, StateReadView, StateView};
-use silver_common::{
-    BeaconStateEvent, PoolChange,
-    ssz_view::{MAX_VOLUNTARY_EXITS, SIGNED_VOLUNTARY_EXIT_SIZE, SignedVoluntaryExitView},
+use silver_common::ssz_view::{
+    MAX_VOLUNTARY_EXITS, SIGNED_VOLUNTARY_EXIT_SIZE, SignedVoluntaryExitView,
 };
 
-use crate::{stf, tile::Producers, validate};
+use crate::{stf, validate};
 
 /// Gossip-verified voluntary exits, one per validator: the first valid exit
 /// wins, as on gossip, and a block holds at most one exit per validator.
@@ -19,21 +17,13 @@ use crate::{stf, tile::Producers, validate};
 #[derive(Default)]
 pub(super) struct ExitPool {
     exits: FxHashMap<u32, [u8; SIGNED_VOLUNTARY_EXIT_SIZE]>,
-    producer: Option<SpineProducer<BeaconStateEvent>>,
 }
 
 impl ExitPool {
-    pub(super) fn with_producer(&mut self, producers: &Producers) {
-        self.producer.replace(producers.beacon_events);
-    }
-
     pub(super) fn insert(&mut self, ssz: &[u8; SIGNED_VOLUNTARY_EXIT_SIZE]) {
         let vi = SignedVoluntaryExitView::validator_index(ssz) as u32;
         if let Entry::Vacant(slot) = self.exits.entry(vi) {
             slot.insert(*ssz);
-            if let Some(producer) = &mut self.producer {
-                producer.produce(&BeaconStateEvent::PoolChange(PoolChange::ExitAdded(*ssz)).into());
-            }
         }
     }
 
@@ -81,15 +71,7 @@ impl ExitPool {
     pub(super) fn prune(&mut self, finalized: &StateReadView) {
         let validators = &finalized.validators;
         self.exits.retain(|&vi, _| {
-            let keep =
-                vi as usize >= validators.count() || validators.exit_epoch(vi as usize) == u64::MAX;
-            if !keep && let Some(producer) = &mut self.producer {
-                producer.produce(
-                    &BeaconStateEvent::PoolChange(PoolChange::ExitRemoved { validator_index: vi })
-                        .into(),
-                );
-            }
-            keep
+            vi as usize >= validators.count() || validators.exit_epoch(vi as usize) == u64::MAX
         });
     }
 

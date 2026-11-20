@@ -4,7 +4,8 @@ use silver_beacon_state_data::B256;
 use silver_common::{
     json_fields::parse_uint64,
     ssz_view::{
-        ProposerPreferencesView, SIGNED_PROPOSER_PREFERENCES_SIZE, SignedProposerPreferencesView,
+        ProposerPreferencesView, SIGNED_PROPOSER_PREFERENCES_PQ_SIZE,
+        SignedProposerPreferencesPqView,
     },
 };
 use silver_httpcore::Query;
@@ -20,16 +21,16 @@ use crate::{
 
 #[derive(Default)]
 pub(crate) struct ProposerPreferences {
-    signed: BTreeMap<(u64, B256), [u8; SIGNED_PROPOSER_PREFERENCES_SIZE]>,
+    signed: BTreeMap<(u64, B256), [u8; SIGNED_PROPOSER_PREFERENCES_PQ_SIZE]>,
 }
 
 impl ProposerPreferences {
     pub(crate) fn record(
         &mut self,
-        signed: &[u8; SIGNED_PROPOSER_PREFERENCES_SIZE],
+        signed: &[u8; SIGNED_PROPOSER_PREFERENCES_PQ_SIZE],
         current_slot: u64,
     ) -> bool {
-        let message = SignedProposerPreferencesView::message(signed);
+        let message = SignedProposerPreferencesPqView::message(signed);
         let slot = ProposerPreferencesView::proposal_slot(message);
         if slot < current_slot {
             return false;
@@ -49,7 +50,7 @@ impl ProposerPreferences {
         current_slot: u64,
         slot: Option<u64>,
         dependent_root: Option<B256>,
-    ) -> impl Iterator<Item = &[u8; SIGNED_PROPOSER_PREFERENCES_SIZE]> {
+    ) -> impl Iterator<Item = &[u8; SIGNED_PROPOSER_PREFERENCES_PQ_SIZE]> {
         self.signed.range((current_slot, [0; 32])..).filter_map(move |(&(s, root), signed)| {
             (slot.is_none_or(|slot| slot == s) && dependent_root.is_none_or(|r| r == root))
                 .then_some(signed)
@@ -83,9 +84,9 @@ pub(crate) fn get_proposer_preferences(req: &Request<'_>, ctx: &ApiCtx, resp: &m
         ctx.proposer_preferences.matching(ctx.node_status.wall_slot, slot, dependent_root);
     if req.accepts_ssz() {
         let parts: Vec<_> = preferences.map(|signed| signed.as_slice()).collect();
-        resp.send(200, Some(SSZ_MEDIA_TYPE), &[("Eth-Consensus-Version", "gloas")], &parts);
+        resp.send(200, Some(SSZ_MEDIA_TYPE), &[("Eth-Consensus-Version", "pq")], &parts);
     } else {
-        resp.versioned_json("gloas", |json| {
+        resp.versioned_json("pq", |json| {
             json.begin_array();
             for signed in preferences {
                 json.signed_proposer_preferences(signed);
@@ -98,6 +99,7 @@ pub(crate) fn get_proposer_preferences(req: &Request<'_>, ctx: &ApiCtx, resp: &m
 #[cfg(test)]
 pub(crate) mod tests {
     use serde_json::{Value, json as value};
+    use silver_common::ssz_view::XMSS_SIGNATURE_SIZE;
     use silver_httpcore::ParsedRequest;
 
     use super::*;
@@ -111,8 +113,8 @@ pub(crate) mod tests {
     pub(crate) fn signed_preferences(
         slot: u64,
         root: u8,
-    ) -> [u8; SIGNED_PROPOSER_PREFERENCES_SIZE] {
-        let mut signed = [0x44; SIGNED_PROPOSER_PREFERENCES_SIZE];
+    ) -> [u8; SIGNED_PROPOSER_PREFERENCES_PQ_SIZE] {
+        let mut signed = [0x44; SIGNED_PROPOSER_PREFERENCES_PQ_SIZE];
         signed[..32].fill(root);
         signed[32..40].copy_from_slice(&slot.to_le_bytes());
         signed[40..48].copy_from_slice(&9u64.to_le_bytes());
@@ -130,7 +132,7 @@ pub(crate) mod tests {
                 "fee_recipient": format!("0x{}", "22".repeat(20)),
                 "target_gas_limit": "60000000",
             },
-            "signature": format!("0x{}", "44".repeat(96)),
+            "signature": format!("0x{}", "44".repeat(XMSS_SIGNATURE_SIZE)),
         })
     }
 
@@ -154,17 +156,11 @@ pub(crate) mod tests {
         ] {
             let response = answer(&ctx, &ParsedRequest { query, ..request("GET", PATH) });
             assert!(
-                std::str::from_utf8(&response)
-                    .unwrap()
-                    .contains("Eth-Consensus-Version: gloas\r\n")
+                std::str::from_utf8(&response).unwrap().contains("Eth-Consensus-Version: pq\r\n")
             );
             let expected: Vec<_> =
                 expected.into_iter().map(|(s, r)| preferences_json(s, r)).collect();
-            assert_eq!(
-                json(&response),
-                value!({ "version": "gloas", "data": expected }),
-                "{query}"
-            );
+            assert_eq!(json(&response), value!({ "version": "pq", "data": expected }), "{query}");
         }
     }
 
@@ -207,7 +203,7 @@ pub(crate) mod tests {
             let headers = std::str::from_utf8(&response[..split]).unwrap();
             assert!(headers.starts_with("HTTP/1.1 200 OK\r\n"));
             assert!(headers.contains("Content-Type: application/octet-stream\r\n"));
-            assert!(headers.contains("Eth-Consensus-Version: gloas\r\n"));
+            assert!(headers.contains("Eth-Consensus-Version: pq\r\n"));
             assert!(headers.contains(&format!("Content-Length: {}\r\n", expected.len())));
             assert_eq!(response[split..], expected, "{query}");
         }
@@ -246,7 +242,7 @@ pub(crate) mod tests {
         assert!(ctx.proposer_preferences.signed.is_empty());
         assert_eq!(
             json(&answer(&ctx, &request("GET", PATH))),
-            value!({ "version": "gloas", "data": [] })
+            value!({ "version": "pq", "data": [] })
         );
     }
 }

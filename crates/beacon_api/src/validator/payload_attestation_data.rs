@@ -9,7 +9,7 @@ use crate::{
     validator::attestation_data::uint64_query,
 };
 
-const VERSION: &str = "gloas";
+const VERSION: &str = "pq";
 
 /// Answers from the head block alone: a slot whose block is not the head has
 /// no block this node would attest to, so it is a 204.
@@ -88,9 +88,9 @@ mod tests {
     fn the_head_block_slot_answers_with_its_observation() {
         let ctx = ctx();
         let response = get(&ctx, "slot=9000", None);
-        assert!(std::str::from_utf8(&response).unwrap().contains("Eth-Consensus-Version: gloas"));
+        assert!(std::str::from_utf8(&response).unwrap().contains("Eth-Consensus-Version: pq"));
         let body = json(&response);
-        assert_eq!(body["version"], "gloas");
+        assert_eq!(body["version"], "pq");
         assert_eq!(body["data"]["beacon_block_root"], format!("0x{}", hex::encode(ROOT)));
         assert_eq!(body["data"]["slot"], "9000");
         assert_eq!(body["data"]["payload_present"], true);

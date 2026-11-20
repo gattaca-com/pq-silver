@@ -1,12 +1,6 @@
 use std::collections::BTreeMap;
 
-use silver_common::{
-    PoolChange, TCacheRead,
-    ssz_view::{
-        PROPOSER_SLASHING_SIZE, SIGNED_BLS_CHANGE_SIZE, SIGNED_VOLUNTARY_EXIT_SIZE,
-        SignedBlsToExecutionChangeView, SignedVoluntaryExitView,
-    },
-};
+use silver_common::{PoolChange, TCacheRead, ssz_view::PROPOSER_SLASHING_PQ_SIZE};
 
 use crate::{
     ctx::ApiCtx,
@@ -14,12 +8,10 @@ use crate::{
 };
 
 /// Beacon State's operation pools, rebuilt from its `PoolChange` events.
-/// Exits and BLS changes are in validator order, slashings in admission order.
+/// Slashings are in admission order.
 #[derive(Default)]
 pub(crate) struct OperationPools {
-    exits: BTreeMap<u32, [u8; SIGNED_VOLUNTARY_EXIT_SIZE]>,
-    bls_changes: BTreeMap<u32, [u8; SIGNED_BLS_CHANGE_SIZE]>,
-    proposer_slashings: BTreeMap<u64, [u8; PROPOSER_SLASHING_SIZE]>,
+    proposer_slashings: BTreeMap<u64, [u8; PROPOSER_SLASHING_PQ_SIZE]>,
     attester_slashings: BTreeMap<u64, Box<[u8]>>,
 }
 
@@ -32,20 +24,6 @@ impl OperationPools {
         handed_off: impl FnOnce(TCacheRead) -> Option<Box<[u8]>>,
     ) {
         match change {
-            PoolChange::ExitAdded(ssz) => {
-                let validator_index = SignedVoluntaryExitView::validator_index(&ssz) as u32;
-                self.exits.insert(validator_index, ssz);
-            }
-            PoolChange::ExitRemoved { validator_index } => {
-                self.exits.remove(&validator_index);
-            }
-            PoolChange::BlsChangeAdded(ssz) => {
-                let validator_index = SignedBlsToExecutionChangeView::validator_index(&ssz) as u32;
-                self.bls_changes.insert(validator_index, ssz);
-            }
-            PoolChange::BlsChangeRemoved { validator_index } => {
-                self.bls_changes.remove(&validator_index);
-            }
             PoolChange::ProposerSlashingAdded { id, ssz } => {
                 if let Some(ssz) = handed_off(ssz).and_then(|bytes| (*bytes).try_into().ok()) {
                     self.proposer_slashings.insert(id, ssz);
@@ -64,18 +42,6 @@ impl OperationPools {
             }
         }
     }
-}
-
-pub(crate) fn get_voluntary_exits(_req: &Request<'_>, ctx: &ApiCtx, resp: &mut Response<'_>) {
-    resp.json_body(|json| {
-        json.data_envelope(|json| {
-            json.begin_array();
-            for ssz in ctx.pools.exits.values() {
-                json.voluntary_exit(ssz);
-            }
-            json.end_array();
-        })
-    });
 }
 
 pub(crate) fn get_proposer_slashings(_req: &Request<'_>, ctx: &ApiCtx, resp: &mut Response<'_>) {
@@ -101,25 +67,9 @@ pub(crate) fn get_attester_slashings(_req: &Request<'_>, ctx: &ApiCtx, resp: &mu
     });
 }
 
-pub(crate) fn get_bls_to_execution_changes(
-    _req: &Request<'_>,
-    ctx: &ApiCtx,
-    resp: &mut Response<'_>,
-) {
-    resp.json_body(|json| {
-        json.data_envelope(|json| {
-            json.begin_array();
-            for ssz in ctx.pools.bls_changes.values() {
-                json.bls_to_execution_change(ssz);
-            }
-            json.end_array();
-        })
-    });
-}
-
 #[cfg(test)]
 mod tests {
-    use silver_common::TCacheProducer;
+    use silver_common::{TCacheProducer, ssz_view::XMSS_SIGNATURE_SIZE};
 
     use super::*;
     use crate::{
@@ -127,28 +77,13 @@ mod tests {
         testing::{answer, json, request, submissions},
     };
 
-    fn exit(validator_index: u64) -> [u8; SIGNED_VOLUNTARY_EXIT_SIZE] {
-        let mut ssz = [0x44; SIGNED_VOLUNTARY_EXIT_SIZE];
-        ssz[0..8].copy_from_slice(&7u64.to_le_bytes());
-        ssz[8..16].copy_from_slice(&validator_index.to_le_bytes());
-        ssz
-    }
-
-    fn bls_change(validator_index: u64) -> [u8; SIGNED_BLS_CHANGE_SIZE] {
-        let mut ssz = [0x44; SIGNED_BLS_CHANGE_SIZE];
-        ssz[0..8].copy_from_slice(&validator_index.to_le_bytes());
-        ssz[8..56].fill(0x55);
-        ssz[56..76].fill(0x66);
-        ssz
-    }
-
     fn pool(ctx: &ApiCtx, path: &str) -> Vec<serde_json::Value> {
         json(&answer(ctx, &request("GET", path)))["data"].as_array().unwrap().clone()
     }
 
-    fn proposer_slashing(proposer_index: u64) -> [u8; PROPOSER_SLASHING_SIZE] {
-        let mut ssz = [0x44; PROPOSER_SLASHING_SIZE];
-        for header in [0, PROPOSER_SLASHING_SIZE / 2] {
+    fn proposer_slashing(proposer_index: u64) -> [u8; PROPOSER_SLASHING_PQ_SIZE] {
+        let mut ssz = [0x44; PROPOSER_SLASHING_PQ_SIZE];
+        for header in [0, PROPOSER_SLASHING_PQ_SIZE / 2] {
             ssz[header..header + 8].copy_from_slice(&9u64.to_le_bytes());
             ssz[header + 8..header + 16].copy_from_slice(&proposer_index.to_le_bytes());
             ssz[header + 16..header + 112].fill(0x11);
@@ -157,10 +92,11 @@ mod tests {
     }
 
     fn indexed_attestation(indices: &[u64]) -> Vec<u8> {
-        let mut ssz = 228u32.to_le_bytes().to_vec();
+        let mut ssz = 136u32.to_le_bytes().to_vec();
         ssz.extend_from_slice(&[0u8; 128]);
-        ssz.extend_from_slice(&[0x44; 96]);
+        ssz.extend_from_slice(&(136 + 8 * indices.len() as u32).to_le_bytes());
         ssz.extend(indices.iter().flat_map(|index| index.to_le_bytes()));
+        ssz.extend_from_slice(&[0x44; 3]);
         ssz
     }
 
@@ -201,7 +137,7 @@ mod tests {
         assert_eq!(header["message"]["proposer_index"], "6");
         assert_eq!(header["message"]["slot"], "9");
         assert_eq!(header["message"]["body_root"], format!("0x{}", "11".repeat(32)));
-        assert_eq!(header["signature"], format!("0x{}", "44".repeat(96)));
+        assert_eq!(header["signature"], format!("0x{}", "44".repeat(XMSS_SIGNATURE_SIZE)));
 
         let path = "/eth/v2/beacon/pool/attester_slashings";
         let response = answer(&ctx, &request("GET", path));
@@ -221,6 +157,7 @@ mod tests {
             body["data"][1]["attestation_2"]["attesting_indices"],
             serde_json::json!(["2", "7"])
         );
+        assert_eq!(body["data"][1]["attestation_2"]["proof"], "0x444444");
 
         ctx.pools.apply(PoolChange::AttesterSlashingRemoved { id: 1 }, |_| None);
         ctx.pools.apply(PoolChange::ProposerSlashingRemoved { id: 3 }, |_| None);
@@ -235,35 +172,5 @@ mod tests {
         let ssz = handoff.write_with(4, |out| out.fill(0)).unwrap();
         ctx.pools.apply(PoolChange::ProposerSlashingAdded { id: 0, ssz }, |_| None);
         assert!(pool(&ctx, "/eth/v1/beacon/pool/proposer_slashings").is_empty());
-    }
-
-    #[test]
-    fn pools_list_their_entries_in_validator_order_until_removed() {
-        let mut ctx = anchor_ctx();
-        for change in [
-            PoolChange::ExitAdded(exit(9)),
-            PoolChange::ExitAdded(exit(2)),
-            PoolChange::BlsChangeAdded(bls_change(5)),
-        ] {
-            ctx.pools.apply(change, |_| None);
-        }
-
-        let exits = pool(&ctx, "/eth/v1/beacon/pool/voluntary_exits");
-        let indices: Vec<_> =
-            exits.iter().map(|e| e["message"]["validator_index"].clone()).collect();
-        assert_eq!(indices, ["2", "9"]);
-        assert_eq!(exits[0]["message"]["epoch"], "7");
-        assert_eq!(exits[0]["signature"], format!("0x{}", "44".repeat(96)));
-
-        let changes = pool(&ctx, "/eth/v1/beacon/pool/bls_to_execution_changes");
-        let [change] = &changes[..] else { panic!("one change: {changes:?}") };
-        assert_eq!(change["message"]["validator_index"], "5");
-        assert_eq!(change["message"]["from_bls_pubkey"], format!("0x{}", "55".repeat(48)));
-        assert_eq!(change["message"]["to_execution_address"], format!("0x{}", "66".repeat(20)));
-
-        ctx.pools.apply(PoolChange::ExitRemoved { validator_index: 2 }, |_| None);
-        ctx.pools.apply(PoolChange::BlsChangeRemoved { validator_index: 5 }, |_| None);
-        assert_eq!(pool(&ctx, "/eth/v1/beacon/pool/voluntary_exits").len(), 1);
-        assert!(pool(&ctx, "/eth/v1/beacon/pool/bls_to_execution_changes").is_empty());
     }
 }

@@ -1,5 +1,5 @@
 use silver_beacon_state_data::{
-    BLSPubkey, Epoch, SLOTS_PER_EPOCH, ShufflingId, Slot, StateReadView, committee_at_position,
+    Epoch, SLOTS_PER_EPOCH, ShufflingId, Slot, StateReadView, committee_at_position,
 };
 
 use crate::{
@@ -52,21 +52,24 @@ pub(crate) fn post_attester_duties(req: &Request<'_>, ctx: &ApiCtx, resp: &mut R
     }
 }
 
-pub(crate) struct AttesterDuty {
-    pub(crate) pubkey: BLSPubkey,
+pub(crate) struct AttesterDuty<'a> {
+    pub(crate) pubkey: &'a [u8],
     pub(crate) validator_index: u64,
     pub(crate) committee_index: u64,
     pub(crate) committee_length: u64,
     pub(crate) committees_at_slot: u64,
     pub(crate) validator_committee_index: u64,
     pub(crate) slot: Slot,
+    /// Its place in the committee's aggregation committee, which staggers
+    /// when aggregators cut off and broadcast.
+    pub(crate) aggregator_position: Option<u64>,
 }
 
-impl AttesterDuty {
+impl<'a> AttesterDuty<'a> {
     /// `None` for an index the epoch's shuffling does not place, which is
     /// every index naming no active validator.
     fn read(
-        view: &StateReadView<'_>,
+        view: &'a StateReadView<'_>,
         shuffling: &Shuffling,
         epoch: Epoch,
         validator_index: u64,
@@ -77,14 +80,21 @@ impl AttesterDuty {
             usize::try_from(validator_index).ok().filter(|&ix| ix < view.validators.count())?;
         let committee =
             committee_at_position(shuffling.shuffled_len(), committees_at_slot, position);
+        let slot = epoch * SLOTS_PER_EPOCH + committee.slot_in_epoch;
+        let aggregator_position = view
+            .epoch
+            .aggregation_committee_window()
+            .committee(view.slot.current_epoch(), slot, committee.committee_index)
+            .and_then(|mut aggregators| aggregators.position(|member| member == validator_index));
         Some(Self {
-            pubkey: *view.validators.pubkey(index),
+            pubkey: view.validators.scheme().public_key(view.validators.pubkey(index)),
             validator_index,
             committee_index: committee.committee_index as u64,
             committee_length: committee.members.len() as u64,
             committees_at_slot: committees_at_slot as u64,
             validator_committee_index: (position - committee.members.start) as u64,
-            slot: epoch * SLOTS_PER_EPOCH + committee.slot_in_epoch,
+            slot,
+            aggregator_position: aggregator_position.map(|position| position as u64),
         })
     }
 }

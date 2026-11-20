@@ -5,9 +5,9 @@ use std::{
 
 use crate::chunked_response::ChunkedResponse;
 
-// Hard cap on the read buffer. Raw SSZ, uncompressed. 16 MiB matches observed
-// production maximums (21 blobs × 128 KiB plus block fields).
-const READ_BUF_MAX: usize = 16 << 20;
+// Hard cap on the read buffer. A JSON body of 4096 XMSS-signed attestations,
+// about 5 KB each, needs ~21 MB; raw SSZ blocks stay well below.
+const READ_BUF_MAX: usize = 32 << 20;
 const READ_BUF_INIT: usize = 4096;
 // Typical request bodies fit, so they never pay to regrow the buffer.
 const READ_BUF_KEPT_MAX: usize = 64 << 10;
@@ -25,7 +25,6 @@ pub struct ParsedRequest<'a> {
     pub accept: Option<&'a str>,
     pub content_type: Option<&'a str>,
     pub eth_consensus_version: Option<&'a str>,
-    pub eth_builder_url: Option<&'a str>,
     pub eth_blob_data_included: Option<&'a str>,
     /// A script or element on a web page sent it: it carries `Origin`, or a
     /// `Sec-Fetch-Site` other than the `none` of a navigation the user typed.
@@ -107,7 +106,6 @@ impl<'a> ParsedRequest<'a> {
                 accept: header("accept").and_then(trimmed_utf8),
                 content_type: header("content-type").and_then(trimmed_utf8),
                 eth_consensus_version: header("eth-consensus-version").and_then(trimmed_utf8),
-                eth_builder_url: header("eth-builder-url").and_then(trimmed_utf8),
                 eth_blob_data_included: header("eth-blob-data-included").and_then(trimmed_utf8),
                 from_web_page: header("origin").is_some() ||
                     header("sec-fetch-site")
@@ -602,12 +600,11 @@ mod tests {
 
     #[test]
     fn parse_negotiation_headers() {
-        let req = b"POST /eth/v2/beacon/blocks HTTP/1.1\r\nHost: x\r\nAccept: application/octet-stream;q=1.0,application/json;q=0.9\r\nContent-Type: application/octet-stream\r\nEth-Consensus-Version: fulu\r\nEth-Builder-Url: http://b:18550\r\n\r\n";
+        let req = b"POST /eth/v2/beacon/blocks HTTP/1.1\r\nHost: x\r\nAccept: application/octet-stream;q=1.0,application/json;q=0.9\r\nContent-Type: application/octet-stream\r\nEth-Consensus-Version: fulu\r\n\r\n";
         let (_, r) = parsed(req);
         assert_eq!(r.accept, Some("application/octet-stream;q=1.0,application/json;q=0.9"));
         assert_eq!(r.content_type, Some("application/octet-stream"));
         assert_eq!(r.eth_consensus_version, Some("fulu"));
-        assert_eq!(r.eth_builder_url, Some("http://b:18550"));
     }
 
     #[test]

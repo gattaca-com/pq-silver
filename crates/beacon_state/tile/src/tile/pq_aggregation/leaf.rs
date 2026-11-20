@@ -1,7 +1,9 @@
 use silver_beacon_state_data::{B256, Slot};
 use silver_common::{
     Nanos, TCacheRead, TProducer,
-    ssz_view::{ATTESTATION_DATA_SIZE, AttestationPqView, SingleAttestationPqView},
+    ssz_view::{
+        ATTESTATION_DATA_SIZE, AttestationPqView, ProvedAttestationView, SingleAttestationPqView,
+    },
 };
 
 use super::{
@@ -83,37 +85,43 @@ impl LeafAggregation {
         self.core.finish(&batch, body).map(|()| self.strategy.adopted(&batch))
     }
 
-    /// The `AttestationPq` of the votes the best proof covers. `None` without
-    /// a best proof.
-    pub(super) fn attestation(&self, committee_index: u64) -> Option<LeafAttestation<'_>> {
-        self.core.best_proof()?;
+    /// `None` without a best proof.
+    pub(super) fn proved(&self, committee_index: u64) -> Option<ProvedAggregate<'_>> {
+        let (_, proof) = self.core.best_proof()?;
         let committee_index = committee_index as usize;
-        let ssz_len = AttestationPqView::one_committee_len(committee_index, self.committee_len)?;
-        Some(LeafAttestation { leaf: self, committee_index, ssz_len })
+        let attestation_len =
+            AttestationPqView::one_committee_len(committee_index, self.committee_len)?;
+        Some(ProvedAggregate { leaf: self, committee_index, attestation_len, proof })
     }
 }
 
-pub struct LeafAttestation<'a> {
+/// The best proof and the votes it covers, as a `ProvedAttestationView`.
+pub struct ProvedAggregate<'a> {
     leaf: &'a LeafAggregation,
     committee_index: usize,
-    ssz_len: usize,
+    attestation_len: usize,
+    proof: &'a [u8],
 }
 
-impl LeafAttestation<'_> {
+impl ProvedAggregate<'_> {
     pub fn ssz_len(&self) -> usize {
-        self.ssz_len
+        ProvedAttestationView::FIXED + self.attestation_len + self.proof.len()
     }
 
     pub fn write_ssz(&self, out: &mut [u8]) {
         let leaf = self.leaf;
+        ProvedAttestationView::write_offsets(out, self.attestation_len);
+        let (attestation, proof) =
+            out[ProvedAttestationView::FIXED..].split_at_mut(self.attestation_len);
         let positions = leaf.core.covered_indices().iter().map(|&index| leaf.positions[index]);
         let written = AttestationPqView::write_one_committee(
-            out,
+            attestation,
             &leaf.data,
             self.committee_index,
             leaf.committee_len,
             positions,
         );
         debug_assert!(written, "votes are checked against their committee on arrival");
+        proof.copy_from_slice(self.proof);
     }
 }

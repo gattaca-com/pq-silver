@@ -115,6 +115,9 @@ fn main() -> Result<(), Box<dyn Error>> {
     let config = args.config()?;
     let chain_config = config.chain()?;
     chain_config.require_pq_from_genesis()?;
+    if config.pbs().is_some() {
+        return Err("PQ has no PBS: remove the [pbs] table and --pbs-endpoint".into());
+    }
 
     let boot_checkpoint = BootCheckpoint::load(&chain_config)
         .inspect_err(|e| silver_log::error!(%e, "no boot checkpoint"))?;

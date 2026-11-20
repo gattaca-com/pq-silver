@@ -1,5 +1,5 @@
 use silver_beacon_state_data::{
-    B256, BLSPubkey, Epoch, MIN_SEED_LOOKAHEAD, SLOTS_PER_EPOCH, Slot, StateReadView,
+    B256, BLSPubkey, Epoch, MIN_SEED_LOOKAHEAD, SLOTS_PER_EPOCH, Slot, StateReadView, pq::KeyScheme,
 };
 
 use crate::{
@@ -32,17 +32,12 @@ fn respond(req: &Request<'_>, ctx: &ApiCtx, resp: &mut Response<'_>, epochs_back
         resp.error(400, "epoch outside the proposer lookahead of the head state");
         return;
     };
-    resp.json_body(|json| {
-        json.proposer_duties(
-            duties.dependent_root,
-            ctx.node_status.execution_optimistic(),
-            duties.duties.iter(),
-        )
-    });
+    resp.json_body(|json| json.proposer_duties(&duties, ctx.node_status.execution_optimistic()));
 }
 
 pub(crate) struct ProposerDuties {
     pub(crate) dependent_root: B256,
+    pub(crate) scheme: KeyScheme,
     pub(crate) duties: [ProposerDuty; SLOTS_PER_EPOCH as usize],
 }
 
@@ -91,7 +86,7 @@ impl ProposerDuties {
         });
         let dependent_root =
             view.block_roots.duty_dependent_root(dependent_epoch, head_root, state_slot)?;
-        Some(Self { dependent_root, duties })
+        Some(Self { dependent_root, scheme: view.validators.scheme(), duties })
     }
 }
 

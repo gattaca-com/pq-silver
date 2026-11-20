@@ -1,11 +1,11 @@
 use serde::{Deserialize, Deserializer};
-use silver_beacon_state_data::{B256, BLSPubkey, ExecutionAddress};
+use silver_beacon_state_data::{B256, BLSPubkey, ExecutionAddress, pq::xmss_pubkey_padded};
 use silver_common::json_fields::{each_array_entry, parse_hex, parse_uint64, uint64};
 
 use crate::http::response::Response;
 
 /// How many validators one POST body may name. No schema that takes a list of
-/// them sets a `maxItems`, and an unbounded list turns a 16 MiB body into
+/// them sets a `maxItems`, and an unbounded list turns a 32 MiB body into
 /// millions of entries to parse, check and answer inside a single request. A
 /// quarter of a million is an order of magnitude past the largest single
 /// validator client in production, against a mainnet registry of ~2M.
@@ -48,8 +48,9 @@ pub(crate) fn parse_root(text: &str) -> Option<B256> {
     parse_hex(text)
 }
 
+/// A BLS key, or an XMSS key in the 48-byte form registries hold.
 pub(crate) fn parse_pubkey(text: &str) -> Option<BLSPubkey> {
-    parse_hex(text)
+    parse_hex(text).or_else(|| parse_hex(text).map(|xmss| xmss_pubkey_padded(&xmss)))
 }
 
 pub(crate) fn parse_execution_address(text: &str) -> Option<ExecutionAddress> {

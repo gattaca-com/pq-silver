@@ -1,9 +1,14 @@
 use serde::Deserialize;
 use silver_common::{
     GossipTopic,
-    json_fields::{BoundedHex, bytes, uint64},
-    ssz_view::{ATTESTATION_FIXED, MAX_VALIDATORS_PER_COMMITTEE, SIGNED_AGG_PROOF_MIN},
+    json_fields::{BoundedHex, HexBytes, bytes, uint64},
+    ssz_view::{
+        ATTESTATION_PQ_FIXED, MAX_STARK_PROOF_SIZE, MAX_VALIDATORS_PER_COMMITTEE,
+        SIGNED_AGG_PROOF_PQ_MIN, SIGNED_PQ_FIXED, XMSSSignature,
+    },
+    xmss::SlotDuty,
 };
+use silver_crypto_simd::xmss::leaf_index;
 
 use crate::{
     ctx::ApiCtx,
@@ -15,31 +20,31 @@ use crate::{
 /// A bitlist over one committee: its members and the terminator.
 const MAX_AGGREGATION_BITS_LEN: usize = MAX_VALIDATORS_PER_COMMITTEE / 8 + 1;
 
-/// Past the message offset and the outer signature.
-const MESSAGE_AT: usize = 4 + 96;
-/// Past `aggregator_index`, the aggregate offset and `selection_proof`.
-const AGGREGATE_IN_MESSAGE: usize = 8 + 4 + 96;
-const _: () =
-    assert!(MESSAGE_AT + AGGREGATE_IN_MESSAGE + ATTESTATION_FIXED == SIGNED_AGG_PROOF_MIN);
+/// Past `aggregator_index` and the aggregate and proof offsets.
+const AGGREGATE_IN_MESSAGE: usize = 8 + 4 + 4;
+const _: () = assert!(
+    SIGNED_PQ_FIXED + AGGREGATE_IN_MESSAGE + ATTESTATION_PQ_FIXED + 1 == SIGNED_AGG_PROOF_PQ_MIN
+);
 
 pub(crate) fn post_aggregate_and_proofs(req: &Request<'_>, ctx: &ApiCtx, resp: &mut Response<'_>) {
     post_submission::<SubmittedAggregate>(req, ctx, resp);
 }
 
 #[derive(Deserialize)]
-struct SubmittedAggregate {
-    message: SubmittedAggregateAndProof,
+struct SubmittedAggregate<'a> {
+    #[serde(borrow)]
+    message: SubmittedAggregateAndProof<'a>,
     #[serde(deserialize_with = "bytes")]
-    signature: [u8; 96],
+    signature: XMSSSignature,
 }
 
 #[derive(Deserialize)]
-struct SubmittedAggregateAndProof {
+struct SubmittedAggregateAndProof<'a> {
     #[serde(deserialize_with = "uint64")]
     aggregator_index: u64,
     aggregate: SubmittedAggregateAttestation,
-    #[serde(deserialize_with = "bytes")]
-    selection_proof: [u8; 96],
+    #[serde(borrow)]
+    proof: HexBytes<'a, MAX_STARK_PROOF_SIZE>,
 }
 
 #[derive(Deserialize)]
@@ -47,52 +52,64 @@ struct SubmittedAggregateAttestation {
     aggregation_bits: BoundedHex<MAX_AGGREGATION_BITS_LEN>,
     data: AttestationData,
     #[serde(deserialize_with = "bytes")]
-    signature: [u8; 96],
-    #[serde(deserialize_with = "bytes")]
-    committee_bits: [u8; 8],
+    committee_bits: [u8; 2],
 }
 
-impl SubmittedEntry for SubmittedAggregate {
+impl SubmittedAggregate<'_> {
+    fn attestation_len(&self) -> usize {
+        ATTESTATION_PQ_FIXED + self.message.aggregate.aggregation_bits.as_bytes().len()
+    }
+}
+
+impl SubmittedEntry for SubmittedAggregate<'_> {
     fn accept(&self, _ctx: &ApiCtx) -> Result<impl IntoIterator<Item = GossipTopic>, &'static str> {
         let aggregate = &self.message.aggregate;
-        if u64::from_le_bytes(aggregate.committee_bits).count_ones() != 1 {
+        if u16::from_le_bytes(aggregate.committee_bits).count_ones() != 1 {
             return Err("committee_bits must name exactly one committee");
         }
         let bits = aggregate.aggregation_bits.as_bytes();
         if bits.last().is_none_or(|&last| last == 0) {
             return Err("aggregation_bits is not a bitlist over one committee");
         }
+        if SlotDuty::AggregateAndProof.leaf(aggregate.data.slot) !=
+            Some(leaf_index(&self.signature))
+        {
+            return Err("incorrect XMSS aggregate and proof leaf");
+        }
         Ok([GossipTopic::BeaconAggregateAndProof])
     }
 
     fn ssz_len(&self) -> usize {
-        SIGNED_AGG_PROOF_MIN + self.message.aggregate.aggregation_bits.as_bytes().len()
+        SIGNED_PQ_FIXED +
+            AGGREGATE_IN_MESSAGE +
+            self.attestation_len() +
+            self.message.proof.byte_len()
     }
 
     fn encode(&self, ssz: &mut [u8]) {
         let aggregate = &self.message.aggregate;
         debug_assert_eq!(ssz.len(), self.ssz_len());
-        ssz[0..4].copy_from_slice(&(MESSAGE_AT as u32).to_le_bytes());
-        ssz[4..MESSAGE_AT].copy_from_slice(&self.signature);
+        ssz[0..4].copy_from_slice(&(SIGNED_PQ_FIXED as u32).to_le_bytes());
+        ssz[4..SIGNED_PQ_FIXED].copy_from_slice(&self.signature);
 
-        let message = &mut ssz[MESSAGE_AT..];
+        let message = &mut ssz[SIGNED_PQ_FIXED..];
+        let proof_at = AGGREGATE_IN_MESSAGE + self.attestation_len();
         message[0..8].copy_from_slice(&self.message.aggregator_index.to_le_bytes());
         message[8..12].copy_from_slice(&(AGGREGATE_IN_MESSAGE as u32).to_le_bytes());
-        message[12..AGGREGATE_IN_MESSAGE].copy_from_slice(&self.message.selection_proof);
+        message[12..16].copy_from_slice(&(proof_at as u32).to_le_bytes());
 
-        let attestation = &mut message[AGGREGATE_IN_MESSAGE..];
-        attestation[0..4].copy_from_slice(&(ATTESTATION_FIXED as u32).to_le_bytes());
+        let attestation = &mut message[AGGREGATE_IN_MESSAGE..proof_at];
+        attestation[0..4].copy_from_slice(&(ATTESTATION_PQ_FIXED as u32).to_le_bytes());
         aggregate.data.encode((&mut attestation[4..132]).try_into().expect("128 bytes"));
-        attestation[132..228].copy_from_slice(&aggregate.signature);
-        attestation[228..ATTESTATION_FIXED].copy_from_slice(&aggregate.committee_bits);
-        attestation[ATTESTATION_FIXED..].copy_from_slice(aggregate.aggregation_bits.as_bytes());
+        attestation[132..ATTESTATION_PQ_FIXED].copy_from_slice(&aggregate.committee_bits);
+        attestation[ATTESTATION_PQ_FIXED..].copy_from_slice(aggregate.aggregation_bits.as_bytes());
+        self.message.proof.decode_into(&mut message[proof_at..]);
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use silver_beacon_state_data::ParsedAggregateAndProof;
-    use silver_common::{TCacheProducer, ssz_view::SignedAggregateAndProofView};
+    use silver_common::{TCacheProducer, ssz_view::SignedAggregateAndProofPqView};
 
     use super::*;
     use crate::{
@@ -101,9 +118,19 @@ mod tests {
         testing::{body, dispatch, dispatch_into, posting, status_code, submissions},
     };
 
+    fn signature(leaf: u32) -> String {
+        let mut signature = [0x66; size_of::<XMSSSignature>()];
+        signature[..4].copy_from_slice(&leaf.to_le_bytes());
+        hex::encode(signature)
+    }
+
+    fn own_leaf() -> u32 {
+        SlotDuty::AggregateAndProof.leaf(SLOT).unwrap()
+    }
+
     /// One entry of the array a validator client posts, spelled as the
     /// schemas do.
-    fn entry(aggregation_bits: &str, committee_bits: &str) -> String {
+    fn entry(aggregation_bits: &str, committee_bits: &str, leaf: u32) -> String {
         format!(
             "{{\"message\":{{\"aggregator_index\":\"7\",\"aggregate\":{{\
              \"aggregation_bits\":\"0x{aggregation_bits}\",\
@@ -111,14 +138,12 @@ mod tests {
              \"beacon_block_root\":\"0x{}\",\
              \"source\":{{\"epoch\":\"298\",\"root\":\"0x{}\"}},\
              \"target\":{{\"epoch\":\"300\",\"root\":\"0x{}\"}}}},\
-             \"signature\":\"0x{}\",\"committee_bits\":\"0x{committee_bits}\"}},\
-             \"selection_proof\":\"0x{}\"}},\"signature\":\"0x{}\"}}",
+             \"committee_bits\":\"0x{committee_bits}\"}},\
+             \"proof\":\"0xabcdef\"}},\"signature\":\"0x{}\"}}",
             "11".repeat(32),
             "22".repeat(32),
             "33".repeat(32),
-            "44".repeat(96),
-            "55".repeat(96),
-            "66".repeat(96),
+            signature(leaf),
         )
     }
 
@@ -128,7 +153,7 @@ mod tests {
 
     #[test]
     fn accepted_aggregate_encodes_as_the_gossip_message() {
-        let entries = format!("[{}]", entry("1a05", "0400000000000000"));
+        let entries = format!("[{}]", entry("1a05", "0400", own_leaf()));
         let mut submissions = submissions();
         let posted = posting("/eth/v2/validator/aggregate_and_proofs", &entries);
         let Outcome::AwaitingVerdicts(submission) =
@@ -139,33 +164,29 @@ mod tests {
         let [accepted] = submission.accepted.as_slice() else { panic!("one accepted") };
         assert_eq!(accepted.topic, GossipTopic::BeaconAggregateAndProof);
         let ssz = submissions.read_buffer(accepted.ssz).unwrap();
-        assert_eq!(ssz.len(), SIGNED_AGG_PROOF_MIN + 2);
-        let parsed = ParsedAggregateAndProof::try_from(ssz).expect("well formed");
-        assert_eq!(parsed.outer_sig, &[0x66; 96]);
-        assert_eq!(parsed.aggregator_index, 7);
-        assert_eq!(parsed.selection_proof, &[0x55; 96]);
-        assert_eq!(parsed.agg_slot, SLOT);
-        assert_eq!(parsed.agg_data_index, 0);
-        assert_eq!(parsed.committee_bits, 1 << 2);
-        assert_eq!(parsed.agg_sig, &[0x44; 96]);
-        assert_eq!(parsed.agg_data.beacon_block_root(), &[0x11; 32]);
-        assert_eq!(parsed.agg_data.source_epoch(), 298);
-        assert_eq!(parsed.agg_data.source_root(), &[0x22; 32]);
-        assert_eq!(parsed.agg_data.target_epoch(), 300);
-        assert_eq!(parsed.agg_data.target_root(), &[0x33; 32]);
-        assert_eq!(parsed.aggregation_bits, &[0x1a, 0x05]);
-        assert_eq!(SignedAggregateAndProofView::agg_slot(ssz), SLOT);
+        assert!(SignedAggregateAndProofPqView::check_size(ssz));
+        assert_eq!(leaf_index(SignedAggregateAndProofPqView::signature(ssz)), own_leaf());
+        assert_eq!(SignedAggregateAndProofPqView::aggregator_index(ssz), 7);
+        let data = SignedAggregateAndProofPqView::agg_data(ssz);
+        assert_eq!(data.slot(), SLOT);
+        assert_eq!(data.beacon_block_root(), &[0x11; 32]);
+        assert_eq!(data.source_root(), &[0x22; 32]);
+        assert_eq!(data.target_epoch(), 300);
+        assert_eq!(SignedAggregateAndProofPqView::agg_committee_bits(ssz), &[0x04, 0]);
+        assert_eq!(SignedAggregateAndProofPqView::agg_aggregation_bits(ssz), &[0x1a, 0x05]);
+        assert_eq!(SignedAggregateAndProofPqView::proof(ssz), &[0xab, 0xcd, 0xef]);
     }
 
     #[test]
-    fn malformed_bitfields_fail_by_index() {
+    fn malformed_entries_fail_by_index() {
         let ctx = ctx();
         let entries = format!(
-            "[{},{},{},{}]",
-            entry("1a05", "0400000000000000"),
-            entry("1a00", "0400000000000000"),
-            entry("", "0400000000000000"),
-            entry("1a05", "0600000000000000"),
+            "[{},{},{},{},{}]",
+            entry("1a05", "0400", own_leaf()),
+            entry("1a00", "0400", own_leaf()),
+            entry("", "0400", own_leaf()),
+            entry("1a05", "0600", own_leaf()),
+            entry("1a05", "0400", own_leaf() - 1),
         );
         let Outcome::AwaitingVerdicts(submission) = submit(&ctx, &entries).0 else {
             panic!("the well-formed entry defers")
@@ -179,9 +200,10 @@ mod tests {
             (1, bitlist),
             (2, bitlist),
             (3, "committee_bits must name exactly one committee"),
+            (4, "incorrect XMSS aggregate and proof leaf"),
         ]);
 
-        let (outcome, response) = submit(&ctx, &format!("[{}]", entry("1a05", "0000000000000000")));
+        let (outcome, response) = submit(&ctx, &format!("[{}]", entry("1a05", "0000", own_leaf())));
         assert_eq!(outcome, Outcome::Response(None));
         assert_eq!(status_code(&response), "400");
         let parsed: serde_json::Value = serde_json::from_slice(body(&response)).unwrap();
@@ -192,14 +214,17 @@ mod tests {
         );
     }
 
-    /// A bitlist longer than any committee does not fit the fixed buffer the
-    /// body is parsed into, so the body itself is malformed.
+    /// Fields the PQ container dropped, or a committee_bits of the old
+    /// width, make the body malformed.
     #[test]
-    fn bitlist_past_one_committee_is_a_malformed_body() {
+    fn pre_pq_shapes_are_a_malformed_body() {
         let too_long = "01".repeat(MAX_AGGREGATION_BITS_LEN + 1);
-        let (outcome, response) =
-            submit(&ctx(), &format!("[{}]", entry(&too_long, "0400000000000000")));
-        assert_eq!(outcome, Outcome::Response(None));
-        assert_eq!(status_code(&response), "400");
+        let old_width = entry("1a05", "0400000000000000", own_leaf());
+        let odd_proof = entry("1a05", "0400", own_leaf()).replace("0xabcdef", "0xabcde");
+        for entry in [entry(&too_long, "0400", own_leaf()), old_width, odd_proof] {
+            let (outcome, response) = submit(&ctx(), &format!("[{entry}]"));
+            assert_eq!(outcome, Outcome::Response(None));
+            assert_eq!(status_code(&response), "400");
+        }
     }
 }

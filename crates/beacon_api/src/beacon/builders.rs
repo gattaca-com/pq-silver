@@ -69,7 +69,7 @@ impl<'a> BuilderFilter<'a> {
             let builder = builders.get(index).expect("resolved within the registry");
             let status = BuilderStatus::of(builder, finalized_epoch);
             if statuses == 0 || statuses & status.bit() != 0 {
-                json.builder(index as u64, status.name(), builder);
+                json.builder(index as u64, status.name(), builder, builders.scheme());
             }
         };
         let named = each_listed(self.ids, |id: BuilderId| {

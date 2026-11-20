@@ -54,6 +54,16 @@ impl KeyScheme {
             Self::Xmss => xmss_pubkey_padded(pubkey[XMSS_DEPOSIT_PREFIX_LEN..].try_into().unwrap()),
         }
     }
+
+    /// A registry key in its scheme's own width: 48 bytes for BLS, 32 for
+    /// XMSS.
+    #[inline]
+    pub fn public_key(self, pubkey: &BLSPubkey) -> &[u8] {
+        match self {
+            Self::Bls => pubkey,
+            Self::Xmss => &pubkey[XMSS_DEPOSIT_PREFIX_LEN..],
+        }
+    }
 }
 
 const LEGACY_XMSS_PUBKEY_DOMAIN: u8 = 0x00;

@@ -13,7 +13,7 @@ use crate::{
     submission::Submission,
     validator::{
         aggregate_attestation::AggregateRequest, execution_payload_envelope::EnvelopeRequest,
-        produce_block::ProduceBlockRequest, sync_contribution::SyncCommitteeContributionRequest,
+        produce_block::ProduceBlockRequest,
     },
 };
 
@@ -48,7 +48,6 @@ pub(crate) enum Outcome {
     Download(RegistryStream),
     AwaitingBlock(BlockRequest),
     AwaitingAggregate(AggregateRequest),
-    AwaitingContribution(SyncCommitteeContributionRequest),
     AwaitingProducedBlock(ProduceBlockRequest),
     AwaitingEnvelope(EnvelopeRequest),
     AwaitingVerdicts(Submission),
@@ -74,7 +73,6 @@ pub(crate) struct Request<'a> {
     pub(crate) accept: Option<&'a str>,
     pub(crate) content_type: Option<&'a str>,
     pub(crate) eth_consensus_version: Option<&'a str>,
-    pub(crate) eth_builder_url: Option<&'a str>,
     pub(crate) eth_blob_data_included: Option<&'a str>,
     pub(crate) body: &'a [u8],
 }
@@ -230,7 +228,6 @@ impl Router {
                 accept: req.accept,
                 content_type: req.content_type,
                 eth_consensus_version: req.eth_consensus_version,
-                eth_builder_url: req.eth_builder_url,
                 eth_blob_data_included: req.eth_blob_data_included,
                 body: req.body,
             };
@@ -294,7 +291,6 @@ mod tests {
             accept: None,
             content_type: None,
             eth_consensus_version: None,
-            eth_builder_url: None,
             eth_blob_data_included: None,
             from_web_page: false,
             host: None,
@@ -360,7 +356,6 @@ mod tests {
             accept: None,
             content_type,
             eth_consensus_version: None,
-            eth_builder_url: None,
             eth_blob_data_included: None,
             from_web_page: false,
             host: None,

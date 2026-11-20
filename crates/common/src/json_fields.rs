@@ -52,6 +52,34 @@ impl<'de, const N: usize> Deserialize<'de> for BoundedHex<N> {
     }
 }
 
+/// [`BoundedHex`] left undecoded, for a bound too large to hold on the stack:
+/// it is decoded straight into its destination.
+pub struct HexBytes<'a, const N: usize>(&'a str);
+
+impl<const N: usize> HexBytes<'_, N> {
+    pub fn byte_len(&self) -> usize {
+        self.0.len() / 2
+    }
+
+    pub fn decode_into(&self, out: &mut [u8]) {
+        hex::decode_to_slice(self.0, out).expect("checked hex of this length");
+    }
+}
+
+impl<'de: 'a, 'a, const N: usize> Deserialize<'de> for HexBytes<'a, N> {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let text = <&'a str>::deserialize(deserializer)?;
+        text.strip_prefix("0x")
+            .filter(|hex| {
+                hex.len() <= 2 * N &&
+                    hex.len().is_multiple_of(2) &&
+                    hex.bytes().all(|byte| byte.is_ascii_hexdigit())
+            })
+            .map(Self)
+            .ok_or_else(|| de::Error::custom("not a byte string of the allowed length"))
+    }
+}
+
 /// `u64::from_str` alone also accepts a leading `+`, which the schemas call an
 /// invalid identifier rather than a number.
 pub fn parse_uint64(text: &str) -> Option<u64> {

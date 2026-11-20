@@ -1,6 +1,7 @@
 use serde::Deserialize;
 use silver_beacon_state_data::{
-    BLSPubkey, Epoch, FAR_FUTURE_EPOCH, PinnedState, StateReadView, ValidatorsView, Withdrawals,
+    B256, BLSPubkey, Epoch, FAR_FUTURE_EPOCH, PinnedState, StateReadView, ValidatorsView,
+    Withdrawals, pq::KeyScheme,
 };
 use silver_common::json_fields::parse_uint64;
 use silver_httpcore::{ChunkedResponse, Query, REQUEST_HEAD_MAX};
@@ -25,8 +26,8 @@ const _: () =
 const VALIDATORS_PER_BATCH: usize = 512;
 
 /// The longest record [`Json::validator`] writes, with its separator: every
-/// number at 20 digits and the longest status.
-const MAX_VALIDATOR_JSON: usize = 550;
+/// number at 20 digits, the longest status, and an XMSS key with its VRF root.
+const MAX_VALIDATOR_JSON: usize = 598;
 
 /// A batch's chunk framing, and the envelope that opens the first batch and
 /// closes the last.
@@ -345,6 +346,8 @@ pub(crate) struct ValidatorRecord {
     pub(crate) balance: u64,
     pub(crate) status: ValidatorStatus,
     pub(crate) pubkey: BLSPubkey,
+    pub(crate) scheme: KeyScheme,
+    pub(crate) vrf_root: Option<B256>,
     pub(crate) withdrawal_credentials: Withdrawals,
     pub(crate) effective_balance: u64,
     pub(crate) lifecycle: Lifecycle,
@@ -360,6 +363,8 @@ impl ValidatorRecord {
             balance,
             status: lifecycle.status(current_epoch, balance),
             pubkey: *validators.pubkey(ix),
+            scheme: validators.scheme(),
+            vrf_root: validators.vrf_root(ix).copied(),
             withdrawal_credentials: *validators.credentials(ix),
             effective_balance: validators.effective_balance(ix),
             lifecycle,
@@ -565,7 +570,6 @@ mod tests {
             accept: None,
             content_type: Some("application/json"),
             eth_consensus_version: None,
-            eth_builder_url: None,
             eth_blob_data_included: None,
             from_web_page: false,
             host: None,
@@ -748,6 +752,8 @@ mod tests {
             balance: u64::MAX,
             status: ValidatorStatus::WithdrawalPossible,
             pubkey: [0xff; 48],
+            scheme: KeyScheme::Xmss,
+            vrf_root: Some([0xff; 32]),
             withdrawal_credentials: Withdrawals([0xff; 32]),
             effective_balance: u64::MAX,
             lifecycle,

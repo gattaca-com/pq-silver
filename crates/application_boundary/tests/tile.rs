@@ -26,7 +26,7 @@ use silver_common::{
         DATA_COLUMN_SIDECAR_MIN, DataColumnSidecarFuluView, SIGNED_BEACON_BLOCK_MIN,
         STATUS_V2_SIZE,
     },
-    test_util::ShmemDir,
+    test_util::{ShmemDir, SynthBid, SynthBlock},
 };
 use silver_config::EngineConfig;
 use silver_engine_api::test_el::{FCU_VALID_RESULT, FakeEl, write_jwt};
@@ -1669,7 +1669,7 @@ fn block_by_root_round_trips_over_the_storage_queues() {
     assert_eq!(lookup, BlockLookup::Root([0xab; 32]));
     assert!(!client.is_finished(), "the connection waits on storage");
 
-    let block = block_bytes(10, 0xab);
+    let block = SynthBlock::pq(10, SynthBid::new(&[])).into_bytes();
     let ssz = write_object(&mut served, &block);
     inj.produce(BeaconApiResponse::Block {
         request_id,

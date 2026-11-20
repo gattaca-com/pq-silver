@@ -7,7 +7,7 @@ use crate::{
     decompose::common::u32_le,
     merkle::{B256, ZERO_HASHES, const_hash_concat, hash_uint64_list, merkleize, mix_in_length},
     progressive::ProgressiveHasher,
-    types::{MIN_SEED_LOOKAHEAD, SLOTS_PER_EPOCH},
+    types::{Epoch, MIN_SEED_LOOKAHEAD, SLOTS_PER_EPOCH, Slot},
 };
 
 pub const AGGREGATION_COMMITTEE_WINDOW_LEN: usize =
@@ -112,6 +112,28 @@ impl AggregationCommitteeWindow {
     #[inline]
     pub fn hash_root(&self) -> B256 {
         self.root
+    }
+
+    /// Spec `get_aggregation_committee` read from a state at `state_epoch`.
+    /// `None` for a slot outside the window or an index past its committees.
+    pub fn committee(
+        &self,
+        state_epoch: Epoch,
+        slot: Slot,
+        index: usize,
+    ) -> Option<impl Iterator<Item = u64> + '_> {
+        let window_epoch = (slot / SLOTS_PER_EPOCH + 1).checked_sub(state_epoch)?;
+        let window_slot =
+            usize::try_from(window_epoch).ok()? * SPE + (slot % SLOTS_PER_EPOCH) as usize;
+        if window_slot >= AGGREGATION_COMMITTEE_WINDOW_LEN {
+            return None;
+        }
+        let slot_ssz = elements(&self.ssz, Some(AGGREGATION_COMMITTEE_WINDOW_LEN))
+            .ok()?
+            .nth(window_slot)?
+            .ok()?;
+        let members = elements(slot_ssz, None).ok()?.nth(index)?.ok()?;
+        Some(members.chunks_exact(8).map(|member| u64::from_le_bytes(member.try_into().unwrap())))
     }
 
     /// Drops the oldest epoch and appends the next, whose slots each hold
@@ -280,6 +302,28 @@ mod tests {
     fn default_is_the_decoded_empty_window() {
         let decoded = AggregationCommitteeWindow::from_ssz(&EMPTY_SSZ).unwrap();
         assert_eq!(decoded, AggregationCommitteeWindow::default());
+    }
+
+    /// The window's first epoch is the one before the state's.
+    #[test]
+    fn committee_reads_the_previous_through_the_lookahead_epoch() {
+        let state_epoch = 10;
+        let marked = SPE + 3;
+        let window =
+            AggregationCommitteeWindow::from_ssz(&window_with(marked, &[&[4, 5], &[6]], &[&[7]]))
+                .unwrap();
+        let members = |slot, index| {
+            window.committee(state_epoch, slot, index).map(Iterator::collect::<Vec<_>>)
+        };
+
+        let marked_slot = state_epoch * SLOTS_PER_EPOCH + 3;
+        assert_eq!(members(marked_slot, 0), Some(vec![4, 5]));
+        assert_eq!(members(marked_slot, 1), Some(vec![6]));
+        assert_eq!(members(marked_slot, 2), None);
+        assert_eq!(members((state_epoch - 1) * SLOTS_PER_EPOCH, 0), Some(vec![7]));
+        assert_eq!(members((state_epoch + 2) * SLOTS_PER_EPOCH - 1, 0), Some(vec![7]));
+        assert_eq!(members((state_epoch - 1) * SLOTS_PER_EPOCH - 1, 0), None);
+        assert_eq!(members((state_epoch + 2) * SLOTS_PER_EPOCH, 0), None);
     }
 
     #[test]

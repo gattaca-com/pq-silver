@@ -1,16 +1,12 @@
 use std::collections::hash_map::Entry;
 
-use flux::spine::SpineProducer;
 use rustc_hash::FxHashMap;
 use silver_beacon_state_data::StateReadView;
-use silver_common::{
-    BeaconStateEvent, PoolChange,
-    ssz_view::{
-        MAX_BLS_TO_EXECUTION_CHANGES, SIGNED_BLS_CHANGE_SIZE, SignedBlsToExecutionChangeView,
-    },
+use silver_common::ssz_view::{
+    MAX_BLS_TO_EXECUTION_CHANGES, SIGNED_BLS_CHANGE_SIZE, SignedBlsToExecutionChangeView,
 };
 
-use crate::{tile::Producers, validate};
+use crate::validate;
 
 /// Gossip-verified BLS to execution changes, one per validator: the first
 /// valid change wins, as on gossip, and a block holds at most one change per
@@ -22,23 +18,13 @@ use crate::{tile::Producers, validate};
 #[derive(Default)]
 pub(super) struct BlsChangePool {
     changes: FxHashMap<u32, [u8; SIGNED_BLS_CHANGE_SIZE]>,
-    producer: Option<SpineProducer<BeaconStateEvent>>,
 }
 
 impl BlsChangePool {
-    pub(super) fn with_producer(&mut self, producers: &Producers) {
-        self.producer.replace(producers.beacon_events);
-    }
-
     pub(super) fn insert(&mut self, ssz: &[u8; SIGNED_BLS_CHANGE_SIZE]) {
         let vi = SignedBlsToExecutionChangeView::validator_index(ssz) as u32;
         if let Entry::Vacant(slot) = self.changes.entry(vi) {
             slot.insert(*ssz);
-            if let Some(producer) = &mut self.producer {
-                producer.produce(
-                    &BeaconStateEvent::PoolChange(PoolChange::BlsChangeAdded(*ssz)).into(),
-                );
-            }
         }
     }
 
@@ -65,18 +51,7 @@ impl BlsChangePool {
     /// Changes for validators past the finalized registry stay.
     pub(super) fn prune(&mut self, finalized: &StateReadView) {
         let count = finalized.validators.count();
-        self.changes.retain(|&vi, ssz| {
-            let keep = vi as usize >= count || applies(finalized, vi, ssz);
-            if !keep && let Some(producer) = &mut self.producer {
-                producer.produce(
-                    &BeaconStateEvent::PoolChange(PoolChange::BlsChangeRemoved {
-                        validator_index: vi,
-                    })
-                    .into(),
-                );
-            }
-            keep
-        });
+        self.changes.retain(|&vi, ssz| vi as usize >= count || applies(finalized, vi, ssz));
     }
 
     #[cfg(test)]

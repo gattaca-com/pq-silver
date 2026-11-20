@@ -2,7 +2,7 @@ use std::iter;
 
 use rustc_hash::FxHashSet;
 use silver_beacon_state_data::{
-    BLSPubkey, Epoch, SLOTS_PER_EPOCH, ShufflingId, Slot, StateReadView, gloas::PtcCommittee,
+    Epoch, SLOTS_PER_EPOCH, ShufflingId, Slot, StateReadView, gloas::PtcCommittee,
 };
 
 use crate::{
@@ -62,18 +62,18 @@ pub(crate) fn post_ptc_duties(req: &Request<'_>, ctx: &ApiCtx, resp: &mut Respon
     }
 }
 
-pub(crate) struct PtcDuty {
-    pub(crate) pubkey: BLSPubkey,
+pub(crate) struct PtcDuty<'a> {
+    pub(crate) pubkey: &'a [u8],
     pub(crate) validator_index: u64,
     pub(crate) slot: Slot,
 }
 
-impl PtcDuty {
+impl<'a> PtcDuty<'a> {
     /// One duty per slot whose PTC holds a requested validator, as Prysm and
     /// Nimbus answer: balance-weighted selection can seat a validator in
     /// several slots, and spec `get_ptc_assignment` names only the first.
     /// `indices` is sorted.
-    fn read_epoch<'a>(
+    fn read_epoch(
         view: &'a StateReadView<'_>,
         committees: &'a [PtcCommittee],
         epoch: Epoch,
@@ -94,7 +94,8 @@ impl PtcDuty {
                     let ix = usize::try_from(validator_index)
                         .ok()
                         .filter(move |&ix| ix < view.validators.count())?;
-                    Some(Self { pubkey: *view.validators.pubkey(ix), validator_index, slot })
+                    let pubkey = view.validators.scheme().public_key(view.validators.pubkey(ix));
+                    Some(Self { pubkey, validator_index, slot })
                 })
         })
     }

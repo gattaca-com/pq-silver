@@ -162,8 +162,12 @@ fn read_request(stream: &mut UnixStream) -> Option<Vec<u8>> {
 
 #[test]
 fn a_good_hello_makes_the_connection_ready() {
-    let sidecar =
-        FakeSidecar::spawn(|mut stream, _| send_frame(&mut stream, &hello(b"leanvmsc", 64)));
+    // The sidecar stays connected: a close right after the hello could read
+    // as going down before the test sees ready.
+    let sidecar = FakeSidecar::spawn(|mut stream, _| {
+        send_frame(&mut stream, &hello(b"leanvmsc", 64));
+        let _ = stream.read_to_end(&mut Vec::new());
+    });
     let mut rig = Rig::new(Some(&sidecar.path));
     rig.wait_ready();
     assert_eq!(rig.health, [true]);

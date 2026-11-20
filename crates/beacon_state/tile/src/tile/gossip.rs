@@ -43,6 +43,7 @@ use super::{
     fork_data_roots::ForkDataRoots,
     held_blocks::BlockSourceMsg,
     pending_envelopes::{BLOCK_WAIT_SLOTS, ParkedEnvelope, ParkedKind, UnverifiedEnvelope},
+    pq_aggregation::VerifiedVote,
     seen_aggregates::Coverage,
     seen_proposer_preferences::ProposerPreferences,
     shuffling_cache::ShufflingRequest,
@@ -148,6 +149,7 @@ pub(crate) struct PreparedPqPtc {
     pub vote: PtcVote,
 }
 
+#[derive(Clone, Copy)]
 struct CheckedAttestation {
     committee_position: usize,
     committee_len: usize,
@@ -158,12 +160,26 @@ struct CheckedAttestation {
     committee_state: StateId,
 }
 
-pub(super) struct PreparedPqAttestation {
+pub(crate) struct PreparedPqAttestation {
     buf: [u8; SINGLE_ATT_PQ_SIZE],
     pubkey: XMSSPubkey,
     signing_root: B256,
-    attester: u32,
-    target: stf::VoteTarget,
+    data_root: B256,
+    subnet: u64,
+    checked: CheckedAttestation,
+}
+
+impl PreparedPqAttestation {
+    fn verified_vote(&self) -> VerifiedVote<'_> {
+        VerifiedVote {
+            single: &self.buf,
+            data_root: self.data_root,
+            message: self.signing_root,
+            pubkey: self.pubkey,
+            committee_position: self.checked.committee_position,
+            committee_len: self.checked.committee_len,
+        }
+    }
 }
 
 #[allow(clippy::large_enum_variant)]
@@ -193,9 +209,9 @@ impl PreparedPqVote {
 
     fn is_seen(&self, tile: &BeaconStateTile) -> bool {
         match self {
-            Self::Attestation(p) => {
-                tile.seen_attesters.contains(p.target.target_epoch, p.attester as usize)
-            }
+            Self::Attestation(p) => tile
+                .seen_attesters
+                .contains(p.checked.target.target_epoch, p.checked.attester as usize),
             Self::Ptc(p) => tile.seen_ptc.contains(p.vote.slot, p.vote.validator as usize),
         }
     }
@@ -383,15 +399,12 @@ impl BeaconStateTile {
             data,
             subnet,
         )?;
-        if !checked.attested.is_ready() {
-            return Err(Feedback::Ignore);
-        }
 
         let view = self.state.read_view(checked.committee_state);
         let Some(pubkey) = view.validator_xmss_pubkey(checked.attester as usize) else {
             return Err(Feedback::Ignore);
         };
-        let (_, signing_root) = self.attestation_root_memo.roots(
+        let (data_root, signing_root) = self.attestation_root_memo.roots(
             data.as_bytes(),
             &Self::attester_domain(&self.spec, &mut self.fork_data_roots, &view, data),
         );
@@ -399,8 +412,9 @@ impl BeaconStateTile {
             buf: *buf,
             pubkey: *pubkey,
             signing_root,
-            attester: checked.attester,
-            target: checked.target,
+            data_root,
+            subnet,
+            checked,
         })
     }
 
@@ -537,14 +551,7 @@ impl BeaconStateTile {
             );
         }
 
-        let n = self.head_validator_count();
-        let slot = self.ticker.current_slot();
-        self.fork_choice.record_or_defer_votes(
-            p.target,
-            std::slice::from_ref(&p.attester),
-            n,
-            slot,
-        );
+        self.record_votes(p.target, std::slice::from_ref(&p.attester));
         Feedback::Accept
     }
 
@@ -611,23 +618,44 @@ impl BeaconStateTile {
             counter.add(self.unknown_root_votes.vote_count(id));
             self.unknown_root_votes.close(id);
         }
+        self.promote_unknown_root_pq_votes(producers);
+    }
+
+    /// The target of buffered votes for `data`, once the block and payload
+    /// they name are ready; until then, what they wait on is requested.
+    fn buffered_vote_target(
+        &self,
+        data: AttestationDataView<'_>,
+        shuffling: ShufflingId,
+        producers: &mut Producers,
+    ) -> Result<stf::VoteTarget, Promotion> {
+        let block_root = *data.beacon_block_root();
+        let payload_present = match self.check_attested_block(data, shuffling) {
+            Ok(AttestedBlock::Ready { payload_present }) => payload_present,
+            Ok(attested) => {
+                if let Some(need) = self.awaited_need(attested, &block_root, data.slot()) {
+                    producers.produce(need);
+                }
+                return Err(Promotion::Waiting);
+            }
+            Err(_) => return Err(Promotion::Dropped),
+        };
+        Ok(stf::VoteTarget {
+            block_root,
+            target_epoch: data.target_epoch(),
+            attestation_slot: data.slot(),
+            payload_present,
+        })
     }
 
     fn promote_buffered_candidate(&mut self, id: usize, producers: &mut Producers) -> Promotion {
         let data = self.unknown_root_votes.data(id);
         let shuffling_id = self.unknown_root_votes.shuffling(id);
-        let att_slot = data.slot();
-        let block_root = *data.beacon_block_root();
-        let payload_present = match self.check_attested_block(data, shuffling_id) {
-            Ok(AttestedBlock::Ready { payload_present }) => payload_present,
-            Ok(attested) => {
-                if let Some(need) = self.awaited_need(attested, &block_root, att_slot) {
-                    producers.produce(need);
-                }
-                return Promotion::Waiting;
-            }
-            Err(_) => return Promotion::Dropped,
+        let target = match self.buffered_vote_target(data, shuffling_id, producers) {
+            Ok(target) => target,
+            Err(promotion) => return promotion,
         };
+        let att_slot = target.attestation_slot;
 
         let Some(shuffling) = self.shuffling_cache.find(shuffling_id) else {
             return Promotion::Dropped;
@@ -638,12 +666,6 @@ impl BeaconStateTile {
             BeaconStateCounters::AttestationPoolFull.inc();
         }
 
-        let target = stf::VoteTarget {
-            block_root,
-            target_epoch: data.target_epoch(),
-            attestation_slot: att_slot,
-            payload_present,
-        };
         let current_slot = self.ticker.current_slot();
         for (index, positions) in self.unknown_root_votes.committees(id) {
             let members = shuffling.committee(att_slot, index);
@@ -704,12 +726,14 @@ impl BeaconStateTile {
                 self.reject_gossip(&m, p.message(), "vote bad signature", producers);
                 continue;
             }
-            match p {
-                PreparedPqVote::Attestation(p) => self.record_pq_attestation(&p),
-                PreparedPqVote::Ptc(p) => committed_ptc |= self.record_pq_ptc_vote(&p.vote),
-            }
-            Self::relay_gossip(&m, None, producers);
-            accepted = true;
+            let feedback = match p {
+                PreparedPqVote::Attestation(p) => self.commit_pq_attestation(p),
+                PreparedPqVote::Ptc(p) => {
+                    committed_ptc |= self.record_pq_ptc_vote(&p.vote);
+                    Feedback::Accept
+                }
+            };
+            accepted |= Self::conclude_vote(&m, feedback, producers);
         }
         self.votes.pq_prepared = prepared;
         self.votes.pq_valid = valid;
@@ -751,16 +775,90 @@ impl BeaconStateTile {
         self.votes.pq_batch = batch;
     }
 
-    fn record_pq_attestation(&mut self, p: &PreparedPqAttestation) {
-        self.seen_attesters.mark(p.target.target_epoch, p.attester as usize);
+    /// A vote waiting for its block or payload is buffered until it arrives.
+    /// A local aggregator on the vote's subnet also proves it.
+    fn commit_pq_attestation(&mut self, p: PreparedPqAttestation) -> Feedback {
+        let checked = p.checked;
+        let target = checked.target;
+        self.seen_attesters.mark(target.target_epoch, checked.attester as usize);
+        let aggregates = self.aggregator_subnets.aggregates(target.attestation_slot, p.subnet);
+        if checked.attested.is_ready() {
+            self.record_votes(target, std::slice::from_ref(&checked.attester));
+            if aggregates {
+                self.aggregate_pq_vote(&p);
+            }
+            return Feedback::Accept;
+        }
+
+        let data = *SingleAttestationPqView::data(&p.buf).as_bytes();
+        let data_root = p.data_root;
+        let new_data = self.unknown_root_pq_votes.insert(
+            AttestationDataView::new(&data),
+            data_root,
+            checked.shuffling,
+            checked.attester,
+            aggregates.then_some(p),
+        );
+        self.buffered_vote_feedback(
+            new_data,
+            checked.attested,
+            &target.block_root,
+            target.attestation_slot,
+        )
+    }
+
+    fn aggregate_pq_vote(&mut self, p: &PreparedPqAttestation) {
+        self.pq_aggregator.add_vote(p.verified_vote(), &self.ticker);
+    }
+
+    fn record_votes(&mut self, target: stf::VoteTarget, attesters: &[u32]) {
         let n = self.head_validator_count();
         let slot = self.ticker.current_slot();
-        self.fork_choice.record_or_defer_votes(
-            p.target,
-            std::slice::from_ref(&p.attester),
-            n,
-            slot,
-        );
+        self.fork_choice.record_or_defer_votes(target, attesters, n, slot);
+    }
+
+    /// Relays an accepted vote; otherwise requests what it waits on and
+    /// answers a local submitter. True when accepted.
+    fn conclude_vote(m: &NewGossipMsg, feedback: Feedback, producers: &mut Producers) -> bool {
+        if feedback == Feedback::Accept {
+            Self::relay_gossip(m, None, producers);
+            return true;
+        }
+        if let Feedback::Request(need) = feedback {
+            producers.produce(need);
+        }
+        Self::local_verdict(m, feedback, producers);
+        false
+    }
+
+    /// Buffered PQ votes whose block is known take the checks that needed
+    /// it, then count as if they had just arrived.
+    fn promote_unknown_root_pq_votes(&mut self, producers: &mut Producers) {
+        let mut from = 0;
+        while let Some(id) = self.unknown_root_pq_votes.next_with_known_block(from, |block_root| {
+            self.fork_choice.find_node_idx(block_root).is_some()
+        }) {
+            from = id + 1;
+            let data = self.unknown_root_pq_votes.data(id);
+            let shuffling = self.unknown_root_pq_votes.shuffling(id);
+            let target = self.buffered_vote_target(data, shuffling, producers);
+            if let Err(Promotion::Waiting) = target {
+                continue;
+            }
+            let votes = self.unknown_root_pq_votes.take(id);
+            let count = votes.attesters.len() as u64;
+            match target {
+                Ok(target) => {
+                    BeaconStateCounters::UnknownRootVotesPromoted.add(count);
+                    self.record_votes(target, &votes.attesters);
+                    for vote in &votes.aggregated {
+                        self.aggregate_pq_vote(vote);
+                    }
+                }
+                Err(_) => BeaconStateCounters::UnknownRootVotesDropped.add(count),
+            }
+            self.unknown_root_pq_votes.recycle(id, votes);
+        }
     }
 
     /// Apply the deferred votes (attestations, sync committee messages, PTC
@@ -798,18 +896,7 @@ impl BeaconStateTile {
                 continue;
             }
             committed_ptc |= matches!(p, PreparedVote::Ptc(_));
-            match self.commit_vote(&p, &sig) {
-                Feedback::Accept => {
-                    Self::relay_gossip(&m, None, producers);
-                    accepted = true;
-                }
-                feedback => {
-                    if let Feedback::Request(need) = feedback {
-                        producers.produce(need);
-                    }
-                    Self::local_verdict(&m, feedback, producers);
-                }
-            }
+            accepted |= Self::conclude_vote(&m, self.commit_vote(&p, &sig), producers);
         }
 
         // PTC votes all dirty the same fork-choice structure; fold the whole
@@ -2332,6 +2419,9 @@ impl BeaconStateTile {
             return Feedback::reject("proposer slashing bad signature");
         }
         self.seen_proposer_slashings.mark(proposer_index);
+        let admission =
+            self.slashing_pool.insert_proposer_slashing(slashing, &view, &mut self.events_producer);
+        silver_log::info!(proposer_index, ?admission, "proposer slashing pooled");
         Feedback::Accept
     }
 

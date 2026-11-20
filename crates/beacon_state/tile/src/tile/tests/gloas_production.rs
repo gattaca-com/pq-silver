@@ -11,9 +11,9 @@ use silver_common::{
     ssz_hash_pq::{EMPTY_EXECUTION_REQUESTS_PQ, EMPTY_EXECUTION_REQUESTS_PQ_ROOT},
     ssz_view::{
         BYTES_PER_BLOB, BeaconBlockBodyGloasView, BeaconBlockBodyPqView,
-        EXECUTION_PAYLOAD_FIXED_GLOAS, ExecutionPayloadEnvelopeView,
-        SignedExecutionPayloadBidPqView, SignedExecutionPayloadBidView, VRF_PROOF_SIZE,
-        XMSS_SIGNATURE_SIZE,
+        EXECUTION_PAYLOAD_FIXED_GLOAS, ExecutionPayloadEnvelopeView, PROPOSER_SLASHING_PQ_SIZE,
+        SIGNED_BEACON_BLOCK_HEADER_PQ_SIZE, SignedExecutionPayloadBidPqView,
+        SignedExecutionPayloadBidView, VRF_PROOF_SIZE, XMSS_SIGNATURE_SIZE,
     },
 };
 
@@ -239,6 +239,27 @@ fn pq_self_build_reveals_its_vrf_proof_under_an_empty_xmss_signature() {
     rig.tile.produce_block(2, foreign, &mut rig.adapter.producers);
     let answers = rig.answers();
     assert!(matches!(answers[..], [(2, Err(ProduceBlockFailure::InvalidRandaoReveal))]));
+}
+
+#[test]
+fn pq_block_packs_a_pooled_proposer_slashing() {
+    let mut rig = ProductionRig::on(SignedBlockLayout::Pq, "empty_block_transition");
+    let mut slashing = vec![0; PROPOSER_SLASHING_PQ_SIZE];
+    for header in [0, SIGNED_BEACON_BLOCK_HEADER_PQ_SIZE] {
+        slashing[header..header + 8].copy_from_slice(&rig.proposal.slot.to_le_bytes());
+        slashing[header + 8..header + 16].copy_from_slice(&7u64.to_le_bytes());
+    }
+    slashing[SIGNED_BEACON_BLOCK_HEADER_PQ_SIZE + 16] = 1;
+    let tile = &mut *rig.tile;
+    let head = tile.state.read_view(tile.canonical_state_id());
+    tile.slashing_pool.insert_proposer_slashing(&slashing, &head, &mut tile.events_producer);
+
+    let attrs = rig.start(1);
+    rig.respond(attrs.id, &rig.payload(attrs, 7, false, 0));
+    let block = rig.one_block(1);
+
+    let bytes = rig.tile.events_producer.read_buffer(block.header).unwrap().to_vec();
+    assert_eq!(BeaconBlockBodyPqView::proposer_slashings(&bytes[84..]), slashing);
 }
 
 #[test]

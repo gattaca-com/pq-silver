@@ -3,6 +3,7 @@ use silver_beacon_state_data::{
     StateWriterView, ValSeed, Withdrawals,
 };
 use silver_common::{TCache, TCacheId};
+use silver_ssz::ssz_view::{INDEXED_ATTESTATION_PQ_FIXED, ProposerSlashingView};
 
 use super::*;
 
@@ -101,6 +102,34 @@ fn attester_proof(signers: [&[u32]; 2], target_epochs: [Epoch; 2]) -> Vec<u8> {
     ssz.extend(first);
     ssz.extend(second);
     assert!(AttesterSlashingView::check_size(&ssz));
+    ssz
+}
+
+fn pq_proposer_proof(offender: u64) -> Vec<u8> {
+    let mut ssz = vec![0; PROPOSER_SLASHING_PQ_SIZE];
+    ssz[..PROPOSER_SLASHING_SIZE].copy_from_slice(&proposer_proof(offender));
+    ssz
+}
+
+fn pq_double_vote(offenders: &[u32]) -> Vec<u8> {
+    let indexed = || {
+        let mut ia = vec![0u8; INDEXED_ATTESTATION_PQ_FIXED];
+        let end = (INDEXED_ATTESTATION_PQ_FIXED + 8 * offenders.len()) as u32;
+        ia[0..4].copy_from_slice(&(INDEXED_ATTESTATION_PQ_FIXED as u32).to_le_bytes());
+        ia[92..100].copy_from_slice(&EPOCH.to_le_bytes());
+        ia[132..136].copy_from_slice(&end.to_le_bytes());
+        for &vi in offenders {
+            ia.extend_from_slice(&(vi as u64).to_le_bytes());
+        }
+        ia
+    };
+    let (first, second) = (indexed(), indexed());
+    let mut ssz = Vec::new();
+    ssz.extend_from_slice(&8u32.to_le_bytes());
+    ssz.extend_from_slice(&(8 + first.len() as u32).to_le_bytes());
+    ssz.extend(first);
+    ssz.extend(second);
+    assert!(AttesterSlashingPqView::check_size(&ssz));
     ssz
 }
 
@@ -418,4 +447,27 @@ fn prune_keeps_proofs_signed_after_the_finalized_state_upgrades() {
 
     assert_eq!(selected(&proposers, &head).proposer_offenders(), [0]);
     assert_eq!(selected(&attesters, &head).attester_slashing(), Some(&upgraded[..]));
+}
+
+#[test]
+fn pq_proofs_are_ranked_and_listed_like_bls_ones() {
+    let chain = Chain::new(&[32, 64, 32]);
+    let head = chain.view(chain.base);
+    let mut pool = SlashingPool::default();
+    let mut handoff = handoff();
+    for vi in [0, 1] {
+        pool.insert_proposer_slashing(&pq_proposer_proof(vi), &head, &mut handoff);
+    }
+    let attester_slashing = pq_double_vote(&[1, 2]);
+    pool.insert_attester_slashing_pq(&attester_slashing, &[1, 2], &head, &mut handoff);
+
+    let selection = selected(&pool, &head);
+    let proposer_slashings = selection.proposer_slashings();
+    assert_eq!(proposer_slashings.len(), 2 * PROPOSER_SLASHING_PQ_SIZE);
+    let first_offender = |ssz: &[u8]| {
+        BeaconBlockHeaderView::proposer_index(ssz[..BEACON_BLOCK_HEADER_SIZE].try_into().unwrap())
+    };
+    assert_eq!(first_offender(proposer_slashings), 1, "the larger balance first");
+    assert_eq!(first_offender(&proposer_slashings[PROPOSER_SLASHING_PQ_SIZE..]), 0);
+    assert_eq!(selection.attester_slashing(), Some(&attester_slashing[..]), "2 is still slashable");
 }

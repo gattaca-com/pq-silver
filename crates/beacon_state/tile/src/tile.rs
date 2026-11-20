@@ -30,7 +30,8 @@ use crate::{
     fork_choice::{ExecutionStatus, FORK_CHOICE_NODES_HINT, ForkChoice},
     ssz_hash, stf,
     tile::{
-        attestation_pool::{AttestationPool, UnknownRootVotes},
+        aggregator_subnets::AggregatorSubnets,
+        attestation_pool::{AttestationPool, UnknownRootPqVotes, UnknownRootVotes},
         attestation_root_memo::AttestationRootMemo,
         bid_pool::BidPool,
         block_production::{BlockProduction, Proposal, Reveal, answer},
@@ -57,6 +58,7 @@ use crate::{
     weak_subjectivity::{weak_subjectivity_period_fulu, weak_subjectivity_period_gloas},
 };
 
+mod aggregator_subnets;
 mod attestation_pool;
 mod precomputed_epochs;
 // `pub` for the crate's `attestation_root_memo` criterion bench.
@@ -219,6 +221,7 @@ pub struct BeaconStateTile {
     seen_aggregates: SeenAggregates,
     attestation_pool: AttestationPool,
     unknown_root_votes: UnknownRootVotes,
+    unknown_root_pq_votes: UnknownRootPqVotes,
     attestation_root_memo: AttestationRootMemo,
     votes: Votes,
     seen_sync_msgs: [SeenValidators; silver_common::SYNC_COMMITTEE_SUBNETS],
@@ -276,6 +279,7 @@ pub struct BeaconStateTile {
     payload_execution_requests: PayloadExecutionRequests,
     payload_attestation_pool: PayloadAttestationPool,
     pq_aggregator: PqAggregator,
+    aggregator_subnets: AggregatorSubnets,
     leanvm_verifier: LeanVmVerifier,
     seen_proposer_preferences: SeenProposerPreferences,
     /// Resolved pending-buffer admission / eviction / fallback bounds.
@@ -341,6 +345,7 @@ impl BeaconStateTile {
             seen_aggregates: SeenAggregates::new(),
             attestation_pool: AttestationPool::new(),
             unknown_root_votes: UnknownRootVotes::new(),
+            unknown_root_pq_votes: UnknownRootPqVotes::new(),
             votes: Votes::new(),
             seen_sync_msgs: std::array::from_fn(|_| SeenValidators::new(val_cap)),
             sync_contribution_pool: SyncContributionPool::new(),
@@ -376,6 +381,7 @@ impl BeaconStateTile {
             payload_execution_requests: PayloadExecutionRequests::default(),
             payload_attestation_pool: PayloadAttestationPool::default(),
             pq_aggregator: PqAggregator::default(),
+            aggregator_subnets: AggregatorSubnets::default(),
             leanvm_verifier: LeanVmVerifier::default(),
             seen_proposer_preferences: SeenProposerPreferences::default(),
             pending_bounds: syncing.pending,
@@ -755,8 +761,16 @@ impl BeaconStateTile {
         beacon_block_root: B256,
         producers: &mut Producers,
     ) {
-        let contribution =
-            self.sync_contribution_pool.contribution(slot, subcommittee_index, beacon_block_root);
+        // PQ has no sync committee.
+        let contribution = (!self.spec.is_pq_at_slot(slot))
+            .then(|| {
+                self.sync_contribution_pool.contribution(
+                    slot,
+                    subcommittee_index,
+                    beacon_block_root,
+                )
+            })
+            .flatten();
         let ssz = contribution.and_then(|contribution| {
             let written =
                 self.events_producer.write_with(SYNC_COMMITTEE_CONTRIBUTION_SIZE, |buffer| {
@@ -791,6 +805,18 @@ impl BeaconStateTile {
         self.proposer_preparations.record(encoded, epoch);
         self.refresh_payload_preparation(producers);
         self.refresh_payload_attributes(producers);
+    }
+
+    fn record_committee_subscriptions(&mut self, subscriptions: TCacheRead) {
+        let acquired = self.reader.acquire(subscriptions);
+        let Ok((encoded, _)) = acquired.buffer() else {
+            silver_log::error!(
+                seq = acquired.seq(),
+                "committee subscriptions overwritten before read"
+            );
+            return;
+        };
+        self.aggregator_subnets.record(encoded);
     }
 
     fn post_shufflings(&mut self, emit: impl FnMut(BeaconStateEvent)) {
@@ -918,6 +944,8 @@ impl BeaconStateTile {
         // only as their committee's sum.
         self.attestation_pool.collapse_before(floor);
         self.unknown_root_votes.on_slot(slot);
+        self.unknown_root_pq_votes.on_slot(slot);
+        self.aggregator_subnets.prune_before(floor);
         self.sync_contribution_pool.prune_before(floor);
         self.payload_attestation_pool.prune_before(floor);
         self.seen_aggregates.prune_before(floor);
@@ -1079,6 +1107,9 @@ impl BeaconStateTile {
             ),
             BeaconApiRequest::ProposerPreparations { preparations } => {
                 self.record_proposer_preparations(preparations, producers)
+            }
+            BeaconApiRequest::BeaconCommitteeSubscriptions { subscriptions } => {
+                self.record_committee_subscriptions(subscriptions)
             }
             BeaconApiRequest::PayloadAttributesWanted(wanted) => {
                 self.set_payload_attributes_wanted(wanted, producers)

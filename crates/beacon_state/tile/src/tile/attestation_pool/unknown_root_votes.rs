@@ -9,7 +9,7 @@ use super::{
 };
 use crate::counters::BeaconStateCounters;
 
-const BUFFERED_SLOTS: usize = 3;
+pub(super) const BUFFERED_SLOTS: usize = 3;
 const MAX_BUFFERED_CANDIDATES: usize = BUFFERED_SLOTS * MAX_SLOT_CANDIDATES;
 /// Sixteen aggregators for each of a candidate's 64 committees, twice over.
 const MAX_BUFFERED_AGGREGATES: usize = 2 * 16 * MAX_COMMITTEES_PER_SLOT;

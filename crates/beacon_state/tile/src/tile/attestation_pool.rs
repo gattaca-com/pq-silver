@@ -16,6 +16,7 @@ mod committee_attestations;
 mod committee_bits;
 mod committee_store;
 mod selection;
+mod unknown_root_pq_votes;
 mod unknown_root_votes;
 mod vote_candidates;
 
@@ -23,6 +24,7 @@ pub(super) use committee_bits::Participants;
 use committee_bits::{CommitteeBits, MAX_COMMITTEE_MEMBERS};
 use committee_store::{CommitteeId, CommitteeStore};
 use selection::{CommitteeAttestation, Selection};
+pub(super) use unknown_root_pq_votes::UnknownRootPqVotes;
 pub(super) use unknown_root_votes::UnknownRootVotes;
 use vote_candidates::{MAX_CANDIDATES, RETAINED_SLOTS, VoteCandidate, VoteCandidates};
 

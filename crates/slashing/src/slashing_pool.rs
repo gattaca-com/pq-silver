@@ -7,8 +7,9 @@ use silver_beacon_state_data::{
 use silver_common::{BeaconStateEvent, PoolChange, TCacheProducer, TCacheRead, TProducer};
 use silver_log::warn;
 use silver_ssz::ssz_view::{
-    AttesterSlashingView, MAX_ATTESTER_SLASHINGS_ELECTRA, MAX_PROPOSER_SLASHINGS,
-    PROPOSER_SLASHING_SIZE, ProposerSlashingView,
+    AttesterSlashingPqView, AttesterSlashingView, BEACON_BLOCK_HEADER_SIZE, BeaconBlockHeaderView,
+    IndexedAttestationPqView, MAX_ATTESTER_SLASHINGS_ELECTRA, MAX_PROPOSER_SLASHINGS,
+    PROPOSER_SLASHING_PQ_SIZE, PROPOSER_SLASHING_SIZE,
 };
 
 const PROPOSER_SLASHINGS_CAPACITY: usize = 128;
@@ -20,6 +21,7 @@ const _: () =
 
 /// Accepts proofs already verified on `head`; does not verify signatures or
 /// slashing conditions. Ranks proofs by the effective balance they can slash.
+/// Holds BLS or PQ proofs, as the forks of the blocks it packs for carry.
 pub struct SlashingPool {
     proposer: Bounded<ProposerSlashing, PROPOSER_SLASHINGS_CAPACITY>,
     attester: Bounded<AttesterSlashing, ATTESTER_SLASHINGS_CAPACITY>,
@@ -79,14 +81,16 @@ impl SlashingPool {
         self.events = Some(events);
     }
 
-    /// `head` values the stored proofs when the pool is full; `handoff`
-    /// carries an admitted proof's bytes to the pool's mirrors.
+    /// `ssz` is a BLS or a PQ `ProposerSlashing`. `head` values the stored
+    /// proofs when the pool is full; `handoff` carries an admitted proof's
+    /// bytes to the pool's mirrors.
     pub fn insert_proposer_slashing(
         &mut self,
-        ssz: &[u8; PROPOSER_SLASHING_SIZE],
+        ssz: &[u8],
         head: &StateReadView,
         handoff: &mut TProducer,
     ) -> Admission {
+        debug_assert!(matches!(ssz.len(), PROPOSER_SLASHING_SIZE | PROPOSER_SLASHING_PQ_SIZE));
         let head = ForkFacts::of(head);
         let id = self.next_id;
         let (admission, evicted) =
@@ -111,11 +115,47 @@ impl SlashingPool {
         handoff: &mut TProducer,
     ) -> Admission {
         debug_assert!(AttesterSlashingView::check_size(ssz));
-        let finalized = head.validators.finalized().validator_count() as u64;
         let signers = [
             AttesterSlashingView::att1_attesting_indices(ssz),
             AttesterSlashingView::att2_attesting_indices(ssz),
         ];
+        let target_epochs = [
+            AttesterSlashingView::att1_target_epoch(ssz),
+            AttesterSlashingView::att2_target_epoch(ssz),
+        ];
+        self.insert_attester(ssz, offenders, signers, target_epochs, head, handoff)
+    }
+
+    /// [`Self::insert_attester_slashing`] for a PQ `AttesterSlashing`.
+    pub fn insert_attester_slashing_pq(
+        &mut self,
+        ssz: &[u8],
+        offenders: &[u32],
+        head: &StateReadView,
+        handoff: &mut TProducer,
+    ) -> Admission {
+        debug_assert!(AttesterSlashingPqView::check_size(ssz));
+        let attestations = [
+            AttesterSlashingPqView::attestation_1(ssz),
+            AttesterSlashingPqView::attestation_2(ssz),
+        ];
+        let signers = attestations.map(IndexedAttestationPqView::attesting_indices);
+        let target_epochs = attestations
+            .map(|attestation| IndexedAttestationPqView::data(attestation).target_epoch());
+        self.insert_attester(ssz, offenders, signers, target_epochs, head, handoff)
+    }
+
+    /// `signers` are each attestation's `attesting_indices` SSZ.
+    fn insert_attester(
+        &mut self,
+        ssz: &[u8],
+        offenders: &[u32],
+        signers: [&[u8]; 2],
+        target_epochs: [Epoch; 2],
+        head: &StateReadView,
+        handoff: &mut TProducer,
+    ) -> Admission {
+        let finalized = head.validators.finalized().validator_count() as u64;
         // Verified attestations have sorted indices. Finalized keys survive reorgs.
         if signers
             .iter()
@@ -126,9 +166,8 @@ impl SlashingPool {
         }
         let head = ForkFacts::of(head);
         let id = self.next_id;
-        let (admission, evicted) = self
-            .attester
-            .admit(AttesterSlashing::new(ssz, offenders, head, id), |a| a.value(head, &[]));
+        let incoming = AttesterSlashing::new(ssz, offenders, target_epochs, head, id);
+        let (admission, evicted) = self.attester.admit(incoming, |a| a.value(head, &[]));
         if let Some(evicted) = evicted {
             publish(&mut self.events, PoolChange::AttesterSlashingRemoved { id: evicted.id });
         }
@@ -238,24 +277,29 @@ fn publish(events: &mut Option<SpineProducer<BeaconStateEvent>>, change: PoolCha
 }
 
 struct ProposerSlashing {
-    ssz: [u8; PROPOSER_SLASHING_SIZE],
+    /// BLS and PQ proofs both open with the first header.
+    ssz: Box<[u8]>,
     signing_version: Version,
     id: u64,
 }
 
 impl ProposerSlashing {
-    fn new(ssz: &[u8; PROPOSER_SLASHING_SIZE], head: ForkFacts, id: u64) -> Self {
-        let mut slashing = Self { ssz: *ssz, signing_version: Version::default(), id };
+    fn new(ssz: &[u8], head: ForkFacts, id: u64) -> Self {
+        let mut slashing = Self { ssz: ssz.into(), signing_version: Version::default(), id };
         slashing.signing_version = head.signing_version(slashing.signing_epoch());
         slashing
     }
 
+    fn header(&self) -> &[u8; BEACON_BLOCK_HEADER_SIZE] {
+        self.ssz[..BEACON_BLOCK_HEADER_SIZE].try_into().expect("a proof holds a header")
+    }
+
     fn offender(&self) -> usize {
-        ProposerSlashingView::h1_proposer_index(&self.ssz) as usize
+        BeaconBlockHeaderView::proposer_index(self.header()) as usize
     }
 
     fn signing_epoch(&self) -> Epoch {
-        ProposerSlashingView::h1_slot(&self.ssz) / SLOTS_PER_EPOCH
+        BeaconBlockHeaderView::slot(self.header()) / SLOTS_PER_EPOCH
     }
 
     fn signatures_hold(&self, fork: ForkFacts) -> bool {
@@ -274,31 +318,30 @@ impl ProposerSlashing {
 struct AttesterSlashing {
     ssz: Vec<u8>,
     offenders: Vec<u32>,
+    signing_epochs: [Epoch; 2],
     signing_versions: [Version; 2],
     id: u64,
 }
 
 impl AttesterSlashing {
-    fn new(ssz: &[u8], offenders: &[u32], head: ForkFacts, id: u64) -> Self {
-        let mut slashing = Self {
+    fn new(
+        ssz: &[u8],
+        offenders: &[u32],
+        signing_epochs: [Epoch; 2],
+        head: ForkFacts,
+        id: u64,
+    ) -> Self {
+        Self {
             ssz: ssz.to_vec(),
             offenders: offenders.to_vec(),
-            signing_versions: Default::default(),
+            signing_epochs,
+            signing_versions: signing_epochs.map(|epoch| head.signing_version(epoch)),
             id,
-        };
-        slashing.signing_versions = slashing.signing_epochs().map(|e| head.signing_version(e));
-        slashing
-    }
-
-    fn signing_epochs(&self) -> [Epoch; 2] {
-        [
-            AttesterSlashingView::att1_target_epoch(&self.ssz),
-            AttesterSlashingView::att2_target_epoch(&self.ssz),
-        ]
+        }
     }
 
     fn signatures_hold(&self, fork: ForkFacts) -> bool {
-        self.signing_epochs().map(|e| fork.signing_version(e)) == self.signing_versions
+        self.signing_epochs.map(|epoch| fork.signing_version(epoch)) == self.signing_versions
     }
 
     fn value(&self, fork: ForkFacts, excluded: &[usize]) -> u64 {

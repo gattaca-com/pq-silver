@@ -168,24 +168,21 @@ impl<'a> AttestationRewards<'a> {
     }
 
     /// What including `attestation`, an `AttestationPq`, pays for the
-    /// attesters it credits.
-    pub(super) fn attestation_value(&self, attestation: &[u8]) -> u64 {
+    /// attesters it credits. `None` when the block may not include it.
+    pub(super) fn attestation_value(&self, attestation: &[u8]) -> Option<u64> {
         let data = AttestationPqView::data(attestation);
-        let Some(earned) = self.earned_flags(data) else {
-            return 0;
-        };
+        let earned = self.earned_flags(data)?;
         let is_current = data.target_epoch() == self.current_epoch;
         let shuffling = self.shuffling.for_target(is_current);
         if !shuffling.indices_in_range(self.pre_state.validators.count()) {
-            return 0;
+            return None;
         }
-        let Ok(committees) = AttestedCommittees::new(attestation, true, shuffling) else {
-            return 0;
-        };
-        committees
+        let committees = AttestedCommittees::new(attestation, true, shuffling).ok()?;
+        let value = committees
             .attesters()
             .map(|validator| self.unearned_weight(earned, is_current, validator as usize))
-            .sum()
+            .sum();
+        Some(value)
     }
 }
 
@@ -468,9 +465,10 @@ mod tests {
         };
 
         let [first, second] = increments(BLOCK_SLOT - 2);
-        assert_eq!(value(BLOCK_SLOT - 2, &[1]), second * SOURCE_TARGET_HEAD);
-        assert_eq!(value(BLOCK_SLOT - 2, &[0, 1]), (first + second) * SOURCE_TARGET_HEAD);
+        assert_eq!(value(BLOCK_SLOT - 2, &[1]), Some(second * SOURCE_TARGET_HEAD));
+        assert_eq!(value(BLOCK_SLOT - 2, &[0, 1]), Some((first + second) * SOURCE_TARGET_HEAD));
         let [first, second] = increments(BLOCK_SLOT - 3);
-        assert_eq!(value(BLOCK_SLOT - 3, &[0, 1]), (first + second) * (14 + 26));
+        assert_eq!(value(BLOCK_SLOT - 3, &[0, 1]), Some((first + second) * (14 + 26)));
+        assert_eq!(value(BLOCK_SLOT - 1, &[0, 1]), None, "inside the inclusion delay");
     }
 }

@@ -6,7 +6,8 @@ use silver_beacon_state_data::{
     },
 };
 use silver_common::{
-    ForkName, GossipDomain, compute_subnet_for_attestation,
+    ForkName, GossipDomain, LeanVmHealthEvent, LeanVmReq, SlotSubnets,
+    compute_subnet_for_attestation,
     ssz_hash::hash_attestation_data,
     ssz_view::{
         BEACON_BLOCK_HEADER_SIZE, EXECUTION_PAYLOAD_ENVELOPE_MIN, EXECUTION_PAYLOAD_FIXED_GLOAS,
@@ -16,6 +17,7 @@ use silver_common::{
     },
 };
 use silver_crypto_simd::xmss::SecretKey;
+use silver_slashing::Selection;
 
 use super::*;
 
@@ -126,6 +128,42 @@ fn preferences_are_accepted_only_at_their_own_leaf() {
     }
 }
 
+/// `validator`'s vote for `block_root`, with the anchor as its target, signed
+/// at the attestation leaf of `leaf_epoch`, and its subnet.
+fn signed_attestation(
+    tile: &BeaconStateTile,
+    key: &SecretKey,
+    validator: u32,
+    leaf_epoch: Epoch,
+    block_root: B256,
+) -> ([u8; SINGLE_ATT_PQ_SIZE], u64) {
+    let (att_slot, committee, _, _) = find_committee_for(tile, validator);
+    let mut buf = [0u8; SINGLE_ATT_PQ_SIZE];
+    buf[..8].copy_from_slice(&(committee as u64).to_le_bytes());
+    buf[8..16].copy_from_slice(&u64::from(validator).to_le_bytes());
+    buf[16..24].copy_from_slice(&att_slot.to_le_bytes());
+    buf[32..64].copy_from_slice(&block_root);
+    buf[112..144].copy_from_slice(&ANCHOR_ROOT);
+    let signing_root = bls::compute_signing_root(
+        &hash_attestation_data(&buf[16..144]),
+        &domain(bls::DOMAIN_BEACON_ATTESTER),
+    );
+    let leaf = compute_xmss_attestation_leaf_index(leaf_epoch);
+    let bottom = key.bottom_tree((leaf >> 16) as u32);
+    buf[144..].copy_from_slice(&key.sign(&bottom, &signing_root, leaf as u32));
+
+    let view = tile.state.read_view(tile.canonical_state_id());
+    let mut indices = Vec::new();
+    let shuffling = stf::EpochShuffling::from_state(&view, 0, &mut indices);
+    let subnet = compute_subnet_for_attestation(
+        ForkName::Pq,
+        shuffling.committees_per_slot as u64,
+        att_slot,
+        committee as u64,
+    );
+    (buf, subnet)
+}
+
 #[test]
 fn batched_votes_count_only_when_signed_at_their_leaf() {
     let key = SecretKey::new(&[7; 32]);
@@ -133,36 +171,11 @@ fn batched_votes_count_only_when_signed_at_their_leaf() {
     let (mut tile, mut gossip, _spine, mut adapter) = pq_tile(&pubkey, 0, 31);
     adapter.consume(|_: PeerEvent, _| {});
     let root = tile.head_block_root();
+    assert_eq!(root, ANCHOR_ROOT);
 
-    let attestation = |tile: &BeaconStateTile, validator: u32, leaf_epoch: Epoch| {
-        let (att_slot, committee, _, _) = find_committee_for(tile, validator);
-        let mut buf = [0u8; SINGLE_ATT_PQ_SIZE];
-        buf[..8].copy_from_slice(&(committee as u64).to_le_bytes());
-        buf[8..16].copy_from_slice(&u64::from(validator).to_le_bytes());
-        buf[16..24].copy_from_slice(&att_slot.to_le_bytes());
-        buf[32..64].copy_from_slice(&root);
-        buf[112..144].copy_from_slice(&root);
-        let signing_root = bls::compute_signing_root(
-            &hash_attestation_data(&buf[16..144]),
-            &domain(bls::DOMAIN_BEACON_ATTESTER),
-        );
-        let leaf = compute_xmss_attestation_leaf_index(leaf_epoch);
-        let bottom = key.bottom_tree((leaf >> 16) as u32);
-        buf[144..].copy_from_slice(&key.sign(&bottom, &signing_root, leaf as u32));
-
-        let view = tile.state.read_view(tile.canonical_state_id());
-        let mut indices = Vec::new();
-        let shuffling = stf::EpochShuffling::from_state(&view, 0, &mut indices);
-        let subnet = compute_subnet_for_attestation(
-            ForkName::Pq,
-            shuffling.committees_per_slot as u64,
-            att_slot,
-            committee as u64,
-        );
-        (buf, GossipTopic::BeaconAttestation(subnet))
-    };
     for (validator, leaf_epoch) in [(0, 0), (1, 1)] {
-        let (bytes, topic) = attestation(&tile, validator, leaf_epoch);
+        let (bytes, subnet) = signed_attestation(&tile, &key, validator, leaf_epoch, root);
+        let topic = GossipTopic::BeaconAttestation(subnet);
         let msg = pq_gossip_msg(&tile, &mut gossip, &bytes, topic);
         tile.on_gossip(msg, &mut adapter.producers);
     }
@@ -226,6 +239,62 @@ fn proposer_slashing_needs_both_signatures() {
         assert_eq!(gossip_verdicts(&mut adapter), if accepted { (1, 0) } else { (0, 1) });
         assert_eq!(tile.seen_proposer_slashings.contains(0), accepted);
     }
+
+    let mut selection = Selection::default();
+    tile.slashing_pool.select(&tile.state.read_view(tile.canonical_state_id()), &mut selection);
+    assert_eq!(selection.proposer_slashings(), slashing, "pooled for a block");
+}
+
+/// A vote for a block not yet seen waits for it unrelayed, then counts in
+/// fork choice and reaches the aggregator of its subnet.
+#[test]
+fn unknown_root_vote_counts_and_is_aggregated_once_its_block_imports() {
+    let key = SecretKey::new(&[7; 32]);
+    let pubkey = key.public_key();
+    let wall_slot = 31;
+    let (mut tile, mut gossip, _spine, mut adapter) = pq_tile(&pubkey, 0, wall_slot);
+    tile.unknown_root_pq_votes.on_slot(wall_slot);
+    adapter.consume(|_: PeerEvent, _| {});
+    adapter.consume(|_: SyncNeed, _| {});
+    adapter.consume(|_: LeanVmReq, _| {});
+    let validator = (0..VALIDATORS as u32)
+        .find(|&validator| find_committee_for(&tile, validator).0 == wall_slot)
+        .expect("a validator attests at the wall slot");
+    let late = [0x42; 32];
+    let (bytes, subnet) = signed_attestation(&tile, &key, validator, 0, late);
+    let mut subscription = [0; SlotSubnets::SIZE];
+    SlotSubnets { slot: wall_slot, attesting: 1 << subnet, aggregating: 1 << subnet }
+        .encode(&mut subscription);
+    tile.aggregator_subnets.record(&subscription);
+    tile.pq_aggregator.on_health(LeanVmHealthEvent { ready: true });
+
+    let msg = pq_gossip_msg(&tile, &mut gossip, &bytes, GossipTopic::BeaconAttestation(subnet));
+    tile.on_gossip(msg, &mut adapter.producers);
+    tile.flush_votes(&mut adapter.producers);
+    assert_eq!(gossip_verdicts(&mut adapter), (0, 0), "held, neither relayed nor rejected");
+    let buffered =
+        |tile: &BeaconStateTile| tile.unknown_root_pq_votes.next_with_known_block(0, |_| true);
+    assert!(buffered(&tile).is_some());
+    let mut needs = Vec::new();
+    adapter.consume(|need: SyncNeed, _| needs.push(need));
+    assert_eq!(needs, [SyncNeed::missing_block(late, wall_slot)]);
+    let mut requests = 0;
+    adapter.consume(|_: LeanVmReq, _| requests += 1);
+    assert_eq!(requests, 0);
+
+    // XMSS signing is slow; keep the clock before the aggregation deadline.
+    let before_deadline = tile.ticker.aggregate_due(wall_slot).as_millis_u64() - 1;
+    tile.ticker.set_since_genesis_ms(before_deadline);
+    tile.fork_choice
+        .on_block(BlockImport { slot: wall_slot, ..anchor_child(late, tile.last_applied) });
+    tile.promote_unknown_root_votes(&mut adapter.producers);
+    tile.pq_aggregator.send_next(&tile.ticker, &mut tile.events_producer, &mut adapter.producers);
+    let validator_count = tile.head_validator_count();
+    tile.fork_choice.drain_pending_votes(validator_count, wall_slot + 1);
+    assert_eq!(voted_weight(&mut tile, late), MAX_EFFECTIVE_BALANCE);
+    assert!(buffered(&tile).is_none(), "promoted once");
+    adapter.consume(|_: LeanVmReq, _| requests += 1);
+    assert_eq!(requests, 1, "the leaf goes to the leanVM sidecar");
 }
 
 /// A PQ envelope that arrives before its block parks only once its signer's

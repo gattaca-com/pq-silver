@@ -219,28 +219,21 @@ impl PackedOperations {
         self.proof.clear();
     }
 
-    /// The attestations and proof of the slot at a delay of two or more whose
-    /// merged proof pays most. Only a delay of exactly two earns the head
-    /// flag, and a tie goes to the newest slot.
-    fn pack_best_merge(
+    /// One proof covers the whole merge, so it is packed only if every
+    /// attestation in it is includable.
+    fn pack_merge(
         &mut self,
         aggregator: &PqAggregator,
         rewards: &AttestationRewards<'_>,
         block_slot: Slot,
     ) {
-        let Some(newest) = block_slot.checked_sub(2) else { return };
-        let oldest = (block_slot / SLOTS_PER_EPOCH).saturating_sub(1) * SLOTS_PER_EPOCH;
         // todo(CL-235): no gossip aggregate reaches a merge yet, so none has a proof.
-        let best = (oldest..=newest)
-            .filter_map(|slot| aggregator.block_proof(slot))
-            .map(|(attestations, proof)| {
-                let value: u64 =
-                    attestations.clone().map(|att| rewards.attestation_value(att)).sum();
-                (value, attestations, proof)
-            })
-            .filter(|&(value, ..)| value > 0)
-            .max_by_key(|&(value, ..)| value);
-        let Some((_, attestations, proof)) = best else { return };
+        let Some((attestations, proof)) = aggregator.block_proof(block_slot) else { return };
+        let value: Option<u64> =
+            attestations.clone().map(|attestation| rewards.attestation_value(attestation)).sum();
+        if value.is_none_or(|value| value == 0) {
+            return;
+        }
         let mut at = 4 * attestations.clone().count();
         for attestation in attestations.clone() {
             self.attestations.extend_from_slice(&(at as u32).to_le_bytes());
@@ -1024,10 +1017,10 @@ impl BeaconStateTile {
             );
         }
         if self.spec.is_pq_at_slot(proposal.slot) {
-            // todo(CL-241): PQ slashings are verified on gossip but not pooled.
             packed.clear();
+            self.slashing_pool.select(&pre_state, &mut packed.slashings);
             if let Some(rewards) = &rewards {
-                packed.pack_best_merge(&self.pq_aggregator, rewards, proposal.slot);
+                packed.pack_merge(&self.pq_aggregator, rewards, proposal.slot);
             }
             return;
         }

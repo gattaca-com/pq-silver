@@ -181,8 +181,8 @@ impl EngineApi {
                 ReqKind::Fcu(block_root) => out.fcu(block_root, response),
                 ReqKind::PreparePayload(spine_id) => out.prepare_payload(spine_id, response),
                 ReqKind::NewPayload(block_root) => out.new_payload(block_root, response),
-                ReqKind::GetPayloadFetch { spine_id, is_gloas } => {
-                    out.get_payload(spine_id, is_gloas, response)
+                ReqKind::GetPayloadFetch { spine_id, fork } => {
+                    out.get_payload(spine_id, fork, response)
                 }
                 ReqKind::GetBlobs { block_root, slot } => out.get_blobs(block_root, slot, response),
             });

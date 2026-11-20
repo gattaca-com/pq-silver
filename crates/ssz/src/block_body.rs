@@ -1,6 +1,9 @@
 use crate::{
     body_offsets::{BlockBodyError, BodyFork, BodyOffsets},
-    ssz_view::{BEACON_BLOCK_BODY_FIXED, BLOCK_SYNC_AGGREGATE_SIZE},
+    ssz_view::{
+        BEACON_BLOCK_BODY_FIXED, BEACON_BLOCK_BODY_PQ_FIXED, BLOCK_SYNC_AGGREGATE_SIZE,
+        ETH1_DATA_SIZE, VRFProof,
+    },
 };
 
 /// Zero participation bits and the G2 point at infinity.
@@ -141,6 +144,59 @@ impl<'a> BeaconBlockBodyGloas<'a> {
             let (at, tail) = rest.split_at_mut(field.len());
             at.copy_from_slice(field);
             rest = tail;
+        }
+    }
+}
+
+/// [Modified in PQ] A progressive container without exits, the sync
+/// aggregate, BLS changes or payload attestations; `proof` proves the
+/// attestations' signatures.
+pub struct BeaconBlockBodyPq<'a> {
+    pub randao_reveal: &'a VRFProof,
+    pub eth1_data: &'a [u8; ETH1_DATA_SIZE],
+    pub graffiti: &'a [u8; 32],
+    pub proposer_slashings: &'a [u8],
+    pub attester_slashings: &'a [u8],
+    pub attestations: &'a [u8],
+    pub deposits: &'a [u8],
+    pub signed_execution_payload_bid: &'a [u8],
+    pub parent_execution_requests: &'a [u8],
+    pub proof: &'a [u8],
+}
+
+impl BeaconBlockBodyPq<'_> {
+    fn variable_fields(&self) -> [&[u8]; 7] {
+        [
+            self.proposer_slashings,
+            self.attester_slashings,
+            self.attestations,
+            self.deposits,
+            self.signed_execution_payload_bid,
+            self.parent_execution_requests,
+            self.proof,
+        ]
+    }
+
+    pub fn ssz_len(&self) -> usize {
+        BEACON_BLOCK_BODY_PQ_FIXED +
+            self.variable_fields().iter().map(|field| field.len()).sum::<usize>()
+    }
+
+    /// `out` is exactly [`Self::ssz_len`] bytes.
+    pub fn encode(&self, mut out: &mut [u8]) {
+        debug_assert_eq!(out.len(), self.ssz_len());
+        let fields = self.variable_fields();
+        let mut at = BEACON_BLOCK_BODY_PQ_FIXED;
+        let offsets = fields.map(|field| {
+            let offset = (at as u32).to_le_bytes();
+            at += field.len();
+            offset
+        });
+        let fixed: [&[u8]; 3] = [self.randao_reveal, self.eth1_data, self.graffiti];
+        for part in fixed.into_iter().chain(offsets.iter().map(|o| &o[..])).chain(fields) {
+            let (head, tail) = out.split_at_mut(part.len());
+            head.copy_from_slice(part);
+            out = tail;
         }
     }
 }

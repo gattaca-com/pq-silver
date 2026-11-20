@@ -8,9 +8,12 @@ use silver_common::{
     ssz_hash_gloas::{
         EMPTY_EXECUTION_REQUESTS, EMPTY_EXECUTION_REQUESTS_ROOT, ExecutionRequestsView,
     },
+    ssz_hash_pq::{EMPTY_EXECUTION_REQUESTS_PQ, EMPTY_EXECUTION_REQUESTS_PQ_ROOT},
     ssz_view::{
-        BYTES_PER_BLOB, BeaconBlockBodyGloasView, EXECUTION_PAYLOAD_FIXED_GLOAS,
-        ExecutionPayloadEnvelopeView, SignedExecutionPayloadBidView,
+        BYTES_PER_BLOB, BeaconBlockBodyGloasView, BeaconBlockBodyPqView,
+        EXECUTION_PAYLOAD_FIXED_GLOAS, ExecutionPayloadEnvelopeView,
+        SignedExecutionPayloadBidPqView, SignedExecutionPayloadBidView, VRF_PROOF_SIZE,
+        XMSS_SIGNATURE_SIZE,
     },
 };
 
@@ -62,15 +65,30 @@ impl ProductionRig {
     }
 
     fn new(fixture: &str) -> Self {
-        let (pre, block, _) = sanity_fixture_of("gloas", fixture);
-        let spec = SpecConfig { fulu_fork_epoch: 0, gloas_fork_epoch: 0, ..SpecConfig::mainnet() };
+        Self::on(SignedBlockLayout::Gloas, fixture)
+    }
+
+    fn on(layout: SignedBlockLayout, fixture: &str) -> Self {
+        let pq = layout == SignedBlockLayout::Pq;
+        let (pre, block, _) = sanity_fixture_of(if pq { "pq" } else { "gloas" }, fixture);
+        let mut spec =
+            SpecConfig { fulu_fork_epoch: 0, gloas_fork_epoch: 0, ..SpecConfig::mainnet() };
+        if pq {
+            (spec.eip8483_fork_epoch, spec.pq_fork_epoch) = (0, 0);
+        }
         let state = BeaconState::from_checkpoint(&pre, &spec, &[]).unwrap();
-        let slot = SignedBeaconBlockView::slot(&block);
-        let body = SignedBeaconBlockView::body(&block);
-        let offsets = BodyOffsets::new(body, BodyFork::Gloas).unwrap();
+        let slot = layout.slot(&block);
+        let body = layout.body(&block);
+        let offsets = BodyOffsets::new(body, layout.body_fork()).unwrap();
         let signed = offsets.signed_bid().unwrap();
-        let bid = stf::decode_bid(signed).unwrap();
-        let signature = *SignedExecutionPayloadBidView::signature(signed);
+        let bid = signed_bid_message(signed);
+        let signature =
+            if pq { [0; 96] } else { *SignedExecutionPayloadBidView::signature(signed) };
+        let randao_reveal = if pq {
+            Reveal::Vrf(*BeaconBlockBodyPqView::randao_reveal(body))
+        } else {
+            Reveal::Bls(*BeaconBlockBodyGloasView::randao_reveal(body))
+        };
         let (mut tile, gossip, rpc, mut spine, adapter) = tile_with_producers_on(slot, state, spec);
         let mut sink = SpineAdapter::connect_tile(&Sink, &mut spine.spine);
         engine_requests(&mut sink);
@@ -80,7 +98,7 @@ impl ProductionRig {
         let proposal = Proposal {
             slot,
             parent_root: tile.head_block_root(),
-            randao_reveal: *BeaconBlockBodyGloasView::randao_reveal(body),
+            randao_reveal,
             graffiti: [0; 32],
             bid_policy: BidPolicy::default(),
             builder_config_hash: None,
@@ -105,7 +123,7 @@ impl ProductionRig {
         let [EngineReq::GetPayload(fetch)] = engine_requests(&mut self.sink)[..] else {
             panic!("one payload fetch");
         };
-        assert!(fetch.is_gloas);
+        assert_eq!(fetch.fork, self.tile.spec.fork_at_slot(self.proposal.slot));
         request
     }
 
@@ -136,18 +154,23 @@ impl ProductionRig {
         }
         let end = payload.len() as u32;
         payload[528..532].copy_from_slice(&end.to_le_bytes());
+        let requests: &[u8] = if self.tile.spec.is_pq_at_slot(self.proposal.slot) {
+            &EMPTY_EXECUTION_REQUESTS_PQ
+        } else {
+            &EMPTY_EXECUTION_REQUESTS
+        };
         let mut frame = vec![0; PayloadFrame::HEADER_LEN];
         PayloadFrame::write_header(
             &mut frame,
             payload.len(),
-            EMPTY_EXECUTION_REQUESTS.len(),
+            requests.len(),
             blobs,
             override_builder,
             &wei_le(value),
         );
         frame.extend_from_slice(&payload);
         frame.extend(vec![0x33; usize::from(blobs) * 48]);
-        frame.extend_from_slice(&EMPTY_EXECUTION_REQUESTS);
+        frame.extend_from_slice(requests);
         frame.extend(vec![0x44; usize::from(blobs) * PayloadFrame::CELL_PROOFS_PER_BLOB_LEN]);
         frame.extend(vec![0x55; usize::from(blobs) * BYTES_PER_BLOB]);
         frame
@@ -179,9 +202,43 @@ impl ProductionRig {
 
     fn bid_of(&self, block: ProducedBlock) -> ExecutionPayloadBid {
         let bytes = self.tile.events_producer.read_buffer(block.header).unwrap();
-        let body = BodyOffsets::validated(&bytes[84..], BodyFork::Gloas).unwrap();
-        stf::decode_bid(body.signed_bid().unwrap()).unwrap()
+        let fork = SignedBlockLayout::at_slot(&self.tile.spec, self.proposal.slot).body_fork();
+        let body = BodyOffsets::validated(&bytes[84..], fork).unwrap();
+        signed_bid_message(body.signed_bid().unwrap())
     }
+}
+
+fn signed_bid_message(signed: &[u8]) -> ExecutionPayloadBid {
+    let message_at = u32::from_le_bytes(signed[..4].try_into().unwrap()) as usize;
+    ExecutionPayloadBid::from_ssz(&signed[message_at..]).unwrap()
+}
+
+/// Under PQ the reveal is the proposer's VRF proof, and a self-built bid
+/// carries the empty XMSS signature over PQ execution requests.
+#[test]
+fn pq_self_build_reveals_its_vrf_proof_under_an_empty_xmss_signature() {
+    let mut rig = ProductionRig::on(SignedBlockLayout::Pq, "empty_block_transition");
+    let attrs = rig.start(1);
+    rig.respond(attrs.id, &rig.payload(attrs, 7, false, 0));
+    let block = rig.one_block(1);
+
+    let bid = rig.bid_of(block);
+    assert_eq!((bid.builder_index, bid.value), (BUILDER_INDEX_SELF_BUILD, 0));
+    assert_eq!(bid.execution_requests_root, *EMPTY_EXECUTION_REQUESTS_PQ_ROOT);
+    let bytes = rig.tile.events_producer.read_buffer(block.header).unwrap().to_vec();
+    let body = &bytes[84..];
+    let Reveal::Vrf(reveal) = rig.proposal.randao_reveal else { unreachable!() };
+    assert_eq!(*BeaconBlockBodyPqView::randao_reveal(body), reveal);
+    let signed_bid = BeaconBlockBodyPqView::signed_execution_payload_bid(body);
+    assert_eq!(*SignedExecutionPayloadBidPqView::signature(signed_bid), [0; XMSS_SIGNATURE_SIZE]);
+    assert_eq!(BeaconBlockBodyPqView::parent_execution_requests(body), EMPTY_EXECUTION_REQUESTS_PQ);
+    assert!(BeaconBlockBodyPqView::attestations(body).is_empty(), "no merged proof yet");
+    assert!(BeaconBlockBodyPqView::proof(body).is_empty());
+
+    let foreign = Proposal { randao_reveal: Reveal::Vrf([0; VRF_PROOF_SIZE]), ..rig.proposal };
+    rig.tile.produce_block(2, foreign, &mut rig.adapter.producers);
+    let answers = rig.answers();
+    assert!(matches!(answers[..], [(2, Err(ProduceBlockFailure::InvalidRandaoReveal))]));
 }
 
 #[test]

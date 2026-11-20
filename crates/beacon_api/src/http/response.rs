@@ -178,10 +178,18 @@ impl<'a> Response<'a> {
         }
     }
 
+    /// `bytes`, held for the tile a deferred request names them to.
+    pub(crate) fn hold(&mut self, bytes: &[u8]) -> Option<TCacheRead> {
+        let held = self.submissions.write_with(bytes.len(), |out| out.copy_from_slice(bytes));
+        if held.is_none() {
+            self.error(500, "api submissions cache full");
+        }
+        held
+    }
+
     pub(crate) fn await_blinded_block_lock(&mut self, block: &[u8]) {
-        match self.submissions.write_with(block.len(), |out| out.copy_from_slice(block)) {
-            Some(ssz) => self.outcome = Outcome::AwaitingBlindedBlockLock { ssz },
-            None => self.error(500, "api submissions cache full"),
+        if let Some(ssz) = self.hold(block) {
+            self.outcome = Outcome::AwaitingBlindedBlockLock { ssz };
         }
     }
 

@@ -3,7 +3,7 @@ use silver_beacon_state_data::{
     Withdrawal, bls,
 };
 use silver_common::{
-    EnginePreparePayloadReq, PreparedPayloadAttributes,
+    EnginePreparePayloadReq, ForkName, PreparedPayloadAttributes,
     ssz_hash_gloas::{EMPTY_EXECUTION_REQUESTS_ROOT, ExecutionRequestsView},
     ssz_view::{
         CONSOLIDATION_REQUEST_SIZE, ProposerPreferencesView, SIGNED_PROPOSER_PREFERENCES_SIZE,
@@ -135,7 +135,7 @@ fn empty_parent_reuses_withdrawals_and_fetches_v6() {
     let [EngineReq::GetPayload(fetch)] = engine_requests(&mut rig.sink)[..] else {
         panic!("expected one fetch");
     };
-    assert!(fetch.is_gloas);
+    assert_eq!(fetch.fork, ForkName::Gloas);
     assert_eq!(fetch.payload_id, [3; 8]);
 }
 

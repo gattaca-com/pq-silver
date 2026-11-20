@@ -15,10 +15,11 @@ use silver_beacon_state_data::{
 use silver_common::{
     BeaconApiRequest, BeaconApiResponse, BeaconStateEvent, BlockSource, BuilderBidsResponse,
     DataColumnsEvent, DataKind, EngineResp, GossipTopic, HeadChange, HeadRoots, LeanVmHealthEvent,
-    LeanVmResp, NewGossipMsg, Origin, PayloadResolution, PayloadValidationStatus, PtcObservation,
-    ReplayBlock, RequestId, RpcInbound, RpcResponse, RpcResponseInbound, SidecarBidResponse,
-    SilverSpine, SyncNeed, SyncUpdate, TCacheError, TCacheId, TCacheProducer, TCacheRead,
-    TCacheReader, TCacheTable, TProducer, TReadMode, TileId, hex32,
+    LeanVmResp, NewGossipMsg, Origin, PayloadResolution, PayloadValidationStatus,
+    ProduceBlockFailure, PtcObservation, ReplayBlock, RequestId, RpcInbound, RpcResponse,
+    RpcResponseInbound, SidecarBidResponse, SilverSpine, SyncNeed, SyncUpdate, TCacheError,
+    TCacheId, TCacheProducer, TCacheRead, TCacheReader, TCacheTable, TProducer, TReadMode, TileId,
+    hex32,
     ssz_view::{STATUS_V2_SIZE, SYNC_COMMITTEE_CONTRIBUTION_SIZE},
     ticker::{MAXIMUM_GOSSIP_CLOCK_DISPARITY, SlotTicker, TickEvent},
 };
@@ -32,7 +33,7 @@ use crate::{
         attestation_pool::{AttestationPool, UnknownRootVotes},
         attestation_root_memo::AttestationRootMemo,
         bid_pool::BidPool,
-        block_production::{BlockProduction, Proposal},
+        block_production::{BlockProduction, Proposal, Reveal, answer},
         bls_change_pool::BlsChangePool,
         envelope_arrivals::EnvelopeArrivals,
         exit_pool::ExitPool,
@@ -1095,6 +1096,9 @@ impl BeaconStateTile {
                 bid_policy,
                 builder_config_hash,
             } => {
+                let Some(randao_reveal) = Reveal::read(randao_reveal, &mut self.reader) else {
+                    return answer(producers, request_id, Err(ProduceBlockFailure::Internal));
+                };
                 let parent_root = self.head_block_root();
                 let proposal = Proposal {
                     slot,

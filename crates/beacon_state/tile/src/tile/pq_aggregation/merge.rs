@@ -60,10 +60,10 @@ impl MergeAggregation {
 
     /// The `AttestationPq` SSZ of each aggregate the best proof covers, and
     /// the proof, for a block body. `None` without a best proof.
-    pub(super) fn block_proof(&self) -> Option<(Vec<&[u8]>, &[u8])> {
+    pub(super) fn block_proof(&self) -> Option<(impl Iterator<Item = &[u8]> + Clone, &[u8])> {
         let (_, proof) = self.core.best_proof()?;
         let attestations =
-            self.core.covered_indices().iter().map(|&index| &self.attestations[index][..]);
-        Some((attestations.collect(), proof))
+            self.core.covered_indices().iter().map(|&index| self.attestations[index].as_slice());
+        Some((attestations, proof))
     }
 }

@@ -15,10 +15,11 @@ use silver_beacon_state_data::{BeaconStateOwner, SLOTS_PER_EPOCH, SpecConfig};
 use silver_common::{
     BeaconApiRequest, BeaconApiResponse, BeaconStateEvent, BlockLookup, BlockSource, BlockStage,
     ColumnOrigin, DataColumnsEvent, ELSyncStatus, EngineFcuReq, EngineGetPayloadReq,
-    EnginePreparePayloadReq, EngineReq, EngineResp, Enr, GossipTopic, HeadChange, HeadRoots,
-    Identify, IpBytes, Keypair, MessageId, P2pStreamId, PayloadResolution, PayloadValidationStatus,
-    PeerEvent, ServedBlock, SilverSpine, SszCache, StreamProtocol, SyncUpdate, TCache, TCacheId,
-    TCacheProducer, TCacheRead, TCacheTable, TProducer, block_root_fulu,
+    EnginePreparePayloadReq, EngineReq, EngineResp, Enr, ForkName, GossipTopic, HeadChange,
+    HeadRoots, Identify, IpBytes, Keypair, MessageId, P2pStreamId, PayloadResolution,
+    PayloadValidationStatus, PeerEvent, ServedBlock, SilverSpine, SszCache, StreamProtocol,
+    SyncUpdate, TCache, TCacheId, TCacheProducer, TCacheRead, TCacheTable, TProducer,
+    block_root_fulu,
     column_util::block_root_from_sidecar,
     ssz_view::{
         BEACON_BLOCK_BODY_FIXED, BYTES_PER_KZG_COMMITMENT, DATA_COLUMN_SIDECAR_GLOAS_MIN,
@@ -758,7 +759,7 @@ fn gloas_engine_requests_use_v4_and_v6_through_the_spine() {
     inj.produce(EngineReq::GetPayload(EngineGetPayloadReq {
         id: 8,
         payload_id: payload_id.unwrap(),
-        is_gloas: true,
+        fork: ForkName::Gloas,
     }));
     while el.requests.len() < 6 {
         crank(&mut tile, &mut el);

@@ -3,7 +3,7 @@ use flux_profiler::timed;
 use serde::Deserialize;
 use silver_common::{
     ELSyncStatus, EngineFcuResp, EngineGetBlobsResp, EngineGetPayloadResp, EngineHealthEvent,
-    EngineNewPayloadResp, EnginePreparePayloadResp, EngineResp, PayloadValidationStatus,
+    EngineNewPayloadResp, EnginePreparePayloadResp, EngineResp, ForkName, PayloadValidationStatus,
     SilverSpine, TCacheProducer, TCacheRead, TProducer, TapeScratch, merkle::B256,
 };
 use simd_json::prelude::{ValueAsArray, ValueAsScalar, ValueObjectAccess};
@@ -286,13 +286,14 @@ impl<'a> Responses<'a> {
     pub(crate) fn get_payload(
         &mut self,
         spine_id: u64,
-        is_gloas: bool,
+        fork: ForkName,
         response: Result<&mut [u8], EngineError>,
     ) {
         let resp = match response {
-            Ok(raw) => match self.scratch.encode(raw, self.producer, |root, out| {
-                json_get_payload_to_tcache(root, out, is_gloas)
-            }) {
+            Ok(raw) => match self
+                .scratch
+                .encode(raw, self.producer, |root, out| json_get_payload_to_tcache(root, out, fork))
+            {
                 Ok(Some(((), data))) => {
                     silver_log::info!(id = spine_id, "getPayload ok");
                     EngineGetPayloadResp { id: spine_id, data: Some(data) }

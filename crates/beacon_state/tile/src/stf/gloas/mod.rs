@@ -23,8 +23,8 @@ pub use envelope::{
     envelope_execution_requests, envelope_layout, envelope_withdrawals_match_expected,
     verify_envelope_signature, verify_execution_payload_envelope,
 };
-pub(crate) use parent_payload::apply_parent_execution_payload;
 pub use parent_payload::process_parent_execution_payload;
+pub(crate) use parent_payload::{RequestsLayout, apply_parent_execution_payload};
 pub(crate) use payload_attestation::hash_payload_attestation_data;
 pub use payload_attestation::{collect_sigs_payload_attestations, process_payload_attestations};
 pub(crate) use withdrawals::get_expected_withdrawals as get_expected_withdrawals_gloas;

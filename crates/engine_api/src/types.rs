@@ -1,7 +1,7 @@
 use flux_profiler::timed;
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use silver_common::{
-    FrameOut, PayloadFrame,
+    ForkName, FrameOut, PayloadFrame,
     ssz_view::{
         BEACON_BLOCK_BODY_FIXED, BYTES_PER_BLOB, BeaconBlockBodyFuluView,
         ExecutionPayloadEnvelopeView, ExecutionPayloadView, NUMBER_OF_COLUMNS,
@@ -500,6 +500,14 @@ const GLOAS_REQUEST_TYPES: [u8; 5] = [0, 1, 2, 3, 4];
 /// PQ removed the 0x05 and 0x06 registrations.
 const PQ_REQUEST_TYPES: [u8; 8] = [0, 1, 2, 3, 4, 7, 8, 9];
 
+fn request_types(fork: ForkName) -> &'static [u8] {
+    match fork {
+        ForkName::Pq => &PQ_REQUEST_TYPES,
+        fork if fork >= ForkName::Gloas => &GLOAS_REQUEST_TYPES,
+        _ => &FULU_REQUEST_TYPES,
+    }
+}
+
 fn write_execution_requests_json(
     er: &[u8],
     request_types: &[u8],
@@ -655,9 +663,10 @@ fn encode_withdrawals_json(
 pub(crate) fn json_get_payload_to_tcache(
     root: TapeValue<'_, '_>,
     out: &mut FrameOut<'_>,
-    is_gloas: bool,
+    fork: ForkName,
 ) -> Result<(), crate::EngineError> {
     debug_assert!(out.is_empty());
+    let is_gloas = fork >= ForkName::Gloas;
 
     if root.get("error").is_some() {
         return Err(crate::EngineError::Ssz("rpc error in getPayload response".into()));
@@ -761,11 +770,7 @@ pub(crate) fn json_get_payload_to_tcache(
     }
 
     let requests_at = out.len();
-    if is_gloas {
-        encode_execution_requests::<5>(exec_requests, out)?;
-    } else {
-        encode_execution_requests::<3>(exec_requests, out)?;
-    }
+    encode_execution_requests(exec_requests, request_types(fork), out)?;
     let requests_len = out.len() - requests_at;
 
     for proof in array_items(proofs) {
@@ -790,13 +795,17 @@ pub(crate) fn json_get_payload_to_tcache(
     Ok(())
 }
 
-fn encode_execution_requests<const N: usize>(
+/// Spec `get_execution_requests`, into `ExecutionRequests` SSZ with a list
+/// per type in `request_types`.
+fn encode_execution_requests(
     requests: Option<TapeArray<'_, '_>>,
+    request_types: &[u8],
     out: &mut FrameOut<'_>,
 ) -> Result<(), crate::EngineError> {
     let invalid = |why: &str| crate::EngineError::Ssz(format!("executionRequests: {why}"));
 
-    let mut data = [""; N];
+    let mut data = [""; PQ_REQUEST_TYPES.len()];
+    let data = &mut data[..request_types.len()];
     let mut previous_type = None;
     for request in array_items(requests) {
         let hex = request
@@ -808,18 +817,18 @@ fn encode_execution_requests<const N: usize>(
         }
         let request_type =
             u8::from_str_radix(&hex[..2], 16).map_err(|_| invalid("bad request type"))?;
-        if request_type as usize >= N {
+        let Some(list) = request_types.iter().position(|&known| known == request_type) else {
             return Err(invalid("unknown request type"));
-        }
+        };
         if previous_type.is_some_and(|previous| request_type <= previous) {
             return Err(invalid("request types out of order"));
         }
         previous_type = Some(request_type);
-        data[request_type as usize] = &hex[2..];
+        data[list] = &hex[2..];
     }
 
     let container = out.len();
-    out.zeroed(4 * N);
+    out.zeroed(4 * data.len());
     for (i, hex) in data.iter().enumerate() {
         let offset = (out.len() - container) as u32;
         out[container + 4 * i..container + 4 * i + 4].copy_from_slice(&offset.to_le_bytes());
@@ -1583,16 +1592,16 @@ mod tests {
     }
 
     fn payload_frame(json: &mut [u8]) -> Result<Vec<u8>, crate::EngineError> {
-        payload_frame_for_fork(json, false)
+        payload_frame_for_fork(json, ForkName::Fulu)
     }
 
     fn payload_frame_for_fork(
         json: &mut [u8],
-        is_gloas: bool,
+        fork: ForkName,
     ) -> Result<Vec<u8>, crate::EngineError> {
         let (mut scratch, mut producer) = (TapeScratch::new(FRAME_SLACK), frames());
         encode(&mut scratch, &mut producer, json, |root, out| {
-            json_get_payload_to_tcache(root, out, is_gloas)
+            json_get_payload_to_tcache(root, out, fork)
         })
         .map(|((), f)| f)
     }
@@ -1671,7 +1680,7 @@ mod tests {
 
     #[test]
     fn get_payload_v6_preserves_gloas_fields_and_builder_requests() {
-        let bytes = payload_frame_for_fork(&mut gloas_payload_json(), true).unwrap();
+        let bytes = payload_frame_for_fork(&mut gloas_payload_json(), ForkName::Gloas).unwrap();
         let frame = PayloadFrame::parse(&bytes).unwrap();
 
         // Shift the independent Fulu fixture's variable section by the new fields'
@@ -1708,10 +1717,11 @@ mod tests {
             let mut json = gloas_payload_json();
             let mut root = simd_json::to_owned_value(&mut json).unwrap();
             root["result"]["executionPayload"][field] = simd_json::OwnedValue::from(());
-            let result = payload_frame_for_fork(&mut simd_json::to_vec(&root).unwrap(), true);
+            let result =
+                payload_frame_for_fork(&mut simd_json::to_vec(&root).unwrap(), ForkName::Gloas);
             assert!(result.is_err(), "{field} cannot be null");
         }
-        assert!(payload_frame_for_fork(&mut get_payload_json(), true).is_err());
+        assert!(payload_frame_for_fork(&mut get_payload_json(), ForkName::Gloas).is_err());
     }
 
     #[test]
@@ -1719,9 +1729,29 @@ mod tests {
         let mut json = gloas_payload_json();
         let mut root = simd_json::to_owned_value(&mut json).unwrap();
         root["result"]["executionRequests"] = simd_json::json!([]);
-        let bytes = payload_frame_for_fork(&mut simd_json::to_vec(&root).unwrap(), true).unwrap();
+        let bytes = payload_frame_for_fork(&mut simd_json::to_vec(&root).unwrap(), ForkName::Gloas)
+            .unwrap();
         let frame = PayloadFrame::parse(&bytes).unwrap();
         assert_eq!(frame.execution_requests, [20u32.to_le_bytes(); 5].as_flattened());
+    }
+
+    /// PQ's eight lists skip the removed 0x05 and 0x06 registrations.
+    #[test]
+    fn get_payload_pq_places_each_request_type_in_its_list() {
+        let pq_requests = |requests| {
+            let mut json = gloas_payload_json();
+            let mut root = simd_json::to_owned_value(&mut json).unwrap();
+            root["result"]["executionRequests"] = requests;
+            payload_frame_for_fork(&mut simd_json::to_vec(&root).unwrap(), ForkName::Pq)
+        };
+
+        let bytes = pq_requests(simd_json::json!(["0x0011", "0x0722", "0x0933"])).unwrap();
+        let frame = PayloadFrame::parse(&bytes).unwrap();
+        let offsets = [32u32, 33, 33, 33, 33, 33, 34, 34];
+        let mut expected: Vec<u8> = offsets.into_iter().flat_map(u32::to_le_bytes).collect();
+        expected.extend([0x11, 0x22, 0x33]);
+        assert_eq!(frame.execution_requests, expected);
+        assert!(pq_requests(simd_json::json!(["0x0500"])).is_err(), "removed in PQ");
     }
 
     #[test]
@@ -1736,7 +1766,10 @@ mod tests {
             let mut json = gloas_payload_json();
             let mut root = simd_json::to_owned_value(&mut json).unwrap();
             root["result"]["executionRequests"] = requests;
-            assert!(payload_frame_for_fork(&mut simd_json::to_vec(&root).unwrap(), true).is_err());
+            assert!(
+                payload_frame_for_fork(&mut simd_json::to_vec(&root).unwrap(), ForkName::Gloas)
+                    .is_err()
+            );
         }
     }
 
@@ -1747,12 +1780,12 @@ mod tests {
         for _ in 0..2 {
             let mut missing_result = br#"{"jsonrpc":"2.0","id":1}"#.to_vec();
             let failed = encode(&mut scratch, &mut producer, &mut missing_result, |root, out| {
-                json_get_payload_to_tcache(root, out, false)
+                json_get_payload_to_tcache(root, out, ForkName::Fulu)
             });
             assert!(failed.is_err());
             let mut json = get_payload_json();
             let encoded = encode(&mut scratch, &mut producer, &mut json, |root, out| {
-                json_get_payload_to_tcache(root, out, false)
+                json_get_payload_to_tcache(root, out, ForkName::Fulu)
             });
             assert_eq!(encoded.unwrap().1, expected);
         }

@@ -1,9 +1,11 @@
 use flux_profiler::timed;
 use silver_beacon_state_data::{Slot, SpecConfig};
 use silver_common::{
-    BeaconApiRequest, BidPolicy, PayloadFrame, ProduceBlockFailure, ProducedBlock, TCacheReader,
+    BeaconApiRequest, BidPolicy, PayloadFrame, ProduceBlockFailure, ProducedBlock, RandaoReveal,
+    TCacheReader,
     json_fields::{parse_hex, parse_uint64},
     merkle::sha256,
+    ssz_view::VRF_PROOF_SIZE,
 };
 use silver_pbs::BuilderConfig;
 
@@ -22,7 +24,7 @@ pub(crate) fn produce_block_v3(req: &Request<'_>, ctx: &ApiCtx, resp: &mut Respo
     if ctx.spec.is_gloas_at_slot(slot) {
         return resp.error(400, "produceBlockV3 serves forks through Fulu; use produceBlockV4");
     }
-    let Some((randao_reveal, graffiti)) = proposal_query(req, resp) else {
+    let Some((randao_reveal, graffiti)) = proposal_query(req, resp, false) else {
         return;
     };
     let builder_boost_factor = match req.query_value("builder_boost_factor") {
@@ -58,7 +60,8 @@ pub(crate) fn produce_block_v4(req: &Request<'_>, ctx: &ApiCtx, resp: &mut Respo
         Some("false") => false,
         _ => return resp.error(400, "include_payload is a required boolean query parameter"),
     };
-    let Some((randao_reveal, graffiti)) = proposal_query(req, resp) else {
+    let is_pq = ctx.spec.is_pq_at_slot(slot);
+    let Some((randao_reveal, graffiti)) = proposal_query(req, resp, is_pq) else {
         return;
     };
     if !req.body_is_ssz() {
@@ -96,11 +99,24 @@ fn proposal_slot(req: &Request<'_>, resp: &mut Response<'_>) -> Option<Slot> {
     slot
 }
 
-fn proposal_query(req: &Request<'_>, resp: &mut Response<'_>) -> Option<([u8; 96], [u8; 32])> {
-    let Some(randao_reveal) = req.query_value("randao_reveal").and_then(|text| parse_hex(&text))
-    else {
-        resp.error(400, "randao_reveal is a required BLSSignature query parameter");
-        return None;
+fn proposal_query(
+    req: &Request<'_>,
+    resp: &mut Response<'_>,
+    is_pq: bool,
+) -> Option<(RandaoReveal, [u8; 32])> {
+    let text = req.query_value("randao_reveal");
+    let randao_reveal = if is_pq {
+        let Some(proof) = text.and_then(|text| parse_hex::<VRF_PROOF_SIZE>(&text)) else {
+            resp.error(400, "randao_reveal is a required VRFProof query parameter");
+            return None;
+        };
+        RandaoReveal::Vrf(resp.hold(&proof)?)
+    } else {
+        let Some(signature) = text.and_then(|text| parse_hex(&text)) else {
+            resp.error(400, "randao_reveal is a required BLSSignature query parameter");
+            return None;
+        };
+        RandaoReveal::Bls(signature)
     };
     let graffiti = match req.query_value("graffiti") {
         None => [0; 32],
@@ -118,7 +134,7 @@ fn proposal_query(req: &Request<'_>, resp: &mut Response<'_>) -> Option<([u8; 96
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct ProduceBlockRequest {
     slot: Slot,
-    randao_reveal: [u8; 96],
+    randao_reveal: RandaoReveal,
     graffiti: [u8; 32],
     bid_policy: BidPolicy,
     /// The SSZ `BuilderConfig`, when it names a builder.
@@ -162,7 +178,7 @@ impl ProduceBlockRequest {
                 return resp.error(400, "the slot does not follow the head");
             }
             Err(ProduceBlockFailure::InvalidRandaoReveal) => {
-                return resp.error(400, "randao_reveal is not the proposer's signature");
+                return resp.error(400, "randao_reveal does not verify for the slot's proposer");
             }
             Err(ProduceBlockFailure::NoFeeRecipient) => {
                 return resp.error(400, "no fee recipient was prepared for the slot's proposer");
@@ -337,7 +353,7 @@ mod tests {
             outcome,
             Outcome::AwaitingProducedBlock(ProduceBlockRequest {
                 slot: SLOT + 1,
-                randao_reveal: [0x11; 96],
+                randao_reveal: RandaoReveal::Bls([0x11; 96]),
                 graffiti: [0x22; 32],
                 bid_policy: BidPolicy::default(),
                 builder_config: None,

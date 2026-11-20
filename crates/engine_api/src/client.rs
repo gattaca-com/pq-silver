@@ -2,7 +2,7 @@ use std::{convert::Infallible, path::PathBuf, time::Duration};
 
 use mio::{Events, Registry};
 use rustc_hash::FxHashMap;
-use silver_common::merkle::B256;
+use silver_common::{ForkName, merkle::B256};
 use silver_httpcore::{
     BufferCapacity, ClientRequest, Endpoint, HttpPool, IDLE_TIMEOUT, MAX_RESPONSE, Method,
     TokenRange,
@@ -53,7 +53,7 @@ pub enum ReqKind {
     Fcu(B256),           // head beacon block root
     PreparePayload(u64), // spine request id
     NewPayload(B256),    // block root
-    GetPayloadFetch { spine_id: u64, is_gloas: bool },
+    GetPayloadFetch { spine_id: u64, fork: ForkName },
     GetBlobs { block_root: B256, slot: u64 },
 }
 
@@ -331,11 +331,12 @@ fn append_decimal_u64(v: u64, out: &mut Vec<u8>) {
     out.extend_from_slice(&buf[20 - n..]);
 }
 
-pub fn get_payload(c: &mut EngineClient, payload_id: [u8; 8], req_id: u64, is_gloas: bool) {
+pub fn get_payload(c: &mut EngineClient, payload_id: [u8; 8], req_id: u64, fork: ForkName) {
     let mut params = *b"[\"0x0000000000000000\"]";
     hex::encode_to_slice(payload_id, &mut params[4..20]).expect("8 bytes are 16 hex digits");
-    let kind = ReqKind::GetPayloadFetch { spine_id: req_id, is_gloas };
-    let method = if is_gloas { "engine_getPayloadV6" } else { "engine_getPayloadV5" };
+    let kind = ReqKind::GetPayloadFetch { spine_id: req_id, fork };
+    let method =
+        if fork >= ForkName::Gloas { "engine_getPayloadV6" } else { "engine_getPayloadV5" };
     let Ok(()) = enqueue_with::<Infallible>(c, method, kind, |out| {
         out.extend_from_slice(&params);
         Ok(())
@@ -454,8 +455,8 @@ mod tests {
             Duration::from_secs(10),
         );
 
-        for (is_gloas, version) in [(false, 5), (true, 6)] {
-            get_payload(&mut client, [0x01, 0x23, 0x45, 0x67, 0x89, 0xab, 0xcd, 0xef], 7, is_gloas);
+        for (fork, version) in [(ForkName::Fulu, 5), (ForkName::Gloas, 6), (ForkName::Pq, 6)] {
+            get_payload(&mut client, [0x01, 0x23, 0x45, 0x67, 0x89, 0xab, 0xcd, 0xef], 7, fork);
 
             let id = client.id - 1;
             let expected = format!(
@@ -464,7 +465,7 @@ mod tests {
             assert_eq!(client.scratch, expected.as_bytes());
             assert!(matches!(
                 client.pending_requests.get(&id),
-                Some(ReqKind::GetPayloadFetch { spine_id: 7, is_gloas: fork }) if *fork == is_gloas
+                Some(ReqKind::GetPayloadFetch { spine_id: 7, fork: sent }) if *sent == fork
             ));
         }
     }

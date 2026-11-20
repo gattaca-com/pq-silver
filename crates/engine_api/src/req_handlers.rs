@@ -218,7 +218,7 @@ fn handle_prepare_payload(
 #[inline]
 fn handle_get_payload(client: &mut EngineClient, r: EngineGetPayloadReq) {
     silver_log::info!(payload_id = %hex::encode(r.payload_id), id = r.id, "fetchPayload ← spine");
-    get_payload(client, r.payload_id, r.id, r.is_gloas);
+    get_payload(client, r.payload_id, r.id, r.fork);
 }
 
 #[inline]

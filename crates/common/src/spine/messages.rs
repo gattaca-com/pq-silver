@@ -11,7 +11,7 @@ use silver_beacon_state_data::{
 };
 
 use crate::{
-    CacheFrameRef, DataKind, Enr, GossipDomain, GossipTopic, GossipTraffic, Identify,
+    CacheFrameRef, DataKind, Enr, ForkName, GossipDomain, GossipTopic, GossipTraffic, Identify,
     LOCAL_GOSSIP_STREAM_ID, MessageId, Origin, P2pStreamId, PayloadFrame, PeerId, StreamProtocol,
     TCacheProducer, TCacheRead, TProducer,
     block_contents::BLOCK_CONTENTS_FIXED,
@@ -126,7 +126,7 @@ pub enum BeaconApiRequest {
     ProduceBlock {
         request_id: u64,
         slot: u64,
-        randao_reveal: [u8; 96],
+        randao_reveal: RandaoReveal,
         graffiti: [u8; 32],
         bid_policy: BidPolicy,
         /// Hash of the request's SSZ builder configuration, when it names
@@ -148,6 +148,13 @@ pub enum BeaconApiRequest {
         blob_data_included: bool,
         validation: BroadcastValidation,
     },
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, TypeHash)]
+#[repr(C, u8)]
+pub enum RandaoReveal {
+    Bls([u8; 96]),
+    Vrf(TCacheRead),
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, TypeHash)]
@@ -1667,7 +1674,7 @@ pub struct EnginePreparePayloadResp {
 pub struct EngineGetPayloadReq {
     pub id: u64,
     pub payload_id: [u8; 8],
-    pub is_gloas: bool,
+    pub fork: ForkName,
 }
 
 /// Response to `EngineGetPayloadReq`.

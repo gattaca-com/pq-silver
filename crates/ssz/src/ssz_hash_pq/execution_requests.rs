@@ -21,6 +21,17 @@ use crate::{
     },
 };
 
+/// SSZ `ExecutionRequests()`: eight offsets, each to the end of the fixed part.
+pub const EMPTY_EXECUTION_REQUESTS_PQ: [u8; 32] = {
+    let mut ssz = [0; 32];
+    let mut at = 0;
+    while at < ssz.len() {
+        ssz[at] = 32;
+        at += 4;
+    }
+    ssz
+};
+
 pub static EMPTY_EXECUTION_REQUESTS_PQ_ROOT: LazyLock<B256> =
     LazyLock::new(|| ExecutionRequestsPqView::hash_tree_root(&[]));
 

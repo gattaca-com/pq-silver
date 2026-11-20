@@ -9,27 +9,27 @@ use flux_profiler::timed;
 use silver_beacon_state_data::{
     B256, BUILDER_INDEX_SELF_BUILD, BeaconBlockHeader, BodyFork, BodyOffsets, ExecutionAddress,
     ExecutionPayloadBid, SLOTS_PER_EPOCH, Slot, StateId, bls::G2_POINT_AT_INFINITY,
-    hash_tree_root_block_header,
+    hash_tree_root_block_header, pq::is_valid_vrf_proof,
 };
 use silver_common::{
     BeaconApiResponse, BidPolicy, BuilderBid, BuilderBidsRequest, BuilderBidsResponse,
     EngineGetPayloadReq, EngineGetPayloadResp, EnginePreparePayloadReq, EnginePreparePayloadResp,
-    EngineReq, PayloadFrame, ProduceBlockFailure, ProducedBlock, ProducedEnvelope,
-    SidecarBidRequest, SidecarBidResponse, TCacheProducer, TCacheRead, TRead,
+    EngineReq, ForkName, PayloadFrame, ProduceBlockFailure, ProducedBlock, ProducedEnvelope,
+    RandaoReveal, SidecarBidRequest, SidecarBidResponse, TCacheProducer, TCacheRead, TCacheReader,
+    TRead,
     block_contents::BLOCK_CONTENTS_FIXED,
     ssz_hash::{BlockFork, HashedBody},
-    ssz_hash_gloas::{
-        EMPTY_EXECUTION_REQUESTS, EMPTY_EXECUTION_REQUESTS_ROOT, ExecutionRequestsView,
-    },
     ssz_view::{
         BEACON_BLOCK_BODY_FIXED, BEACON_BLOCK_FIXED, BLOCK_SYNC_AGGREGATE_SIZE, BuilderBidFuluView,
         ExecutionPayloadEnvelopeView, ExecutionPayloadView, SignedBuilderBidFuluView,
-        SignedExecutionPayloadBidView,
+        SignedExecutionPayloadBidView, VRFProof, XMSS_SIGNATURE_SIZE,
     },
     wei_saturating,
 };
 use silver_slashing::Selection;
-use silver_ssz::block_body::{BeaconBlockBodyFulu, BeaconBlockBodyGloas, EMPTY_SYNC_AGGREGATE};
+use silver_ssz::block_body::{
+    BeaconBlockBodyFulu, BeaconBlockBodyGloas, BeaconBlockBodyPq, EMPTY_SYNC_AGGREGATE,
+};
 
 use super::{
     BeaconStateTile, Feedback, Producers,
@@ -37,8 +37,9 @@ use super::{
     block::AppliedBlock,
     gossip::BidSignature,
     payload_attributes::{PayloadBasis, PayloadContext},
+    pq_aggregation::PqAggregator,
 };
-use crate::stf::{self, BlockInput, decode_bid, get_expected_withdrawals};
+use crate::stf::{self, BlockInput, RequestsLayout, decode_bid, get_expected_withdrawals};
 
 mod attestation_rewards;
 mod bid_weight;
@@ -55,7 +56,7 @@ use submitted_body::SubmittedBody;
 pub(super) struct Proposal {
     pub(super) slot: Slot,
     pub(super) parent_root: B256,
-    pub(super) randao_reveal: [u8; 96],
+    pub(super) randao_reveal: Reveal,
     pub(super) graffiti: [u8; 32],
     pub(super) bid_policy: BidPolicy,
     pub(super) builder_config_hash: Option<B256>,
@@ -64,6 +65,45 @@ pub(super) struct Proposal {
 impl Proposal {
     fn builds_on(&self, slot: Slot, parent_root: B256) -> bool {
         self.slot == slot && self.parent_root == parent_root
+    }
+}
+
+/// A proposal's `randao_reveal`, held while its block builds. Inline, so a
+/// `Proposal` stays `Copy`; there is one a slot.
+#[derive(Clone, Copy, PartialEq, Eq)]
+#[allow(clippy::large_enum_variant)]
+pub(super) enum Reveal {
+    Bls([u8; 96]),
+    Vrf(VRFProof),
+}
+
+impl Reveal {
+    /// `None` when the API's cache lapped the VRF proof before it was read.
+    pub(super) fn read(reveal: RandaoReveal, reader: &mut TCacheReader) -> Option<Self> {
+        match reveal {
+            RandaoReveal::Bls(signature) => Some(Self::Bls(signature)),
+            RandaoReveal::Vrf(read) => {
+                let acquired = reader.acquire(read);
+                let proof = acquired.buffer().ok()?.0.try_into().ok()?;
+                acquired.revalidate().ok()?;
+                Some(Self::Vrf(proof))
+            }
+        }
+    }
+
+    /// The reveal of a pre-PQ slot's block.
+    fn bls(&self) -> Result<&[u8; 96], ProduceBlockFailure> {
+        match self {
+            Self::Bls(signature) => Ok(signature),
+            Self::Vrf(_) => Err(ProduceBlockFailure::InvalidRandaoReveal),
+        }
+    }
+
+    fn vrf(&self) -> Result<&VRFProof, ProduceBlockFailure> {
+        match self {
+            Self::Vrf(proof) => Ok(proof),
+            Self::Bls(_) => Err(ProduceBlockFailure::InvalidRandaoReveal),
+        }
     }
 }
 
@@ -106,13 +146,9 @@ impl BlockBuild {
         self.slot == slot && self.parent_root == parent_root
     }
 
-    fn fetch(&mut self, payload_id: [u8; 8], producers: &mut Producers) {
+    fn fetch(&mut self, payload_id: [u8; 8], fork: ForkName, producers: &mut Producers) {
         let id = self.engine_id;
-        producers.produce(EngineReq::GetPayload(EngineGetPayloadReq {
-            id,
-            payload_id,
-            is_gloas: self.context.expect("payload prepared before fetch").is_gloas,
-        }));
+        producers.produce(EngineReq::GetPayload(EngineGetPayloadReq { id, payload_id, fork }));
         self.stage = PayloadStage::Fetching { payload_id };
     }
 
@@ -131,6 +167,8 @@ pub(super) struct Operations<'a> {
     pub(super) bls_to_execution_changes: &'a [u8],
     /// Gloas only.
     pub(super) payload_attestations: &'a [u8],
+    /// PQ only: proves `attestations`.
+    pub(super) proof: &'a [u8],
 }
 
 impl Operations<'static> {
@@ -142,6 +180,7 @@ impl Operations<'static> {
         sync_aggregate: &EMPTY_SYNC_AGGREGATE,
         bls_to_execution_changes: &[],
         payload_attestations: &[],
+        proof: &[],
     };
 }
 
@@ -152,6 +191,7 @@ pub(super) struct PackedOperations {
     sync_aggregate: [u8; BLOCK_SYNC_AGGREGATE_SIZE],
     bls_to_execution_changes: Vec<u8>,
     payload_attestations: Vec<u8>,
+    proof: Vec<u8>,
 }
 
 impl Default for PackedOperations {
@@ -163,6 +203,7 @@ impl Default for PackedOperations {
             sync_aggregate: EMPTY_SYNC_AGGREGATE,
             bls_to_execution_changes: Vec::new(),
             payload_attestations: Vec::new(),
+            proof: Vec::new(),
         }
     }
 }
@@ -175,6 +216,38 @@ impl PackedOperations {
         self.sync_aggregate = EMPTY_SYNC_AGGREGATE;
         self.bls_to_execution_changes.clear();
         self.payload_attestations.clear();
+        self.proof.clear();
+    }
+
+    /// The attestations and proof of the slot at a delay of two or more whose
+    /// merged proof pays most. Only a delay of exactly two earns the head
+    /// flag, and a tie goes to the newest slot.
+    fn pack_best_merge(
+        &mut self,
+        aggregator: &PqAggregator,
+        rewards: &AttestationRewards<'_>,
+        block_slot: Slot,
+    ) {
+        let Some(newest) = block_slot.checked_sub(2) else { return };
+        let oldest = (block_slot / SLOTS_PER_EPOCH).saturating_sub(1) * SLOTS_PER_EPOCH;
+        // todo(CL-235): no gossip aggregate reaches a merge yet, so none has a proof.
+        let best = (oldest..=newest)
+            .filter_map(|slot| aggregator.block_proof(slot))
+            .map(|(attestations, proof)| {
+                let value: u64 =
+                    attestations.clone().map(|att| rewards.attestation_value(att)).sum();
+                (value, attestations, proof)
+            })
+            .filter(|&(value, ..)| value > 0)
+            .max_by_key(|&(value, ..)| value);
+        let Some((_, attestations, proof)) = best else { return };
+        let mut at = 4 * attestations.clone().count();
+        for attestation in attestations.clone() {
+            self.attestations.extend_from_slice(&(at as u32).to_le_bytes());
+            at += attestation.len();
+        }
+        attestations.for_each(|attestation| self.attestations.extend_from_slice(attestation));
+        self.proof.extend_from_slice(proof);
     }
 
     fn operations(&self) -> Operations<'_> {
@@ -186,6 +259,7 @@ impl PackedOperations {
             sync_aggregate: &self.sync_aggregate,
             bls_to_execution_changes: &self.bls_to_execution_changes,
             payload_attestations: &self.payload_attestations,
+            proof: &self.proof,
         }
     }
 }
@@ -569,19 +643,21 @@ impl BeaconStateTile {
             }
             Err(failure) => build.local = Some(Err(failure)),
         }
-        let bids = if proposal.builder_config_hash.is_some() {
-            let view = self.state.read_view(parent);
-            producers.produce(BuilderBidsRequest {
-                request_id,
-                slot: proposal.slot,
-                parent_hash: branch.parent_hash,
-                parent_root: proposal.parent_root,
-                proposer_pubkey: *view.validators.pubkey(proposer as usize),
-            });
-            SidecarBid::Awaiting
-        } else {
-            SidecarBid::NotAsked
-        };
+        // todo(CL-241): builder bids are BLS-signed; PQ slots self-build.
+        let bids =
+            if proposal.builder_config_hash.is_some() && !self.spec.is_pq_at_slot(proposal.slot) {
+                let view = self.state.read_view(parent);
+                producers.produce(BuilderBidsRequest {
+                    request_id,
+                    slot: proposal.slot,
+                    parent_hash: branch.parent_hash,
+                    parent_root: proposal.parent_root,
+                    proposer_pubkey: *view.validators.pubkey(proposer as usize),
+                });
+                SidecarBid::Awaiting
+            } else {
+                SidecarBid::NotAsked
+            };
         self.block_production.pending_gloas.push(PendingGloas {
             request_id,
             proposal,
@@ -663,7 +739,7 @@ impl BeaconStateTile {
                 if let PayloadStage::Prepared { payload_id } = build.stage &&
                     (build.local.is_none() || !self.spec.is_gloas_at_slot(proposal.slot))
                 {
-                    build.fetch(payload_id, producers);
+                    build.fetch(payload_id, self.spec.fork_at_slot(proposal.slot), producers);
                 }
                 Ok(())
             }
@@ -706,11 +782,19 @@ impl BeaconStateTile {
         proposal: &Proposal,
     ) -> bool {
         let view = self.state.read_view(parent);
-        let signing_root = stf::randao_signing_root(view.imm, &view.epoch, proposal.slot);
-        let pubkey = view.validators.pubkey_decompressed(proposer as usize);
-        self.sig_batch.clear();
-        self.sig_batch.push_one(pubkey, &proposal.randao_reveal, signing_root);
-        self.sig_batch.verify_all()
+        match &proposal.randao_reveal {
+            Reveal::Bls(signature) => {
+                let signing_root = stf::randao_signing_root(view.imm, &view.epoch, proposal.slot);
+                let pubkey = view.validators.pubkey_decompressed(proposer as usize);
+                self.sig_batch.clear();
+                self.sig_batch.push_one(pubkey, signature, signing_root);
+                self.sig_batch.verify_all()
+            }
+            Reveal::Vrf(proof) => view
+                .validators
+                .vrf_root(proposer as usize)
+                .is_some_and(|vrf_root| is_valid_vrf_proof(proof, proposal.slot, vrf_root)),
+        }
     }
 
     #[timed]
@@ -735,7 +819,7 @@ impl BeaconStateTile {
         if production.pending.is_empty() && production.pending_gloas.is_empty() {
             build.stage = PayloadStage::Prepared { payload_id };
         } else {
-            build.fetch(payload_id, producers);
+            build.fetch(payload_id, self.spec.fork_at_slot(build.slot), producers);
         }
     }
 
@@ -923,30 +1007,38 @@ impl BeaconStateTile {
             return packed.clear();
         };
         let pre_state = self.state.read_view(parent);
+        let epoch = proposal.slot / SLOTS_PER_EPOCH;
+        let rewards = self.shuffling_cache.for_block(&pre_state, epoch).map(|shuffling| {
+            AttestationRewards::new(
+                &pre_state,
+                shuffling,
+                proposal.parent_root,
+                proposal.slot,
+                builds_on_full_parent,
+            )
+        });
+        if rewards.is_none() {
+            silver_log::warn!(
+                slot = proposal.slot,
+                "no shuffling for the proposal; packed no attestations"
+            );
+        }
+        if self.spec.is_pq_at_slot(proposal.slot) {
+            // todo(CL-241): PQ slashings are verified on gossip but not pooled.
+            packed.clear();
+            if let Some(rewards) = &rewards {
+                packed.pack_best_merge(&self.pq_aggregator, rewards, proposal.slot);
+            }
+            return;
+        }
         self.slashing_pool.select(&pre_state, &mut packed.slashings);
         let gloas = self.spec.is_gloas_at_slot(proposal.slot);
-        let epoch = proposal.slot / SLOTS_PER_EPOCH;
-        match self.shuffling_cache.for_block(&pre_state, epoch) {
-            Some(shuffling) => {
-                let rewards = AttestationRewards::new(
-                    &pre_state,
-                    shuffling,
-                    proposal.parent_root,
-                    proposal.slot,
-                    builds_on_full_parent,
-                );
-                self.attestation_pool.pack(
-                    |data, committee_index, weights| rewards.weigh(data, committee_index, weights),
-                    &mut packed.attestations,
-                );
-            }
-            None => {
-                silver_log::warn!(
-                    slot = proposal.slot,
-                    "no shuffling for the proposal; packed no attestations"
-                );
-                packed.attestations.clear();
-            }
+        match &rewards {
+            Some(rewards) => self.attestation_pool.pack(
+                |data, committee_index, weights| rewards.weigh(data, committee_index, weights),
+                &mut packed.attestations,
+            ),
+            None => packed.attestations.clear(),
         }
         self.sync_contribution_pool.write_sync_aggregate(
             proposal.slot - 1,
@@ -1061,7 +1153,11 @@ impl BeaconStateTile {
             return Err(ProduceBlockFailure::PayloadUnavailable);
         }
         let (parent, _) = self.verified_parent(&proposal)?;
-        let external = self.bid_commitment(&proposal, parent, builder_bids);
+        let external = if self.spec.is_pq_at_slot(proposal.slot) {
+            None
+        } else {
+            self.bid_commitment(&proposal, parent, builder_bids)
+        };
         let local = local.and_then(|payload| match self.local_commitment(&proposal, payload) {
             Ok(local) => Some(local),
             Err(failure) => {
@@ -1126,10 +1222,6 @@ impl BeaconStateTile {
         builds_on_full_parent: bool,
         build: impl FnMut(&mut Self, Operations<'_>) -> Result<BuiltBlock, ProduceBlockFailure>,
     ) -> Result<ProducedBlock, ProduceBlockFailure> {
-        if self.spec.is_pq_at_slot(proposal.slot) {
-            silver_log::warn!(slot = proposal.slot, "PQ block production is not implemented");
-            return Err(ProduceBlockFailure::SlotNotProposable);
-        }
         let mut packed = mem::take(&mut self.block_production.packed);
         self.pack_operations(&proposal, builds_on_full_parent, &mut packed);
         let block = self.build_with_fallbacks(proposal, packed.operations(), build);
@@ -1210,7 +1302,7 @@ impl BeaconStateTile {
                 return None;
             }
         };
-        let parent_requests = self.parent_requests(full, &proposal.parent_root);
+        let parent_requests = self.parent_requests(proposal.slot, full, &proposal.parent_root);
         let parent_state = self.state.read_view(parent);
         Some(BidCommitment {
             signed_bid,
@@ -1285,9 +1377,10 @@ impl BeaconStateTile {
         let frame = PayloadFrame::parse(bytes).ok_or(ProduceBlockFailure::Invalid)?;
         let execution = frame.execution_payload;
         let (branch, full) = self.bid_branch(proposal)?;
+        let requests = self.requests_layout(proposal.slot);
         if !ExecutionPayloadView::check_canonical_gloas(execution) ||
-            !ExecutionRequestsView::check_canonical(frame.execution_requests) ||
-            ExecutionRequestsView::check_counts(frame.execution_requests).is_err()
+            !requests.check_canonical(frame.execution_requests) ||
+            requests.check_counts(frame.execution_requests).is_err()
         {
             return Err(ProduceBlockFailure::Invalid);
         }
@@ -1315,9 +1408,7 @@ impl BeaconStateTile {
                 .chunks_exact(48)
                 .map(|commitment| commitment.try_into().expect("48 bytes"))
                 .collect(),
-            execution_requests_root: ExecutionRequestsView::hash_tree_root(
-                frame.execution_requests,
-            ),
+            execution_requests_root: requests.hash_tree_root(frame.execution_requests),
         };
         let commitment = self.self_build_commitment(&bid, full, frame.block_value, Some(payload));
         Ok((commitment, frame.should_override_builder))
@@ -1347,7 +1438,7 @@ impl BeaconStateTile {
             value: 0,
             execution_payment: 0,
             blob_kzg_commitments: Default::default(),
-            execution_requests_root: *EMPTY_EXECUTION_REQUESTS_ROOT,
+            execution_requests_root: self.requests_layout(proposal.slot).empty_root(),
         };
         Ok(self.self_build_commitment(&bid, full, [0; 32], None))
     }
@@ -1360,25 +1451,42 @@ impl BeaconStateTile {
         local: Option<TCacheRead>,
     ) -> BidCommitment {
         let mut signed_bid = Vec::new();
-        bid.write_signed_ssz(&G2_POINT_AT_INFINITY, &mut signed_bid);
+        if self.spec.is_pq_at_slot(bid.slot) {
+            bid.write_signed_ssz(&[0; XMSS_SIGNATURE_SIZE], &mut signed_bid);
+        } else {
+            bid.write_signed_ssz(&G2_POINT_AT_INFINITY, &mut signed_bid);
+        }
         BidCommitment {
             signed_bid,
             value,
             weight: BidWeight::local(&value),
             local,
-            parent_requests: self.parent_requests(builds_on_full_parent, &bid.parent_block_root),
+            parent_requests: self.parent_requests(
+                bid.slot,
+                builds_on_full_parent,
+                &bid.parent_block_root,
+            ),
             builds_on_full_parent,
             builder_entry: None,
         }
     }
 
-    fn parent_requests(&self, builds_on_full_parent: bool, parent_root: &B256) -> Box<[u8]> {
+    fn parent_requests(
+        &self,
+        slot: Slot,
+        builds_on_full_parent: bool,
+        parent_root: &B256,
+    ) -> Box<[u8]> {
         let requests = if builds_on_full_parent {
             self.payload_execution_requests.get(parent_root)
         } else {
-            &EMPTY_EXECUTION_REQUESTS
+            self.requests_layout(slot).empty()
         };
         requests.into()
+    }
+
+    fn requests_layout(&self, slot: Slot) -> RequestsLayout {
+        RequestsLayout::for_fork(self.spec.is_pq_at_slot(slot))
     }
 
     #[timed]
@@ -1412,7 +1520,7 @@ impl BeaconStateTile {
         let (parent, proposer_index) = self.proposal_parent(&proposal)?;
         let eth1_data = self.state.read_view(parent).slot.state().eth1_data.to_ssz();
         let body = BeaconBlockBodyFulu {
-            randao_reveal: &proposal.randao_reveal,
+            randao_reveal: proposal.randao_reveal.bls()?,
             eth1_data: &eth1_data,
             graffiti: &proposal.graffiti,
             proposer_slashings: operations.proposer_slashings,
@@ -1478,25 +1586,44 @@ impl BeaconStateTile {
         let slot = proposal.slot;
         let (parent, proposer_index) = self.proposal_parent(&proposal)?;
         let eth1_data = self.state.read_view(parent).slot.state().eth1_data.to_ssz();
-        let body = BeaconBlockBodyGloas {
-            randao_reveal: &proposal.randao_reveal,
-            eth1_data: &eth1_data,
-            graffiti: &proposal.graffiti,
-            proposer_slashings: operations.proposer_slashings,
-            attester_slashings: operations.attester_slashings,
-            attestations: operations.attestations,
-            deposits: &[],
-            voluntary_exits: operations.voluntary_exits,
-            sync_aggregate: operations.sync_aggregate,
-            bls_to_execution_changes: operations.bls_to_execution_changes,
-            signed_execution_payload_bid: &commitment.signed_bid,
-            payload_attestations: operations.payload_attestations,
-            parent_execution_requests: &commitment.parent_requests,
-        };
         // No payload to splice around, so the body is encoded whole.
-        let mut encoded = vec![0; body.ssz_len()];
-        body.encode(&mut encoded);
-        let offsets = BodyOffsets::validated(&encoded, BodyFork::Gloas).map_err(|e| {
+        let (encoded, body_fork) = if self.spec.is_pq_at_slot(slot) {
+            let body = BeaconBlockBodyPq {
+                randao_reveal: proposal.randao_reveal.vrf()?,
+                eth1_data: &eth1_data,
+                graffiti: &proposal.graffiti,
+                proposer_slashings: operations.proposer_slashings,
+                attester_slashings: operations.attester_slashings,
+                attestations: operations.attestations,
+                deposits: &[],
+                signed_execution_payload_bid: &commitment.signed_bid,
+                parent_execution_requests: &commitment.parent_requests,
+                proof: operations.proof,
+            };
+            let mut encoded = vec![0; body.ssz_len()];
+            body.encode(&mut encoded);
+            (encoded, BodyFork::Pq)
+        } else {
+            let body = BeaconBlockBodyGloas {
+                randao_reveal: proposal.randao_reveal.bls()?,
+                eth1_data: &eth1_data,
+                graffiti: &proposal.graffiti,
+                proposer_slashings: operations.proposer_slashings,
+                attester_slashings: operations.attester_slashings,
+                attestations: operations.attestations,
+                deposits: &[],
+                voluntary_exits: operations.voluntary_exits,
+                sync_aggregate: operations.sync_aggregate,
+                bls_to_execution_changes: operations.bls_to_execution_changes,
+                signed_execution_payload_bid: &commitment.signed_bid,
+                payload_attestations: operations.payload_attestations,
+                parent_execution_requests: &commitment.parent_requests,
+            };
+            let mut encoded = vec![0; body.ssz_len()];
+            body.encode(&mut encoded);
+            (encoded, BodyFork::Gloas)
+        };
+        let offsets = BodyOffsets::validated(&encoded, body_fork).map_err(|e| {
             silver_log::warn!(?e, slot, "assembled body is over its limits");
             ProduceBlockFailure::Invalid
         })?;
@@ -1575,7 +1702,7 @@ impl BeaconStateTile {
         let (parent, proposer_index) = self.proposal_parent(&proposal)?;
         let eth1_data = self.state.read_view(parent).slot.state().eth1_data.to_ssz();
         let body = BeaconBlockBodyFulu {
-            randao_reveal: &proposal.randao_reveal,
+            randao_reveal: proposal.randao_reveal.bls()?,
             eth1_data: &eth1_data,
             graffiti: &proposal.graffiti,
             proposer_slashings: operations.proposer_slashings,
@@ -1791,7 +1918,7 @@ fn wei_from_gwei(gwei: u128) -> [u8; 32] {
     wei
 }
 
-fn answer(
+pub(super) fn answer(
     producers: &mut Producers,
     request_id: u64,
     block: Result<ProducedBlock, ProduceBlockFailure>,

@@ -12,7 +12,7 @@ use silver_beacon_state_data::{
 };
 use silver_common::{
     BeaconApiResponse, BidPolicy, BlockStage, EngineFcuResp, EngineGetPayloadResp,
-    EngineNewPayloadResp, EnginePreparePayloadResp, EngineReq, GossipTopic, HeadChange,
+    EngineNewPayloadResp, EnginePreparePayloadResp, EngineReq, ForkName, GossipTopic, HeadChange,
     LOCAL_GOSSIP_STREAM_ID, LocalGossipFailure, MessageId, P2pStreamId, PayloadResolution,
     PayloadValidationStatus, PeerEvent, PoolChange, ProduceBlockFailure, ProposerPreparation,
     SignedBlockLayout, StreamProtocol, SyncNeed, TCache, TCacheId, TCacheProducer, TCacheRead,
@@ -6158,7 +6158,8 @@ fn unregistered_proposer_gets_no_payload_prepared() {
 /// Validator 0, the seeded proposer, signs with test key 0.
 /// Local only, so no sidecar bid is asked.
 fn proposal(tile: &BeaconStateTile, slot: Slot) -> Proposal {
-    let randao_reveal = test_signing::sign_randao_reveal(0, slot, &Immutable::default());
+    let randao_reveal =
+        Reveal::Bls(test_signing::sign_randao_reveal(0, slot, &Immutable::default()));
     Proposal {
         slot,
         parent_root: tile.head_block_root(),
@@ -6229,7 +6230,7 @@ fn block_for_a_slot_the_head_already_holds_is_refused() {
 fn block_with_a_foreign_randao_reveal_is_refused() {
     let (mut tile, _spine, mut adapter, mut sink) = production_rig();
     register_proposer(&mut tile, 0, [7; 20]);
-    let randao_reveal = test_signing::sign_randao_reveal(1, 11, &Immutable::default());
+    let randao_reveal = Reveal::Bls(test_signing::sign_randao_reveal(1, 11, &Immutable::default()));
 
     tile.produce_block(
         5,
@@ -6258,7 +6259,7 @@ fn block_without_a_prepared_payload_prepares_one_then_fetches_it() {
         panic!("expected a payload fetch");
     };
     assert_eq!(fetch.payload_id, [9; 8]);
-    assert!(!fetch.is_gloas);
+    assert!(fetch.fork < ForkName::Gloas);
     assert!(produced_blocks(&mut sink).is_empty());
 
     no_payload(&mut tile, fetch.id, &mut adapter.producers);
@@ -6344,7 +6345,8 @@ fn request_waits_for_the_el_until_the_payload_deadline() {
 fn reveal_is_checked_when_the_el_builds_nothing() {
     let (mut tile, _spine, mut adapter, mut sink) = production_rig();
     let bid_policy = BidPolicy::default();
-    let proposal = Proposal { randao_reveal: [0; 96], bid_policy, ..proposal(&tile, 11) };
+    let proposal =
+        Proposal { randao_reveal: Reveal::Bls([0; 96]), bid_policy, ..proposal(&tile, 11) };
     tile.produce_block(5, proposal, &mut adapter.producers);
     assert_eq!(produced_blocks(&mut sink), [(5, Some(ProduceBlockFailure::InvalidRandaoReveal))]);
 }
@@ -6648,7 +6650,7 @@ fn a_gloas_block_commits_to_the_pooled_bid() {
     let proposal = |min_bid| Proposal {
         slot,
         parent_root,
-        randao_reveal: *BeaconBlockBodyGloasView::randao_reveal(body),
+        randao_reveal: Reveal::Bls(*BeaconBlockBodyGloasView::randao_reveal(body)),
         graffiti: *BeaconBlockBodyGloasView::graffiti(body),
         bid_policy: BidPolicy { min_bid, ..BidPolicy::default() },
         builder_config_hash: None,
@@ -6733,7 +6735,7 @@ fn a_proposal_waits_on_its_builders_and_falls_back_to_the_pool() {
         let proposal = Proposal {
             slot,
             parent_root,
-            randao_reveal: *BeaconBlockBodyGloasView::randao_reveal(body),
+            randao_reveal: Reveal::Bls(*BeaconBlockBodyGloasView::randao_reveal(body)),
             graffiti: *BeaconBlockBodyGloasView::graffiti(body),
             bid_policy: BidPolicy::default(),
             builder_config_hash: Some(builder_config_hash),
@@ -6842,7 +6844,7 @@ fn concurrent_builder_configs_report_their_winning_bids_total_payment() {
         let proposal = Proposal {
             slot,
             parent_root,
-            randao_reveal: *BeaconBlockBodyGloasView::randao_reveal(body),
+            randao_reveal: Reveal::Bls(*BeaconBlockBodyGloasView::randao_reveal(body)),
             graffiti: *BeaconBlockBodyGloasView::graffiti(body),
             bid_policy: BidPolicy::default(),
             builder_config_hash: Some([id; 32]),
@@ -7183,7 +7185,7 @@ fn fixture_proposal(tile: &BeaconStateTile, block_ssz: &[u8]) -> Proposal {
     Proposal {
         slot: SignedBeaconBlockView::slot(block_ssz),
         parent_root: tile.head_block_root(),
-        randao_reveal: *BeaconBlockBodyFuluView::randao_reveal(body),
+        randao_reveal: Reveal::Bls(*BeaconBlockBodyFuluView::randao_reveal(body)),
         graffiti: *BeaconBlockBodyFuluView::graffiti(body),
         bid_policy: BidPolicy::default(),
         builder_config_hash: None,
@@ -7968,7 +7970,7 @@ mod pq_aggregator {
 
         rig.respond(request.request_id, &[[1; 64], [2; 64]]);
         let (attestations, proof) = rig.tile.pq_aggregator.block_proof(SLOT + 1).unwrap();
-        assert_eq!(attestations, [attestation(0, 0..2).as_slice()]);
+        assert_eq!(attestations.collect::<Vec<_>>(), [attestation(0, 0..2).as_slice()]);
         assert_eq!(proof, b"proof");
     }
 

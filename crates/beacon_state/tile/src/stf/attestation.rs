@@ -219,7 +219,7 @@ impl<'a> AttestedCommittees<'a> {
         })
     }
 
-    fn attesters(&self) -> impl Iterator<Item = u32> + use<'_, 'a> {
+    pub(crate) fn attesters(&self) -> impl Iterator<Item = u32> + use<'_, 'a> {
         self.members(true)
     }
 

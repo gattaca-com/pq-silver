@@ -4,10 +4,13 @@ use silver_beacon_state_data::{
     B256, Checkpoint, Epoch, PARTICIPATION_FLAGS, PARTICIPATION_WEIGHTS, SLOTS_PER_EPOCH, Slot,
     StateReadView, TIMELY_TARGET_FLAG,
 };
-use silver_common::ssz_view::AttestationDataView;
+use silver_common::ssz_view::{AttestationDataView, AttestationPqView};
 
 use crate::{
-    stf::{EFFECTIVE_BALANCE_INCREMENT, ParsedAttestationData, ShufflingRef, voted_block_slot},
+    stf::{
+        AttestedCommittees, EFFECTIVE_BALANCE_INCREMENT, ParsedAttestationData, ShufflingRef,
+        voted_block_slot,
+    },
     validate::validate_attestation_data_view,
 };
 
@@ -133,9 +136,8 @@ impl<'a> AttestationRewards<'a> {
         };
         let is_current = data.target_epoch() == self.current_epoch;
         let shuffling = self.shuffling.for_target(is_current);
-        let validators = &self.pre_state.validators;
         if committee_index as usize >= shuffling.committees_per_slot ||
-            !shuffling.indices_in_range(validators.count())
+            !shuffling.indices_in_range(self.pre_state.validators.count())
         {
             return;
         }
@@ -143,22 +145,47 @@ impl<'a> AttestationRewards<'a> {
         if committee.len() != weights.len() {
             return;
         }
-        let participation = |validator| {
-            if is_current {
-                self.pre_state.current_participation.get(validator)
-            } else {
-                self.pre_state.previous_participation.get(validator)
-            }
-        };
         for (weight, &validator) in weights.iter_mut().zip(committee) {
-            let validator = validator as usize;
-            let missing = earned & !participation(validator);
-            if missing == 0 {
-                continue;
-            }
-            let increments = validators.effective_balance(validator) / EFFECTIVE_BALANCE_INCREMENT;
-            *weight = increments * self.flags_weight[missing as usize];
+            *weight = self.unearned_weight(earned, is_current, validator as usize);
         }
+    }
+
+    /// `validator`'s base reward increments times the weight of the `earned`
+    /// flags it still lacks.
+    fn unearned_weight(&self, earned: u8, is_current: bool, validator: usize) -> u64 {
+        let participation = if is_current {
+            self.pre_state.current_participation.get(validator)
+        } else {
+            self.pre_state.previous_participation.get(validator)
+        };
+        let missing = earned & !participation;
+        if missing == 0 {
+            return 0;
+        }
+        let increments =
+            self.pre_state.validators.effective_balance(validator) / EFFECTIVE_BALANCE_INCREMENT;
+        increments * self.flags_weight[missing as usize]
+    }
+
+    /// What including `attestation`, an `AttestationPq`, pays for the
+    /// attesters it credits.
+    pub(super) fn attestation_value(&self, attestation: &[u8]) -> u64 {
+        let data = AttestationPqView::data(attestation);
+        let Some(earned) = self.earned_flags(data) else {
+            return 0;
+        };
+        let is_current = data.target_epoch() == self.current_epoch;
+        let shuffling = self.shuffling.for_target(is_current);
+        if !shuffling.indices_in_range(self.pre_state.validators.count()) {
+            return 0;
+        }
+        let Ok(committees) = AttestedCommittees::new(attestation, true, shuffling) else {
+            return 0;
+        };
+        committees
+            .attesters()
+            .map(|validator| self.unearned_weight(earned, is_current, validator as usize))
+            .sum()
     }
 }
 
@@ -417,5 +444,33 @@ mod tests {
 
         assert_eq!(paid(1), increments(slot).map(|i| i * SOURCE_TARGET_HEAD));
         assert_eq!(paid(0), increments(slot).map(|i| i * (14 + 26)));
+    }
+
+    /// An `AttestationPq` pays for the attesters its bits credit, and only at
+    /// a delay of two does it earn the head flag.
+    #[test]
+    fn pq_attestation_value_sums_the_attesters_it_credits() {
+        let (bs, id) = pq_state_over_a_skipped_slot();
+        let pre_state = bs.read_view(id);
+        let shuffled: Vec<_> = (0..VALIDATORS as u32).collect();
+        let shuffling = ShufflingRef {
+            curr: EpochShuffling::with_committees_per_slot(&shuffled, 1),
+            prev: EpochShuffling::with_committees_per_slot(&shuffled, 1),
+        };
+        let rewards =
+            AttestationRewards::new(&pre_state, shuffling, PARENT_ROOT, BLOCK_SLOT, false);
+        let value = |slot, positions: &[usize]| {
+            let data = with_index(vote(slot, PARENT_ROOT), 1);
+            let attestation =
+                AttestationPqView::encode_one_committee(&data, 0, 2, positions.iter().copied())
+                    .unwrap();
+            rewards.attestation_value(&attestation)
+        };
+
+        let [first, second] = increments(BLOCK_SLOT - 2);
+        assert_eq!(value(BLOCK_SLOT - 2, &[1]), second * SOURCE_TARGET_HEAD);
+        assert_eq!(value(BLOCK_SLOT - 2, &[0, 1]), (first + second) * SOURCE_TARGET_HEAD);
+        let [first, second] = increments(BLOCK_SLOT - 3);
+        assert_eq!(value(BLOCK_SLOT - 3, &[0, 1]), (first + second) * (14 + 26));
     }
 }

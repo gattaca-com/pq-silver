@@ -36,7 +36,7 @@ pub use epoch_shuffling::{EpochShuffling, ShufflingRef};
 pub use fork_transition::upgrade_to_gloas;
 pub use gloas::*;
 pub(crate) use gloas::{
-    apply_parent_execution_payload, get_expected_withdrawals_gloas, get_ptc,
+    RequestsLayout, apply_parent_execution_payload, get_expected_withdrawals_gloas, get_ptc,
     hash_payload_attestation_data, payload_withdrawals_match_expected,
 };
 pub(crate) use operations::process_execution_requests;

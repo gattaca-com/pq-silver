@@ -4,9 +4,12 @@ use silver_beacon_state_data::{
 };
 use silver_common::{
     ssz_hash_gloas::{
-        EMPTY_EXECUTION_REQUESTS_ROOT, ExecutionRequestsView, RequestCountOutOfBounds,
+        EMPTY_EXECUTION_REQUESTS, EMPTY_EXECUTION_REQUESTS_ROOT, ExecutionRequestsView,
+        RequestCountOutOfBounds,
     },
-    ssz_hash_pq::{EMPTY_EXECUTION_REQUESTS_PQ_ROOT, ExecutionRequestsPqView},
+    ssz_hash_pq::{
+        EMPTY_EXECUTION_REQUESTS_PQ, EMPTY_EXECUTION_REQUESTS_PQ_ROOT, ExecutionRequestsPqView,
+    },
     ssz_view::ExecutionPayloadBidView,
 };
 
@@ -86,10 +89,24 @@ impl RequestsLayout {
         }
     }
 
-    fn empty_root(self) -> B256 {
+    pub(crate) fn empty(self) -> &'static [u8] {
+        match self {
+            Self::Gloas => &EMPTY_EXECUTION_REQUESTS,
+            Self::Pq => &EMPTY_EXECUTION_REQUESTS_PQ,
+        }
+    }
+
+    pub(crate) fn empty_root(self) -> B256 {
         match self {
             Self::Gloas => *EMPTY_EXECUTION_REQUESTS_ROOT,
             Self::Pq => *EMPTY_EXECUTION_REQUESTS_PQ_ROOT,
+        }
+    }
+
+    pub(crate) fn check_canonical(self, requests: &[u8]) -> bool {
+        match self {
+            Self::Gloas => ExecutionRequestsView::check_canonical(requests),
+            Self::Pq => ExecutionRequestsPqView::check_canonical(requests),
         }
     }
 

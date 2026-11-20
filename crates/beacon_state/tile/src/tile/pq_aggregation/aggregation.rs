@@ -3,7 +3,7 @@ use std::{
     collections::{BinaryHeap, binary_heap::PeekMut},
 };
 
-use silver_common::Nanos;
+use silver_common::{Nanos, TCacheProducer, TCacheRead, TProducer};
 
 use super::{
     claims::{Claim, VerifiedClaims},
@@ -68,7 +68,20 @@ impl<C: VerifiedClaims> Aggregation<C> {
         self.failures >= MAX_FAILURES
     }
 
-    pub fn next_batch(&mut self, now: Nanos) -> Option<Batch> {
+    /// The next batch, with its request written to `tcache`. The request is
+    /// `None` when the tcache is full.
+    pub fn next_request(
+        &mut self,
+        now: Nanos,
+        tcache: &mut TProducer,
+    ) -> Option<(Batch, Option<TCacheRead>)> {
+        let batch = self.next_batch(now)?;
+        let request = self.request(&batch);
+        let body = tcache.write_with(request.len(), |out| request.write(out));
+        Some((batch, body))
+    }
+
+    fn next_batch(&mut self, now: Nanos) -> Option<Batch> {
         if now >= self.deadline || self.is_stopped() {
             return None;
         }
@@ -76,7 +89,7 @@ impl<C: VerifiedClaims> Aggregation<C> {
         self.accepts(&batch).then_some(batch)
     }
 
-    pub fn request(&self, batch: &Batch) -> AggregateRequest<'_> {
+    fn request(&self, batch: &Batch) -> AggregateRequest<'_> {
         let children = (self.best.iter())
             .map(|best| (best.claims.as_slice(), best.proof.as_slice()))
             .collect();

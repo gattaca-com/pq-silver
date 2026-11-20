@@ -1141,14 +1141,9 @@ impl BeaconStateTile {
 
         // Health first: a disconnect fails the batch in flight once, before
         // its `None` answer arrives.
-        adapter.consume(|health: LeanVmHealthEvent, producers| {
-            let tcache = &mut self.events_producer;
-            self.pq_aggregator.on_health(health, &self.ticker, tcache, producers);
-        });
-        adapter.consume(|resp: LeanVmResp, producers| {
-            let (reader, tcache) = (&mut self.reader, &mut self.events_producer);
-            self.pq_aggregator.on_response(resp, reader, &self.ticker, tcache, producers);
-        });
+        adapter.consume(|health: LeanVmHealthEvent, _| self.pq_aggregator.on_health(health));
+        adapter
+            .consume(|resp: LeanVmResp, _| self.pq_aggregator.on_response(resp, &mut self.reader));
 
         adapter.consume(|answer: SidecarBidResponse, producers| {
             self.on_sidecar_bid(answer, producers);
@@ -1483,6 +1478,10 @@ impl Tile<SilverSpine> for BeaconStateTile {
             self.try_detect_reorg(&mut adapter.producers);
             self.publish_status_on_head_change(&mut adapter.producers);
         }
+
+        // After every event, so a request goes out in the iteration that unlocked it.
+        let tcache = &mut self.events_producer;
+        self.pq_aggregator.send_next(&self.ticker, tcache, &mut adapter.producers);
     }
 }
 

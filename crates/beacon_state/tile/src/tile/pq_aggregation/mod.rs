@@ -18,7 +18,6 @@ mod merge;
 mod strategy;
 pub(super) mod wire;
 
-use aggregation::Aggregation;
 pub use aggregator::PqAggregator;
 pub use claims::{Aggregate, Claim, VerifiedVote};
 

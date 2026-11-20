@@ -7620,14 +7620,19 @@ mod pq_aggregator {
             self.sink.produce(LeanVmResp { request_id, body: None });
             self.sink.produce(LeanVmHealthEvent { ready: false });
             self.tile.consume_shared(&mut self.adapter);
+            self.send_next();
+        }
+
+        /// What the tile does at the end of each loop.
+        fn send_next(&mut self) {
+            let tile = &mut self.tile;
+            let tcache = &mut tile.events_producer;
+            tile.pq_aggregator.send_next(&tile.ticker, tcache, &mut self.adapter.producers);
         }
 
         fn ready(&mut self) {
-            let tile = &mut self.tile;
-            let producers = &mut self.adapter.producers;
-            let health = LeanVmHealthEvent { ready: true };
-            let tcache = &mut tile.events_producer;
-            tile.pq_aggregator.on_health(health, &tile.ticker, tcache, producers);
+            self.tile.pq_aggregator.on_health(LeanVmHealthEvent { ready: true });
+            self.send_next();
         }
 
         fn vote(&mut self, tag: u8) {
@@ -7645,20 +7650,15 @@ mod pq_aggregator {
                 committee_position: tag as usize,
                 committee_len: COMMITTEE_LEN,
             };
-            let tile = &mut self.tile;
-            let producers = &mut self.adapter.producers;
-            tile.pq_aggregator.add_vote(vote, &tile.ticker, &mut tile.events_producer, producers);
+            self.tile.pq_aggregator.add_vote(vote, &self.tile.ticker);
+            self.send_next();
         }
 
         fn aggregate(&mut self, slot: Slot, claims: &[Claim]) {
             let attestation = attestation(0, 0..claims.len());
             let aggregate = Aggregate::new(claims.to_vec(), b"child".to_vec(), attestation);
-            let aggregate = aggregate.unwrap();
-            let tile = &mut self.tile;
-            let producers = &mut self.adapter.producers;
-            let aggregator = &mut tile.pq_aggregator;
-            let tcache = &mut tile.events_producer;
-            aggregator.add_aggregate(slot, aggregate, &tile.ticker, tcache, producers);
+            self.tile.pq_aggregator.add_aggregate(slot, aggregate.unwrap());
+            self.send_next();
         }
 
         fn tags(&mut self, request: &LeanVmReq) -> Vec<u8> {
@@ -7685,11 +7685,9 @@ mod pq_aggregator {
         fn respond(&mut self, request_id: u64, claims: &[Claim]) {
             let body = aggregate_response(claims, b"proof");
             let body = self.gossip.write_with(body.len(), |out| out.copy_from_slice(&body));
-            let tile = &mut self.tile;
-            let producers = &mut self.adapter.producers;
-            let (reader, tcache) = (&mut tile.reader, &mut tile.events_producer);
             let resp = LeanVmResp { request_id, body };
-            tile.pq_aggregator.on_response(resp, reader, &tile.ticker, tcache, producers);
+            self.tile.pq_aggregator.on_response(resp, &mut self.tile.reader);
+            self.send_next();
         }
 
         fn served(&mut self) -> Option<Vec<u8>> {

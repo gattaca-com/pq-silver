@@ -25,7 +25,7 @@ fn claim(tag: u8) -> Claim {
 #[test]
 fn the_attestation_marks_the_covered_positions() {
     let mut leaf = LeafAggregation::new(&verified(0), Nanos::MAX);
-    (0..3).for_each(|tag| leaf.add(&verified(tag)));
+    (0..3).for_each(|tag| assert!(leaf.add(&verified(tag))));
     assert!(leaf.attestation(0).is_none(), "no proof yet");
     let batch = leaf.core.next_batch(Nanos::ZERO).unwrap();
     let claims: Vec<Claim> = (0..3).map(claim).collect();

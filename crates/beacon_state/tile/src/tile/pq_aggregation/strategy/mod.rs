@@ -1,33 +1,27 @@
-mod greedy;
-mod max_coverage;
-#[cfg(test)]
-mod test_util;
+mod arrival_order;
+mod marginal_gain;
 
-use super::claims::Claim;
+pub use arrival_order::ArrivalOrder;
+pub use marginal_gain::MarginalGain;
 
 const LOG_INV_RATE: u8 = 2;
 
-#[derive(Clone, Debug)]
-pub enum Strategy {
-    Greedy,
-    MaxCoverage,
-}
+/// Picks the batches of one aggregation. It keeps its own view of committee
+/// positions, fed by events, and never sees claim bytes.
+pub trait Strategy: Default {
+    /// What the strategy reads of one verified claims.
+    type Positions;
 
-pub struct WaitingClaims<'a> {
-    pub index: usize,
-    /// Sorted, without repeats.
-    pub claims: &'a [Claim],
-    /// How many of `claims` the best proof lacks.
-    pub new_claim_count: usize,
-}
+    /// The verified claims at `index` arrived, above every earlier index.
+    /// `false` refuses them: their positions do not fit the view.
+    fn arrived(&mut self, index: usize, positions: Self::Positions) -> bool;
 
-/// What a strategy sees: no bytes, no clock, no spine.
-pub struct BatchInput<'a> {
-    /// Most waiting claims one batch takes.
-    pub limit: usize,
-    /// Sorted.
-    pub best_claims: Option<&'a [Claim]>,
-    pub waiting: &'a [WaitingClaims<'a>],
+    /// The best proof now covers `batch` as well.
+    fn adopted(&mut self, batch: &Batch);
+
+    /// At most `limit` waiting indices that add positions. `None` when none
+    /// does.
+    fn next_batch(&self, limit: usize) -> Option<Batch>;
 }
 
 /// VerifiedClaims indices to prove on top of the best proof: ascending, without
@@ -54,15 +48,6 @@ impl Batch {
 
     pub fn log_inv_rate(&self) -> u8 {
         self.log_inv_rate
-    }
-}
-
-impl Strategy {
-    pub(super) fn next_batch(&mut self, input: &BatchInput) -> Option<Batch> {
-        match self {
-            Self::Greedy => greedy::next_batch(input),
-            Self::MaxCoverage => max_coverage::next_batch(input),
-        }
     }
 }
 

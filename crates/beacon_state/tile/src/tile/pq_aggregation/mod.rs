@@ -8,8 +8,9 @@
 //! [`PqAggregator`] owns every aggregation and talks to the spine: it routes
 //! verified claims and responses, and keeps one request in flight. Each
 //! aggregation owns its verified claims, its proof and every check on a
-//! response. A strategy only
-//! picks the next batch, from a view that holds no bytes.
+//! response. It also owns a strategy that picks the next batch. The strategy
+//! keeps its own view of committee positions, fed by events; it holds no
+//! claim bytes.
 
 mod aggregation;
 mod aggregator;

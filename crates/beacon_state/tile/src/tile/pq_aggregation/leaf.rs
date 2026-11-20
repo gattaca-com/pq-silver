@@ -7,7 +7,6 @@ use silver_common::{
 use super::{
     aggregation::Aggregation,
     claims::{VerifiedVote, Vote},
-    strategy::Strategy,
 };
 
 #[derive(Clone, Copy, Debug, Hash, PartialEq, Eq)]
@@ -39,16 +38,17 @@ impl LeafAggregation {
         Self {
             committee_len: vote.committee_len,
             data: *SingleAttestationPqView::data(vote.single).as_bytes(),
-            core: Aggregation::new(Strategy::Greedy, deadline),
+            core: Aggregation::new(deadline),
         }
     }
 
-    pub(super) fn add(&mut self, vote: &VerifiedVote) {
+    /// `false` for a position beyond the largest committee.
+    pub(super) fn add(&mut self, vote: &VerifiedVote) -> bool {
         debug_assert_eq!(SingleAttestationPqView::data(vote.single).as_bytes(), &self.data);
         debug_assert_eq!(vote.committee_len, self.committee_len);
         let signature = SingleAttestationPqView::signature(vote.single);
         let vote = Vote::new(vote.committee_position, vote.pubkey, vote.message, signature);
-        self.core.add(vote);
+        self.core.add(vote)
     }
 
     /// The `AttestationPq` of the votes the best proof covers. `None` without

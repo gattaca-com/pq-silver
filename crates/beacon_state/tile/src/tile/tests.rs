@@ -7592,6 +7592,12 @@ mod pq_aggregator {
     const ROOT_A: B256 = [0xAA; 32];
     const ROOT_B: B256 = [0xBB; 32];
 
+    /// An aggregate's `AttestationPq`: positions `0..claims` of committee 0.
+    fn attestation(claims: usize) -> Vec<u8> {
+        let data = [0; ATTESTATION_DATA_SIZE];
+        AttestationPqView::encode_one_committee(&data, 0, COMMITTEE_LEN, 0..claims).unwrap()
+    }
+
     struct Rig {
         tile: BeaconStateTile,
         gossip: TProducer,
@@ -7657,7 +7663,9 @@ mod pq_aggregator {
         }
 
         fn aggregate(&mut self, slot: Slot, claims: &[Claim]) {
-            let aggregate = Aggregate::new(claims.to_vec(), b"child".to_vec(), vec![7]).unwrap();
+            let attestation = attestation(claims.len());
+            let aggregate = Aggregate::new(claims.to_vec(), b"child".to_vec(), attestation);
+            let aggregate = aggregate.unwrap();
             let tile = &mut self.tile;
             let producers = &mut self.adapter.producers;
             let aggregator = &mut tile.pq_aggregator;
@@ -7760,7 +7768,7 @@ mod pq_aggregator {
 
         rig.respond(requests[0].request_id, &[[1; 64], [2; 64]]);
         let (attestations, proof) = rig.tile.pq_aggregator.block_proof(SLOT).unwrap();
-        assert_eq!(attestations, [&[7u8][..]]);
+        assert_eq!(attestations, [attestation(2).as_slice()]);
         assert_eq!(proof, b"proof");
     }
 

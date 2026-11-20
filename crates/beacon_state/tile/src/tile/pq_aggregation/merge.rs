@@ -1,6 +1,6 @@
 use silver_common::Nanos;
 
-use super::{aggregation::Aggregation, claims::Aggregate, strategy::Strategy};
+use super::{aggregation::Aggregation, claims::Aggregate};
 
 /// The aggregates of one slot, proved as the proof of the block body. It has
 /// no deadline: the proposer reads the best proof when it asks.
@@ -10,11 +10,12 @@ pub(super) struct MergeAggregation {
 
 impl MergeAggregation {
     pub(super) fn new() -> Self {
-        Self { core: Aggregation::new(Strategy::MaxCoverage, Nanos::MAX) }
+        Self { core: Aggregation::new(Nanos::MAX) }
     }
 
-    pub(super) fn add(&mut self, aggregate: Aggregate) {
-        self.core.add(aggregate);
+    /// `false` once the merge holds too many committees for another.
+    pub(super) fn add(&mut self, aggregate: Aggregate) -> bool {
+        self.core.add(aggregate)
     }
 
     /// The `AttestationPq` SSZ of each aggregate the best proof covers, and

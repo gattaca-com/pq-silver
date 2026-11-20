@@ -1,8 +1,13 @@
+use std::{
+    cmp::{Ordering, Reverse},
+    collections::{BinaryHeap, binary_heap::PeekMut},
+};
+
 use silver_common::Nanos;
 
 use super::{
     claims::{Claim, VerifiedClaims},
-    strategy::{Batch, BatchInput, Strategy, WaitingClaims},
+    strategy::{Batch, Strategy},
     wire::{AggregateRequest, decode_aggregate_response},
 };
 
@@ -25,9 +30,10 @@ impl BestProof {
 }
 
 /// The aggregation of one key: it owns the verified claims, the best proof and
-/// every check, and never decides what to prove. The strategy decides.
-pub struct Aggregation<C> {
-    strategy: Strategy,
+/// every check, and never decides what to prove. Its strategy decides, from
+/// the events the aggregation tells it.
+pub struct Aggregation<C: VerifiedClaims> {
+    strategy: C::Strategy,
     deadline: Nanos,
     verified: Vec<C>,
     best: Option<BestProof>,
@@ -36,12 +42,18 @@ pub struct Aggregation<C> {
 }
 
 impl<C: VerifiedClaims> Aggregation<C> {
-    pub fn new(strategy: Strategy, deadline: Nanos) -> Self {
+    pub fn new(deadline: Nanos) -> Self {
+        let strategy = C::Strategy::default();
         Self { strategy, deadline, verified: Vec::new(), best: None, failures: 0 }
     }
 
-    pub fn add(&mut self, verified: C) {
-        self.verified.push(verified);
+    /// `false` if the strategy refuses the positions of `verified`.
+    pub fn add(&mut self, verified: C) -> bool {
+        let fits = self.strategy.arrived(self.verified.len(), verified.positions());
+        if fits {
+            self.verified.push(verified);
+        }
+        fits
     }
 
     /// The verified claims the best proof covers, in arrival order.
@@ -65,20 +77,7 @@ impl<C: VerifiedClaims> Aggregation<C> {
         if now >= self.deadline || self.is_stopped() {
             return None;
         }
-        let best = self.best.as_ref();
-        let lacks =
-            |claim: &&Claim| best.is_none_or(|best| best.claims.binary_search(claim).is_err());
-        let waiting: Vec<WaitingClaims> = (self.verified.iter().enumerate())
-            .filter(|&(index, _)| !self.is_covered(index))
-            .map(|(index, verified)| {
-                let claims = verified.claims();
-                let new_claim_count = claims.iter().filter(lacks).count();
-                WaitingClaims { index, claims, new_claim_count }
-            })
-            .collect();
-        let best_claims = best.map(|best| best.claims.as_slice());
-        let input = BatchInput { limit: self.batch_limit(), best_claims, waiting: &waiting };
-        let batch = self.strategy.next_batch(&input)?;
+        let batch = self.strategy.next_batch(self.batch_limit())?;
         self.accepts(&batch).then_some(batch)
     }
 
@@ -128,12 +127,9 @@ impl<C: VerifiedClaims> Aggregation<C> {
 
     fn adopt_response(&mut self, body: &[u8], batch: &Batch) -> Result<(), &'static str> {
         let (claims, proof) = decode_aggregate_response(body)?;
-        let mut expected: Vec<Claim> =
-            self.best.iter().flat_map(|best| best.claims.iter().copied()).collect();
-        expected.extend(batch.indices().iter().flat_map(|&index| self.verified[index].claims()));
-        expected.sort_unstable();
-        expected.dedup();
-        if claims != expected {
+        let best = self.best.iter().map(|best| best.claims.as_slice());
+        let batch_claims = batch.indices().iter().map(|&index| self.verified[index].claims());
+        if !is_union(&claims, best.chain(batch_claims)) {
             return Err("the proof covers other claims");
         }
         let mut covered_indices =
@@ -141,8 +137,38 @@ impl<C: VerifiedClaims> Aggregation<C> {
         covered_indices.extend(batch.indices());
         covered_indices.sort_unstable();
         self.best = Some(BestProof { claims, proof: proof.to_vec(), covered_indices });
+        self.strategy.adopted(batch);
         Ok(())
     }
+}
+
+/// Whether strictly ascending `claims` is exactly the union of `sets`, each
+/// sorted without repeats. A merge of the sets: no copy, no sort.
+fn is_union<'a>(claims: &[Claim], sets: impl Iterator<Item = &'a [Claim]>) -> bool {
+    // Slices order by their first claim first, so the top holds the least.
+    let mut heads: BinaryHeap<Reverse<&[Claim]>> =
+        sets.filter(|set| !set.is_empty()).map(Reverse).collect();
+    for claim in claims {
+        let mut found = false;
+        while let Some(mut top) = heads.peek_mut() {
+            match top.0[0].cmp(claim) {
+                // `claims` passed this one without taking it.
+                Ordering::Less => return false,
+                Ordering::Greater => break,
+                Ordering::Equal => {
+                    found = true;
+                    top.0 = &top.0[1..];
+                    if top.0.is_empty() {
+                        PeekMut::pop(top);
+                    }
+                }
+            }
+        }
+        if !found {
+            return false;
+        }
+    }
+    heads.is_empty()
 }
 
 #[cfg(test)]

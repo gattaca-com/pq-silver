@@ -5,7 +5,7 @@ use rustc_hash::FxHashMap;
 use silver_beacon_state_data::{B256, Slot};
 use silver_common::{
     LeanVmHealthEvent, LeanVmReq, LeanVmResp, Nanos, TCacheProducer, TCacheRead, TCacheReader,
-    TProducer, ticker::SlotTicker,
+    TProducer, ssz_view::MAX_VALIDATORS_PER_COMMITTEE, ticker::SlotTicker,
 };
 
 use super::{
@@ -98,7 +98,7 @@ impl PqAggregator {
         producers: &mut Producers,
     ) {
         let leaf = LeafKey::new(&vote);
-        if vote.committee_position >= vote.committee_len {
+        if vote.committee_position >= vote.committee_len.min(MAX_VALIDATORS_PER_COMMITTEE) {
             let (committee_position, committee_len) = (vote.committee_position, vote.committee_len);
             silver_log::error!(
                 slot = leaf.slot,
@@ -118,12 +118,14 @@ impl PqAggregator {
         }
         let aggregation =
             self.leaves.entry(leaf).or_insert_with(|| LeafAggregation::new(&vote, deadline));
-        aggregation.add(&vote);
+        let added = aggregation.add(&vote);
+        debug_assert!(added, "the position was checked against the largest committee");
         self.enqueue(AggregationKey::Leaf(leaf));
         self.send_next(ticker, tcache, producers);
     }
 
-    /// `aggregate` is verified, for the block of `slot`.
+    /// `aggregate` is verified, for the block of `slot`. A merge refuses it
+    /// once it holds too many committees.
     pub fn add_aggregate(
         &mut self,
         slot: Slot,
@@ -132,7 +134,10 @@ impl PqAggregator {
         tcache: &mut TProducer,
         producers: &mut Producers,
     ) {
-        self.merges.entry(slot).or_insert_with(MergeAggregation::new).add(aggregate);
+        if !self.merges.entry(slot).or_insert_with(MergeAggregation::new).add(aggregate) {
+            silver_log::warn!(slot, "aggregate dropped: the merge holds too many committees");
+            return;
+        }
         self.enqueue(AggregationKey::Merge(slot));
         self.send_next(ticker, tcache, producers);
     }

@@ -7744,7 +7744,7 @@ mod pq_aggregator {
     fn a_vote_after_the_deadline_is_dropped() {
         let mut rig = Rig::new();
         rig.ready();
-        let due_ms = rig.tile.ticker.aggregate_due_ms(SLOT);
+        let due_ms = rig.tile.ticker.aggregate_due(SLOT).as_millis_u64();
         rig.tile.ticker.set_since_genesis_ms(due_ms);
         rig.vote(1);
         assert!(rig.requests().is_empty());

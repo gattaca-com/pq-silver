@@ -111,8 +111,8 @@ impl PqAggregator {
         // TODO: the aggregate due time stands in for the VC's pull. A VC that
         // pulls later gets a proof frozen at the due time. Consider ending on
         // the last local aggregator's pull instead.
-        let deadline = Nanos::from_millis(ticker.aggregate_due_ms(leaf.slot));
-        if now(ticker) >= deadline {
+        let deadline = ticker.aggregate_due(leaf.slot);
+        if ticker.since_genesis() >= deadline {
             silver_log::debug!(slot = leaf.slot, "vote after the aggregation deadline");
             return;
         }
@@ -237,7 +237,7 @@ impl PqAggregator {
         if !matches!(self.leanvm, LeanVm::Idle) {
             return;
         }
-        let now = now(ticker);
+        let now = ticker.since_genesis();
         while let Some(key) = self.pop_next() {
             let next = match key {
                 AggregationKey::Leaf(leaf) => (self.leaves.get_mut(&leaf))
@@ -286,8 +286,4 @@ fn next_request<C: VerifiedClaims>(
     let request = core.request(&batch);
     let body = tcache.write_with(request.len(), |out| request.write(out));
     Some((batch, body))
-}
-
-fn now(ticker: &SlotTicker) -> Nanos {
-    Nanos::from_millis(ticker.millis_since_genesis())
 }

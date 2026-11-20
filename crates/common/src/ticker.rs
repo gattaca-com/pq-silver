@@ -2,6 +2,8 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use silver_chain_spec::SpecConfig;
 
+use crate::Nanos;
+
 type Slot = u64;
 
 /// Consensus-spec clock-skew allowance for slot-scoped gossip validation.
@@ -150,6 +152,10 @@ impl SlotTicker {
         self.anchor_genesis_ms.saturating_add(self.anchor.elapsed().as_millis() as u64)
     }
 
+    pub fn since_genesis(&self) -> Nanos {
+        Nanos::from_millis(self.millis_since_genesis())
+    }
+
     pub fn slot_time_elapsed(&self) -> Duration {
         Duration::from_millis(self.millis_since_genesis() % self.slot_ms)
     }
@@ -209,10 +215,12 @@ impl SlotTicker {
         if self.is_current_slot_with_disparity(next, disparity) { next } else { wall }
     }
 
-    /// Milliseconds since genesis at which `slot`'s aggregates are due.
-    pub fn aggregate_due_ms(&self, slot: Slot) -> u64 {
+    /// Time since genesis at which `slot`'s aggregates are due.
+    pub fn aggregate_due(&self, slot: Slot) -> Nanos {
         let is_gloas = slot >= self.gloas_fork_slot;
-        slot * self.slot_ms + self.slot_ms * aggregate_due_bps(is_gloas) / BASIS_POINTS
+        Nanos::from_millis(
+            slot * self.slot_ms + self.slot_ms * aggregate_due_bps(is_gloas) / BASIS_POINTS,
+        )
     }
 
     pub fn is_before_attesting_interval(&self, is_gloas: bool) -> bool {
@@ -306,8 +314,11 @@ mod tests {
         );
         let gloas_slot = ticker.gloas_fork_slot;
         let fulu = gloas_slot - 1;
-        assert_eq!(ticker.aggregate_due_ms(fulu), fulu * 12_000 + 8_000);
-        assert_eq!(ticker.aggregate_due_ms(gloas_slot), gloas_slot * 12_000 + 6_000);
+        assert_eq!(ticker.aggregate_due(fulu), Nanos::from_millis(fulu * 12_000 + 8_000));
+        assert_eq!(
+            ticker.aggregate_due(gloas_slot),
+            Nanos::from_millis(gloas_slot * 12_000 + 6_000)
+        );
     }
 
     #[test]

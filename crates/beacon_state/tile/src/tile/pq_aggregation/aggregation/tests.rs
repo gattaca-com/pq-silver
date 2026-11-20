@@ -8,7 +8,7 @@ use super::{
         claims::{Aggregate, Vote},
         leaf::LeafAggregation,
         merge::MergeAggregation,
-        wire::{MAX_RECORDS, aggregate_response},
+        wire::{MAX_SIGNATURES, aggregate_response},
     },
     *,
 };
@@ -70,26 +70,32 @@ fn settle(leaf: &mut LeafAggregation, body: Option<&[u8]>) -> Result<(), &'stati
 
 #[test]
 fn batches_take_the_waiting_votes_up_to_the_limit() {
-    assert_eq!(MAX_RECORDS, MAX_VALIDATORS_PER_COMMITTEE, "one batch holds the largest committee");
-    let first_votes = MAX_RECORDS as u16 - 2;
+    assert_eq!(
+        MAX_SIGNATURES, MAX_VALIDATORS_PER_COMMITTEE,
+        "one batch holds the largest committee"
+    );
+    let first_votes = MAX_SIGNATURES as u16 - 2;
     let mut aggregation = aggregation(first_votes);
     let batch = aggregation.next_batch(Nanos::ZERO).unwrap();
     let first = aggregation.core.request(&batch).body();
-    assert_eq!(first.len() / (64 + XMSS_SIGNATURE_SIZE), MAX_RECORDS - 2);
+    assert_eq!(first.len() / (64 + XMSS_SIGNATURE_SIZE), MAX_SIGNATURES - 2);
 
     aggregation.finish(batch, Some(&answer(0..first_votes))).unwrap();
-    assert_eq!(aggregation.core.covered_indices().len(), MAX_RECORDS - 2);
+    assert_eq!(aggregation.core.covered_indices().len(), MAX_SIGNATURES - 2);
     assert!(aggregation.add(vote(first_votes)));
     assert!(aggregation.add(vote(first_votes + 1)));
     let batch = aggregation.next_batch(Nanos::ZERO).unwrap();
     assert_eq!(batch.indices().len(), 2);
     let second = aggregation.core.request(&batch).body();
     assert!(second.windows(5).any(|window| window == b"proof"), "the best proof is the child");
-    aggregation.finish(batch, Some(&answer(0..MAX_RECORDS as u16))).unwrap();
+    aggregation.finish(batch, Some(&answer(0..MAX_SIGNATURES as u16))).unwrap();
     assert!(aggregation.next_batch(Nanos::ZERO).is_none(), "nothing waits");
-    assert_eq!(aggregation.core.covered_indices().len(), MAX_RECORDS);
-    assert_eq!(best_claims(&aggregation.core), MAX_RECORDS);
-    assert!(!aggregation.add(vote(MAX_RECORDS as u16)), "a position beyond the largest committee");
+    assert_eq!(aggregation.core.covered_indices().len(), MAX_SIGNATURES);
+    assert_eq!(best_claims(&aggregation.core), MAX_SIGNATURES);
+    assert!(
+        !aggregation.add(vote(MAX_SIGNATURES as u16)),
+        "a position beyond the largest committee"
+    );
 }
 
 #[test]
@@ -163,11 +169,11 @@ fn merge_batches_respect_the_child_limit_with_the_best_proof_as_one() {
     let mut merge = merge((0..40).map(|tag| child(&[tag])));
     let batch = merge.next_batch(Nanos::ZERO).unwrap();
     assert_eq!(batch.indices().len(), 16);
-    assert_eq!(merge.core.request(&batch).children.len(), 16);
+    assert_eq!(merge.core.request(&batch).proofs.len(), 16);
     merge.finish(batch, Some(&answer(0..16))).unwrap();
     let batch = merge.next_batch(Nanos::ZERO).unwrap();
     assert_eq!(batch.indices(), (16..31).collect::<Vec<_>>());
-    assert_eq!(merge.core.request(&batch).children.len(), 16, "the best proof is one");
+    assert_eq!(merge.core.request(&batch).proofs.len(), 16, "the best proof is one");
 }
 
 #[test]

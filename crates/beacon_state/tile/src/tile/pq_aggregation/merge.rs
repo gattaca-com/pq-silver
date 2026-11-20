@@ -4,7 +4,7 @@ use super::{
     aggregation::{Aggregation, Priority, VerifiedClaims},
     claims::Aggregate,
     strategy::{Batch, MarginalGain, Strategy},
-    wire::MAX_CHILDREN,
+    wire::MAX_PROOFS,
 };
 
 /// The aggregates of one slot, proved as the proof of the block body. It has
@@ -42,10 +42,10 @@ impl MergeAggregation {
     }
 
     /// `None` exactly when `priority` is, unless the strategy has a bug. The
-    /// best proof counts as one child.
+    /// best proof counts as one of `MAX_PROOFS`.
     pub(super) fn next_batch(&mut self, now: Nanos) -> Option<Batch> {
         self.priority(now)?;
-        let limit = MAX_CHILDREN - usize::from(self.core.best_proof().is_some());
+        let limit = MAX_PROOFS - usize::from(self.core.best_proof().is_some());
         self.core.check_batch(self.strategy.next_batch(limit), limit)
     }
 

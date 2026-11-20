@@ -8,7 +8,7 @@ use super::{
     aggregation::{Aggregation, Priority, VerifiedClaims},
     claims::{VerifiedVote, Vote},
     strategy::{ArrivalOrder, Batch, Strategy},
-    wire::MAX_RECORDS,
+    wire::MAX_SIGNATURES,
 };
 
 #[derive(Clone, Copy, Debug, Hash, PartialEq, Eq, PartialOrd, Ord)]
@@ -29,7 +29,7 @@ impl LeafKey {
 }
 
 /// The votes of one committee for one attestation data, proved as a leaf.
-/// The best proof is the only child, so a batch takes up to `MAX_RECORDS`.
+/// The best proof is the only proof, so a batch takes up to `MAX_SIGNATURES`.
 pub(super) struct LeafAggregation {
     committee_len: usize,
     data: [u8; ATTESTATION_DATA_SIZE],
@@ -69,7 +69,7 @@ impl LeafAggregation {
     /// `None` exactly when `priority` is, unless the strategy has a bug.
     pub(super) fn next_batch(&mut self, now: Nanos) -> Option<Batch> {
         self.priority(now)?;
-        self.core.check_batch(self.strategy.next_batch(MAX_RECORDS), MAX_RECORDS)
+        self.core.check_batch(self.strategy.next_batch(MAX_SIGNATURES), MAX_SIGNATURES)
     }
 
     pub(super) fn next_request(

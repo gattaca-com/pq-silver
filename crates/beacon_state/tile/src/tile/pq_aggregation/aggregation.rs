@@ -15,7 +15,7 @@ const MAX_FAILURES: u8 = 3;
 
 /// Claims verified by a signature or a proof, and what they add to a request.
 pub enum VerifiedClaims {
-    /// A vote: its claim and leanXMSS signature, as a record.
+    /// A vote: its claim and leanXMSS signature.
     Signature(Claim, Box<[u8; XMSS_SIGNATURE_SIZE]>),
     /// An aggregate: its claims, sorted without repeats, and their proof.
     Proof(Vec<Claim>, Vec<u8>),
@@ -31,8 +31,8 @@ impl VerifiedClaims {
 
     fn add_to<'a>(&'a self, request: &mut AggregateRequest<'a>) {
         match self {
-            Self::Signature(claim, signature) => request.records.push((claim, signature)),
-            Self::Proof(claims, proof) => request.children.push((claims, proof)),
+            Self::Signature(claim, signature) => request.signatures.push((claim, signature)),
+            Self::Proof(claims, proof) => request.proofs.push((claims, proof)),
         }
     }
 }
@@ -130,11 +130,11 @@ impl Aggregation {
     }
 
     fn request(&self, batch: &Batch) -> AggregateRequest<'_> {
-        let children = (self.best.iter())
+        let proofs = (self.best.iter())
             .map(|best| (best.claims.as_slice(), best.proof.as_slice()))
             .collect();
         let log_inv_rate = batch.log_inv_rate();
-        let mut request = AggregateRequest { log_inv_rate, children, records: Vec::new() };
+        let mut request = AggregateRequest { log_inv_rate, proofs, signatures: Vec::new() };
         for &index in batch.indices() {
             self.verified[index].add_to(&mut request);
         }

@@ -23,8 +23,8 @@ fn le(value: usize) -> [u8; 8] {
 /// The protocol's `aggregate` layout, appended field by field.
 fn naive_body(request: &AggregateRequest) -> Vec<u8> {
     let mut body = vec![OP_AGGREGATE, request.log_inv_rate];
-    body.extend(le(request.children.len()));
-    for (claims, proof) in &request.children {
+    body.extend(le(request.proofs.len()));
+    for (claims, proof) in &request.proofs {
         body.extend(le(8 + claims.len() * 64 + 8 + 1));
         body.extend(le(claims.len()));
         claims.iter().for_each(|claim| body.extend(claim));
@@ -33,8 +33,8 @@ fn naive_body(request: &AggregateRequest) -> Vec<u8> {
         body.extend(le(proof.len()));
         body.extend(*proof);
     }
-    body.extend(le(request.records.len()));
-    for (claim, signature) in &request.records {
+    body.extend(le(request.signatures.len()));
+    for (claim, signature) in &request.signatures {
         body.extend(*claim);
         body.extend(*signature);
     }
@@ -46,7 +46,7 @@ fn naive_body(request: &AggregateRequest) -> Vec<u8> {
 fn the_length_is_exactly_the_bytes_written() {
     let signature = [5u8; XMSS_SIGNATURE_SIZE];
     let claims: Vec<Claim> = (0..=255).map(claim).collect();
-    let records: Vec<_> = (0..2048).map(|i| (&claims[i % 256], &signature)).collect();
+    let signatures: Vec<_> = (0..2048).map(|i| (&claims[i % 256], &signature)).collect();
     let proof = vec![3u8; 1000];
     let best = (&claims[..100], &proof[..]);
     let sixteen: Vec<_> = (0..16).map(|i| (&claims[i..i + 1], &proof[..i])).collect();
@@ -54,11 +54,11 @@ fn the_length_is_exactly_the_bytes_written() {
         (vec![], vec![]),
         (vec![best], vec![]),
         (sixteen, vec![]),
-        (vec![best], records.clone()),
-        (vec![], records[..3].to_vec()),
+        (vec![best], signatures.clone()),
+        (vec![], signatures[..3].to_vec()),
     ];
-    for (children, records) in shapes {
-        let request = AggregateRequest { log_inv_rate: 2, children, records };
+    for (proofs, signatures) in shapes {
+        let request = AggregateRequest { log_inv_rate: 2, proofs, signatures };
         let mut out = vec![0xAA; request.len()];
         request.write(&mut out);
         assert_eq!(out[0], 1, "aggregate op");
@@ -73,14 +73,14 @@ fn the_longest_request_takes_exactly_the_bound() {
     let proof = vec![3u8; MAX_STARK_PROOF_SIZE];
     let best = (&claims[..], &proof[..]);
     let child = (&claims[..MAX_VALIDATORS_PER_COMMITTEE], &proof[..]);
-    let merge = [vec![best], vec![child; MAX_CHILDREN - 1]].concat();
+    let merge = [vec![best], vec![child; MAX_PROOFS - 1]].concat();
     let shapes = [
-        (vec![best], vec![(&claims[0], &signature); MAX_RECORDS]),
-        (vec![child; MAX_CHILDREN], vec![]),
+        (vec![best], vec![(&claims[0], &signature); MAX_SIGNATURES]),
+        (vec![child; MAX_PROOFS], vec![]),
         (merge, vec![]),
     ];
-    let lens = shapes.map(|(children, records)| {
-        AggregateRequest { log_inv_rate: 2, children, records }.body().len()
+    let lens = shapes.map(|(proofs, signatures)| {
+        AggregateRequest { log_inv_rate: 2, proofs, signatures }.body().len()
     });
     assert!(lens.iter().all(|&len| len <= MAX_REQUEST_LEN), "{lens:?}");
     assert_eq!(lens[2], MAX_REQUEST_LEN, "a merge on the largest best proof");
@@ -89,7 +89,7 @@ fn the_longest_request_takes_exactly_the_bound() {
 #[test]
 #[should_panic(expected = "shorter than its slice")]
 fn a_slice_longer_than_the_request_is_a_bug() {
-    let request = AggregateRequest { log_inv_rate: 2, children: vec![], records: vec![] };
+    let request = AggregateRequest { log_inv_rate: 2, proofs: vec![], signatures: vec![] };
     request.write(&mut vec![0; request.len() + 1]);
 }
 
@@ -162,12 +162,12 @@ fn a_real_sidecar_aggregates_then_extends() {
     let mut bytes = vec![0; 16 * RECORD];
     let file = std::env::var("LEANVM_SIGNATURES").expect("LEANVM_SIGNATURES");
     std::fs::File::open(file).unwrap().read_exact(&mut bytes).unwrap();
-    let records: Vec<(Claim, &[u8; XMSS_SIGNATURE_SIZE])> = bytes
+    let signatures: Vec<(Claim, &[u8; XMSS_SIGNATURE_SIZE])> = bytes
         .chunks_exact(RECORD)
-        .map(|record| (record[..64].try_into().unwrap(), record[64..].try_into().unwrap()))
+        .map(|signed| (signed[..64].try_into().unwrap(), signed[64..].try_into().unwrap()))
         .collect();
-    let sorted = |records: &[(Claim, &[u8; XMSS_SIGNATURE_SIZE])]| {
-        let mut claims: Vec<Claim> = records.iter().map(|(claim, _)| *claim).collect();
+    let sorted = |signatures: &[(Claim, &[u8; XMSS_SIGNATURE_SIZE])]| {
+        let mut claims: Vec<Claim> = signatures.iter().map(|(claim, _)| *claim).collect();
         claims.sort_unstable();
         claims
     };
@@ -176,16 +176,16 @@ fn a_real_sidecar_aggregates_then_extends() {
     let mut stream = UnixStream::connect(socket).unwrap();
     assert!(read_frame(&mut stream).starts_with(b"leanvmsc"));
 
-    let request = |children: Vec<_>, records: &[(Claim, &[u8; XMSS_SIGNATURE_SIZE])]| {
-        let records = records.iter().map(|(claim, signature)| (claim, *signature)).collect();
-        AggregateRequest { log_inv_rate: 2, children, records }.body()
+    let request = |proofs: Vec<_>, signatures: &[(Claim, &[u8; XMSS_SIGNATURE_SIZE])]| {
+        let signatures = signatures.iter().map(|(claim, signature)| (claim, *signature)).collect();
+        AggregateRequest { log_inv_rate: 2, proofs, signatures }.body()
     };
-    let response = exchange(&mut stream, &request(vec![], &records[..8]));
+    let response = exchange(&mut stream, &request(vec![], &signatures[..8]));
     let (claims, proof) = decode_aggregate_response(&response).unwrap();
-    assert_eq!(claims, sorted(&records[..8]));
+    assert_eq!(claims, sorted(&signatures[..8]));
 
     let child = (claims.as_slice(), proof);
-    let response = exchange(&mut stream, &request(vec![child], &records[8..]));
+    let response = exchange(&mut stream, &request(vec![child], &signatures[8..]));
     let (union, _) = decode_aggregate_response(&response).unwrap();
-    assert_eq!(union, sorted(&records));
+    assert_eq!(union, sorted(&signatures));
 }

@@ -268,7 +268,7 @@ pub struct BeaconStateTile {
     /// Gloas: payload envelopes seen before their block entered fork choice.
     pending_envelopes: PendingEnvelopes,
     /// Signature → block root.
-    el_rejected_envelopes: FxHashMap<[u8; 96], B256>,
+    el_rejected_envelopes: FxHashMap<B256, B256>,
     envelope_arrivals: EnvelopeArrivals,
     /// Gload: payload bids for the current slot
     payload_bids_pool: BidPool,
@@ -1220,10 +1220,16 @@ impl BeaconStateTile {
                 });
                 return;
             }
-            // todo(CL-239): PQ envelopes reach the EL over gossip only.
             if topic == GossipTopic::BeaconBlock {
                 silver_log::debug!(?stream_id, "received PQ beacon block over rpc");
                 self.handle_rpc_block(stream_id, ssz, false, producers);
+            } else {
+                self.handle_execution_payload_envelope(
+                    acquired.clone(),
+                    data,
+                    BlockSource::Rpc,
+                    producers,
+                );
             }
             return;
         }

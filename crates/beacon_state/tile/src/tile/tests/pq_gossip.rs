@@ -1,5 +1,5 @@
 use silver_beacon_state_data::{
-    EpochState, FinalizedValidators, Fork, HashFormat, ValidatorsGroup,
+    BUILDER_INDEX_SELF_BUILD, EpochState, FinalizedValidators, Fork, HashFormat, ValidatorsGroup,
     pq::PQ_FORK_VERSION,
     xmss::{
         LeafOffset, SignatureCheck, compute_xmss_attestation_leaf_index, compute_xmss_leaf_index,
@@ -9,9 +9,10 @@ use silver_common::{
     ForkName, GossipDomain, compute_subnet_for_attestation,
     ssz_hash::hash_attestation_data,
     ssz_view::{
-        BEACON_BLOCK_HEADER_SIZE, PAYLOAD_ATTESTATION_MESSAGE_PQ_SIZE, PROPOSER_PREFERENCES_SIZE,
-        PROPOSER_SLASHING_PQ_SIZE, SIGNED_BEACON_BLOCK_HEADER_PQ_SIZE,
-        SIGNED_PROPOSER_PREFERENCES_PQ_SIZE, SINGLE_ATT_PQ_SIZE, XMSS_SIGNATURE_SIZE, XMSSPubkey,
+        BEACON_BLOCK_HEADER_SIZE, EXECUTION_PAYLOAD_ENVELOPE_MIN, EXECUTION_PAYLOAD_FIXED_GLOAS,
+        PAYLOAD_ATTESTATION_MESSAGE_PQ_SIZE, PROPOSER_PREFERENCES_SIZE, PROPOSER_SLASHING_PQ_SIZE,
+        SIGNED_BEACON_BLOCK_HEADER_PQ_SIZE, SIGNED_PQ_FIXED, SIGNED_PROPOSER_PREFERENCES_PQ_SIZE,
+        SINGLE_ATT_PQ_SIZE, XMSS_SIGNATURE_SIZE, XMSSPubkey,
     },
 };
 use silver_crypto_simd::xmss::SecretKey;
@@ -224,5 +225,54 @@ fn proposer_slashing_needs_both_signatures() {
         tile.handle_gossip(msg.ssz, msg, true, false, &mut adapter.producers);
         assert_eq!(gossip_verdicts(&mut adapter), if accepted { (1, 0) } else { (0, 1) });
         assert_eq!(tile.seen_proposer_slashings.contains(0), accepted);
+    }
+}
+
+/// A PQ envelope that arrives before its block parks only once its signer's
+/// XMSS signature verifies against the parent's registry.
+#[test]
+fn envelope_for_an_unseen_block_parks_only_with_its_signature() {
+    let key = SecretKey::new(&[7; 32]);
+    let pubkey = key.public_key();
+    let (mut tile, mut gossip, _spine, mut adapter) = pq_tile(&pubkey, 0, 1);
+    adapter.consume(|_: PeerEvent, _| {});
+
+    let slot: Slot = 1;
+    let block_root = [0xB1; 32];
+    let requests_start = EXECUTION_PAYLOAD_ENVELOPE_MIN + EXECUTION_PAYLOAD_FIXED_GLOAS;
+    let mut signed = vec![0; SIGNED_PQ_FIXED + requests_start + 8 * 4];
+    signed[..4].copy_from_slice(&(SIGNED_PQ_FIXED as u32).to_le_bytes());
+    let message = &mut signed[SIGNED_PQ_FIXED..];
+    message[..4].copy_from_slice(&(EXECUTION_PAYLOAD_ENVELOPE_MIN as u32).to_le_bytes());
+    message[4..8].copy_from_slice(&(requests_start as u32).to_le_bytes());
+    message[8..16].copy_from_slice(&BUILDER_INDEX_SELF_BUILD.to_le_bytes());
+    message[16..48].copy_from_slice(&block_root);
+    message[48..80].copy_from_slice(&ANCHOR_ROOT);
+    let payload = &mut message[EXECUTION_PAYLOAD_ENVELOPE_MIN..requests_start];
+    for pos in [436, 504, 508, 528] {
+        payload[pos..][..4].copy_from_slice(&(EXECUTION_PAYLOAD_FIXED_GLOAS as u32).to_le_bytes());
+    }
+    payload[532..540].copy_from_slice(&slot.to_le_bytes());
+    for offset in message[requests_start..].chunks_exact_mut(4) {
+        offset.copy_from_slice(&32u32.to_le_bytes());
+    }
+
+    let domain = domain(bls::DOMAIN_BEACON_BUILDER);
+    let check = SignatureCheck::execution_payload_envelope(&signed, slot, &pubkey, &domain)
+        .expect("a canonical PQ envelope");
+    let (leaf, signing_root) = (check.leaf_index, check.signing_root);
+    let bottom = key.bottom_tree((leaf >> 16) as u32);
+    let wrong_leaf = compute_xmss_leaf_index(slot, LeafOffset::BeaconProposer);
+    for (leaf, parked) in [(wrong_leaf, false), (leaf, true)] {
+        signed[4..SIGNED_PQ_FIXED].copy_from_slice(&key.sign(&bottom, &signing_root, leaf as u32));
+        let read = tile.reader.acquire(tcache_write(&mut gossip, &signed));
+        let feedback = tile.handle_execution_payload_envelope(
+            read,
+            &signed,
+            BlockSource::Gossip,
+            &mut adapter.producers,
+        );
+        assert_eq!(matches!(feedback, Feedback::Reject { .. }), !parked);
+        assert_eq!(tile.pending_envelopes.holds(&block_root), parked);
     }
 }

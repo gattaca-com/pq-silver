@@ -866,7 +866,7 @@ impl HeadRig {
             read,
             source: BlockSource::Gossip,
             slot,
-            signature: [0; 96],
+            signature_digest: [0; 32],
         });
     }
 

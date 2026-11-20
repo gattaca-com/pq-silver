@@ -5,7 +5,8 @@ use silver_common::{
     ssz_view::{
         BEACON_BLOCK_BODY_FIXED, BYTES_PER_BLOB, BeaconBlockBodyFuluView,
         ExecutionPayloadEnvelopeView, ExecutionPayloadView, NUMBER_OF_COLUMNS,
-        SIGNED_BEACON_BLOCK_MIN, SignedBeaconBlockView, SignedExecutionPayloadEnvelopeView,
+        SIGNED_BEACON_BLOCK_MIN, SignedBeaconBlockView, SignedExecutionPayloadEnvelopePqView,
+        SignedExecutionPayloadEnvelopeView,
     },
 };
 use simd_json::{
@@ -356,7 +357,7 @@ pub(crate) fn write_new_payload_params_fulu(
     append_hex(SignedBeaconBlockView::parent_root(data), out);
     out.push(b'"');
 
-    write_execution_requests_json::<3>(&body[execution_requests_offset..], out)?;
+    write_execution_requests_json(&body[execution_requests_offset..], &FULU_REQUEST_TYPES, out)?;
 
     out.push(b']');
 
@@ -373,10 +374,14 @@ pub(crate) fn write_new_payload_params_gloas(
     versioned_hashes: &[[u8; 32]],
     out: &mut Vec<u8>,
 ) -> Result<(), crate::EngineError> {
-    if !SignedExecutionPayloadEnvelopeView::check_size(data) {
+    // The first offset tells the signature schemes apart.
+    let (envelope, request_types) = if SignedExecutionPayloadEnvelopePqView::check_size(data) {
+        (SignedExecutionPayloadEnvelopePqView::message(data), &PQ_REQUEST_TYPES[..])
+    } else if SignedExecutionPayloadEnvelopeView::check_size(data) {
+        (SignedExecutionPayloadEnvelopeView::message(data), &GLOAS_REQUEST_TYPES[..])
+    } else {
         return Err(crate::EngineError::Ssz("execution payload envelope malformed".into()));
-    }
-    let envelope = SignedExecutionPayloadEnvelopeView::message(data);
+    };
     if !ExecutionPayloadEnvelopeView::check_size(envelope) {
         return Err(crate::EngineError::Ssz("execution payload envelope malformed".into()));
     }
@@ -391,8 +396,9 @@ pub(crate) fn write_new_payload_params_gloas(
     append_hex(ExecutionPayloadEnvelopeView::parent_beacon_block_root(envelope), out);
     out.push(b'"');
 
-    write_execution_requests_json::<5>(
+    write_execution_requests_json(
         ExecutionPayloadEnvelopeView::execution_requests(envelope),
+        request_types,
         out,
     )?;
 
@@ -487,27 +493,32 @@ fn write_execution_payload_obj(
 /// byte is the list's position: fulu has 3 (deposits 0x00, withdrawals 0x01,
 /// consolidations 0x02), gloas 5 (EIP-8282 adds builder_deposits 0x03 and
 /// builder_exits 0x04).
-fn write_execution_requests_json<const N: usize>(
+/// EIP-7685 request types, one per `ExecutionRequests` list in serialization
+/// order.
+const FULU_REQUEST_TYPES: [u8; 3] = [0, 1, 2];
+const GLOAS_REQUEST_TYPES: [u8; 5] = [0, 1, 2, 3, 4];
+/// PQ removed the 0x05 and 0x06 registrations.
+const PQ_REQUEST_TYPES: [u8; 8] = [0, 1, 2, 3, 4, 7, 8, 9];
+
+fn write_execution_requests_json(
     er: &[u8],
+    request_types: &[u8],
     out: &mut Vec<u8>,
 ) -> Result<(), crate::EngineError> {
-    if er.len() < 4 * N {
+    let n = request_types.len();
+    if er.len() < 4 * n {
         return Err(crate::EngineError::Ssz("execution_requests too short".into()));
     }
-    let mut offs = [0usize; N];
-    for (i, off) in offs.iter_mut().enumerate() {
-        *off = u32::from_le_bytes(er[4 * i..4 * i + 4].try_into().unwrap()) as usize;
-    }
-    let in_order = offs.windows(2).all(|w| w[0] <= w[1]);
-    if offs[0] < 4 * N || !in_order || offs[N - 1] > er.len() {
+    let offset = |i: usize| u32::from_le_bytes(er[4 * i..4 * i + 4].try_into().unwrap()) as usize;
+    let end = |i: usize| if i + 1 < n { offset(i + 1) } else { er.len() };
+    if offset(0) < 4 * n || (0..n).any(|i| offset(i) > end(i)) {
         return Err(crate::EngineError::Ssz("invalid execution_requests offsets".into()));
     }
 
     out.extend_from_slice(b",[");
     let mut first = true;
-    for i in 0..N {
-        let type_byte = i as u8;
-        let data = &er[offs[i]..offs.get(i + 1).copied().unwrap_or(er.len())];
+    for (i, &type_byte) in request_types.iter().enumerate() {
+        let data = &er[offset(i)..end(i)];
         if data.is_empty() {
             continue;
         }
@@ -877,7 +888,9 @@ pub(crate) fn json_get_blobs_to_tcache(
 
 #[cfg(test)]
 mod tests {
-    use silver_common::{TCache, TCacheId, TCacheProducer, TProducer, TapeScratch};
+    use silver_common::{
+        TCache, TCacheId, TCacheProducer, TProducer, TapeScratch, ssz_view::XMSS_SIGNATURE_SIZE,
+    };
     use simd_json::{
         owned::to_value,
         prelude::{ValueAsArray, ValueAsMutObject, ValueAsScalar, ValueObjectAccess},
@@ -971,8 +984,14 @@ mod tests {
     // Wraps a payload + 5-list gloas ExecutionRequests in a
     // SignedExecutionPayloadEnvelope (zeroed signature and roots).
     fn make_signed_envelope(payload: &[u8], requests: [&[u8]; 5]) -> Vec<u8> {
-        let mut out = vec![0u8; 100];
-        out[0..4].copy_from_slice(&100u32.to_le_bytes());
+        signed_envelope(96, payload, &requests)
+    }
+
+    /// The fixed part is the message offset, then a `signature_len` signature.
+    fn signed_envelope(signature_len: usize, payload: &[u8], requests: &[&[u8]]) -> Vec<u8> {
+        let fixed = 4 + signature_len;
+        let mut out = vec![0u8; fixed];
+        out[0..4].copy_from_slice(&(fixed as u32).to_le_bytes());
 
         let msg = out.len();
         out.resize(msg + 80, 0);
@@ -981,12 +1000,12 @@ mod tests {
         out[msg + 4..msg + 8].copy_from_slice(&requests_off.to_le_bytes());
         out.extend_from_slice(payload);
 
-        let mut off = 20u32;
-        for r in &requests {
+        let mut off = 4 * requests.len() as u32;
+        for r in requests {
             out.extend_from_slice(&off.to_le_bytes());
             off += r.len() as u32;
         }
-        for r in &requests {
+        for r in requests {
             out.extend_from_slice(r);
         }
         out
@@ -1462,6 +1481,22 @@ mod tests {
         assert_eq!(reqs[2].as_str(), Some("0x0233"));
         assert_eq!(reqs[3].as_str(), Some("0x0344"));
         assert_eq!(reqs[4].as_str(), Some("0x0455"));
+    }
+
+    /// PQ's eight lists skip the removed 0x05 and 0x06 registrations.
+    #[test]
+    fn write_new_payload_params_pq_request_types() {
+        let payload = make_gloas_payload(&[], &[], 1);
+        let requests: [&[u8]; 8] = [&[0x11], &[], &[], &[], &[0x55], &[0x77], &[], &[0x99]];
+        let envelope = signed_envelope(XMSS_SIGNATURE_SIZE, &payload, &requests);
+
+        let mut out = Vec::new();
+        write_new_payload_params_gloas(&envelope, &[], &mut out).unwrap();
+
+        let val = simd_json::to_borrowed_value(&mut out).unwrap();
+        let reqs: Vec<_> =
+            val.as_array().unwrap()[3].as_array().unwrap().iter().map(|r| r.as_str()).collect();
+        assert_eq!(reqs, [Some("0x0011"), Some("0x0455"), Some("0x0777"), Some("0x0999")]);
     }
 
     #[test]

@@ -34,7 +34,7 @@ pub(super) struct UnverifiedEnvelope {
     pub(super) read: TRead,
     pub(super) source: BlockSource,
     pub(super) slot: Slot,
-    pub(super) signature: [u8; 96],
+    pub(super) signature_digest: B256,
 }
 
 pub(super) struct PendingEnvelopes {

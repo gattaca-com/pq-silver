@@ -26,16 +26,14 @@ use silver_common::{
         SIGNED_BLS_CHANGE_SIZE, SIGNED_CONTRIBUTION_AND_PROOF_SIZE,
         SIGNED_PROPOSER_PREFERENCES_PQ_SIZE, SIGNED_PROPOSER_PREFERENCES_SIZE,
         SIGNED_VOLUNTARY_EXIT_SIZE, SINGLE_ATT_SIZE, SYNC_COMMITTEE_MSG_SIZE,
-        SignedBlsToExecutionChangeView, SignedExecutionPayloadEnvelopeView as SignedPayload,
-        SignedProposerPreferencesPqView, SignedProposerPreferencesView,
-        SignedSyncCommitteeProofView, SignedVoluntaryExitView, SingleAttestationView,
-        SyncCommitteeView,
+        SignedBlsToExecutionChangeView, SignedProposerPreferencesPqView,
+        SignedProposerPreferencesView, SignedSyncCommitteeProofView, SignedVoluntaryExitView,
+        SingleAttestationView, SyncCommitteeView,
     },
 };
 use silver_ssz::ssz_view::{
     PAYLOAD_ATTESTATION_MESSAGE_PQ_SIZE, SINGLE_ATT_PQ_SIZE, SignedExecutionPayloadBidPqView,
-    SignedExecutionPayloadBidView, SignedExecutionPayloadEnvelopePqView, SingleAttestationPqView,
-    XMSSPubkey,
+    SignedExecutionPayloadBidView, SingleAttestationPqView, XMSSPubkey,
 };
 
 use super::{
@@ -1676,7 +1674,7 @@ impl BeaconStateTile {
         envelope: &UnverifiedEnvelope,
         producers: &mut Producers,
     ) {
-        self.el_rejected_envelopes.insert(envelope.signature, block_root);
+        self.el_rejected_envelopes.insert(envelope.signature_digest, block_root);
         self.pending_envelopes.request(block_root, envelope.slot, producers);
     }
 
@@ -1725,14 +1723,10 @@ impl BeaconStateTile {
         source: BlockSource,
         producers: &mut Producers,
     ) -> Feedback {
-        // todo(CL-239): the EL submission reads BLS-signed envelopes only.
-        if SignedExecutionPayloadEnvelopePqView::check_size(ssz) {
-            return Feedback::Ignore;
-        }
-        // BLS signatures are deterministic: a rejected one either repeats the
-        // rejected envelope or fails verification.
-        if SignedPayload::check_size(ssz) &&
-            self.el_rejected_envelopes.contains_key(SignedPayload::signature(ssz))
+        // BLS and XMSS signatures are deterministic: a rejected one either
+        // repeats the rejected envelope or fails verification.
+        if envelope_signature_digest(ssz)
+            .is_some_and(|digest| self.el_rejected_envelopes.contains_key(&digest))
         {
             return Feedback::Ignore;
         }
@@ -1758,7 +1752,8 @@ impl BeaconStateTile {
         source: BlockSource,
         producers: &mut Producers,
     ) -> Feedback {
-        let signature = *SignedPayload::signature(ssz);
+        let signature_digest =
+            envelope_signature_digest(ssz).expect("a verified envelope fits its layout");
 
         let rv = self.state.read_view(state_id);
         let slot = rv.slot.slot_number();
@@ -1812,7 +1807,7 @@ impl BeaconStateTile {
             read: acquired,
             source,
             slot,
-            signature,
+            signature_digest,
         });
 
         Feedback::Accept
@@ -1822,11 +1817,14 @@ impl BeaconStateTile {
     /// signature first keeps a peer without the signer's key from displacing
     /// the real envelope, or from filling the buffer.
     fn park_signed_envelope(&mut self, block_root: B256, acquired: TRead, ssz: &[u8]) -> Feedback {
-        if !SignedPayload::check_canonical(ssz) {
+        let Some(layout) = stf::envelope_layout(ssz) else {
             return Feedback::reject("envelope malformed");
-        }
-        let envelope = SignedPayload::message(ssz);
+        };
+        let envelope = layout.envelope_message(ssz).expect("a canonical envelope");
         let slot = ExecutionPayloadView::slot_number(Envelope::payload(envelope));
+        if SignedBlockLayout::at_slot(&self.spec, slot) != layout {
+            return Feedback::reject("envelope signed for another fork");
+        }
         let builder_index = Envelope::builder_index(envelope);
         let awaits_block = self.ticker.is_within_slot_range(
             slot,
@@ -1847,8 +1845,8 @@ impl BeaconStateTile {
         };
         let rv = self.state.read_view(self.fork_choice.node(parent_idx).state_id);
         let fork_version = self.spec.fork_version_at(slot / SLOTS_PER_EPOCH);
-        match stf::verify_envelope_signature(&rv, ssz, fork_version, lookahead_proposer(&rv, slot))
-        {
+        let proposer = lookahead_proposer(&rv, slot);
+        match stf::verify_envelope_signature(&rv, layout, ssz, fork_version, proposer) {
             Ok(()) => {}
             Err(EnvelopeError::BuilderOutOfRange { .. }) => return Feedback::Ignore,
             Err(e) => {
@@ -2725,4 +2723,13 @@ impl Display for GossipFields<'_> {
             _ => write!(f, "len={}", data.len()),
         }
     }
+}
+
+/// The key a rejected envelope is remembered by: the signature itself is too
+/// large to hold under XMSS.
+fn envelope_signature_digest(ssz: &[u8]) -> Option<B256> {
+    [SignedBlockLayout::Gloas, SignedBlockLayout::Pq]
+        .into_iter()
+        .find_map(|layout| layout.envelope_signature(ssz))
+        .map(merkle::sha256)
 }

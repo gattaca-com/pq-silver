@@ -137,6 +137,18 @@ impl SignedBlockLayout {
         ExecutionPayloadEnvelopeView::check_size(message).then_some(message)
     }
 
+    /// The signature over `envelope`, in this layout's scheme: `None` before
+    /// Gloas, or when the envelope is out of bounds.
+    pub fn envelope_signature(self, envelope: &[u8]) -> Option<&[u8]> {
+        match self {
+            Self::Fulu => None,
+            Self::Gloas => SignedExecutionPayloadEnvelopeView::check_size(envelope)
+                .then(|| &SignedExecutionPayloadEnvelopeView::signature(envelope)[..]),
+            Self::Pq => SignedExecutionPayloadEnvelopePqView::check_size(envelope)
+                .then(|| &SignedExecutionPayloadEnvelopePqView::signature(envelope)[..]),
+        }
+    }
+
     /// The serialized `ExecutionPayloadBid`: `None` before Gloas, or when the
     /// bid is out of bounds.
     pub fn bid(self, block: &[u8]) -> Option<&[u8]> {

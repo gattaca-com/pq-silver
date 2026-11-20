@@ -5,7 +5,7 @@ use silver_common::{Nanos, TCacheProducer, TCacheRead, TProducer, ssz_view::XMSS
 use super::{
     claims::Claim,
     strategy::Batch,
-    wire::{AggregateRequest, MAX_REQUEST_LEN, decode_aggregate_response},
+    wire::{AggregateRequest, AggregateResponse, MAX_REQUEST_LEN},
 };
 
 const MAX_FAILURES: u8 = 3;
@@ -161,7 +161,7 @@ impl Aggregation {
     }
 
     fn adopt_response(&mut self, body: &[u8], batch: &Batch) -> Result<(), &'static str> {
-        let (claims, proof) = decode_aggregate_response(body)?;
+        let AggregateResponse { claims, proof } = AggregateResponse::decode(body)?;
         if !self.proves_exactly(&claims, batch) {
             return Err("the proof covers other claims");
         }

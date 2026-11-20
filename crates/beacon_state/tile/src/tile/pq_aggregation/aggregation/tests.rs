@@ -8,7 +8,7 @@ use super::{
         claims::{Aggregate, Vote},
         leaf::LeafAggregation,
         merge::MergeAggregation,
-        wire::{MAX_SIGNATURES, aggregate_response},
+        wire::{AggregateResponse, MAX_SIGNATURES},
     },
     *,
 };
@@ -39,7 +39,7 @@ fn claim(tag: u16) -> Claim {
 fn answer(tags: impl IntoIterator<Item = u16>) -> Vec<u8> {
     let mut claims: Vec<Claim> = tags.into_iter().map(claim).collect();
     claims.sort_unstable();
-    aggregate_response(&claims, b"proof")
+    AggregateResponse::encode(&claims, b"proof")
 }
 
 fn best_claims(core: &Aggregation) -> usize {
@@ -123,7 +123,7 @@ fn nothing_is_sent_at_the_deadline() {
 #[test]
 fn a_response_with_other_claims_is_refused() {
     let junk = b"\0junk".to_vec();
-    for body in [answer([0, 1]), answer([1]), aggregate_response(&[], b"p"), junk] {
+    for body in [answer([0, 1]), answer([1]), AggregateResponse::encode(&[], b"p"), junk] {
         let mut aggregation = aggregation(1);
         assert!(settle(&mut aggregation, Some(&body)).is_err());
         assert!(aggregation.core.best.is_none());
@@ -179,9 +179,9 @@ fn merge_batches_respect_the_child_limit_with_the_best_proof_as_one() {
 #[test]
 fn a_proof_above_1_mib_is_refused() {
     let mut aggregation = aggregation(1);
-    let body = aggregate_response(&[claim(0)], &vec![0; MAX_STARK_PROOF_SIZE + 1]);
+    let body = AggregateResponse::encode(&[claim(0)], &vec![0; MAX_STARK_PROOF_SIZE + 1]);
     assert_eq!(settle(&mut aggregation, Some(&body)), Err("malformed response"));
-    let body = aggregate_response(&[claim(0)], &vec![0; MAX_STARK_PROOF_SIZE]);
+    let body = AggregateResponse::encode(&[claim(0)], &vec![0; MAX_STARK_PROOF_SIZE]);
     settle(&mut aggregation, Some(&body)).unwrap();
 }
 

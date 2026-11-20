@@ -104,16 +104,6 @@ fn put_claims(out: &mut &mut [u8], claims: &[Claim]) {
     put(out, &[0]);
 }
 
-#[cfg(test)]
-pub(in crate::tile) fn aggregate_response(claims: &[Claim], proof: &[u8]) -> Vec<u8> {
-    let mut body = vec![0; 1 + proof_len(claims.len(), proof.len())];
-    let mut out = body.as_mut_slice();
-    put(&mut out, &[0]);
-    put_claims(&mut out, claims);
-    put_bytes(&mut out, proof);
-    body
-}
-
 fn take<'a>(buf: &mut &'a [u8], len: usize) -> Option<&'a [u8]> {
     let (head, tail) = buf.split_at_checked(len)?;
     *buf = tail;
@@ -130,32 +120,53 @@ fn take_bytes<'a>(buf: &mut &'a [u8]) -> Option<&'a [u8]> {
     take(buf, len)
 }
 
-fn parse_claims(mut bytes: &[u8]) -> Option<Vec<Claim>> {
-    let count = take_u64(&mut bytes).filter(|&count| count <= MAX_PROOF_CLAIMS)?;
-    let claim_bytes = take(&mut bytes, count.checked_mul(64)?)?;
-    let claims: Vec<Claim> = claim_bytes.chunks_exact(64).map(|c| c.try_into().unwrap()).collect();
-    let sorted = claims.windows(2).all(|pair| pair[0] < pair[1]);
-    let no_sphincs_and_no_da = take_u64(&mut bytes)? == 0 && take(&mut bytes, 1)? == [0];
-    (sorted && no_sphincs_and_no_da && bytes.is_empty()).then_some(claims)
+/// One `aggregate` response: the proof and the claims it proves.
+#[derive(Debug, PartialEq, Eq)]
+pub(in crate::tile) struct AggregateResponse<'a> {
+    /// Strictly ascending.
+    pub claims: Vec<Claim>,
+    pub proof: &'a [u8],
 }
 
-fn parse_aggregate_body(mut body: &[u8]) -> Option<(Vec<Claim>, &[u8])> {
-    let claims = parse_claims(take_bytes(&mut body)?)?;
-    let proof = take_bytes(&mut body)?;
-    (proof.len() <= MAX_STARK_PROOF_SIZE && body.is_empty()).then_some((claims, proof))
-}
-
-/// Decodes an `aggregate` response into its strictly sorted claims and proof.
-/// A non-zero status logs the leanVM sidecar's message and fails.
-pub(super) fn decode_aggregate_response(body: &[u8]) -> Result<(Vec<Claim>, &[u8]), &'static str> {
-    let (&status, mut rest) = body.split_first().ok_or("empty response")?;
-    if status != 0 {
-        let message = take_bytes(&mut rest).unwrap_or_default();
-        let message = String::from_utf8_lossy(message);
-        silver_log::warn!(status, %message, "leanvm sidecar rejected the batch");
-        return Err("rejected by the leanvm sidecar");
+impl<'a> AggregateResponse<'a> {
+    /// A non-zero status logs the leanVM sidecar's message and fails.
+    pub(super) fn decode(body: &'a [u8]) -> Result<Self, &'static str> {
+        let (&status, mut rest) = body.split_first().ok_or("empty response")?;
+        if status != 0 {
+            let message = take_bytes(&mut rest).unwrap_or_default();
+            let message = String::from_utf8_lossy(message);
+            silver_log::warn!(status, %message, "leanvm sidecar rejected the batch");
+            return Err("rejected by the leanvm sidecar");
+        }
+        Self::parse(rest).ok_or("malformed response")
     }
-    parse_aggregate_body(rest).ok_or("malformed response")
+
+    fn parse(mut body: &'a [u8]) -> Option<Self> {
+        let claims = Self::parse_claims(take_bytes(&mut body)?)?;
+        let proof = take_bytes(&mut body)?;
+        (proof.len() <= MAX_STARK_PROOF_SIZE && body.is_empty()).then_some(Self { claims, proof })
+    }
+
+    fn parse_claims(mut bytes: &[u8]) -> Option<Vec<Claim>> {
+        let count = take_u64(&mut bytes).filter(|&count| count <= MAX_PROOF_CLAIMS)?;
+        let claim_bytes = take(&mut bytes, count.checked_mul(64)?)?;
+        let claims: Vec<Claim> =
+            claim_bytes.chunks_exact(64).map(|c| c.try_into().unwrap()).collect();
+        let sorted = claims.windows(2).all(|pair| pair[0] < pair[1]);
+        let no_sphincs_and_no_da = take_u64(&mut bytes)? == 0 && take(&mut bytes, 1)? == [0];
+        (sorted && no_sphincs_and_no_da && bytes.is_empty()).then_some(claims)
+    }
+
+    /// A successful response body, as the leanVM sidecar writes it.
+    #[cfg(test)]
+    pub(in crate::tile) fn encode(claims: &[Claim], proof: &[u8]) -> Vec<u8> {
+        let mut body = vec![0; 1 + proof_len(claims.len(), proof.len())];
+        let mut out = body.as_mut_slice();
+        put(&mut out, &[0]);
+        put_claims(&mut out, claims);
+        put_bytes(&mut out, proof);
+        body
+    }
 }
 
 #[cfg(test)]

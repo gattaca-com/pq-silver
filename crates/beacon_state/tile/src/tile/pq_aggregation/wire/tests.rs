@@ -95,40 +95,43 @@ fn a_slice_longer_than_the_request_is_a_bug() {
 
 #[test]
 fn a_good_response_decodes() {
-    let body = aggregate_response(&[claim(1), claim(2)], b"proof");
-    let (claims, proof) = decode_aggregate_response(&body).unwrap();
+    let body = AggregateResponse::encode(&[claim(1), claim(2)], b"proof");
+    let AggregateResponse { claims, proof } = AggregateResponse::decode(&body).unwrap();
     assert_eq!(claims, [claim(1), claim(2)]);
     assert_eq!(proof, b"proof");
 }
 
 #[test]
 fn every_malformed_response_is_refused() {
-    let good = aggregate_response(&[claim(1), claim(2)], b"proof");
-    assert!(decode_aggregate_response(&[]).is_err());
-    assert!(decode_aggregate_response(&good[..good.len() - 1]).is_err(), "truncated");
-    assert!(decode_aggregate_response(&[good.clone(), vec![0]].concat()).is_err(), "trailing");
+    let good = AggregateResponse::encode(&[claim(1), claim(2)], b"proof");
+    assert!(AggregateResponse::decode(&[]).is_err());
+    assert!(AggregateResponse::decode(&good[..good.len() - 1]).is_err(), "truncated");
+    assert!(AggregateResponse::decode(&[good.clone(), vec![0]].concat()).is_err(), "trailing");
     assert!(
-        decode_aggregate_response(&aggregate_response(&[claim(2), claim(1)], b"p")).is_err(),
+        AggregateResponse::decode(&AggregateResponse::encode(&[claim(2), claim(1)], b"p")).is_err(),
         "unsorted"
     );
     assert!(
-        decode_aggregate_response(&aggregate_response(&[claim(1), claim(1)], b"p")).is_err(),
+        AggregateResponse::decode(&AggregateResponse::encode(&[claim(1), claim(1)], b"p")).is_err(),
         "repeated"
     );
     let many: Vec<Claim> = (0..=MAX_PROOF_CLAIMS).map(numbered).collect();
-    assert!(decode_aggregate_response(&aggregate_response(&many, b"p")).is_err(), "too many");
-    assert!(decode_aggregate_response(&aggregate_response(&many[1..], b"p")).is_ok());
+    assert!(
+        AggregateResponse::decode(&AggregateResponse::encode(&many, b"p")).is_err(),
+        "too many"
+    );
+    assert!(AggregateResponse::decode(&AggregateResponse::encode(&many[1..], b"p")).is_ok());
 
     let mut sphincs = good.clone();
     sphincs[1 + 8 + 8 + 128] = 1;
-    assert!(decode_aggregate_response(&sphincs).is_err(), "leanSPHINCS claims");
+    assert!(AggregateResponse::decode(&sphincs).is_err(), "leanSPHINCS claims");
     let mut da = good.clone();
     da[1 + 8 + 8 + 128 + 8] = 1;
-    assert!(decode_aggregate_response(&da).is_err(), "DA commitment");
+    assert!(AggregateResponse::decode(&da).is_err(), "DA commitment");
 
     let mut huge_count = good.clone();
     huge_count[9..17].copy_from_slice(&u64::MAX.to_le_bytes());
-    assert!(decode_aggregate_response(&huge_count).is_err(), "count beyond the bytes present");
+    assert!(AggregateResponse::decode(&huge_count).is_err(), "count beyond the bytes present");
 }
 
 #[test]
@@ -136,7 +139,7 @@ fn a_rejection_is_an_error() {
     let mut body = vec![1];
     body.extend(le(3));
     body.extend(b"bad");
-    assert_eq!(decode_aggregate_response(&body), Err("rejected by the leanvm sidecar"));
+    assert_eq!(AggregateResponse::decode(&body), Err("rejected by the leanvm sidecar"));
 }
 
 fn exchange(stream: &mut UnixStream, request: &[u8]) -> Vec<u8> {
@@ -181,11 +184,11 @@ fn a_real_sidecar_aggregates_then_extends() {
         AggregateRequest { log_inv_rate: 2, proofs, signatures }.body()
     };
     let response = exchange(&mut stream, &request(vec![], &signatures[..8]));
-    let (claims, proof) = decode_aggregate_response(&response).unwrap();
+    let AggregateResponse { claims, proof } = AggregateResponse::decode(&response).unwrap();
     assert_eq!(claims, sorted(&signatures[..8]));
 
     let child = (claims.as_slice(), proof);
     let response = exchange(&mut stream, &request(vec![child], &signatures[8..]));
-    let (union, _) = decode_aggregate_response(&response).unwrap();
+    let union = AggregateResponse::decode(&response).unwrap().claims;
     assert_eq!(union, sorted(&signatures));
 }

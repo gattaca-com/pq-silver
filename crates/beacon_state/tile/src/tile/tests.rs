@@ -7585,7 +7585,7 @@ mod pq_aggregator {
 
     use super::*;
     use crate::tile::pq_aggregation::{
-        Aggregate, Claim, VerifiedVote, attestation, wire::aggregate_response,
+        Aggregate, Claim, VerifiedVote, attestation, wire::AggregateResponse,
     };
 
     const SLOT: Slot = 40;
@@ -7699,7 +7699,7 @@ mod pq_aggregator {
         }
 
         fn respond(&mut self, request_id: u64, claims: &[Claim]) {
-            let body = aggregate_response(claims, b"proof");
+            let body = AggregateResponse::encode(claims, b"proof");
             let body = self.gossip.write_with(body.len(), |out| out.copy_from_slice(&body));
             let resp = LeanVmResp { request_id, body };
             self.tile.pq_aggregator.on_response(resp, &mut self.tile.reader);

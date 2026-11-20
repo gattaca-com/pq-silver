@@ -127,8 +127,14 @@ impl PqAggregator {
 
     /// `aggregate` is verified, for the block of `slot`. A merge refuses it
     /// once it holds too many committees.
-    pub fn add_aggregate(&mut self, slot: Slot, aggregate: Aggregate) {
-        if !self.merges.entry(slot).or_default().add(aggregate) {
+    pub fn add_aggregate(&mut self, slot: Slot, aggregate: Aggregate, ticker: &SlotTicker) {
+        let deadline = ticker.slot_start(slot);
+        if ticker.since_genesis() >= deadline {
+            silver_log::debug!(slot, "aggregate after the merge deadline");
+            return;
+        }
+        let merge = self.merges.entry(slot).or_insert_with(|| MergeAggregation::new(deadline));
+        if !merge.add(aggregate) {
             silver_log::warn!(slot, "aggregate dropped: the merge holds too many committees");
             return;
         }

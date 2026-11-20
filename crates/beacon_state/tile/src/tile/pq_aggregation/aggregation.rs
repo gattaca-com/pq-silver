@@ -54,11 +54,12 @@ impl BestProof {
 
 /// How much an aggregation wants the leanVM sidecar; the highest goes first.
 /// Fields compare in declaration order.
+///
+/// A leaf of slot `S` ends at `aggregate_due(S)`. A merge for the block of
+/// slot `B` ends at `slot_start(B)`, later than the due time of `B - 1`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub struct Priority {
-    /// A merge goes before any leaf.
-    pub merge: bool,
-    /// Then the earliest deadline.
+    /// The earliest deadline first, leaf or merge.
     pub deadline: Reverse<Nanos>,
     /// Then the most waiting verified claims that add something.
     pub waiting: usize,
@@ -97,10 +98,10 @@ impl Aggregation {
         self.failures >= MAX_FAILURES
     }
 
-    /// The deadline, or `None` once it may not send: at or past the
-    /// deadline, or stopped.
-    pub fn open_deadline(&self, now: Nanos) -> Option<Reverse<Nanos>> {
-        (now < self.deadline && !self.is_stopped()).then_some(Reverse(self.deadline))
+    /// `None` at or past its deadline, once stopped, or with nothing waiting.
+    pub fn priority(&self, now: Nanos, waiting: usize) -> Option<Priority> {
+        let open = now < self.deadline && !self.is_stopped() && waiting > 0;
+        open.then_some(Priority { deadline: Reverse(self.deadline), waiting })
     }
 
     /// `batch` if it holds at most `limit` verified claims, all waiting.

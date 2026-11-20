@@ -7607,6 +7607,8 @@ mod pq_aggregator {
             let spec = SpecConfig { pq_fork_epoch: 1, ..SpecConfig::mainnet() };
             let (mut tile, gossip, _rpc, mut spine, mut adapter) =
                 tile_with_producers_on(SLOT, BeaconState::empty_test(0), spec);
+            // A frozen clock, 1 s into the slot, so deadlines do not race the test.
+            tile.ticker.set_since_genesis_ms(SLOT * 12_000 + 1_000);
             let mut sink = SpineAdapter::connect_tile(&Sink, &mut spine.spine);
             sink.consume(|_: LeanVmReq, _| {});
             sink.consume(|_: BeaconApiResponse, _| {});
@@ -7661,7 +7663,7 @@ mod pq_aggregator {
         fn aggregate(&mut self, slot: Slot, claims: &[Claim]) {
             let attestation = attestation(0, 0..claims.len());
             let aggregate = Aggregate::new(claims.to_vec(), b"child".to_vec(), attestation);
-            self.tile.pq_aggregator.add_aggregate(slot, aggregate.unwrap());
+            self.tile.pq_aggregator.add_aggregate(slot, aggregate.unwrap(), &self.tile.ticker);
             self.send_next();
         }
 
@@ -7765,12 +7767,12 @@ mod pq_aggregator {
     fn an_aggregate_is_merged_into_the_block_proof() {
         let mut rig = Rig::new();
         rig.ready();
-        rig.aggregate(SLOT, &[[1; 64], [2; 64]]);
+        rig.aggregate(SLOT + 1, &[[1; 64], [2; 64]]);
         let request = rig.request();
-        assert!(rig.tile.pq_aggregator.block_proof(SLOT).is_none(), "no proof yet");
+        assert!(rig.tile.pq_aggregator.block_proof(SLOT + 1).is_none(), "no proof yet");
 
         rig.respond(request.request_id, &[[1; 64], [2; 64]]);
-        let (attestations, proof) = rig.tile.pq_aggregator.block_proof(SLOT).unwrap();
+        let (attestations, proof) = rig.tile.pq_aggregator.block_proof(SLOT + 1).unwrap();
         assert_eq!(attestations, [attestation(0, 0..2).as_slice()]);
         assert_eq!(proof, b"proof");
     }
@@ -7802,19 +7804,21 @@ mod pq_aggregator {
     }
 
     #[test]
-    fn merges_go_before_leaves_and_ties_go_to_the_lower_key() {
+    fn earlier_deadlines_go_first_whatever_the_kind_and_ties_go_to_the_lower_key() {
         let mut rig = Rig::new();
         rig.ready();
         rig.vote_on(ROOT_A, 1);
         let mut request = rig.request();
+        rig.aggregate(SLOT + 2, &[[10; 64]]);
+        rig.vote_in(SLOT + 1, ROOT_A, 4);
+        rig.aggregate(SLOT + 1, &[[9; 64]]);
         rig.vote_on(ROOT_B, 3);
-        rig.aggregate(SLOT + 1, &[[10; 64]]);
-        rig.aggregate(SLOT, &[[9; 64]]);
         rig.vote_on(ROOT_A, 2);
         assert!(rig.requests().is_empty(), "the others wait");
 
         let mut order = Vec::new();
-        let answers: [&[Claim]; 4] = [&[[1; 64]], &[[9; 64]], &[[10; 64]], &[[1; 64], [2; 64]]];
+        let answers: [&[Claim]; 5] =
+            [&[[1; 64]], &[[1; 64], [2; 64]], &[[3; 64]], &[[9; 64]], &[[4; 64]]];
         for (request_id, claims) in (1..).zip(answers) {
             rig.respond(request.request_id, claims);
             request = rig.request();
@@ -7822,7 +7826,21 @@ mod pq_aggregator {
             let merge = [9, 10].into_iter().find(|&tag| rig.carries(&request, tag));
             order.push(merge.map_or_else(|| rig.tags(&request), |tag| vec![tag]));
         }
-        assert_eq!(order, [vec![9], vec![10], vec![1, 2], vec![3]], "lower slot, then lower root");
+        let by_deadline = [vec![1, 2], vec![3], vec![9], vec![4], vec![10]];
+        assert_eq!(order, by_deadline, "earliest deadline, then the lower root");
+    }
+
+    #[test]
+    fn an_aggregate_at_its_block_slot_start_is_dropped() {
+        let mut rig = Rig::new();
+        rig.ready();
+        let start_ms = rig.tile.ticker.slot_start(SLOT + 1).as_millis_u64();
+        rig.tile.ticker.set_since_genesis_ms(start_ms);
+        rig.aggregate(SLOT + 1, &[[9; 64]]);
+        rig.tile.ticker.set_since_genesis_ms(start_ms - 1);
+        rig.aggregate(SLOT + 1, &[[10; 64]]);
+        let request = rig.request();
+        assert!(rig.carries(&request, 10), "an earlier arrival would go first");
     }
 
     #[test]
@@ -7853,7 +7871,7 @@ mod pq_aggregator {
         let mut rig = Rig::new();
         rig.ready();
         let pin = rig.fill_tcache();
-        rig.aggregate(SLOT, &[[9; 64]]);
+        rig.aggregate(SLOT + 1, &[[9; 64]]);
         for _ in 0..5 {
             rig.send_next();
         }

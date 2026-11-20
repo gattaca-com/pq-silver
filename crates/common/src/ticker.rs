@@ -215,12 +215,15 @@ impl SlotTicker {
         if self.is_current_slot_with_disparity(next, disparity) { next } else { wall }
     }
 
+    /// Time since genesis at which `slot` starts.
+    pub fn slot_start(&self, slot: Slot) -> Nanos {
+        Nanos::from_millis(slot * self.slot_ms)
+    }
+
     /// Time since genesis at which `slot`'s aggregates are due.
     pub fn aggregate_due(&self, slot: Slot) -> Nanos {
-        let is_gloas = slot >= self.gloas_fork_slot;
-        Nanos::from_millis(
-            slot * self.slot_ms + self.slot_ms * aggregate_due_bps(is_gloas) / BASIS_POINTS,
-        )
+        let due_ms = self.slot_ms * aggregate_due_bps(slot >= self.gloas_fork_slot) / BASIS_POINTS;
+        self.slot_start(slot) + Nanos::from_millis(due_ms)
     }
 
     pub fn is_before_attesting_interval(&self, is_gloas: bool) -> bool {
@@ -319,6 +322,17 @@ mod tests {
             ticker.aggregate_due(gloas_slot),
             Nanos::from_millis(gloas_slot * 12_000 + 6_000)
         );
+    }
+
+    #[test]
+    fn a_slot_starts_after_the_aggregates_of_the_one_before_are_due() {
+        let ticker =
+            SlotTicker::new(genesis_secs_ago(20), &spec(12_000, 2), Duration::from_secs(4));
+        let gloas_slot = ticker.gloas_fork_slot;
+        assert_eq!(ticker.slot_start(gloas_slot), Nanos::from_millis(gloas_slot * 12_000));
+        for slot in [gloas_slot, gloas_slot + 1] {
+            assert!(ticker.slot_start(slot) > ticker.aggregate_due(slot - 1), "slot {slot}");
+        }
     }
 
     #[test]

@@ -62,8 +62,7 @@ impl LeafAggregation {
     /// `None` when it has nothing to send: past its deadline, stopped, or no
     /// waiting vote adds a position.
     pub(super) fn priority(&self, now: Nanos) -> Option<Priority> {
-        let (deadline, waiting) = (self.core.open_deadline(now)?, self.strategy.waiting());
-        (waiting > 0).then_some(Priority { merge: false, deadline, waiting })
+        self.core.priority(now, self.strategy.waiting())
     }
 
     /// `None` exactly when `priority` is, unless the strategy has a bug.

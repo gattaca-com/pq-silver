@@ -47,7 +47,7 @@ fn best_claims(core: &Aggregation) -> usize {
 }
 
 fn merge(children: impl IntoIterator<Item = Aggregate>) -> MergeAggregation {
-    let mut merge = MergeAggregation::default();
+    let mut merge = MergeAggregation::new(DEADLINE);
     children.into_iter().for_each(|child| assert!(merge.add(child)));
     merge
 }
@@ -186,21 +186,18 @@ fn a_proof_above_1_mib_is_refused() {
 }
 
 #[test]
-fn a_merge_goes_before_any_leaf() {
+fn the_earliest_deadline_goes_first_whatever_the_kind() {
     let merge = merge([child(&[1])]).priority(Nanos::ZERO).unwrap();
-    assert!(merge > priority(&leaf(Nanos::from_secs(1), 100)), "despite a later deadline");
-}
-
-#[test]
-fn then_the_earliest_deadline_goes_first() {
-    let early = leaf(DEADLINE - Nanos(1), 1);
-    assert!(priority(&early) > priority(&aggregation(100)), "despite fewer votes");
+    assert!(priority(&leaf(DEADLINE - Nanos(1), 1)) > merge, "a leaf before a merge");
+    assert!(merge > priority(&leaf(DEADLINE + Nanos(1), 100)), "despite fewer claims");
 }
 
 #[test]
 fn then_the_most_new_claims_go_first() {
     let mut leaf = aggregation(3);
     assert!(priority(&leaf) > priority(&aggregation(2)));
+    let merge = merge([child(&[1])]).priority(Nanos::ZERO).unwrap();
+    assert!(priority(&aggregation(2)) > merge, "whatever the kind");
     settle(&mut leaf, Some(&answer(0..3))).unwrap();
     assert!(leaf.priority(Nanos::ZERO).is_none(), "nothing new waits");
     (0..4).for_each(|tag| assert!(leaf.add(vote(tag))));

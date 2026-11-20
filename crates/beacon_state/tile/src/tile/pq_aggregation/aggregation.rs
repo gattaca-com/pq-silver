@@ -2,7 +2,7 @@ use silver_common::Nanos;
 
 use super::{
     claims::{Claim, VerifiedClaims},
-    strategy::{Batch, BatchInput, BatchLimits, ClaimsKind, Strategy, WaitingClaims},
+    strategy::{Batch, BatchInput, Strategy, WaitingClaims},
     wire::{AggregateRequest, decode_aggregate_response},
 };
 
@@ -26,32 +26,26 @@ impl BestProof {
 
 /// The aggregation of one key: it owns the verified claims, the best proof and
 /// every check, and never decides what to prove. The strategy decides.
-pub struct Aggregation {
-    limits: BatchLimits,
+pub struct Aggregation<C> {
     strategy: Strategy,
     deadline: Nanos,
-    verified: Vec<VerifiedClaims>,
+    verified: Vec<C>,
     best: Option<BestProof>,
     /// Failed batches since the best proof last grew.
     failures: u8,
 }
 
-impl Aggregation {
-    pub fn new(limits: BatchLimits, strategy: Strategy, deadline: Nanos) -> Self {
-        Self { limits, strategy, deadline, verified: Vec::new(), best: None, failures: 0 }
+impl<C: VerifiedClaims> Aggregation<C> {
+    pub fn new(strategy: Strategy, deadline: Nanos) -> Self {
+        Self { strategy, deadline, verified: Vec::new(), best: None, failures: 0 }
     }
 
-    pub fn add(&mut self, verified: VerifiedClaims) {
-        let allowed = match verified.kind() {
-            ClaimsKind::Vote => self.limits.max_signatures > 0,
-            ClaimsKind::Aggregate => self.limits.max_children > 0,
-        };
-        debug_assert!(allowed, "this aggregation takes no claims of that kind");
+    pub fn add(&mut self, verified: C) {
         self.verified.push(verified);
     }
 
     /// The verified claims the best proof covers, in arrival order.
-    pub fn covered(&self) -> impl Iterator<Item = &VerifiedClaims> {
+    pub fn covered(&self) -> impl Iterator<Item = &C> {
         let best = self.best.iter().flat_map(|best| &best.covered_indices);
         best.map(|&index| &self.verified[index])
     }
@@ -79,30 +73,25 @@ impl Aggregation {
             .map(|(index, verified)| {
                 let claims = verified.claims();
                 let new_claim_count = claims.iter().filter(lacks).count();
-                let kind = verified.kind();
-                WaitingClaims { index, kind, claims, new_claim_count }
+                WaitingClaims { index, claims, new_claim_count }
             })
             .collect();
         let best_claims = best.map(|best| best.claims.as_slice());
-        let input = BatchInput { limits: self.limits, best_claims, waiting: &waiting };
+        let input = BatchInput { limit: self.batch_limit(), best_claims, waiting: &waiting };
         let batch = self.strategy.next_batch(&input)?;
         self.accepts(&batch).then_some(batch)
     }
 
     pub fn request(&self, batch: &Batch) -> AggregateRequest<'_> {
-        let mut children: Vec<_> = (self.best.iter())
+        let children = (self.best.iter())
             .map(|best| (best.claims.as_slice(), best.proof.as_slice()))
             .collect();
-        let mut records = Vec::new();
+        let log_inv_rate = batch.log_inv_rate();
+        let mut request = AggregateRequest { log_inv_rate, children, records: Vec::new() };
         for &index in batch.indices() {
-            match &self.verified[index] {
-                VerifiedClaims::Vote(vote) => records.push((&vote.claim, &*vote.signature)),
-                VerifiedClaims::Aggregate(aggregate) => {
-                    children.push((&aggregate.claims, &aggregate.proof))
-                }
-            }
+            self.verified[index].add_to(&mut request);
         }
-        AggregateRequest { log_inv_rate: batch.log_inv_rate(), children, records }
+        request
     }
 
     /// Settles `batch` with the leanVM sidecar's response body, or `None`
@@ -119,18 +108,17 @@ impl Aggregation {
         self.best.as_ref().is_some_and(|best| best.covers(index))
     }
 
-    /// A batch that breaks a batch limit or takes verified claims that are not
+    fn batch_limit(&self) -> usize {
+        C::batch_limit(self.best.is_some())
+    }
+
+    /// A batch above the batch limit or with verified claims that are not
     /// waiting is a strategy bug.
     fn accepts(&self, batch: &Batch) -> bool {
         let indices = batch.indices();
         let all_waiting =
             indices.iter().all(|&index| index < self.verified.len() && !self.is_covered(index));
-        let count =
-            |kind| indices.iter().filter(|&&index| self.verified[index].kind() == kind).count();
-        let ok = all_waiting &&
-            count(ClaimsKind::Vote) <= self.limits.max_signatures &&
-            count(ClaimsKind::Aggregate) + usize::from(self.best.is_some()) <=
-                self.limits.max_children;
+        let ok = all_waiting && indices.len() <= self.batch_limit();
         if !ok {
             silver_log::error!("strategy returned an invalid batch");
             debug_assert!(false, "strategy returned an invalid batch");

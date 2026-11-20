@@ -13,27 +13,8 @@ pub enum Strategy {
     MaxCoverage,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct BatchLimits {
-    pub max_signatures: usize,
-    /// The best proof counts as one child.
-    pub max_children: usize,
-}
-
-impl BatchLimits {
-    pub const LEAF: Self = Self { max_signatures: 2048, max_children: 16 };
-    pub const MERGE: Self = Self { max_signatures: 0, max_children: 16 };
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum ClaimsKind {
-    Vote,
-    Aggregate,
-}
-
 pub struct WaitingClaims<'a> {
     pub index: usize,
-    pub kind: ClaimsKind,
     /// Sorted, without repeats.
     pub claims: &'a [Claim],
     /// How many of `claims` the best proof lacks.
@@ -42,7 +23,8 @@ pub struct WaitingClaims<'a> {
 
 /// What a strategy sees: no bytes, no clock, no spine.
 pub struct BatchInput<'a> {
-    pub limits: BatchLimits,
+    /// Most waiting claims one batch takes.
+    pub limit: usize,
     /// Sorted.
     pub best_claims: Option<&'a [Claim]>,
     pub waiting: &'a [WaitingClaims<'a>],
@@ -72,13 +54,6 @@ impl Batch {
 
     pub fn log_inv_rate(&self) -> u8 {
         self.log_inv_rate
-    }
-}
-
-impl BatchInput<'_> {
-    /// The child limit left once the best proof takes its place.
-    fn new_child_limit(&self) -> usize {
-        self.limits.max_children.saturating_sub(usize::from(self.best_claims.is_some()))
     }
 }
 

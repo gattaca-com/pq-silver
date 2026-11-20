@@ -11,25 +11,20 @@ use super::{
 
 const DEADLINE: Nanos = Nanos::from_secs(8);
 
-fn aggregation(votes: u16) -> Aggregation {
-    let mut aggregation = Aggregation::new(BatchLimits::LEAF, Greedy, DEADLINE);
+fn aggregation(votes: u16) -> Aggregation<Vote> {
+    let mut aggregation = Aggregation::new(Greedy, DEADLINE);
     (0..votes).for_each(|tag| aggregation.add(vote(tag)));
     aggregation
 }
 
-fn vote(tag: u16) -> VerifiedClaims {
+fn vote(tag: u16) -> Vote {
     let mut pubkey = [0u8; 32];
     pubkey[..2].copy_from_slice(&tag.to_be_bytes());
-    VerifiedClaims::Vote(Vote::new(
-        tag as usize,
-        pubkey,
-        [1; 32],
-        &[tag as u8; XMSS_SIGNATURE_SIZE],
-    ))
+    Vote::new(tag as usize, pubkey, [1; 32], &[tag as u8; XMSS_SIGNATURE_SIZE])
 }
 
 fn claim(tag: u16) -> Claim {
-    vote(tag).claims()[0]
+    vote(tag).claim
 }
 
 fn answer(tags: impl IntoIterator<Item = u16>) -> Vec<u8> {
@@ -38,42 +33,46 @@ fn answer(tags: impl IntoIterator<Item = u16>) -> Vec<u8> {
     aggregate_response(&claims, b"proof")
 }
 
-fn covered(aggregation: &Aggregation) -> Vec<usize> {
+fn covered<C: VerifiedClaims>(aggregation: &Aggregation<C>) -> Vec<usize> {
     aggregation.best.as_ref().map_or_else(Vec::new, |best| best.covered_indices.clone())
 }
 
-fn merge(strategy: Strategy) -> Aggregation {
-    Aggregation::new(BatchLimits::MERGE, strategy, DEADLINE)
+fn merge(strategy: Strategy) -> Aggregation<Aggregate> {
+    Aggregation::new(strategy, DEADLINE)
 }
 
-fn child(tags: &[u16]) -> VerifiedClaims {
+fn child(tags: &[u16]) -> Aggregate {
     let claims = tags.iter().copied().map(claim).collect();
-    VerifiedClaims::Aggregate(Aggregate::new(claims, b"child".to_vec(), vec![7]).unwrap())
+    Aggregate::new(claims, b"child".to_vec(), vec![7]).unwrap()
 }
 
 /// Takes the next batch at time 0 and settles it with `body`.
-fn settle(aggregation: &mut Aggregation, body: Option<&[u8]>) -> Result<(), &'static str> {
+fn settle<C: VerifiedClaims>(
+    aggregation: &mut Aggregation<C>,
+    body: Option<&[u8]>,
+) -> Result<(), &'static str> {
     let batch = aggregation.next_batch(Nanos::ZERO).unwrap();
     aggregation.finish(batch, body)
 }
 
 #[test]
 fn batches_take_the_waiting_votes_up_to_the_limit() {
-    let max_signatures = BatchLimits::LEAF.max_signatures;
-    let mut aggregation = aggregation(max_signatures as u16 + 2);
+    let max_votes = Vote::batch_limit(false);
+    assert_eq!(max_votes, Vote::batch_limit(true), "the best proof takes no vote's place");
+    let mut aggregation = aggregation(max_votes as u16 + 2);
     let batch = aggregation.next_batch(Nanos::ZERO).unwrap();
     let first = aggregation.request(&batch).body();
-    assert_eq!(first.len() / (64 + XMSS_SIGNATURE_SIZE), max_signatures);
+    assert_eq!(first.len() / (64 + XMSS_SIGNATURE_SIZE), max_votes);
 
-    aggregation.finish(batch, Some(&answer(0..max_signatures as u16))).unwrap();
-    assert_eq!(covered(&aggregation).len(), max_signatures);
+    aggregation.finish(batch, Some(&answer(0..max_votes as u16))).unwrap();
+    assert_eq!(covered(&aggregation).len(), max_votes);
     let batch = aggregation.next_batch(Nanos::ZERO).unwrap();
     let second = aggregation.request(&batch).body();
     assert!(second.windows(5).any(|window| window == b"proof"), "the best proof is the child");
-    aggregation.finish(batch, Some(&answer(0..max_signatures as u16 + 2))).unwrap();
+    aggregation.finish(batch, Some(&answer(0..max_votes as u16 + 2))).unwrap();
     assert!(aggregation.next_batch(Nanos::ZERO).is_none(), "nothing waits");
-    assert_eq!(aggregation.covered().count(), max_signatures + 2);
-    assert_eq!(aggregation.best.as_ref().map_or(0, |best| best.claims.len()), max_signatures + 2);
+    assert_eq!(aggregation.covered().count(), max_votes + 2);
+    assert_eq!(aggregation.best.as_ref().map_or(0, |best| best.claims.len()), max_votes + 2);
 }
 
 #[test]
@@ -128,7 +127,7 @@ fn a_non_contiguous_batch_is_checked_against_exactly_its_claims() {
     let mut aggregation = merge(MaxCoverage);
     [child(&[1, 2]), child(&[2, 3]), child(&[4]), child(&[3, 4, 5])]
         .into_iter()
-        .for_each(|verified| aggregation.add(verified));
+        .for_each(|aggregate| aggregation.add(aggregate));
     let batch = aggregation.next_batch(Nanos::ZERO).unwrap();
     assert_eq!(batch.indices(), [0, 3], "two children cover 1..=5");
 
@@ -145,9 +144,12 @@ fn a_non_contiguous_batch_is_checked_against_exactly_its_claims() {
 #[test]
 fn merge_batches_respect_the_child_limit_with_the_best_proof_as_one() {
     let mut aggregation = merge(Greedy);
-    (0..20).for_each(|tag| aggregation.add(child(&[tag])));
+    (0..40).for_each(|tag| aggregation.add(child(&[tag])));
     let batch = aggregation.next_batch(Nanos::ZERO).unwrap();
     assert_eq!(batch.indices().len(), 16);
+    assert_eq!(aggregation.request(&batch).children.len(), 16);
     aggregation.finish(batch, Some(&answer(0..16))).unwrap();
-    assert_eq!(aggregation.next_batch(Nanos::ZERO).unwrap().indices(), [16, 17, 18, 19]);
+    let batch = aggregation.next_batch(Nanos::ZERO).unwrap();
+    assert_eq!(batch.indices(), (16..31).collect::<Vec<_>>());
+    assert_eq!(aggregation.request(&batch).children.len(), 16, "the best proof is one");
 }

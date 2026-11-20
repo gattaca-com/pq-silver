@@ -2,18 +2,15 @@ use std::cmp::Reverse;
 
 use rustc_hash::FxHashMap;
 
-use super::{Batch, BatchInput, ClaimsKind, WaitingClaims, greedy};
+use super::{Batch, BatchInput, WaitingClaims};
 
 /// Largest group of overlapping children that is enumerated exhaustively.
 /// Above it, only the children with the most new claims are enumerated.
 const MAX_EXHAUSTIVE_GROUP: usize = 12;
 
-/// Votes as `Greedy` does. Children by the most new claims within the child
-/// limit.
+/// The children with the most new claims, within the limit.
 pub(super) fn next_batch(input: &BatchInput) -> Option<Batch> {
-    let mut indices = greedy::pick(input, ClaimsKind::Vote, input.limits.max_signatures);
-    indices.extend(choose_children(input, input.new_child_limit()));
-    Batch::new(indices)
+    Batch::new(Candidates::new(input).choose(input.limit))
 }
 
 /// Children with new claims, each as the dense ids of those claims.
@@ -28,11 +25,8 @@ type BestBySize = Vec<(usize, Vec<usize>)>;
 impl<'a> Candidates<'a> {
     fn new(input: &'a BatchInput) -> Self {
         let best_claims = input.best_claims.unwrap_or_default();
-        let waiting: Vec<_> = input
-            .waiting
-            .iter()
-            .filter(|waiting| waiting.kind == ClaimsKind::Aggregate && waiting.new_claim_count > 0)
-            .collect();
+        let waiting: Vec<_> =
+            input.waiting.iter().filter(|waiting| waiting.new_claim_count > 0).collect();
         let mut dense = FxHashMap::default();
         let ids = waiting
             .iter()
@@ -146,10 +140,6 @@ fn root(parent: &mut [usize], mut node: usize) -> usize {
         node = parent[node];
     }
     node
-}
-
-fn choose_children(input: &BatchInput, budget: usize) -> Vec<usize> {
-    Candidates::new(input).choose(budget)
 }
 
 #[cfg(test)]

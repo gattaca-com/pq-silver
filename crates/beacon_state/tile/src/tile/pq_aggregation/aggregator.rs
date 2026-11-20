@@ -4,12 +4,13 @@ use flux::spine::SpineProducers;
 use rustc_hash::FxHashMap;
 use silver_beacon_state_data::{B256, Slot};
 use silver_common::{
-    LeanvmHealthEvent, LeanvmReq, LeanvmResp, Nanos, TCacheProducer, TCacheReader, TProducer,
-    ticker::SlotTicker,
+    LeanvmHealthEvent, LeanvmReq, LeanvmResp, Nanos, TCacheProducer, TCacheRead, TCacheReader,
+    TProducer, ticker::SlotTicker,
 };
 
 use super::{
     Aggregate, Aggregation, VerifiedVote,
+    claims::VerifiedClaims,
     leaf::{LeafAggregation, LeafKey},
     merge::MergeAggregation,
     strategy::Batch,
@@ -196,20 +197,18 @@ impl PqAggregator {
         self.merges.get(&slot)?.block_proof()
     }
 
-    fn core_mut(&mut self, key: AggregationKey) -> Option<&mut Aggregation> {
-        match key {
-            AggregationKey::Leaf(leaf) => self.leaves.get_mut(&leaf).map(|leaf| &mut leaf.core),
-            AggregationKey::Merge(slot) => self.merges.get_mut(&slot).map(|merge| &mut merge.core),
-        }
-    }
-
+    /// A pruned aggregation drops `batch`.
     fn finish(&mut self, key: AggregationKey, batch: Batch, body: Option<&[u8]>) {
-        let Some(core) = self.core_mut(key) else { return };
-        if let Err(reason) = core.finish(batch, body) {
-            let slot = key.slot();
-            silver_log::warn!(slot, reason, "aggregation batch failed");
-            if core.is_stopped() {
-                silver_log::warn!(slot, "aggregation stopped after repeated failures");
+        match key {
+            AggregationKey::Leaf(leaf) => {
+                if let Some(aggregation) = self.leaves.get_mut(&leaf) {
+                    settle(&mut aggregation.core, leaf.slot, batch, body);
+                }
+            }
+            AggregationKey::Merge(slot) => {
+                if let Some(aggregation) = self.merges.get_mut(&slot) {
+                    settle(&mut aggregation.core, slot, batch, body);
+                }
             }
         }
     }
@@ -240,10 +239,14 @@ impl PqAggregator {
         }
         let now = now(ticker);
         while let Some(key) = self.pop_next() {
-            let Some(core) = self.core_mut(key) else { continue };
-            let Some(batch) = core.next_batch(now) else { continue };
-            let request = core.request(&batch);
-            let Some(body) = tcache.write_with(request.len(), |out| request.write(out)) else {
+            let next = match key {
+                AggregationKey::Leaf(leaf) => (self.leaves.get_mut(&leaf))
+                    .and_then(|leaf| next_request(&mut leaf.core, now, tcache)),
+                AggregationKey::Merge(slot) => (self.merges.get_mut(&slot))
+                    .and_then(|merge| next_request(&mut merge.core, now, tcache)),
+            };
+            let Some((batch, body)) = next else { continue };
+            let Some(body) = body else {
                 silver_log::error!(slot = key.slot(), "beacon_state tcache full; batch not sent");
                 self.finish(key, batch, None);
                 self.queue.push_front(key);
@@ -256,6 +259,33 @@ impl PqAggregator {
             return;
         }
     }
+}
+
+fn settle<C: VerifiedClaims>(
+    core: &mut Aggregation<C>,
+    slot: Slot,
+    batch: Batch,
+    body: Option<&[u8]>,
+) {
+    if let Err(reason) = core.finish(batch, body) {
+        silver_log::warn!(slot, reason, "aggregation batch failed");
+        if core.is_stopped() {
+            silver_log::warn!(slot, "aggregation stopped after repeated failures");
+        }
+    }
+}
+
+/// The next batch of `core`, with its request written to `tcache`. The request
+/// is `None` when the tcache is full.
+fn next_request<C: VerifiedClaims>(
+    core: &mut Aggregation<C>,
+    now: Nanos,
+    tcache: &mut TProducer,
+) -> Option<(Batch, Option<TCacheRead>)> {
+    let batch = core.next_batch(now)?;
+    let request = core.request(&batch);
+    let body = tcache.write_with(request.len(), |out| request.write(out));
+    Some((batch, body))
 }
 
 fn now(ticker: &SlotTicker) -> Nanos {

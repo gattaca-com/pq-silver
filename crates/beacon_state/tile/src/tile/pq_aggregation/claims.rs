@@ -1,10 +1,15 @@
 use silver_beacon_state_data::B256;
 use silver_common::ssz_view::{MAX_STARK_PROOF_SIZE, SINGLE_ATT_PQ_SIZE, XMSS_SIGNATURE_SIZE};
 
-use super::strategy::ClaimsKind;
+use super::wire::AggregateRequest;
 
 /// `pubkey | message`, so byte order is the leanVM sidecar's claim order.
 pub type Claim = [u8; 64];
+
+/// Most leanXMSS records in one request.
+const MAX_RECORDS: usize = 2048;
+/// Most children in one request.
+const MAX_CHILDREN: usize = 16;
 
 /// A single attestation whose XMSS signature the tile has verified, with the
 /// facts only the tile has.
@@ -16,6 +21,17 @@ pub struct VerifiedVote<'a> {
     /// Index in the committee, which has `committee_len` members.
     pub committee_position: usize,
     pub committee_len: usize,
+}
+
+/// What one aggregation proves: a vote for a leaf, an aggregate for a merge.
+pub trait VerifiedClaims {
+    /// Sorted and without repeats.
+    fn claims(&self) -> &[Claim];
+
+    /// The most of these one batch takes, given whether a best proof exists.
+    fn batch_limit(has_best_proof: bool) -> usize;
+
+    fn add_to<'a>(&'a self, request: &mut AggregateRequest<'a>);
 }
 
 pub struct Vote {
@@ -36,6 +52,21 @@ impl Vote {
         claim[..32].copy_from_slice(&pubkey);
         claim[32..].copy_from_slice(&message);
         Self { committee_position, claim, signature: Box::new(*signature) }
+    }
+}
+
+impl VerifiedClaims for Vote {
+    fn claims(&self) -> &[Claim] {
+        std::slice::from_ref(&self.claim)
+    }
+
+    /// The best proof is the only child.
+    fn batch_limit(_: bool) -> usize {
+        MAX_RECORDS
+    }
+
+    fn add_to<'a>(&'a self, request: &mut AggregateRequest<'a>) {
+        request.records.push((&self.claim, &self.signature));
     }
 }
 
@@ -62,24 +93,17 @@ impl Aggregate {
     }
 }
 
-pub enum VerifiedClaims {
-    Vote(Vote),
-    Aggregate(Aggregate),
-}
-
-impl VerifiedClaims {
-    pub(super) fn kind(&self) -> ClaimsKind {
-        match self {
-            Self::Vote(_) => ClaimsKind::Vote,
-            Self::Aggregate(_) => ClaimsKind::Aggregate,
-        }
+impl VerifiedClaims for Aggregate {
+    fn claims(&self) -> &[Claim] {
+        &self.claims
     }
 
-    /// Sorted and without repeats.
-    pub fn claims(&self) -> &[Claim] {
-        match self {
-            Self::Vote(vote) => std::slice::from_ref(&vote.claim),
-            Self::Aggregate(aggregate) => &aggregate.claims,
-        }
+    /// The best proof counts as one child.
+    fn batch_limit(has_best_proof: bool) -> usize {
+        MAX_CHILDREN - usize::from(has_best_proof)
+    }
+
+    fn add_to<'a>(&'a self, request: &mut AggregateRequest<'a>) {
+        request.children.push((&self.claims, &self.proof));
     }
 }

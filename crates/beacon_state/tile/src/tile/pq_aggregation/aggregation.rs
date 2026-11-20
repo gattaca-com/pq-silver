@@ -28,6 +28,26 @@ impl BestProof {
     }
 }
 
+/// How much an aggregation wants the leanVM sidecar; the highest goes first.
+/// Fields compare in declaration order.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub struct Priority {
+    /// A merge goes before any leaf.
+    merge: bool,
+    /// Then the earliest deadline.
+    deadline: Reverse<Nanos>,
+    /// Then the most waiting claims that add something.
+    waiting: usize,
+}
+
+/// Why a request was not written to the tcache.
+pub enum Unwritten {
+    /// No room yet. Readers free it, so the batch waits.
+    Full,
+    /// Above the tcache's largest payload. It never fits.
+    TooLarge,
+}
+
 /// The aggregation of one key. It owns the verified claims, the best proof and
 /// every check. Its strategy decides what to prove.
 pub struct Aggregation<C: VerifiedClaims> {
@@ -68,25 +88,42 @@ impl<C: VerifiedClaims> Aggregation<C> {
         self.failures >= MAX_FAILURES
     }
 
-    /// The next batch, with its request written to `tcache`. The request is
-    /// `None` when the tcache is full.
+    /// `None` when it has nothing to send: past its deadline, stopped, or
+    /// nothing waiting adds a claim. The strategy keeps the count.
+    pub fn priority(&self, now: Nanos) -> Option<Priority> {
+        let waiting = self.strategy.waiting();
+        let sends = now < self.deadline && !self.is_stopped() && waiting > 0;
+        sends.then_some(Priority { merge: C::MERGE, deadline: Reverse(self.deadline), waiting })
+    }
+
+    /// The next batch, with its request written to `tcache`.
     pub fn next_request(
         &mut self,
         now: Nanos,
         tcache: &mut TProducer,
-    ) -> Option<(Batch, Option<TCacheRead>)> {
+    ) -> Option<(Batch, Result<TCacheRead, Unwritten>)> {
         let batch = self.next_batch(now)?;
         let request = self.request(&batch);
-        let body = tcache.write_with(request.len(), |out| request.write(out));
+        let body = if request.len() > tcache.cache_ref().max_payload_len() {
+            Err(Unwritten::TooLarge)
+        } else {
+            tcache.write_with(request.len(), |out| request.write(out)).ok_or(Unwritten::Full)
+        };
         Some((batch, body))
     }
 
+    /// `None` exactly when `priority` is, unless the strategy has a bug. A
+    /// bug counts as a failure, so it cannot repeat forever.
     fn next_batch(&mut self, now: Nanos) -> Option<Batch> {
-        if now >= self.deadline || self.is_stopped() {
-            return None;
+        self.priority(now)?;
+        let batch = self.strategy.next_batch(self.batch_limit());
+        let batch = batch.filter(|batch| self.accepts(batch));
+        if batch.is_none() {
+            silver_log::error!("strategy returned no valid batch");
+            debug_assert!(false, "strategy returned no valid batch");
+            self.failures += 1;
         }
-        let batch = self.strategy.next_batch(self.batch_limit())?;
-        self.accepts(&batch).then_some(batch)
+        batch
     }
 
     fn request(&self, batch: &Batch) -> AggregateRequest<'_> {
@@ -119,18 +156,13 @@ impl<C: VerifiedClaims> Aggregation<C> {
         C::batch_limit(self.best.is_some())
     }
 
-    /// A batch above the batch limit or with verified claims that are not
-    /// waiting is a strategy bug.
+    /// `false` for a batch above the batch limit or with verified claims that
+    /// are not waiting.
     fn accepts(&self, batch: &Batch) -> bool {
         let indices = batch.indices();
         let all_waiting =
             indices.iter().all(|&index| index < self.verified.len() && !self.is_covered(index));
-        let ok = all_waiting && indices.len() <= self.batch_limit();
-        if !ok {
-            silver_log::error!("strategy returned an invalid batch");
-            debug_assert!(false, "strategy returned an invalid batch");
-        }
-        ok
+        all_waiting && indices.len() <= self.batch_limit()
     }
 
     fn adopt_response(&mut self, body: &[u8], batch: &Batch) -> Result<(), &'static str> {

@@ -1,4 +1,7 @@
-use silver_common::ssz_view::{MAX_VALIDATORS_PER_COMMITTEE, XMSS_SIGNATURE_SIZE};
+use silver_common::{
+    TCache, TCacheId,
+    ssz_view::{MAX_VALIDATORS_PER_COMMITTEE, XMSS_SIGNATURE_SIZE},
+};
 
 use super::{
     super::{
@@ -50,6 +53,10 @@ fn child(tags: &[u16]) -> Aggregate {
     Aggregate::new(claims, b"child".to_vec(), ssz).unwrap()
 }
 
+fn priority<C: VerifiedClaims>(aggregation: &Aggregation<C>) -> Priority {
+    aggregation.priority(Nanos::ZERO).unwrap()
+}
+
 fn settle<C: VerifiedClaims>(
     aggregation: &mut Aggregation<C>,
     body: Option<&[u8]>,
@@ -98,6 +105,7 @@ fn a_failure_leaves_the_waiting_claims_where_they_were() {
 fn nothing_is_sent_at_the_deadline() {
     let mut aggregation = aggregation(1);
     assert!(aggregation.next_batch(DEADLINE).is_none());
+    assert!(aggregation.priority(DEADLINE).is_none());
     let batch = aggregation.next_batch(DEADLINE - 1).unwrap();
     aggregation.finish(batch, Some(&answer([0]))).unwrap();
     assert!(aggregation.add(vote(1)));
@@ -128,6 +136,7 @@ fn the_aggregation_stops_after_three_failures_and_a_success_resets_the_count() {
         settle(&mut aggregation, None).unwrap_err();
     }
     assert!(aggregation.is_stopped());
+    assert!(aggregation.priority(Nanos::ZERO).is_none(), "stopped");
     assert!(aggregation.next_batch(Nanos::ZERO).is_none(), "stopped");
 }
 
@@ -157,6 +166,40 @@ fn merge_batches_respect_the_child_limit_with_the_best_proof_as_one() {
     let batch = aggregation.next_batch(Nanos::ZERO).unwrap();
     assert_eq!(batch.indices(), (16..31).collect::<Vec<_>>());
     assert_eq!(aggregation.request(&batch).children.len(), 16, "the best proof is one");
+}
+
+#[test]
+fn a_request_above_the_tcache_payload_never_fits() {
+    let mut tcache = TCache::producer(TCacheId::BeaconStateHandoff, 1 << 16);
+    let (batch, body) = aggregation(30).next_request(Nanos::ZERO, &mut tcache).unwrap();
+    assert!(matches!(body, Err(Unwritten::TooLarge)), "30 votes take more than 64 KiB");
+    assert_eq!(batch.indices().len(), 30);
+    let (_, body) = aggregation(1).next_request(Nanos::ZERO, &mut tcache).unwrap();
+    assert!(body.is_ok());
+}
+
+#[test]
+fn a_merge_goes_before_any_leaf() {
+    let mut leaf = Aggregation::new(Nanos::from_secs(1));
+    (0..100).for_each(|tag| assert!(leaf.add(vote(tag))));
+    assert!(priority(&merge([child(&[1])])) > priority(&leaf), "despite a later deadline");
+}
+
+#[test]
+fn then_the_earliest_deadline_goes_first() {
+    let mut early = Aggregation::new(DEADLINE - Nanos(1));
+    assert!(early.add(vote(0)));
+    assert!(priority(&early) > priority(&aggregation(100)), "despite fewer votes");
+}
+
+#[test]
+fn then_the_most_new_claims_go_first() {
+    let mut leaf = aggregation(3);
+    assert!(priority(&leaf) > priority(&aggregation(2)));
+    settle(&mut leaf, Some(&answer(0..3))).unwrap();
+    assert!(leaf.priority(Nanos::ZERO).is_none(), "nothing new waits");
+    (0..4).for_each(|tag| assert!(leaf.add(vote(tag))));
+    assert_eq!(priority(&leaf), priority(&aggregation(1)), "only vote 3 is new");
 }
 
 #[test]

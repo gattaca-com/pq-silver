@@ -9,7 +9,7 @@ use super::{
     claims::{VerifiedVote, Vote},
 };
 
-#[derive(Clone, Copy, Debug, Hash, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, Hash, PartialEq, Eq, PartialOrd, Ord)]
 pub(super) struct LeafKey {
     pub slot: Slot,
     pub committee_index: u64,

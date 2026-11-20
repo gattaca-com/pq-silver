@@ -45,6 +45,7 @@ struct Candidate {
 impl Strategy for MarginalGain {
     type Positions = Positions;
 
+    /// A child that adds nothing to the best proof does not wait.
     fn arrived(&mut self, index: usize, positions: Positions) -> bool {
         let known = self.committees.iter().position(|&c| c == positions.committee);
         let group = match known {
@@ -56,7 +57,10 @@ impl Strategy for MarginalGain {
             }
             None => return false,
         };
-        self.waiting.push(Waiting { index, group, bits: positions.bits });
+        let waiting = Waiting { index, group, bits: positions.bits };
+        if waiting.gain(&self.have) > 0 {
+            self.waiting.push(waiting);
+        }
         true
     }
 
@@ -91,6 +95,10 @@ impl Strategy for MarginalGain {
             });
         }
         Batch::new(picks)
+    }
+
+    fn waiting(&self) -> usize {
+        self.waiting.len()
     }
 }
 

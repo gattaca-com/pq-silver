@@ -75,8 +75,10 @@ fn children_that_add_nothing_are_skipped() {
     strategy.adopted(&Batch::new(vec![0]).unwrap());
     assert!(strategy.next_batch(16).is_none(), "index 1 adds nothing to the best proof");
     assert!(strategy.arrived(2, positions(0, 5..10)));
+    assert_eq!(strategy.waiting(), 0, "index 2 adds nothing either");
     assert!(strategy.arrived(3, positions(0, 77..78)));
     assert_eq!(strategy.next_batch(16).unwrap().indices, [3]);
+    assert_eq!(strategy.waiting(), 1);
 }
 
 /// A decoy that straddles two disjoint aggregates and arrives first.

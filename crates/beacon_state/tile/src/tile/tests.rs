@@ -7580,7 +7580,7 @@ fn gloas_head_on_a_pending_full_parent_payload_is_optimistic_until_that_verdict(
 }
 
 mod pq_aggregator {
-    use silver_common::{LeanVmHealthEvent, LeanVmReq, LeanVmResp};
+    use silver_common::{LeanVmHealthEvent, LeanVmReq, LeanVmResp, TReservation};
     use silver_ssz::ssz_view::{AttestationPqView, SINGLE_ATT_PQ_SIZE};
 
     use super::*;
@@ -7640,8 +7640,12 @@ mod pq_aggregator {
         }
 
         fn vote_on(&mut self, data_root: B256, tag: u8) {
+            self.vote_in(SLOT, data_root, tag);
+        }
+
+        fn vote_in(&mut self, slot: Slot, data_root: B256, tag: u8) {
             let mut single = [0u8; SINGLE_ATT_PQ_SIZE];
-            single[16..24].copy_from_slice(&SLOT.to_le_bytes());
+            single[16..24].copy_from_slice(&slot.to_le_bytes());
             let vote = VerifiedVote {
                 single: &single,
                 data_root,
@@ -7659,6 +7663,16 @@ mod pq_aggregator {
             let aggregate = Aggregate::new(claims.to_vec(), b"child".to_vec(), attestation);
             self.tile.pq_aggregator.add_aggregate(slot, aggregate.unwrap());
             self.send_next();
+        }
+
+        /// Fills the tcache until the returned reservation drops.
+        fn fill_tcache(&mut self) -> TReservation {
+            let tcache = &mut self.tile.events_producer;
+            let pin = tcache.reserve(1, false).unwrap();
+            for chunk in [4096, 16] {
+                while tcache.write_with(chunk, |_| {}).is_some() {}
+            }
+            pin
         }
 
         fn tags(&mut self, request: &LeanVmReq) -> Vec<u8> {
@@ -7762,50 +7776,53 @@ mod pq_aggregator {
     }
 
     #[test]
-    fn leaves_take_the_leanvm_sidecar_in_turns() {
+    fn leaves_go_by_earliest_deadline_then_most_new_votes() {
         let mut rig = Rig::new();
         rig.ready();
         rig.vote_on(ROOT_A, 1);
-        rig.vote_on(ROOT_B, 3);
-        rig.vote_on(ROOT_A, 2);
         let a1 = rig.request();
-        assert_eq!(rig.tags(&a1), [1]);
+        rig.vote_in(SLOT + 1, ROOT_B, 2);
+        rig.vote_in(SLOT + 1, ROOT_B, 3);
+        rig.vote_on(ROOT_B, 4);
+        rig.vote_on(ROOT_A, 5);
+        rig.vote_on(ROOT_A, 6);
+        rig.vote_on(ROOT_A, 1);
 
         rig.respond(a1.request_id, &[[1; 64]]);
-        let b1 = rig.request();
-        assert_eq!(rig.tags(&b1), [3], "leaf B before A's second batch");
-        rig.vote_on(ROOT_B, 4);
-
-        rig.respond(b1.request_id, &[[3; 64]]);
         let a2 = rig.request();
-        assert_eq!(rig.tags(&a2), [1, 2], "the best proof and the new vote");
+        assert_eq!(rig.tags(&a2), [1, 5, 6], "two new votes beat one; vote 1 again adds none");
 
-        rig.respond(a2.request_id, &[[1; 64], [2; 64]]);
-        let b2 = rig.request();
-        assert_eq!(rig.tags(&b2), [3, 4]);
+        rig.respond(a2.request_id, &[[1; 64], [5; 64], [6; 64]]);
+        let b = rig.request();
+        assert_eq!(rig.tags(&b), [4], "the earlier deadline beats more votes");
+
+        rig.respond(b.request_id, &[[4; 64]]);
+        let later = rig.request();
+        assert_eq!(rig.tags(&later), [2, 3]);
     }
 
     #[test]
-    fn merges_go_before_leaves_and_each_kind_in_arrival_order() {
+    fn merges_go_before_leaves_and_ties_go_to_the_lower_key() {
         let mut rig = Rig::new();
         rig.ready();
         rig.vote_on(ROOT_A, 1);
         let mut request = rig.request();
         rig.vote_on(ROOT_B, 3);
+        rig.aggregate(SLOT + 1, &[[10; 64]]);
         rig.aggregate(SLOT, &[[9; 64]]);
         rig.vote_on(ROOT_A, 2);
-        rig.aggregate(SLOT + 1, &[[10; 64]]);
         assert!(rig.requests().is_empty(), "the others wait");
 
         let mut order = Vec::new();
-        for (request_id, claims) in (1..).zip([[[1; 64]], [[9; 64]], [[10; 64]], [[3; 64]]]) {
-            rig.respond(request.request_id, &claims);
+        let answers: [&[Claim]; 4] = [&[[1; 64]], &[[9; 64]], &[[10; 64]], &[[1; 64], [2; 64]]];
+        for (request_id, claims) in (1..).zip(answers) {
+            rig.respond(request.request_id, claims);
             request = rig.request();
             assert_eq!(request.request_id, request_id);
             let merge = [9, 10].into_iter().find(|&tag| rig.carries(&request, tag));
             order.push(merge.map_or_else(|| rig.tags(&request), |tag| vec![tag]));
         }
-        assert_eq!(order, [vec![9], vec![10], vec![3], vec![1, 2]]);
+        assert_eq!(order, [vec![9], vec![10], vec![1, 2], vec![3]], "lower slot, then lower root");
     }
 
     #[test]
@@ -7822,31 +7839,32 @@ mod pq_aggregator {
 
         rig.ready();
         let second = rig.request();
-        assert_eq!(rig.tags(&second), [3], "leaf B waited its turn");
+        assert_eq!(rig.tags(&second), [1], "A ties with B and has the lower key");
         rig.respond(first.request_id, &[[1; 64]]);
         assert!(rig.requests().is_empty(), "a late answer to the lost request is ignored");
 
-        rig.respond(second.request_id, &[[3; 64]]);
+        rig.respond(second.request_id, &[[1; 64]]);
         let third = rig.request();
-        assert_eq!(rig.tags(&third), [1], "leaf A goes out again");
+        assert_eq!(rig.tags(&third), [3]);
     }
 
     #[test]
-    fn a_batch_that_met_a_full_tcache_goes_out_on_the_next_event() {
+    fn a_full_tcache_retries_without_a_failure_and_logs_once() {
         let mut rig = Rig::new();
         rig.ready();
-        let tcache = &mut rig.tile.events_producer;
-        let pin = tcache.reserve(1, false).unwrap();
-        for chunk in [4096, 16] {
-            while tcache.write_with(chunk, |_| {}).is_some() {}
-        }
+        let pin = rig.fill_tcache();
         rig.aggregate(SLOT, &[[9; 64]]);
+        for _ in 0..5 {
+            rig.send_next();
+        }
         assert!(rig.requests().is_empty(), "the tcache is full");
+        assert!(rig.tile.pq_aggregator.tcache_full(), "one error log for the stall");
 
         drop(pin);
-        rig.vote(1);
-        let first = rig.request();
-        assert!(rig.tags(&first).is_empty(), "the merge goes out before the leaf");
+        rig.send_next();
+        let request = rig.request();
+        assert!(rig.carries(&request, 9), "six misses did not stop the merge");
+        assert!(!rig.tile.pq_aggregator.tcache_full(), "the stall is over");
     }
 
     #[test]

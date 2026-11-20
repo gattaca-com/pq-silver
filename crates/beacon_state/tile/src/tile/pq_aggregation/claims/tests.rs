@@ -11,7 +11,9 @@ fn an_aggregate_reads_its_positions_from_its_attestation() {
     let positions = aggregate.positions();
     assert_eq!(positions.committee, Committee { data: [3; ATTESTATION_DATA_SIZE], index: 3 });
     assert_eq!(positions.bits.count(), 3, "a repeated claim counts once");
-    assert!([1, 5, 2047].iter().all(|&position| positions.bits.contains(position)));
+    let mut bits = Bits::default();
+    [1, 5, 2047].map(|position| bits.insert(position));
+    assert_eq!(positions.bits, bits);
 }
 
 #[test]

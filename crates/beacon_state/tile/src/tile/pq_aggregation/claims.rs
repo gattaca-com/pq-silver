@@ -33,6 +33,9 @@ pub struct VerifiedVote<'a> {
 pub trait VerifiedClaims {
     type Strategy: Strategy;
 
+    /// Whether these are a merge's. A merge goes before any leaf.
+    const MERGE: bool;
+
     /// Sorted and without repeats.
     fn claims(&self) -> &[Claim];
 
@@ -57,10 +60,6 @@ impl Bits {
         let fresh = *word & bit == 0;
         *word |= bit;
         fresh
-    }
-
-    pub fn contains(&self, position: usize) -> bool {
-        self.0[position / 64] >> (position % 64) & 1 == 1
     }
 
     pub fn count(&self) -> usize {
@@ -141,6 +140,8 @@ impl Vote {
 impl VerifiedClaims for Vote {
     type Strategy = ArrivalOrder;
 
+    const MERGE: bool = false;
+
     fn claims(&self) -> &[Claim] {
         std::slice::from_ref(&self.claim)
     }
@@ -190,6 +191,8 @@ impl Aggregate {
 
 impl VerifiedClaims for Aggregate {
     type Strategy = MarginalGain;
+
+    const MERGE: bool = true;
 
     fn claims(&self) -> &[Claim] {
         &self.claims

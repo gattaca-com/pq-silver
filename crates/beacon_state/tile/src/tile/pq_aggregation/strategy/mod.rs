@@ -22,6 +22,10 @@ pub trait Strategy: Default {
     /// At most `limit` waiting indices that add positions. `None` when none
     /// does.
     fn next_batch(&self, limit: usize) -> Option<Batch>;
+
+    /// How many waiting indices add positions. Zero exactly when `next_batch`
+    /// is `None`.
+    fn waiting(&self) -> usize;
 }
 
 /// Indices of verified claims to prove on top of the best proof: ascending,

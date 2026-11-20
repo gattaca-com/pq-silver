@@ -1,22 +1,23 @@
-use std::{collections::VecDeque, mem};
+use std::{cmp::Reverse, mem};
 
 use flux::spine::SpineProducers;
 use rustc_hash::FxHashMap;
 use silver_beacon_state_data::{B256, Slot};
 use silver_common::{
-    LeanVmHealthEvent, LeanVmReq, LeanVmResp, TCacheReader, TProducer,
+    LeanVmHealthEvent, LeanVmReq, LeanVmResp, Nanos, TCacheReader, TProducer,
     ssz_view::MAX_VALIDATORS_PER_COMMITTEE, ticker::SlotTicker,
 };
 
 use super::{
     Aggregate, VerifiedVote,
+    aggregation::Unwritten,
     leaf::{LeafAggregation, LeafKey},
     merge::MergeAggregation,
     strategy::Batch,
 };
 use crate::tile::Producers;
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 enum AggregationKey {
     Leaf(LeafKey),
     Merge(Slot),
@@ -81,10 +82,10 @@ impl LeanVm {
 pub struct PqAggregator {
     leaves: FxHashMap<LeafKey, LeafAggregation>,
     merges: FxHashMap<Slot, MergeAggregation>,
-    /// Leaves that may have a batch, oldest first, each at most once.
-    leaf_queue: VecDeque<LeafKey>,
-    /// Merges that may have a batch, as for leaves. They go before leaves.
-    merge_queue: VecDeque<Slot>,
+    /// An event changed state since `send_next` last found nothing to send.
+    changed: bool,
+    /// The last write met a full tcache; its error is logged once.
+    tcache_full: bool,
     leanvm: LeanVm,
     next_request_id: u64,
 }
@@ -114,7 +115,7 @@ impl PqAggregator {
             self.leaves.entry(leaf).or_insert_with(|| LeafAggregation::new(&vote, deadline));
         let added = aggregation.add(&vote);
         debug_assert!(added, "the position was checked against the largest committee");
-        self.enqueue(AggregationKey::Leaf(leaf));
+        self.changed = true;
     }
 
     /// `aggregate` is verified, for the block of `slot`. A merge refuses it
@@ -124,7 +125,7 @@ impl PqAggregator {
             silver_log::warn!(slot, "aggregate dropped: the merge holds too many committees");
             return;
         }
-        self.enqueue(AggregationKey::Merge(slot));
+        self.changed = true;
     }
 
     /// A response to a request that is not in flight is ignored. A body that
@@ -137,7 +138,7 @@ impl PqAggregator {
         }
         let Some((key, batch)) = self.leanvm.take_answered(resp.request_id) else { return };
         self.finish(key, batch, body.map(|(body, _)| body));
-        self.enqueue(key);
+        self.changed = true;
     }
 
     /// A leanVM sidecar that goes down fails the batch in flight at once. The
@@ -147,8 +148,8 @@ impl PqAggregator {
             self.leanvm.up();
         } else if let Some((key, batch)) = self.leanvm.down() {
             self.finish(key, batch, None);
-            self.enqueue(key);
         }
+        self.changed = true;
     }
 
     /// Drops the aggregations of slots before `floor`. The request in flight
@@ -156,50 +157,60 @@ impl PqAggregator {
     pub fn prune_before(&mut self, floor: Slot) {
         self.leaves.retain(|leaf, _| leaf.slot >= floor);
         self.merges.retain(|&slot, _| slot >= floor);
-        self.leaf_queue.retain(|leaf| leaf.slot >= floor);
-        self.merge_queue.retain(|&slot| slot >= floor);
     }
 
-    /// Sends the first batch the queues offer, if the leanVM sidecar is idle.
-    /// The tile calls it once per loop, after the events.
+    /// Sends a batch of the highest priority aggregation, if the leanVM
+    /// sidecar is idle. The tile calls it once per loop, after the events.
     ///
-    /// An aggregation without a batch leaves its queue until its next event.
-    /// A pruned one is skipped. One that meets a full tcache keeps its place,
-    /// and the pass stops.
+    /// It returns at once until an event changes state. A full tcache leaves
+    /// `changed` set, so the next loop retries. It is not a failure.
     pub fn send_next(
         &mut self,
         ticker: &SlotTicker,
         tcache: &mut TProducer,
         producers: &mut Producers,
     ) {
-        let queued = !self.merge_queue.is_empty() || !self.leaf_queue.is_empty();
-        if !(queued && matches!(self.leanvm, LeanVm::Idle)) {
+        if !(self.changed && matches!(self.leanvm, LeanVm::Idle)) {
             return;
         }
         let now = ticker.since_genesis();
-        while let Some(key) = self.pop_next() {
-            let next = match key {
-                AggregationKey::Leaf(leaf) => (self.leaves.get_mut(&leaf))
-                    .and_then(|leaf| leaf.core.next_request(now, tcache)),
-                AggregationKey::Merge(slot) => (self.merges.get_mut(&slot))
-                    .and_then(|merge| merge.core.next_request(now, tcache)),
-            };
-            let Some((batch, body)) = next else { continue };
-            let Some(body) = body else {
-                silver_log::error!(slot = key.slot(), "beacon_state tcache full; batch not sent");
-                self.finish(key, batch, None);
-                match key {
-                    AggregationKey::Leaf(leaf) => self.leaf_queue.push_front(leaf),
-                    AggregationKey::Merge(slot) => self.merge_queue.push_front(slot),
+        let Some(key) = self.highest_priority(now) else {
+            self.changed = false;
+            return;
+        };
+        let next = match key {
+            AggregationKey::Leaf(leaf) => {
+                self.leaves.get_mut(&leaf).and_then(|leaf| leaf.core.next_request(now, tcache))
+            }
+            AggregationKey::Merge(slot) => {
+                self.merges.get_mut(&slot).and_then(|merge| merge.core.next_request(now, tcache))
+            }
+        };
+        // `None` only for a strategy bug, which counts as a failure.
+        let Some((batch, body)) = next else { return };
+        let body = match body {
+            Ok(body) => body,
+            // Back-pressure: the batch is dropped and its claims still wait.
+            Err(Unwritten::Full) => {
+                if !mem::replace(&mut self.tcache_full, true) {
+                    silver_log::error!(slot = key.slot(), "beacon_state tcache full; batch waits");
                 }
                 return;
-            };
-            let request_id = self.next_request_id;
-            self.next_request_id += 1;
-            self.leanvm = LeanVm::Busy { request_id, key, batch };
-            producers.produce(LeanVmReq { request_id, body });
-            return;
-        }
+            }
+            Err(Unwritten::TooLarge) => {
+                silver_log::error!(
+                    slot = key.slot(),
+                    "request larger than the beacon_state tcache"
+                );
+                self.finish(key, batch, None);
+                return;
+            }
+        };
+        self.tcache_full = false;
+        let request_id = self.next_request_id;
+        self.next_request_id += 1;
+        self.leanvm = LeanVm::Busy { request_id, key, batch };
+        producers.produce(LeanVmReq { request_id, body });
     }
 
     pub fn aggregate_ssz(
@@ -231,20 +242,19 @@ impl PqAggregator {
         }
     }
 
-    fn enqueue(&mut self, key: AggregationKey) {
-        match key {
-            AggregationKey::Leaf(leaf) if !self.leaf_queue.contains(&leaf) => {
-                self.leaf_queue.push_back(leaf);
-            }
-            AggregationKey::Merge(slot) if !self.merge_queue.contains(&slot) => {
-                self.merge_queue.push_back(slot);
-            }
-            AggregationKey::Leaf(_) | AggregationKey::Merge(_) => {}
-        }
+    #[cfg(test)]
+    pub(in crate::tile) fn tcache_full(&self) -> bool {
+        self.tcache_full
     }
 
-    fn pop_next(&mut self) -> Option<AggregationKey> {
-        let merge = self.merge_queue.pop_front().map(AggregationKey::Merge);
-        merge.or_else(|| self.leaf_queue.pop_front().map(AggregationKey::Leaf))
+    /// Ties go to the lower key, so the order is total and deterministic.
+    fn highest_priority(&self, now: Nanos) -> Option<AggregationKey> {
+        let leaves = self.leaves.iter().filter_map(|(&leaf, aggregation)| {
+            Some((aggregation.core.priority(now)?, Reverse(AggregationKey::Leaf(leaf))))
+        });
+        let merges = self.merges.iter().filter_map(|(&slot, aggregation)| {
+            Some((aggregation.core.priority(now)?, Reverse(AggregationKey::Merge(slot))))
+        });
+        leaves.chain(merges).max().map(|(_, Reverse(key))| key)
     }
 }

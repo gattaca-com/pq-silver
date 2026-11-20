@@ -24,11 +24,15 @@ fn covered_and_already_picked_positions_are_skipped() {
     let mut strategy = strategy(&[1, 2, 3, 2, 4]);
     let batch = strategy.next_batch(16).unwrap();
     assert_eq!(batch.indices, [0, 1, 2, 4], "index 3 repeats position 2");
+    assert_eq!(strategy.waiting(), 4);
 
     strategy.adopted(&Batch::new(vec![0, 1]).unwrap());
+    assert!(strategy.arrived(5, 1), "a covered position fits but adds nothing");
     assert_eq!(strategy.next_batch(16).unwrap().indices, [2, 4]);
+    assert_eq!(strategy.waiting(), 2);
     strategy.adopted(&Batch::new(vec![2, 4]).unwrap());
     assert!(strategy.next_batch(16).is_none(), "position 2 is covered");
+    assert_eq!(strategy.waiting(), 0);
 }
 
 #[test]

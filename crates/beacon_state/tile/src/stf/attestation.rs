@@ -1,9 +1,10 @@
 use blst::min_pk::PublicKey;
 use flux_profiler::timed;
 use silver_beacon_state_data::{
-    B256, BlockRoots, Checkpoint, Epoch, EpochView, Immutable, PARTICIPATION_WEIGHTS,
-    ParticipationWriteView, RootsView, SLOTS_PER_EPOCH, Slot, SlotStateWriteView, StateWriterView,
-    TIMELY_HEAD_FLAG, TIMELY_SOURCE_FLAG, TIMELY_TARGET_FLAG, TreeSpec, ValidatorsView, Version,
+    B256, BlockRoots, Checkpoint, Epoch, EpochReadView, EpochView, Immutable,
+    PARTICIPATION_WEIGHTS, ParticipationWriteView, RootsView, SLOTS_PER_EPOCH, Slot,
+    SlotStateWriteView, StateWriterView, TIMELY_HEAD_FLAG, TIMELY_SOURCE_FLAG, TIMELY_TARGET_FLAG,
+    TreeSpec, ValidatorsView,
     bls::{self, SigBatch},
 };
 use silver_common::ssz_view::{
@@ -74,18 +75,12 @@ pub(crate) fn voted_block_slot(
 
 pub(crate) fn attester_signing_root(
     imm: &Immutable,
-    (fork_epoch, previous_version, current_version): (Epoch, Version, Version),
+    epoch: &EpochReadView,
     data: AttestationDataView,
 ) -> B256 {
-    let fork_version = bls::fork_version_at_epoch(
-        fork_epoch,
-        previous_version,
-        current_version,
-        data.target_epoch(),
-    );
     let domain = bls::compute_domain(
         bls::DOMAIN_BEACON_ATTESTER,
-        fork_version,
+        epoch.fork_version_at(data.target_epoch()),
         &imm.genesis_validators_root,
     );
     bls::compute_signing_root(&ssz_hash::hash_attestation_data(data.as_bytes()), &domain)
@@ -112,8 +107,8 @@ impl<'a> Attestation<'a> {
         Ok(Self::electra(att))
     }
 
-    /// `att` holds at least the fixed part.
     fn electra(att: &'a [u8]) -> Self {
+        debug_assert!(att.len() >= ATTESTATION_FIXED);
         Self {
             data: AttestationView::data(att),
             committee_bits: u64::from_le_bytes(*AttestationView::committee_bits(att)),
@@ -317,7 +312,6 @@ pub fn collect_sigs_single_attestation(
     shuffling: &ShufflingRef<'_>,
     sig_batch: &mut SigBatch,
 ) -> Result<(), AttestationError> {
-    let (fork_epoch, prev_v, curr_v) = epoch.fork_descriptor();
     let data = AttestationView::data(att);
     let target_epoch = data.target_epoch();
     let is_current = target_epoch == current_epoch;
@@ -329,7 +323,7 @@ pub fn collect_sigs_single_attestation(
     )?;
 
     let sig = AttestationView::signature(att);
-    let signing_root = attester_signing_root(imm, (fork_epoch, prev_v, curr_v), data);
+    let signing_root = attester_signing_root(imm, epoch, data);
 
     committees.push_aggregate_sig(validators, sig, signing_root, sig_batch);
     Ok(())
@@ -450,8 +444,7 @@ impl<'a> BlockAttestations<'a> {
             attestation_slot: parsed.att_slot,
             payload_present: parsed.payload_present(),
         };
-        let statements = stark
-            .map(|claims| claims.attestation(view.imm, self.epoch.fork_descriptor(), att.data));
+        let statements = stark.map(|claims| claims.attestation(view.imm, &self.epoch, att.data));
         self.collect_participants(view.validators.count(), &att, is_current, active, statements)?;
         if active.is_empty() {
             return Ok(0);

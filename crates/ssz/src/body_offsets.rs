@@ -363,11 +363,13 @@ impl<'a> BodyOffsets<'a> {
 
     #[inline]
     pub fn blob_commitments_fulu(&self) -> &'a [u8] {
+        debug_assert!(matches!(self.fork, BodyFork::Fulu | BodyFork::FuluBlinded));
         self.fields[7].unwrap_or(&[])
     }
 
     #[inline]
     pub fn execution_requests(&self) -> &'a [u8] {
+        debug_assert!(matches!(self.fork, BodyFork::Fulu | BodyFork::FuluBlinded));
         self.fields[8].unwrap_or(&[])
     }
 

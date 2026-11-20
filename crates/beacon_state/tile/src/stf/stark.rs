@@ -1,21 +1,14 @@
 use std::ops::Range;
 
-use silver_beacon_state_data::{
-    B256, Epoch, Immutable, Version, xmss::compute_xmss_attestation_leaf_index,
-};
-#[cfg(test)]
-use silver_beacon_state_data::{ValidatorsView, pq::xmss_pubkey, xmss::SignatureCheck};
+use silver_beacon_state_data::{B256, EpochView, Immutable};
 use silver_common::ssz_view::AttestationDataView;
-#[cfg(test)]
-use silver_common::ssz_view::XMSS_SIGNATURE_SIZE;
 
 use crate::stf::attestation::attester_signing_root;
 
 /// Spec `XMSSAggregateStatement`, its public keys held as validator indices
-/// into [`StarkClaims::signers`].
+/// into [`StarkClaims::signers`]. A leanVM sidecar claim carries no leaf
+/// index, so none is kept.
 struct Statement {
-    #[cfg_attr(not(test), allow(dead_code, reason = "a leanVM sidecar claim has no leaf index"))]
-    leaf_index: u64,
     message: B256,
     signers: Range<usize>,
 }
@@ -54,18 +47,13 @@ impl StarkClaims {
         self.statements.len()
     }
 
-    /// `fork` is the state's `fork_descriptor`.
     pub(crate) fn attestation(
         &mut self,
         imm: &Immutable,
-        fork: (Epoch, Version, Version),
+        epoch: &EpochView,
         data: AttestationDataView,
     ) -> AttestationStatements<'_> {
-        AttestationStatements {
-            leaf_index: compute_xmss_attestation_leaf_index(data.target_epoch()),
-            message: attester_signing_root(imm, fork, data),
-            claims: self,
-        }
+        AttestationStatements { message: attester_signing_root(imm, epoch, data), claims: self }
     }
 
     /// Claims `proof`, a slice of the body, proves the statements pushed
@@ -109,37 +97,10 @@ impl StarkClaims {
         let offset = start - self.body.start;
         offset..offset + part.len()
     }
-
-    /// The spec's reference `stark.VerifyAggregates`, which proves statements
-    /// by concatenating their signatures in statement order, then key order.
-    #[cfg(test)]
-    pub fn verify_reference(&self, body: &[u8], validators: &ValidatorsView) -> bool {
-        self.claims.iter().all(|claim| {
-            let mut signatures = body[claim.proof.clone()].chunks(XMSS_SIGNATURE_SIZE);
-            let statements = &self.statements[claim.statements.clone()];
-            let all_verify = statements.iter().all(|statement| {
-                self.signers[statement.signers.clone()].iter().all(|&signer| {
-                    signatures.next().and_then(|signature| signature.try_into().ok()).is_some_and(
-                        |signature| {
-                            SignatureCheck {
-                                public_key: xmss_pubkey(validators.pubkey(signer as usize)),
-                                leaf_index: statement.leaf_index,
-                                signing_root: statement.message,
-                                signature,
-                            }
-                            .verify()
-                        },
-                    )
-                })
-            });
-            all_verify && signatures.next().is_none()
-        })
-    }
 }
 
 pub(crate) struct AttestationStatements<'a> {
     claims: &'a mut StarkClaims,
-    leaf_index: u64,
     message: B256,
 }
 
@@ -148,61 +109,15 @@ impl AttestationStatements<'_> {
         let claims = &mut *self.claims;
         let start = claims.signers.len();
         claims.signers.extend(signers);
-        claims.statements.push(Statement {
-            leaf_index: self.leaf_index,
-            message: self.message,
-            signers: start..claims.signers.len(),
-        });
+        claims
+            .statements
+            .push(Statement { message: self.message, signers: start..claims.signers.len() });
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use silver_beacon_state_data::{
-        FinalizedValidators, HashFormat, ValidatorsGroup, xmss::compute_xmss_attestation_leaf_index,
-    };
-    use silver_crypto_simd::xmss::SecretKey;
-
     use super::{AttestationStatements, StarkClaims};
-
-    /// A one-validator XMSS registry: pubkey, VRF root, then the shared fields.
-    fn registry(pubkey: &[u8; 32]) -> ValidatorsGroup {
-        let mut record = pubkey.to_vec();
-        record.resize(32 + 32 + 32 + 8 + 1 + 4 * 8, 0);
-        ValidatorsGroup::new(FinalizedValidators::try_new_xmss(&record).unwrap(), HashFormat::Fixed)
-    }
-
-    /// Validator 0's statement of `message` at `leaf_index`.
-    fn push_statement(claims: &mut StarkClaims, leaf_index: u64, message: [u8; 32]) {
-        AttestationStatements { claims, leaf_index, message }.push([0]);
-    }
-
-    #[test]
-    fn reference_proof_concatenates_signatures_in_statement_order() {
-        let key = SecretKey::new(&[1; 32]);
-        let mut group = registry(&key.public_key());
-        let validators = group.roll_fresh();
-        let validators = validators.reader();
-
-        let leaf = compute_xmss_attestation_leaf_index(3);
-        let bottom = key.bottom_tree(0);
-        let messages = [[1; 32], [2; 32]];
-        let [first, second] = messages.map(|message| key.sign(&bottom, &message, leaf as u32));
-
-        let verifies = |body: &[u8], leaf: u64| {
-            let mut claims = StarkClaims::default();
-            claims.begin(body);
-            push_statement(&mut claims, leaf, messages[0]);
-            push_statement(&mut claims, leaf, messages[1]);
-            claims.push_proof(0, body);
-            claims.verify_reference(body, &validators)
-        };
-        assert!(verifies(&[first, second].concat(), leaf));
-        assert!(!verifies(&[second, first].concat(), leaf));
-        assert!(!verifies(&first, leaf), "a signature missing");
-        assert!(!verifies(&[&first[..], &second, &[0]].concat(), leaf), "trailing bytes");
-        assert!(!verifies(&[first, second].concat(), leaf + 1));
-    }
 
     #[test]
     fn each_proof_comes_with_its_statements_signers() {
@@ -210,9 +125,9 @@ mod tests {
         let body = &block[1..];
         let mut claims = StarkClaims::default();
         claims.begin(body);
-        AttestationStatements { claims: &mut claims, leaf_index: 0, message: [1; 32] }.push([4, 5]);
+        AttestationStatements { claims: &mut claims, message: [1; 32] }.push([4, 5]);
         claims.push_proof(0, &body[..2]);
-        AttestationStatements { claims: &mut claims, leaf_index: 0, message: [2; 32] }.push([6]);
+        AttestationStatements { claims: &mut claims, message: [2; 32] }.push([6]);
         claims.push_proof(1, &body[2..]);
 
         let proofs: Vec<_> = claims
@@ -224,18 +139,5 @@ mod tests {
         let expected =
             [(vec![(4, [1; 32]), (5, [1; 32])], &[1, 2][..]), (vec![(6, [2; 32])], &[3][..])];
         assert_eq!(proofs, expected);
-    }
-
-    #[test]
-    fn no_statements_need_an_empty_proof() {
-        let mut group = registry(&[0; 32]);
-        let validators = group.roll_fresh();
-        let body = [7, 0];
-        let mut claims = StarkClaims::default();
-        claims.begin(&body);
-        claims.push_proof(0, &body[..0]);
-        assert!(claims.verify_reference(&body, &validators.reader()));
-        claims.push_proof(0, &body[1..]);
-        assert!(!claims.verify_reference(&body, &validators.reader()));
     }
 }

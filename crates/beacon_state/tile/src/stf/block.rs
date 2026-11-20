@@ -567,7 +567,12 @@ fn apply_block_body(
         )?;
     }
     if let Some(claims) = stark {
-        claims.push_proof(block_statements, offsets.proof());
+        let proof = offsets.proof();
+        if claims.statement_count() > block_statements {
+            claims.push_proof(block_statements, proof);
+        } else if !proof.is_empty() {
+            return Err(input.invalid(BlockError::ProofWithoutAttestations));
+        }
     }
 
     if let Some(section) = offsets.voluntary_exits() {

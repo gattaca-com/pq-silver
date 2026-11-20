@@ -52,7 +52,12 @@ fn state_encodes_back_to_its_ssz() {
 #[test]
 fn epoch_transitions_match_the_spec() {
     let mut state = load_state(Path::new(GENESIS));
-    let cfg = SpecConfig::mainnet();
+    let cfg = SpecConfig {
+        gloas_fork_epoch: 0,
+        eip8483_fork_epoch: 0,
+        pq_fork_epoch: 0,
+        ..SpecConfig::mainnet()
+    };
     let mut scratch = stf::StfScratch::new(0);
     for (slot, expected) in EPOCH_ROOTS {
         let mut fork = state.bs.fork_writer(state.state_id);

@@ -31,7 +31,7 @@ pub fn process_execution_payload_bid(
 ) -> Result<(), E> {
     let (bid, has_empty_signature) = if epoch.is_pq(view.imm) {
         let signature = SignedExecutionPayloadBidPqView::signature(signed_bid);
-        let bid = decode_bid_pq(signed_bid)?;
+        let bid = decode_signed_bid(signed_bid, true)?;
         let leaf_index = u64::from(leaf_index(signature));
         if bid.builder_index != BUILDER_INDEX_SELF_BUILD && !is_builder_bid_leaf_index(leaf_index) {
             return Err(E::LeafNotForBids { index: bid.builder_index, leaf_index });
@@ -155,7 +155,7 @@ pub fn verify_execution_payload_bid_signature_pq(
     signed_bid: &[u8],
     current_epoch: Epoch,
 ) -> Result<(), E> {
-    let bid = decode_bid_pq(signed_bid)?;
+    let bid = decode_signed_bid(signed_bid, true)?;
     let index = bid.builder_index;
     if index == BUILDER_INDEX_SELF_BUILD {
         return Ok(());
@@ -221,10 +221,6 @@ pub fn verify_execution_payload_bid_signature(
 
 pub fn decode_bid(signed_bid: &[u8]) -> Result<ExecutionPayloadBid, E> {
     decode_signed_bid(signed_bid, false)
-}
-
-fn decode_bid_pq(signed_bid: &[u8]) -> Result<ExecutionPayloadBid, E> {
-    decode_signed_bid(signed_bid, true)
 }
 
 fn decode_signed_bid(signed_bid: &[u8], is_pq: bool) -> Result<ExecutionPayloadBid, E> {

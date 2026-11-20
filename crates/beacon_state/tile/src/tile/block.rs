@@ -141,15 +141,6 @@ pub(super) enum ImportGate {
     StarkVerdict(TRead, BlockSource),
 }
 
-/// The verify requests a PQ block's STARK proofs went out as: an empty range
-/// when no proof needed leanVM.
-enum StarkRequests {
-    Sent(Range<u64>),
-    ProofOfNoClaims,
-    /// A request did not fit in the tcache.
-    Unsent,
-}
-
 /// The root and stage of a block held back from import.
 fn held_stage(feedback: Feedback) -> Option<(B256, BlockStage)> {
     match feedback {
@@ -518,21 +509,16 @@ impl BeaconStateTile {
             }
             ImportGate::StarkVerdict(ssz, source) => {
                 match self.send_stark_proofs(data, applied.id, producers) {
-                    StarkRequests::Sent(requests) if requests.is_empty() => {
+                    Some(requests) if requests.is_empty() => {
                         self.import_block(parsed, applied, data, |event| producers.produce(event));
                         Feedback::BlockImported(block_root)
                     }
-                    StarkRequests::Sent(requests) => {
+                    Some(requests) => {
                         let block = StagedBlock { parsed, applied, ssz, source, el_valid: false };
                         self.held.park_for_verify(block, requests);
                         Feedback::AwaitVerify(block_root)
                     }
-                    StarkRequests::ProofOfNoClaims => {
-                        self.held.reject(block_root, parsed.header.slot);
-                        self.stf_scratch.votes.recycle(applied.votes);
-                        Feedback::reject_block(block_root, "a STARK proof of no claims")
-                    }
-                    StarkRequests::Unsent => {
+                    None => {
                         self.stf_scratch.votes.recycle(applied.votes);
                         Feedback::Ignore
                     }
@@ -542,36 +528,24 @@ impl BeaconStateTile {
     }
 
     /// Sends each STARK proof the block's transition collected, before the
-    /// next block reuses them. A proof of no claims has nothing for leanVM
-    /// to check: it must be empty.
+    /// next block reuses them: the ids they went out under, or `None` when
+    /// one did not fit in the tcache.
     fn send_stark_proofs(
         &mut self,
         data: &[u8],
         state_id: StateId,
         producers: &mut Producers,
-    ) -> StarkRequests {
+    ) -> Option<Range<u64>> {
         let Self { state, stf_scratch, leanvm_verifier, events_producer, .. } = self;
         let validators = &state.read_view(state_id).validators;
         let first = leanvm_verifier.next_request_id();
-        let mut claims = Vec::new();
         for (signed, proof) in stf_scratch.stark.proofs(data) {
-            claims.clear();
-            claims.extend(signed.map(|(signer, message)| {
+            let claims = signed.map(|(signer, message)| {
                 claim(xmss_pubkey(validators.pubkey(signer as usize)), message)
-            }));
-            if claims.is_empty() {
-                if !proof.is_empty() {
-                    return StarkRequests::ProofOfNoClaims;
-                }
-                continue;
-            }
-            claims.sort_unstable();
-            claims.dedup();
-            if leanvm_verifier.send(&claims, proof, events_producer, producers).is_none() {
-                return StarkRequests::Unsent;
-            }
+            });
+            leanvm_verifier.send(claims, proof, events_producer, producers)?;
         }
-        StarkRequests::Sent(first..leanvm_verifier.next_request_id())
+        Some(first..leanvm_verifier.next_request_id())
     }
 
     pub(super) fn handle_stark_verdict(
@@ -676,6 +650,8 @@ impl BeaconStateTile {
         data: &[u8],
     ) -> crate::Result<AppliedBlock> {
         if let Some(applied) = self.block_production.take_produced_state(&parsed.block_root) {
+            // Its proofs are this node's own: none goes to leanVM.
+            self.stf_scratch.stark.begin(parsed.layout.body(data));
             return Ok(applied);
         }
         let block_epoch = parsed.header.slot / SLOTS_PER_EPOCH;

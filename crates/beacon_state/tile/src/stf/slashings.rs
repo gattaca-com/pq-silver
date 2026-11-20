@@ -2,9 +2,9 @@ use core::cmp::max;
 
 use flux_profiler::timed;
 use silver_beacon_state_data::{
-    B256, BeaconBlockHeader, BuilderPendingPayment, EPOCHS_PER_SLASHINGS_VECTOR, Epoch,
-    EpochBalancesRow, EpochView, Immutable, SLOTS_PER_EPOCH, SlotStateWriteView, SpecConfig,
-    StateReadView, StateWriterView, ValidatorsView, Version,
+    B256, BeaconBlockHeader, BuilderPendingPayment, EPOCHS_PER_SLASHINGS_VECTOR, EpochBalancesRow,
+    EpochView, Immutable, SLOTS_PER_EPOCH, SlotStateWriteView, SpecConfig, StateReadView,
+    StateWriterView, ValidatorsView,
     bls::{self, SigBatch},
     hash_tree_root_block_header,
     pq::xmss_pubkey,
@@ -92,7 +92,6 @@ pub fn verify_proposer_slashing_signatures_pq(
     validators: &ValidatorsView,
     data: &[u8],
 ) -> Result<(), ProposerSlashingError> {
-    let (fork_epoch, prev_ver, cur_ver) = epoch.fork_descriptor();
     let n = validators.count();
     for s in data.chunks_exact(PROPOSER_SLASHING_PQ_SIZE) {
         let s: &[u8; PROPOSER_SLASHING_PQ_SIZE] = s.try_into().unwrap();
@@ -102,10 +101,9 @@ pub fn verify_proposer_slashing_signatures_pq(
             return Err(ProposerSlashingError::ValidatorOutOfRange { vi, count: n });
         }
         let header_epoch = BeaconBlockHeaderView::slot(header) / SLOTS_PER_EPOCH;
-        let fork_version = bls::fork_version_at_epoch(fork_epoch, prev_ver, cur_ver, header_epoch);
         let domain = bls::compute_domain(
             bls::DOMAIN_BEACON_PROPOSER,
-            fork_version,
+            epoch.fork_version_at(header_epoch),
             &imm.genesis_validators_root,
         );
         let checks =
@@ -196,7 +194,6 @@ pub fn collect_sigs_attester_slashings(
     active_scratch: &mut Vec<u32>,
     sig_batch: &mut SigBatch,
 ) -> Result<(), AttesterSlashingError> {
-    let fork = epoch.fork_descriptor();
     for_each_ssz_list_item(
         data,
         |start, end| AttesterSlashingError::BadOffsets { start, end, parent_len: data.len() },
@@ -222,7 +219,7 @@ pub fn collect_sigs_attester_slashings(
                 }
                 let data = IndexedAttestationView::data(ia);
                 let sig: &[u8; 96] = IndexedAttestationView::signature(ia);
-                let signing_root = attester_signing_root(imm, fork, data);
+                let signing_root = attester_signing_root(imm, epoch, data);
                 sig_batch.push_aggregate(
                     active_scratch.iter().map(|&vi| validators.pubkey_decompressed(vi as usize)),
                     sig,
@@ -276,7 +273,6 @@ pub fn process_attester_slashings(
     let proposer_index = get_beacon_proposer_index(&view.slot, epoch);
     let n = view.validators.count();
     let current_epoch = view.slot.state().slot / SLOTS_PER_EPOCH;
-    let fork = epoch.fork_descriptor();
 
     let mut proposer_reward = 0;
     for_each_ssz_list_item(
@@ -286,7 +282,8 @@ pub fn process_attester_slashings(
             let pair = SlashedAttestation::checked_pair(slashing, is_pq, n)?;
             let (i1, i2) = (pair[0].indices, pair[1].indices);
             if let Some(claims) = stark.as_deref_mut() {
-                pair.iter().for_each(|attestation| attestation.push_claims(claims, view.imm, fork));
+                pair.iter()
+                    .for_each(|attestation| attestation.push_claims(claims, view.imm, &epoch));
             }
 
             // Spec requires ≥1 currently-slashable validator in the
@@ -294,7 +291,7 @@ pub fn process_attester_slashings(
             let start = slashed_sink.len();
             let validators = view.validators.reader();
             for_each_sorted_intersection(i1, i2, |vi| {
-                if vi < n && validators.is_slashable(vi, current_epoch) {
+                if validators.is_slashable(vi, current_epoch) {
                     slashed_sink.push(vi as u32);
                 }
                 false
@@ -311,15 +308,15 @@ pub fn process_attester_slashings(
     Ok(proposer_reward)
 }
 
-/// Spec `on_attester_slashing` short of its `is_valid_indexed_attestation`
-/// proofs: fills `equivocators` with the attestations' common attesters.
+/// Spec `on_attester_slashing` for a PQ slashing, short of its
+/// `is_valid_indexed_attestation` proofs: fills `equivocators` with the
+/// attestations' common attesters.
 pub fn attester_slashing_equivocators(
     slashing: &[u8],
-    is_pq: bool,
     validator_count: usize,
     equivocators: &mut Vec<u32>,
 ) -> Result<(), AttesterSlashingError> {
-    let [first, second] = SlashedAttestation::checked_pair(slashing, is_pq, validator_count)?;
+    let [first, second] = SlashedAttestation::checked_pair(slashing, true, validator_count)?;
     equivocators.clear();
     for_each_sorted_intersection(first.indices, second.indices, |vi| {
         equivocators.push(vi as u32);
@@ -400,18 +397,13 @@ impl<'a> SlashedAttestation<'a> {
 
     /// Spec `is_valid_indexed_attestation`'s `stark.VerifyAggregates` call:
     /// `proof` over the one statement the attesters sign.
-    fn push_claims(
-        &self,
-        claims: &mut StarkClaims,
-        imm: &Immutable,
-        fork: (Epoch, Version, Version),
-    ) {
+    fn push_claims(&self, claims: &mut StarkClaims, imm: &Immutable, epoch: &EpochView) {
         let first_statement = claims.statement_count();
         let attesters = self
             .indices
             .chunks_exact(8)
             .map(|index| u64::from_le_bytes(index.try_into().unwrap()) as u32);
-        claims.attestation(imm, fork, self.data).push(attesters);
+        claims.attestation(imm, epoch, self.data).push(attesters);
         claims.push_proof(first_statement, self.proof);
     }
 }
@@ -447,7 +439,6 @@ pub fn validate_attester_slashing_for_gossip(
     equivocating_out: &mut Vec<u32>,
     sig_batch: &mut SigBatch,
 ) -> bool {
-    let fork = view.epoch.fork_descriptor();
     let Ok((off1, off2)) = attester_slashing_inner_offsets(slashing) else {
         return false;
     };
@@ -496,7 +487,7 @@ pub fn validate_attester_slashing_for_gossip(
         }
         let data = IndexedAttestationView::data(ia);
         let sig: &[u8; 96] = IndexedAttestationView::signature(ia);
-        let signing_root = attester_signing_root(view.imm, fork, data);
+        let signing_root = attester_signing_root(view.imm, &view.epoch, data);
         sig_batch.push_aggregate(
             (0..n_idx).map(|k| {
                 let vi = u64::from_le_bytes(indices[k * 8..k * 8 + 8].try_into().unwrap()) as u32;

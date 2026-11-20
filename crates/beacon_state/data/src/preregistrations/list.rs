@@ -147,7 +147,12 @@ impl<T: Preregistration> ListDelta<T> {
         let shift = |position: u32| position - rank(&winner.removed, position) as u32;
         self.removed.retain(|position| winner.removed.binary_search(position).is_err());
         self.removed.iter_mut().for_each(|position| *position = shift(*position));
-        self.overwritten.retain(|entry| !winner.overwritten.contains(entry));
+        self.overwritten.retain(|entry| {
+            match winner.overwritten.binary_search_by_key(&entry.0, |&(p, _)| p) {
+                Ok(i) => winner.overwritten[i] != *entry,
+                Err(_) => true,
+            }
+        });
         self.overwritten.iter_mut().for_each(|(position, _)| *position = shift(*position));
 
         let promoted_start = (base.len() - winner.removed.len()) as u32;
@@ -261,7 +266,7 @@ impl<'w, 'a, T: Preregistration> ListWriter<'w, 'a, T> {
         ListView { base: self.base, delta: self.delta, roots: self.roots.reader() }
     }
 
-    pub fn push(&mut self, record: T) {
+    pub(super) fn push(&mut self, record: T) {
         self.delta.appended.push(record);
         let index = self.roots.append_empty();
         self.roots.set(index, record.hash_tree_root());

@@ -21,7 +21,12 @@ pub use loaded_state::{LoadedState, load_state, load_state_gloas, snappy_decode}
 
 /// The PQ EF config: mainnet preset with Gloas and PQ active from genesis.
 pub fn pq_config() -> SpecConfig {
-    SpecConfig { gloas_fork_epoch: 0, pq_fork_epoch: 0, ..SpecConfig::mainnet() }
+    SpecConfig {
+        gloas_fork_epoch: 0,
+        eip8483_fork_epoch: 0,
+        pq_fork_epoch: 0,
+        ..SpecConfig::mainnet()
+    }
 }
 
 impl LoadedState {
@@ -425,6 +430,7 @@ pub fn ef_tile(state: silver_beacon_state_data::BeaconState) -> BeaconStateTile 
         spec.gloas_fork_epoch = 0;
     }
     if state.is_finalized_pq() {
+        spec.eip8483_fork_epoch = 0;
         spec.pq_fork_epoch = 0;
     }
     ef_tile_with_spec(state, spec)

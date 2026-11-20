@@ -429,10 +429,8 @@ pub fn process_voluntary_exit_requests(view: &mut StateWriterView, cfg: &SpecCon
         let Some(vi) = view.validators.find_by_pubkey(&pubkey) else {
             continue;
         };
-        if !is_active(&view.validators.reader(), vi, current_epoch) ||
-            view.validators.exit_epoch(vi as usize) != u64::MAX ||
-            current_epoch <
-                view.validators.activation_epoch(vi as usize) + cfg.shard_committee_period ||
+        let validators = view.validators.reader();
+        if validate::validate_exit_eligibility(cfg, &validators, vi as u64, current_epoch).is_err() ||
             get_pending_balance_to_withdraw(&view.pending.reader(), vi) != 0
         {
             continue;

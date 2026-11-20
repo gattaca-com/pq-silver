@@ -29,20 +29,25 @@ pub enum ProofVerdict {
 #[derive(Default)]
 pub struct LeanVmVerifier {
     sent: u64,
+    claims: Vec<Claim>,
 }
 
 impl LeanVmVerifier {
-    /// Asks whether `proof` proves exactly `claims`. `None` when the tcache
-    /// has no room for the request.
+    /// Asks whether `proof` proves exactly the set of `claims`. `None` when
+    /// the tcache has no room for the request.
     pub fn send(
         &mut self,
-        claims: &[Claim],
+        claims: impl IntoIterator<Item = Claim>,
         proof: &[u8],
         tcache: &mut TProducer,
         producers: &mut Producers,
     ) -> Option<u64> {
-        debug_assert!(claims.is_sorted_by(|a, b| a < b), "a proof's claims are strictly sorted");
-        let request = VerifyRequest { claims, proof };
+        self.claims.clear();
+        self.claims.extend(claims);
+        self.claims.sort_unstable();
+        self.claims.dedup();
+        debug_assert!(!self.claims.is_empty(), "leanVM has nothing to check against");
+        let request = VerifyRequest { claims: &self.claims, proof };
         let Some(body) = tcache.write_with(request.len(), |out| request.write(out)) else {
             silver_log::error!(len = request.len(), "beacon_state tcache full; verify not sent");
             return None;

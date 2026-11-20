@@ -7753,8 +7753,8 @@ mod leanvm_verifier {
         let mut verifier = LeanVmVerifier::default();
         let claims = [[1; 64], [2; 64]];
         let tcache = &mut tile.events_producer;
-        let first = verifier.send(&claims, b"proof", tcache, &mut adapter.producers).unwrap();
-        let second = verifier.send(&claims, b"proof", tcache, &mut adapter.producers).unwrap();
+        let first = verifier.send(claims, b"proof", tcache, &mut adapter.producers).unwrap();
+        let second = verifier.send(claims, b"proof", tcache, &mut adapter.producers).unwrap();
         assert_ne!(first, second);
         let mut requests = Vec::new();
         sink.consume(|request: LeanVmReq, _| requests.push(request));

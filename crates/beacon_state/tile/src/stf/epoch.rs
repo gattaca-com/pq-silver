@@ -584,14 +584,15 @@ pub fn process_pending_deposits(
             break;
         }
 
-        let vi = view.validators.find_by_pubkey(&scheme.deposit_pubkey(&deposit.pubkey));
+        let registry_pubkey = scheme.deposit_pubkey(&deposit.pubkey);
+        let vi = view.validators.find_by_pubkey(&registry_pubkey);
         let is_exited = vi.is_some_and(|v| view.validators.exit_epoch(v as usize) != u64::MAX);
         let is_withdrawn =
             vi.is_some_and(|v| view.validators.withdrawable_epoch(v as usize) < next_epoch);
 
         // A legacy deposit's validator is never active, so it takes no churn.
         if is_withdrawn || scheme.is_legacy(&deposit.pubkey) {
-            apply_pending_deposit(cfg, view, &deposit);
+            apply_pending_deposit(cfg, view, &deposit, &registry_pubkey, vi);
         } else if is_exited {
             postponed.push(deposit);
         } else {
@@ -600,7 +601,7 @@ pub fn process_pending_deposits(
                 break;
             }
             processed_amount += deposit.amount;
-            apply_pending_deposit(cfg, view, &deposit);
+            apply_pending_deposit(cfg, view, &deposit, &registry_pubkey, vi);
         }
         next_deposit_index += 1;
     }
@@ -617,10 +618,11 @@ fn apply_pending_deposit(
     cfg: &SpecConfig,
     view: &mut StateWriterView,
     deposit: &common::PendingDeposit,
+    registry_pubkey: &BLSPubkey,
+    registry_index: Option<u32>,
 ) {
     let scheme = view.validators.reader().scheme();
-    let registry_pubkey = scheme.deposit_pubkey(&deposit.pubkey);
-    if let Some(v) = view.validators.find_by_pubkey(&registry_pubkey) {
+    if let Some(v) = registry_index {
         let balance = view.balances.get(v as usize);
         view.balances.set(v, balance.saturating_add(deposit.amount));
         return;
@@ -642,7 +644,7 @@ fn apply_pending_deposit(
         }
         // A PQ deposit carries no signature to verify.
         KeyScheme::Xmss => view.append_xmss_validator(
-            xmss_pubkey(&registry_pubkey),
+            xmss_pubkey(registry_pubkey),
             deposit_vrf_root(&deposit.pubkey, &deposit.signature),
             deposit.withdrawal_credentials,
         ),

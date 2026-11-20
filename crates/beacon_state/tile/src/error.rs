@@ -319,6 +319,8 @@ pub enum BlockError {
     ParentRootMismatch { expected: B256, got: B256 },
     #[error("post-state root mismatch: expected=0x{} got=0x{}", b256_hex(expected), b256_hex(got))]
     PostStateRootMismatch { expected: B256, got: B256 },
+    #[error("STARK proof in a block without attestations")]
+    ProofWithoutAttestations,
     #[error(transparent)]
     Body(#[from] BlockBodyError),
 }

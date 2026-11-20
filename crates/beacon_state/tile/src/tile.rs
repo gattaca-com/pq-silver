@@ -1317,7 +1317,7 @@ impl BeaconStateTile {
         }
         let n = self.head_validator_count();
         let equivocators = &mut self.stf_scratch.active;
-        if stf::attester_slashing_equivocators(ssz, true, n, equivocators).is_err() {
+        if stf::attester_slashing_equivocators(ssz, n, equivocators).is_err() {
             return;
         }
         for &idx in equivocators.iter() {

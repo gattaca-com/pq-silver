@@ -1,7 +1,4 @@
-use std::{
-    cmp::{Ordering, Reverse},
-    collections::{BinaryHeap, binary_heap::PeekMut},
-};
+use std::cmp::Reverse;
 
 use silver_common::{Nanos, TCacheProducer, TCacheRead, TProducer, ssz_view::XMSS_SIGNATURE_SIZE};
 
@@ -165,9 +162,7 @@ impl Aggregation {
 
     fn adopt_response(&mut self, body: &[u8], batch: &Batch) -> Result<(), &'static str> {
         let (claims, proof) = decode_aggregate_response(body)?;
-        let best = self.best.iter().map(|best| best.claims.as_slice());
-        let batch_claims = batch.indices().iter().map(|&index| self.verified[index].claims());
-        if !is_union(&claims, best.chain(batch_claims)) {
+        if !self.proves_exactly(&claims, batch) {
             return Err("the proof covers other claims");
         }
         let mut covered_indices =
@@ -177,35 +172,26 @@ impl Aggregation {
         self.best = Some(BestProof { claims, proof: proof.to_vec(), covered_indices });
         Ok(())
     }
-}
 
-/// Whether strictly ascending `claims` is exactly the union of `sets`, each
-/// sorted without repeats. A merge of the sets: no copy, no sort.
-fn is_union<'a>(claims: &[Claim], sets: impl Iterator<Item = &'a [Claim]>) -> bool {
-    // Slices order by their first claim first, so the top holds the least.
-    let mut heads: BinaryHeap<Reverse<&[Claim]>> =
-        sets.filter(|set| !set.is_empty()).map(Reverse).collect();
-    for claim in claims {
-        let mut found = false;
-        while let Some(mut top) = heads.peek_mut() {
-            match top.0[0].cmp(claim) {
-                // `claims` passed this one without taking it.
-                Ordering::Less => return false,
-                Ordering::Greater => break,
-                Ordering::Equal => {
-                    found = true;
-                    top.0 = &top.0[1..];
-                    if top.0.is_empty() {
-                        PeekMut::pop(top);
-                    }
+    /// Whether strictly ascending `claims` is exactly the claims of the best
+    /// proof and of `batch`. Each set walks `claims` once and marks its own;
+    /// all must be marked.
+    fn proves_exactly(&self, claims: &[Claim], batch: &Batch) -> bool {
+        let best = self.best.iter().map(|best| best.claims.as_slice());
+        let batch_claims = batch.indices().iter().map(|&index| self.verified[index].claims());
+        let mut seen = vec![false; claims.len()];
+        for set in best.chain(batch_claims) {
+            let mut index = 0;
+            for claim in set {
+                index += claims[index..].iter().take_while(|&lower| lower < claim).count();
+                if claims.get(index) != Some(claim) {
+                    return false;
                 }
+                seen[index] = true;
             }
         }
-        if !found {
-            return false;
-        }
+        seen.into_iter().all(|seen| seen)
     }
-    heads.is_empty()
 }
 
 #[cfg(test)]

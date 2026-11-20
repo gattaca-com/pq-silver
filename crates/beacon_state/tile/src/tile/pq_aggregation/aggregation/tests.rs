@@ -206,16 +206,16 @@ fn then_the_most_new_claims_go_first() {
 
 #[test]
 fn a_response_must_hold_exactly_the_union_of_its_claims() {
-    let sets = [vec![claim(1), claim(3)], vec![claim(2), claim(3)], Vec::new()];
-    let sets = || sets.iter().map(Vec::as_slice);
-    let union = |tags: &[u16]| tags.iter().copied().map(claim).collect::<Vec<_>>();
-    let mut sorted = union(&[1, 2, 3]);
-    sorted.sort_unstable();
-    assert!(is_union(&sorted, sets()));
-    for tags in [&[1, 2][..], &[2, 3], &[1, 3], &[1, 2, 3, 4], &[0, 1, 2, 3]] {
-        let mut claims = union(tags);
+    let mut merge = merge([child(&[1, 3]), child(&[2, 3])]);
+    let batch = merge.next_batch(Nanos::ZERO).unwrap();
+    assert_eq!(batch.indices(), [0, 1]);
+    let proves = |tags: &[u16]| {
+        let mut claims: Vec<_> = tags.iter().copied().map(claim).collect();
         claims.sort_unstable();
-        assert!(!is_union(&claims, sets()), "{tags:?}");
+        merge.core.proves_exactly(&claims, &batch)
+    };
+    assert!(proves(&[1, 2, 3]));
+    for tags in [&[1, 2][..], &[2, 3], &[1, 3], &[1, 2, 3, 4], &[0, 1, 2, 3]] {
+        assert!(!proves(tags), "{tags:?}");
     }
-    assert!(is_union(&[], std::iter::empty()));
 }

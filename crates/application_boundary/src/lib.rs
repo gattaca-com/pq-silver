@@ -14,7 +14,7 @@ use silver_common::{
 use silver_config::{EngineConfig, PbsConfig};
 use silver_engine_api::EngineApi;
 use silver_httpcore::{Bind, Readiness, TokenRange};
-use silver_leanvm_api::LeanvmApi;
+use silver_leanvm_api::LeanVmApi;
 use silver_pbs::{BuilderBids, BuilderEvent, PbsClient, SidecarEvent};
 
 /// A tenant added here takes the next share of a raised `TENANTS`, which keeps
@@ -32,7 +32,7 @@ pub struct ApplicationBoundaryTile {
     readiness: Readiness,
     pub beacon: BeaconApi,
     engine: EngineApi,
-    leanvm: LeanvmApi,
+    leanvm: LeanVmApi,
     pbs: Option<PbsClient>,
     builder_bids: BuilderBids,
     /// The tile's one producer, shared by engine responses and the messages
@@ -138,7 +138,7 @@ impl ApplicationBoundaryTile {
         let sockets = binds.len() +
             max_connections +
             EngineApi::max_sockets(engine_config.max_connections) +
-            LeanvmApi::MAX_SOCKETS +
+            LeanVmApi::MAX_SOCKETS +
             PbsClient::MAX_SOCKETS +
             BuilderBids::MAX_SOCKETS;
 
@@ -181,7 +181,7 @@ impl ApplicationBoundaryTile {
         );
         let builder_bids =
             BuilderBids::new(readiness.registry(), BUILDER_TOKENS, builder_bid_timeout);
-        let leanvm = LeanvmApi::new(readiness.registry(), LEANVM_TOKENS, leanvm_socket, tcaches);
+        let leanvm = LeanVmApi::new(readiness.registry(), LEANVM_TOKENS, leanvm_socket, tcaches);
         Self { readiness, beacon, engine, leanvm, pbs, builder_bids, processing }
     }
 

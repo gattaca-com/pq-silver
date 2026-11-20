@@ -1759,7 +1759,7 @@ pub struct EngineHealthEvent {
 /// A leanVM sidecar request body, op byte onwards and unframed.
 #[derive(Clone, Copy, Debug, TypeHash)]
 #[repr(C)]
-pub struct LeanvmReq {
+pub struct LeanVmReq {
     pub request_id: u64,
     pub body: TCacheRead,
 }
@@ -1767,14 +1767,14 @@ pub struct LeanvmReq {
 /// A leanVM sidecar response body, status byte included. `None` is no answer.
 #[derive(Clone, Copy, Debug, TypeHash)]
 #[repr(C)]
-pub struct LeanvmResp {
+pub struct LeanVmResp {
     pub request_id: u64,
     pub body: Option<TCacheRead>,
 }
 
 #[derive(Clone, Copy, Debug, TypeHash)]
 #[repr(C)]
-pub struct LeanvmHealthEvent {
+pub struct LeanVmHealthEvent {
     pub ready: bool,
 }
 

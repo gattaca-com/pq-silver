@@ -12,11 +12,11 @@ use std::{
 
 use flux::{spine::SpineAdapter, tile::Tile};
 use silver_common::{
-    LeanvmHealthEvent, LeanvmReq, LeanvmResp, SilverSpine, TCache, TCacheId, TCacheProducer,
+    LeanVmHealthEvent, LeanVmReq, LeanVmResp, SilverSpine, TCache, TCacheId, TCacheProducer,
     TCacheTable, TProducer, test_util::ShmemDir,
 };
 use silver_httpcore::{Readiness, TokenRange};
-use silver_leanvm_api::LeanvmApi;
+use silver_leanvm_api::LeanVmApi;
 use tempfile::TempDir;
 
 struct Injector;
@@ -28,7 +28,7 @@ struct Rig {
     _base: ShmemDir,
     _spine: Box<SilverSpine>,
     readiness: Readiness,
-    api: LeanvmApi,
+    api: LeanVmApi,
     adapter: SpineAdapter<SilverSpine>,
     injector: SpineAdapter<SilverSpine>,
     processing: TProducer,
@@ -46,12 +46,12 @@ impl Rig {
         let tcaches = TCacheTable::from_iter([processing.cache_ref(), handoff.cache_ref()]);
         let readiness = Readiness::new(4);
         let socket = socket.map(|path| path.to_str().unwrap());
-        let mut api = LeanvmApi::new(readiness.registry(), TokenRange::whole(), socket, tcaches);
+        let mut api = LeanVmApi::new(readiness.registry(), TokenRange::whole(), socket, tcaches);
         api.open_tcaches().unwrap();
         let adapter = SpineAdapter::connect_tile(&Injector, &mut *spine);
         let mut injector = SpineAdapter::connect_tile(&Injector, &mut *spine);
-        injector.consume(|_: LeanvmResp, _| {});
-        injector.consume(|_: LeanvmHealthEvent, _| {});
+        injector.consume(|_: LeanVmResp, _| {});
+        injector.consume(|_: LeanVmHealthEvent, _| {});
         let mut rig = Self {
             _base: base,
             _spine: spine,
@@ -74,11 +74,11 @@ impl Rig {
         self.readiness.wait(Duration::from_millis(1));
         self.api.spin(&mut self.adapter, self.readiness.events(), &mut self.processing);
         let Self { injector, processing, answers, health, .. } = self;
-        injector.consume(|resp: LeanvmResp, _| {
+        injector.consume(|resp: LeanVmResp, _| {
             let body = resp.body.map(|read| processing.read_buffer(read).unwrap().to_vec());
             answers.push((resp.request_id, body));
         });
-        injector.consume(|resp: LeanvmHealthEvent, _| health.push(resp.ready));
+        injector.consume(|resp: LeanVmHealthEvent, _| health.push(resp.ready));
     }
 
     fn wait_until(&mut self, what: &str, done: impl Fn(&Self) -> bool) {
@@ -96,7 +96,7 @@ impl Rig {
     fn request(&mut self, request_id: u64, body: &[u8]) {
         let body = self.handoff.write_with(body.len(), |out| out.copy_from_slice(body)).unwrap();
         self.handoff.loop_start();
-        self.injector.produce(LeanvmReq { request_id, body });
+        self.injector.produce(LeanVmReq { request_id, body });
     }
 
     fn answer(&mut self, request_id: u64) -> Option<Vec<u8>> {

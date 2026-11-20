@@ -14,8 +14,8 @@ use silver_beacon_state_data::{
 };
 use silver_common::{
     BeaconApiRequest, BeaconApiResponse, BeaconStateEvent, BlockSource, BuilderBidsResponse,
-    DataColumnsEvent, DataKind, EngineResp, GossipTopic, HeadChange, HeadRoots, LeanvmHealthEvent,
-    LeanvmResp, NewGossipMsg, Origin, PayloadResolution, PayloadValidationStatus, PtcObservation,
+    DataColumnsEvent, DataKind, EngineResp, GossipTopic, HeadChange, HeadRoots, LeanVmHealthEvent,
+    LeanVmResp, NewGossipMsg, Origin, PayloadResolution, PayloadValidationStatus, PtcObservation,
     ReplayBlock, RequestId, RpcInbound, RpcResponse, RpcResponseInbound, SidecarBidResponse,
     SilverSpine, SyncNeed, SyncUpdate, TCacheError, TCacheId, TCacheProducer, TCacheRead,
     TCacheReader, TCacheTable, TProducer, TReadMode, TileId, hex32,
@@ -1141,11 +1141,11 @@ impl BeaconStateTile {
 
         // Health first: a disconnect then fails the batch in flight once, and
         // the transport's `None` answer for it is ignored.
-        adapter.consume(|health: LeanvmHealthEvent, producers| {
+        adapter.consume(|health: LeanVmHealthEvent, producers| {
             let tcache = &mut self.events_producer;
             self.pq_aggregator.on_health(health, &self.ticker, tcache, producers);
         });
-        adapter.consume(|resp: LeanvmResp, producers| {
+        adapter.consume(|resp: LeanVmResp, producers| {
             let (reader, tcache) = (&mut self.reader, &mut self.events_producer);
             self.pq_aggregator.on_response(resp, reader, &self.ticker, tcache, producers);
         });

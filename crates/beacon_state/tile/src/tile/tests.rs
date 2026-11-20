@@ -7580,7 +7580,7 @@ fn gloas_head_on_a_pending_full_parent_payload_is_optimistic_until_that_verdict(
 }
 
 mod pq_aggregator {
-    use silver_common::{LeanvmHealthEvent, LeanvmReq, LeanvmResp};
+    use silver_common::{LeanVmHealthEvent, LeanVmReq, LeanVmResp};
     use silver_ssz::ssz_view::{AttestationPqView, SINGLE_ATT_PQ_SIZE};
 
     use super::*;
@@ -7606,7 +7606,7 @@ mod pq_aggregator {
             let (mut tile, gossip, _rpc, mut spine, mut adapter) =
                 tile_with_producers_on(SLOT, BeaconState::empty_test(0), spec);
             let mut sink = SpineAdapter::connect_tile(&Sink, &mut spine.spine);
-            sink.consume(|_: LeanvmReq, _| {});
+            sink.consume(|_: LeanVmReq, _| {});
             sink.consume(|_: BeaconApiResponse, _| {});
             tile.consume_shared(&mut adapter);
             Self { tile, gossip, adapter, sink, _spine: spine }
@@ -7615,15 +7615,15 @@ mod pq_aggregator {
         /// What the transport publishes when the connection drops while a
         /// request is out, taken in through the tile's own consume path.
         fn disconnect(&mut self, request_id: u64) {
-            self.sink.produce(LeanvmResp { request_id, body: None });
-            self.sink.produce(LeanvmHealthEvent { ready: false });
+            self.sink.produce(LeanVmResp { request_id, body: None });
+            self.sink.produce(LeanVmHealthEvent { ready: false });
             self.tile.consume_shared(&mut self.adapter);
         }
 
         fn health(&mut self, ready: bool) {
             let tile = &mut self.tile;
             let producers = &mut self.adapter.producers;
-            let health = LeanvmHealthEvent { ready };
+            let health = LeanVmHealthEvent { ready };
             tile.pq_aggregator.on_health(
                 health,
                 &tile.ticker,
@@ -7665,20 +7665,20 @@ mod pq_aggregator {
             aggregator.add_aggregate(slot, aggregate, &tile.ticker, tcache, producers);
         }
 
-        fn tags(&mut self, request: &LeanvmReq) -> Vec<u8> {
+        fn tags(&mut self, request: &LeanVmReq) -> Vec<u8> {
             let body = self.tile.events_producer.read_buffer(request.body).unwrap();
             let has = |tag: u8| body.windows(64).any(|window| window == [tag; 64]);
             (1..COMMITTEE_LEN as u8).filter(|&tag| has(tag)).collect()
         }
 
-        fn carries(&mut self, request: &LeanvmReq, tag: u8) -> bool {
+        fn carries(&mut self, request: &LeanVmReq, tag: u8) -> bool {
             let body = self.tile.events_producer.read_buffer(request.body).unwrap();
             body.windows(64).any(|window| window == [tag; 64])
         }
 
-        fn requests(&mut self) -> Vec<LeanvmReq> {
+        fn requests(&mut self) -> Vec<LeanVmReq> {
             let mut requests = Vec::new();
-            self.sink.consume(|request: LeanvmReq, _| requests.push(request));
+            self.sink.consume(|request: LeanVmReq, _| requests.push(request));
             requests
         }
 
@@ -7688,7 +7688,7 @@ mod pq_aggregator {
             let tile = &mut self.tile;
             let producers = &mut self.adapter.producers;
             let (reader, tcache) = (&mut tile.reader, &mut tile.events_producer);
-            let resp = LeanvmResp { request_id, body };
+            let resp = LeanVmResp { request_id, body };
             tile.pq_aggregator.on_response(resp, reader, &tile.ticker, tcache, producers);
         }
 

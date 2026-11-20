@@ -1,9 +1,9 @@
 //! The connection to the leanVM sidecar, a separate process that proves.
 //!
-//! [`LeanvmApi`] takes `LeanvmReq` bodies off the spine and frames them onto
+//! [`LeanVmApi`] takes `LeanVmReq` bodies off the spine and frames them onto
 //! a Unix socket, one request at a time. Each response body goes back as a
-//! `LeanvmResp`, unparsed, status byte included. Every request is answered:
-//! `None` means no answer. `LeanvmHealthEvent` says whether the sidecar can
+//! `LeanVmResp`, unparsed, status byte included. Every request is answered:
+//! `None` means no answer. `LeanVmHealthEvent` says whether the sidecar can
 //! take a request.
 
 mod connection;
@@ -19,7 +19,7 @@ use connection::Connection;
 use flux::spine::SpineAdapter;
 use mio::{Events, Interest, Registry, Token, net::UnixStream};
 use silver_common::{
-    LeanvmHealthEvent, LeanvmReq, LeanvmResp, SilverSpine, TCacheError, TCacheId, TCacheReader,
+    LeanVmHealthEvent, LeanVmReq, LeanVmResp, SilverSpine, TCacheError, TCacheId, TCacheReader,
     TCacheTable, TProducer, TReadMode,
 };
 use silver_httpcore::TokenRange;
@@ -31,18 +31,18 @@ enum Link {
     Up(Connection),
 }
 
-pub struct LeanvmApi {
+pub struct LeanVmApi {
     registry: Registry,
     token: Token,
     socket: Option<PathBuf>,
     link: Link,
     reader: TCacheReader,
-    answers: Vec<LeanvmResp>,
+    answers: Vec<LeanVmResp>,
     ready_published: bool,
     drained: bool,
 }
 
-impl LeanvmApi {
+impl LeanVmApi {
     pub const MAX_SOCKETS: usize = 1;
 
     pub fn new(
@@ -81,7 +81,7 @@ impl LeanvmApi {
         }
         self.drained = false;
         while !self.is_busy() {
-            if !adapter.consume_one(|req: LeanvmReq, _| self.start(req)) {
+            if !adapter.consume_one(|req: LeanVmReq, _| self.start(req)) {
                 self.drained = true;
                 break;
             }
@@ -116,7 +116,7 @@ impl LeanvmApi {
         matches!(&self.link, Link::Up(connection) if connection.request_id().is_some())
     }
 
-    fn start(&mut self, req: LeanvmReq) {
+    fn start(&mut self, req: LeanVmReq) {
         if let Link::Up(connection) = &mut self.link &&
             connection.is_idle() &&
             connection.load(&mut self.reader, req)
@@ -125,7 +125,7 @@ impl LeanvmApi {
                 self.close(error);
             }
         } else {
-            self.answers.push(LeanvmResp { request_id: req.request_id, body: None });
+            self.answers.push(LeanVmResp { request_id: req.request_id, body: None });
         }
     }
 
@@ -157,18 +157,18 @@ impl LeanvmApi {
         let Link::Up(mut connection) = mem::replace(&mut self.link, down) else { return };
         let _ = self.registry.deregister(&mut connection.stream);
         if let Some(request_id) = connection.request_id() {
-            self.answers.push(LeanvmResp { request_id, body: None });
+            self.answers.push(LeanVmResp { request_id, body: None });
         }
     }
 
     /// Health before answers, so a reader that sees a disconnect's `None`
-    /// answer has its `LeanvmHealthEvent` already published.
+    /// answer has its `LeanVmHealthEvent` already published.
     fn publish(&mut self, adapter: &mut SpineAdapter<SilverSpine>) {
         let ready = matches!(&self.link, Link::Up(connection) if connection.is_ready());
         if ready != self.ready_published {
             silver_log::info!(ready, "leanvm sidecar readiness changed");
             self.ready_published = ready;
-            adapter.produce(LeanvmHealthEvent { ready });
+            adapter.produce(LeanVmHealthEvent { ready });
         }
         for resp in self.answers.drain(..) {
             adapter.produce(resp);

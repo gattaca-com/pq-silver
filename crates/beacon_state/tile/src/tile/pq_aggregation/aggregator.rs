@@ -4,7 +4,7 @@ use flux::spine::SpineProducers;
 use rustc_hash::FxHashMap;
 use silver_beacon_state_data::{B256, Slot};
 use silver_common::{
-    LeanvmHealthEvent, LeanvmReq, LeanvmResp, Nanos, TCacheProducer, TCacheRead, TCacheReader,
+    LeanVmHealthEvent, LeanVmReq, LeanVmResp, Nanos, TCacheProducer, TCacheRead, TCacheReader,
     TProducer, ticker::SlotTicker,
 };
 
@@ -35,7 +35,7 @@ impl AggregationKey {
 /// The leanVM sidecar as the aggregator sees it: one request at a time, and
 /// none while it is down.
 #[derive(Default)]
-enum Leanvm {
+enum LeanVm {
     #[default]
     Down,
     Idle,
@@ -46,7 +46,7 @@ enum Leanvm {
     },
 }
 
-impl Leanvm {
+impl LeanVm {
     fn up(&mut self) {
         if let Self::Down = self {
             *self = Self::Idle;
@@ -76,7 +76,7 @@ impl Leanvm {
     }
 }
 
-/// Every aggregation this node runs. One `LeanvmReq` is in flight at a time,
+/// Every aggregation this node runs. One `LeanVmReq` is in flight at a time,
 /// across all aggregations.
 #[derive(Default)]
 pub struct PqAggregator {
@@ -85,7 +85,7 @@ pub struct PqAggregator {
     /// Aggregations that may have a batch, oldest first, each at most once.
     /// Merges are taken before leaves.
     queue: VecDeque<AggregationKey>,
-    leanvm: Leanvm,
+    leanvm: LeanVm,
     next_request_id: u64,
 }
 
@@ -141,7 +141,7 @@ impl PqAggregator {
     /// cannot be read counts as no answer.
     pub fn on_response(
         &mut self,
-        resp: LeanvmResp,
+        resp: LeanVmResp,
         reader: &mut TCacheReader,
         ticker: &SlotTicker,
         tcache: &mut TProducer,
@@ -162,7 +162,7 @@ impl PqAggregator {
     /// transport's `None` answer for it comes later and is ignored.
     pub fn on_health(
         &mut self,
-        health: LeanvmHealthEvent,
+        health: LeanVmHealthEvent,
         ticker: &SlotTicker,
         tcache: &mut TProducer,
         producers: &mut Producers,
@@ -234,7 +234,7 @@ impl PqAggregator {
         tcache: &mut TProducer,
         producers: &mut Producers,
     ) {
-        if !matches!(self.leanvm, Leanvm::Idle) {
+        if !matches!(self.leanvm, LeanVm::Idle) {
             return;
         }
         let now = now(ticker);
@@ -254,8 +254,8 @@ impl PqAggregator {
             };
             let request_id = self.next_request_id;
             self.next_request_id += 1;
-            self.leanvm = Leanvm::Busy { request_id, key, batch };
-            producers.produce(LeanvmReq { request_id, body });
+            self.leanvm = LeanVm::Busy { request_id, key, batch };
+            producers.produce(LeanVmReq { request_id, body });
             return;
         }
     }

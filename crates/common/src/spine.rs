@@ -77,11 +77,11 @@ pub struct SilverSpine {
     pub engine_health: SpineQueue<EngineHealthEvent>,
 
     #[queue(size(2usize.pow(8)))]
-    pub leanvm_reqs: SpineQueue<LeanvmReq>,
+    pub leanvm_reqs: SpineQueue<LeanVmReq>,
     #[queue(size(2usize.pow(8)))]
-    pub leanvm_resps: SpineQueue<LeanvmResp>,
+    pub leanvm_resps: SpineQueue<LeanVmResp>,
     #[queue(size(2usize.pow(8)))]
-    pub leanvm_health: SpineQueue<LeanvmHealthEvent>,
+    pub leanvm_health: SpineQueue<LeanVmHealthEvent>,
 
     #[queue(size(2usize.pow(6)))]
     pub sidecar_bid_requests: SpineQueue<SidecarBidRequest>,

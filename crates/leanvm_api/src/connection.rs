@@ -4,7 +4,7 @@ use std::{
 };
 
 use mio::net::UnixStream;
-use silver_common::{LeanvmReq, LeanvmResp, TCacheProducer, TCacheReader, TProducer};
+use silver_common::{LeanVmReq, LeanVmResp, TCacheProducer, TCacheReader, TProducer};
 
 /// A proof takes 1-2 s. This bound only frees a sidecar that hangs without
 /// closing; a response a mainnet slot late helps no aggregation.
@@ -62,7 +62,7 @@ impl Connection {
 
     /// Frames `req`'s body for sending, if it is still in the tcache and
     /// within the hello's max request length.
-    pub(crate) fn load(&mut self, reader: &mut TCacheReader, req: LeanvmReq) -> bool {
+    pub(crate) fn load(&mut self, reader: &mut TCacheReader, req: LeanVmReq) -> bool {
         debug_assert!(self.is_idle(), "one request at a time");
         let request_id = req.request_id;
         if !reader.is_open(req.body.id()) {
@@ -97,11 +97,11 @@ impl Connection {
 
     /// Writes what is pending, reads what arrived, then takes a whole frame
     /// off `read_buf`: the hello, or the response once the request is out. A
-    /// response goes into `producer`, and its `LeanvmResp` into `answers`.
+    /// response goes into `producer`, and its `LeanVmResp` into `answers`.
     pub(crate) fn pump(
         &mut self,
         producer: &mut TProducer,
-        answers: &mut Vec<LeanvmResp>,
+        answers: &mut Vec<LeanVmResp>,
     ) -> io::Result<()> {
         self.write()?;
         let hung_up = self.read()?;
@@ -170,7 +170,7 @@ impl Connection {
     fn advance(
         &mut self,
         producer: &mut TProducer,
-        answers: &mut Vec<LeanvmResp>,
+        answers: &mut Vec<LeanVmResp>,
     ) -> io::Result<()> {
         match self.phase {
             Phase::Hello => {
@@ -187,7 +187,7 @@ impl Connection {
                 if body.is_none() {
                     silver_log::error!(request_id, "boundary tcache full; leanvm response dropped");
                 }
-                answers.push(LeanvmResp { request_id, body });
+                answers.push(LeanVmResp { request_id, body });
                 self.read_buf.clear();
                 self.phase = Phase::Idle;
             }

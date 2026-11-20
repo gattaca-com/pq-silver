@@ -1600,26 +1600,23 @@ impl BeaconStateTile {
             return self.slot_window_miss(parsed.agg_slot);
         }
 
-        self.seen_aggregators.rotate_to(self.seen_window_epoch());
-        if self.seen_aggregators.contains(parsed.att_epoch, parsed.aggregator_index) {
-            return Feedback::AlreadySeen;
-        }
-
         if parsed.committee_bits.count_ones() != 1 {
             return Feedback::reject("aggregate committee bits");
         }
         let committee_index = parsed.committee_bits.trailing_zeros() as usize;
 
         let data_root = self.attestation_root_memo.data_root(parsed.agg_data.as_bytes());
-        let coverage = self.seen_aggregates.coverage(
+        let coverage = match self.unseen_aggregate_coverage(
             parsed.agg_slot,
+            parsed.att_epoch,
             committee_index as u64,
+            parsed.aggregator_index,
             data_root,
             parsed.aggregation_bits,
-        );
-        if coverage == Coverage::BySuperset {
-            return Feedback::AlreadySeen;
-        }
+        ) {
+            Ok(coverage) => coverage,
+            Err(feedback) => return feedback,
+        };
 
         let canon_id = self.epoch_start_state(self.canonical_state_id(), parsed.agg_slot);
         let view = self.state.read_view(canon_id);
@@ -2069,6 +2066,25 @@ impl BeaconStateTile {
         self.ticker.latest_slot_with_disparity(MAXIMUM_GOSSIP_CLOCK_DISPARITY) / SLOTS_PER_EPOCH
     }
 
+    fn unseen_aggregate_coverage(
+        &mut self,
+        slot: Slot,
+        target_epoch: Epoch,
+        committee_index: u64,
+        aggregator_index: usize,
+        data_root: B256,
+        bits: &[u8],
+    ) -> Result<Coverage, Feedback> {
+        self.seen_aggregators.rotate_to(self.seen_window_epoch());
+        if self.seen_aggregators.contains(target_epoch, aggregator_index) {
+            return Err(Feedback::AlreadySeen);
+        }
+        match self.seen_aggregates.coverage(slot, committee_index, data_root, bits) {
+            Coverage::BySuperset => Err(Feedback::AlreadySeen),
+            coverage => Ok(coverage),
+        }
+    }
+
     /// The attested block's fork-choice index; `None` while it is unknown.
     fn validate_attestation_target(
         &self,
@@ -2434,6 +2450,28 @@ impl BeaconStateTile {
         signed: &[u8],
         producers: &mut Producers,
     ) -> Result<(u64, AggregateAwaitingProof), Feedback> {
+        let (state_id, aggregate) = self.check_pq_aggregate(signed)?;
+        self.verify_pq_aggregator(signed, state_id, &aggregate)?;
+
+        let data = SignedAggregateAndProofPqView::agg_data(signed);
+        let view = self.state.read_view(state_id);
+        let domain = Self::attester_domain(&self.spec, &mut self.fork_data_roots, &view, data);
+        let (_, message) = self.attestation_root_memo.roots(data.as_bytes(), &domain);
+        let claims = aggregate.attesters.iter().map(|&attester| {
+            claim(xmss_pubkey(view.validators.pubkey(attester as usize)), &message)
+        });
+        let proof = SignedAggregateAndProofPqView::proof(signed);
+        let request_id = self
+            .leanvm_verifier
+            .send(claims, proof, &mut self.events_producer, producers)
+            .ok_or(Feedback::Ignore)?;
+        Ok((request_id, aggregate))
+    }
+
+    fn check_pq_aggregate(
+        &mut self,
+        signed: &[u8],
+    ) -> Result<(StateId, AggregateAwaitingProof), Feedback> {
         let data = SignedAggregateAndProofPqView::agg_data(signed);
         let slot = data.slot();
         let target_epoch = data.target_epoch();
@@ -2452,16 +2490,15 @@ impl BeaconStateTile {
         let committee_index = committee_bits.trailing_zeros() as usize;
         let bits = SignedAggregateAndProofPqView::agg_aggregation_bits(signed);
         let data_root = self.attestation_root_memo.data_root(data.as_bytes());
-        let coverage = self.seen_aggregates.coverage(slot, committee_index as u64, data_root, bits);
-        if coverage == Coverage::BySuperset {
-            return Err(Feedback::AlreadySeen);
-        }
-
         let aggregator_index = SignedAggregateAndProofPqView::aggregator_index(signed) as usize;
-        self.seen_aggregators.rotate_to(self.seen_window_epoch());
-        if self.seen_aggregators.contains(target_epoch, aggregator_index) {
-            return Err(Feedback::AlreadySeen);
-        }
+        self.unseen_aggregate_coverage(
+            slot,
+            target_epoch,
+            committee_index as u64,
+            aggregator_index,
+            data_root,
+            bits,
+        )?;
         if self.gossip_proofs.is_full() ||
             self.gossip_proofs.awaits_aggregator(target_epoch, aggregator_index)
         {
@@ -2490,60 +2527,61 @@ impl BeaconStateTile {
         if merkle::bitlist_len(bits) != shuffling.committee(slot, committee_index).len() {
             return Err(Feedback::reject("aggregate bits do not match committee size"));
         }
-        let attesters = &mut self.stf_scratch.active;
+        let mut attesters = Vec::new();
         let aggregate = SignedAggregateAndProofPqView::aggregate(signed);
         if stf::AttestedCommittees::new(aggregate, true, &shuffling)
-            .and_then(|committees| committees.attesters_into(count, attesters))
+            .and_then(|committees| committees.attesters_into(count, &mut attesters))
             .is_err() ||
             attesters.is_empty()
         {
             return Err(Feedback::reject("aggregate has no attesters"));
         }
 
-        match view.is_aggregator(slot, committee_index, aggregator_index as u64) {
-            Some(true) => {}
-            Some(false) => return Err(Feedback::reject("aggregator not selected")),
-            None => return Err(Feedback::Ignore),
-        }
-        let Some(pubkey) = view.validator_xmss_pubkey(aggregator_index) else {
-            return Err(Feedback::Ignore);
-        };
-        let fork_data_root = self
-            .fork_data_roots
-            .root(self.spec.fork_version_at(target_epoch), &view.imm.genesis_validators_root);
-        let domain = |domain_type| bls::domain_from_fork_data(domain_type, &fork_data_root);
-        let signature = SignatureCheck::aggregate_and_proof(
-            signed,
-            pubkey,
-            &domain(bls::DOMAIN_AGGREGATE_AND_PROOF),
-        );
-        if !signature.verify() {
-            return Err(Feedback::reject("aggregate bad signature"));
-        }
-
-        let (_, message) =
-            self.attestation_root_memo.roots(data.as_bytes(), &domain(bls::DOMAIN_BEACON_ATTESTER));
-        let claims = attesters.iter().map(|&attester| {
-            claim(xmss_pubkey(view.validators.pubkey(attester as usize)), &message)
-        });
-        let proof = SignedAggregateAndProofPqView::proof(signed);
-        let request_id = self
-            .leanvm_verifier
-            .send(claims, proof, &mut self.events_producer, producers)
-            .ok_or(Feedback::Ignore)?;
-
-        Ok((request_id, AggregateAwaitingProof {
+        Ok((state_id, AggregateAwaitingProof {
             target: stf::VoteTarget {
                 block_root: *data.beacon_block_root(),
                 target_epoch,
                 attestation_slot: slot,
                 payload_present,
             },
-            attesters: attesters.clone(),
+            attesters,
             committee_index: committee_index as u64,
             data_root,
             aggregator_index,
         }))
+    }
+
+    fn verify_pq_aggregator(
+        &mut self,
+        signed: &[u8],
+        state_id: StateId,
+        aggregate: &AggregateAwaitingProof,
+    ) -> Result<(), Feedback> {
+        let target = aggregate.target;
+        let view = self.state.read_view(state_id);
+        match view.is_aggregator(
+            target.attestation_slot,
+            aggregate.committee_index as usize,
+            aggregate.aggregator_index as u64,
+        ) {
+            Some(true) => {}
+            Some(false) => return Err(Feedback::reject("aggregator not selected")),
+            None => return Err(Feedback::Ignore),
+        }
+        let Some(pubkey) = view.validator_xmss_pubkey(aggregate.aggregator_index) else {
+            return Err(Feedback::Ignore);
+        };
+        let domain = bls::domain_from_fork_data(
+            bls::DOMAIN_AGGREGATE_AND_PROOF,
+            &self.fork_data_roots.root(
+                self.spec.fork_version_at(target.target_epoch),
+                &view.imm.genesis_validators_root,
+            ),
+        );
+        if !SignatureCheck::aggregate_and_proof(signed, pubkey, &domain).verify() {
+            return Err(Feedback::reject("aggregate bad signature"));
+        }
+        Ok(())
     }
 
     fn send_pq_attester_slashing_proofs(
@@ -2610,14 +2648,17 @@ impl BeaconStateTile {
         let target = aggregate.target;
         let (slot, committee_index) = (target.attestation_slot, aggregate.committee_index);
         let bits = SignedAggregateAndProofPqView::agg_aggregation_bits(signed);
-        let coverage =
-            self.seen_aggregates.coverage(slot, committee_index, aggregate.data_root, bits);
-        self.seen_aggregators.rotate_to(self.seen_window_epoch());
-        if coverage == Coverage::BySuperset ||
-            self.seen_aggregators.contains(target.target_epoch, aggregate.aggregator_index)
-        {
-            return Feedback::AlreadySeen;
-        }
+        let coverage = match self.unseen_aggregate_coverage(
+            slot,
+            target.target_epoch,
+            committee_index,
+            aggregate.aggregator_index,
+            aggregate.data_root,
+            bits,
+        ) {
+            Ok(coverage) => coverage,
+            Err(feedback) => return feedback,
+        };
         self.seen_aggregates.record(slot, committee_index, aggregate.data_root, bits);
         self.seen_aggregators.mark(target.target_epoch, aggregate.aggregator_index);
 

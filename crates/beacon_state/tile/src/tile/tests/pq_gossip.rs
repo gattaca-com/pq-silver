@@ -18,8 +18,10 @@ use silver_common::{
 };
 use silver_crypto_simd::xmss::SecretKey;
 use silver_slashing::Selection;
+use silver_ssz::ssz_view::AttestationPqView;
 
 use super::*;
+use crate::tile::leanvm_verifier::ProofVerdict;
 
 const VALIDATORS: usize = 128;
 
@@ -295,6 +297,121 @@ fn unknown_root_vote_counts_and_is_aggregated_once_its_block_imports() {
     assert!(buffered(&tile).is_none(), "promoted once");
     adapter.consume(|_: LeanVmReq, _| requests += 1);
     assert_eq!(requests, 1, "the leaf goes to the leanVM sidecar");
+}
+
+const AGGREGATE_SLOT: Slot = 2 * SLOTS_PER_EPOCH;
+
+struct PqAggregate {
+    signed: Vec<u8>,
+    aggregator: usize,
+    attesters: u64,
+    block_root: B256,
+}
+
+impl PqAggregate {
+    fn of_committee_zero(tile: &mut BeaconStateTile) -> Self {
+        let anchor = tile.last_applied;
+        let state_id = tile.epoch_start_state(anchor, AGGREGATE_SLOT);
+        let view = tile.state.read_view(state_id);
+        let root = ShufflingId::from_state(&view, 2).unwrap().dependent_root;
+        let checkpoint = Checkpoint { epoch: 0, root };
+        tile.fork_choice = ForkChoice::init(
+            checkpoint,
+            checkpoint,
+            0,
+            root,
+            ANCHOR_STATE_ROOT,
+            [0; 32],
+            false,
+            anchor,
+            VALIDATORS,
+        );
+        let aggregator = (0..VALIDATORS as u64)
+            .find(|&validator| view.is_aggregator(AGGREGATE_SLOT, 0, validator) == Some(true))
+            .expect("committee zero has an aggregator");
+        let mut indices = Vec::new();
+        let epoch = AGGREGATE_SLOT / SLOTS_PER_EPOCH;
+        let shuffling = stf::EpochShuffling::from_state(&view, epoch, &mut indices);
+        let committee_len = shuffling.committee(AGGREGATE_SLOT, 0).len();
+
+        let mut data = [0u8; 128];
+        data[..8].copy_from_slice(&AGGREGATE_SLOT.to_le_bytes());
+        data[16..48].copy_from_slice(&root);
+        data[88..96].copy_from_slice(&epoch.to_le_bytes());
+        data[96..].copy_from_slice(&root);
+        let aggregate =
+            AttestationPqView::encode_one_committee(&data, 0, committee_len, 0..committee_len)
+                .unwrap();
+
+        let mut signed = vec![0; SIGNED_PQ_FIXED];
+        signed[..4].copy_from_slice(&(SIGNED_PQ_FIXED as u32).to_le_bytes());
+        signed.extend_from_slice(&aggregator.to_le_bytes());
+        signed.extend_from_slice(&16u32.to_le_bytes());
+        signed.extend_from_slice(&(16 + aggregate.len() as u32).to_le_bytes());
+        signed.extend_from_slice(&aggregate);
+        signed.extend_from_slice(b"proof");
+        Self {
+            signed,
+            aggregator: aggregator as usize,
+            attesters: committee_len as u64,
+            block_root: root,
+        }
+    }
+
+    fn sign(&mut self, key: &SecretKey, leaf_offset: LeafOffset) {
+        let pubkey = key.public_key();
+        let domain = domain(bls::DOMAIN_AGGREGATE_AND_PROOF);
+        let signing_root =
+            SignatureCheck::aggregate_and_proof(&self.signed, &pubkey, &domain).signing_root;
+        let leaf = compute_xmss_leaf_index(AGGREGATE_SLOT, leaf_offset);
+        let bottom = key.bottom_tree((leaf >> 16) as u32);
+        self.signed[4..SIGNED_PQ_FIXED].copy_from_slice(&key.sign(
+            &bottom,
+            &signing_root,
+            leaf as u32,
+        ));
+    }
+}
+
+#[test]
+fn aggregate_counts_only_once_signed_and_proven() {
+    let key = SecretKey::new(&[7; 32]);
+    let (mut tile, mut gossip, _spine, mut adapter) =
+        pq_tile(&key.public_key(), 0, AGGREGATE_SLOT + 1);
+    adapter.consume(|_: PeerEvent, _| {});
+    let mut aggregate = PqAggregate::of_committee_zero(&mut tile);
+    let mut send = |tile: &mut BeaconStateTile, adapter: &mut SpineAdapter<_>, signed: &[u8]| {
+        let msg = pq_gossip_msg(tile, &mut gossip, signed, GossipTopic::BeaconAggregateAndProof);
+        let request_id = tile.leanvm_verifier.next_request_id();
+        tile.handle_gossip(msg.ssz, msg, true, false, &mut adapter.producers);
+        (tile.gossip_proofs.awaits(request_id).then_some(request_id), gossip_verdicts(adapter))
+    };
+
+    aggregate.sign(&key, LeafOffset::BeaconProposer);
+    let sent = send(&mut tile, &mut adapter, &aggregate.signed);
+    assert_eq!(sent, (None, (0, 1)), "signed at another duty's leaf");
+
+    aggregate.sign(&key, LeafOffset::AggregateAndProof);
+    for (verdict, counted) in [(ProofVerdict::Invalid, false), (ProofVerdict::Valid, true)] {
+        let (request_id, verdicts) = send(&mut tile, &mut adapter, &aggregate.signed);
+        let request_id = request_id.expect("parked until its proof is judged");
+        assert_eq!(verdicts, (0, 0));
+        let resent = send(&mut tile, &mut adapter, &aggregate.signed);
+        assert_eq!(resent, (None, (0, 0)), "already awaiting a proof");
+
+        let awaiting = tile.gossip_proofs.on_verdict(request_id, verdict).unwrap();
+        tile.settle_gossip_proofs(awaiting, verdict, &mut adapter.producers);
+        assert_eq!(gossip_verdicts(&mut adapter), if counted { (1, 0) } else { (0, 1) });
+        assert_eq!(tile.seen_aggregators.contains(2, aggregate.aggregator), counted);
+        let weight = if counted { aggregate.attesters * MAX_EFFECTIVE_BALANCE } else { 0 };
+        assert_eq!(voted_weight(&mut tile, aggregate.block_root), weight);
+    }
+
+    let source_root = SIGNED_PQ_FIXED + 16 + 4 + 56;
+    aggregate.signed[source_root] ^= 1;
+    aggregate.sign(&key, LeafOffset::AggregateAndProof);
+    let second = send(&mut tile, &mut adapter, &aggregate.signed);
+    assert_eq!(second, (None, (0, 0)), "aggregator already seen");
 }
 
 /// A PQ envelope that arrives before its block parks only once its signer's

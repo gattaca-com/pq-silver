@@ -5,11 +5,13 @@ use rustc_hash::FxHashMap;
 use silver_beacon_state_data::{B256, Slot};
 use silver_common::{
     LeanVmHealthEvent, LeanVmReq, LeanVmResp, Nanos, TCacheRead, TCacheReader, TProducer,
-    ssz_view::MAX_VALIDATORS_PER_COMMITTEE, ticker::SlotTicker,
+    ssz_view::{MAX_VALIDATORS_PER_COMMITTEE, SingleAttestationPqView},
+    ticker::SlotTicker,
 };
 
 use super::{
     Aggregate, VerifiedVote,
+    claims::Vote,
     leaf::{LeafAggregation, LeafKey},
     merge::MergeAggregation,
     strategy::Batch,
@@ -112,9 +114,13 @@ impl PqAggregator {
             silver_log::debug!(slot = leaf.slot, "vote after the aggregation deadline");
             return;
         }
-        let aggregation =
-            self.leaves.entry(leaf).or_insert_with(|| LeafAggregation::new(&vote, deadline));
-        let added = aggregation.add(&vote);
+        let aggregation = self.leaves.entry(leaf).or_insert_with(|| {
+            let data = SingleAttestationPqView::data(vote.single);
+            LeafAggregation::new(*data.as_bytes(), vote.committee_len, deadline)
+        });
+        let (position, signature) =
+            (vote.committee_position, SingleAttestationPqView::signature(vote.single));
+        let added = aggregation.add(Vote::new(position, vote.pubkey, vote.message, signature));
         debug_assert!(added, "the position was checked against the largest committee");
         self.changed = true;
     }
@@ -122,7 +128,7 @@ impl PqAggregator {
     /// `aggregate` is verified, for the block of `slot`. A merge refuses it
     /// once it holds too many committees.
     pub fn add_aggregate(&mut self, slot: Slot, aggregate: Aggregate) {
-        if !self.merges.entry(slot).or_insert_with(MergeAggregation::new).add(aggregate) {
+        if !self.merges.entry(slot).or_default().add(aggregate) {
             silver_log::warn!(slot, "aggregate dropped: the merge holds too many committees");
             return;
         }
@@ -205,9 +211,9 @@ impl PqAggregator {
     fn finish(&mut self, key: AggregationKey, batch: Batch, body: Option<&[u8]>) {
         let settled = match key {
             AggregationKey::Leaf(leaf) => (self.leaves.get_mut(&leaf))
-                .map(|leaf| (leaf.core.finish(batch, body), leaf.core.is_stopped())),
+                .map(|leaf| (leaf.finish(batch, body), leaf.core.is_stopped())),
             AggregationKey::Merge(slot) => (self.merges.get_mut(&slot))
-                .map(|merge| (merge.core.finish(batch, body), merge.core.is_stopped())),
+                .map(|merge| (merge.finish(batch, body), merge.core.is_stopped())),
         };
         let Some((Err(reason), stopped)) = settled else { return };
         let slot = key.slot();
@@ -225,22 +231,18 @@ impl PqAggregator {
         tcache: &mut TProducer,
     ) -> Option<(Batch, TCacheRead)> {
         match key {
-            AggregationKey::Leaf(leaf) => {
-                self.leaves.get_mut(&leaf)?.core.next_request(now, tcache)
-            }
-            AggregationKey::Merge(slot) => {
-                self.merges.get_mut(&slot)?.core.next_request(now, tcache)
-            }
+            AggregationKey::Leaf(leaf) => self.leaves.get_mut(&leaf)?.next_request(now, tcache),
+            AggregationKey::Merge(slot) => self.merges.get_mut(&slot)?.next_request(now, tcache),
         }
     }
 
     /// Ties go to the lower key, so the order is total and deterministic.
     fn highest_priority(&self, now: Nanos) -> Option<AggregationKey> {
         let leaves = self.leaves.iter().filter_map(|(&leaf, aggregation)| {
-            Some((aggregation.core.priority(now)?, Reverse(AggregationKey::Leaf(leaf))))
+            Some((aggregation.priority(now)?, Reverse(AggregationKey::Leaf(leaf))))
         });
         let merges = self.merges.iter().filter_map(|(&slot, aggregation)| {
-            Some((aggregation.core.priority(now)?, Reverse(AggregationKey::Merge(slot))))
+            Some((aggregation.priority(now)?, Reverse(AggregationKey::Merge(slot))))
         });
         leaves.chain(merges).max().map(|(_, Reverse(key))| key)
     }

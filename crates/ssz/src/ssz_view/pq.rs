@@ -10,6 +10,7 @@ use super::{
 };
 use crate::{
     body_offsets::{BlockBodyError, OperationKind},
+    merkle::bitlist_len,
     ssz_hash_pq::ExecutionRequestsPqView,
 };
 
@@ -101,6 +102,25 @@ impl AttestationPqView {
         buf.len() >= ATTESTATION_PQ_FIXED &&
             u32_le(buf, 0) as usize == ATTESTATION_PQ_FIXED &&
             bitlist_ok(&buf[ATTESTATION_PQ_FIXED..], MAX_ATTESTING_INDICES_PQ)
+    }
+
+    /// The committee index and set positions of an attestation of one
+    /// committee. `None` unless `buf` is canonical, names exactly one
+    /// committee and has at most `MAX_VALIDATORS_PER_COMMITTEE` positions.
+    pub fn one_committee_positions(
+        buf: &[u8],
+    ) -> Option<(usize, impl Iterator<Item = usize> + '_)> {
+        if !Self::check_canonical(buf) {
+            return None;
+        }
+        let committees = u16::from_le_bytes(*Self::committee_bits(buf));
+        let bits = Self::aggregation_bits(buf);
+        let len = bitlist_len(bits);
+        if committees.count_ones() != 1 || len > MAX_VALIDATORS_PER_COMMITTEE {
+            return None;
+        }
+        let positions = (0..len).filter(move |&p| bits[p / 8] >> (p % 8) & 1 == 1);
+        Some((committees.trailing_zeros() as usize, positions))
     }
 
     /// An attestation of one committee: `positions` are indices into it.

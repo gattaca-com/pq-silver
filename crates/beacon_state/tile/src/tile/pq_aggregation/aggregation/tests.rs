@@ -1,22 +1,29 @@
 use silver_common::ssz_view::{
-    MAX_STARK_PROOF_SIZE, MAX_VALIDATORS_PER_COMMITTEE, XMSS_SIGNATURE_SIZE,
+    ATTESTATION_DATA_SIZE, MAX_STARK_PROOF_SIZE, MAX_VALIDATORS_PER_COMMITTEE, XMSS_SIGNATURE_SIZE,
 };
 
 use super::{
     super::{
         attestation,
         claims::{Aggregate, Vote},
-        wire::aggregate_response,
+        leaf::LeafAggregation,
+        merge::MergeAggregation,
+        wire::{MAX_RECORDS, aggregate_response},
     },
     *,
 };
 
 const DEADLINE: Nanos = Nanos::from_secs(8);
 
-fn aggregation(votes: u16) -> Aggregation<Vote> {
-    let mut aggregation = Aggregation::new(DEADLINE);
-    (0..votes).for_each(|tag| assert!(aggregation.add(vote(tag))));
-    aggregation
+fn leaf(deadline: Nanos, votes: u16) -> LeafAggregation {
+    let data = [0; ATTESTATION_DATA_SIZE];
+    let mut leaf = LeafAggregation::new(data, MAX_VALIDATORS_PER_COMMITTEE, deadline);
+    (0..votes).for_each(|tag| assert!(leaf.add(vote(tag))));
+    leaf
+}
+
+fn aggregation(votes: u16) -> LeafAggregation {
+    leaf(DEADLINE, votes)
 }
 
 fn vote(tag: u16) -> Vote {
@@ -35,14 +42,14 @@ fn answer(tags: impl IntoIterator<Item = u16>) -> Vec<u8> {
     aggregate_response(&claims, b"proof")
 }
 
-fn covered<C: VerifiedClaims>(aggregation: &Aggregation<C>) -> Vec<usize> {
-    aggregation.best.as_ref().map_or_else(Vec::new, |best| best.covered_indices.clone())
+fn best_claims(core: &Aggregation) -> usize {
+    core.best.as_ref().map_or(0, |best| best.claims.len())
 }
 
-fn merge(children: impl IntoIterator<Item = Aggregate>) -> Aggregation<Aggregate> {
-    let mut aggregation = Aggregation::new(DEADLINE);
-    children.into_iter().for_each(|child| assert!(aggregation.add(child)));
-    aggregation
+fn merge(children: impl IntoIterator<Item = Aggregate>) -> MergeAggregation {
+    let mut merge = MergeAggregation::default();
+    children.into_iter().for_each(|child| assert!(merge.add(child)));
+    merge
 }
 
 /// Claim `tag` sits at position `tag` of committee 0.
@@ -52,52 +59,47 @@ fn child(tags: &[u16]) -> Aggregate {
     Aggregate::new(claims, b"child".to_vec(), ssz).unwrap()
 }
 
-fn priority<C: VerifiedClaims>(aggregation: &Aggregation<C>) -> Priority {
-    aggregation.priority(Nanos::ZERO).unwrap()
+fn priority(leaf: &LeafAggregation) -> Priority {
+    leaf.priority(Nanos::ZERO).unwrap()
 }
 
-fn settle<C: VerifiedClaims>(
-    aggregation: &mut Aggregation<C>,
-    body: Option<&[u8]>,
-) -> Result<(), &'static str> {
-    let batch = aggregation.next_batch(Nanos::ZERO).unwrap();
-    aggregation.finish(batch, body)
+fn settle(leaf: &mut LeafAggregation, body: Option<&[u8]>) -> Result<(), &'static str> {
+    let batch = leaf.next_batch(Nanos::ZERO).unwrap();
+    leaf.finish(batch, body)
 }
 
 #[test]
 fn batches_take_the_waiting_votes_up_to_the_limit() {
-    let max_votes = Vote::batch_limit(false);
-    assert_eq!(max_votes, Vote::batch_limit(true), "the best proof takes no vote's place");
-    assert_eq!(max_votes, MAX_VALIDATORS_PER_COMMITTEE, "one batch holds the largest committee");
-    let first_votes = max_votes as u16 - 2;
+    assert_eq!(MAX_RECORDS, MAX_VALIDATORS_PER_COMMITTEE, "one batch holds the largest committee");
+    let first_votes = MAX_RECORDS as u16 - 2;
     let mut aggregation = aggregation(first_votes);
     let batch = aggregation.next_batch(Nanos::ZERO).unwrap();
-    let first = aggregation.request(&batch).body();
-    assert_eq!(first.len() / (64 + XMSS_SIGNATURE_SIZE), max_votes - 2);
+    let first = aggregation.core.request(&batch).body();
+    assert_eq!(first.len() / (64 + XMSS_SIGNATURE_SIZE), MAX_RECORDS - 2);
 
     aggregation.finish(batch, Some(&answer(0..first_votes))).unwrap();
-    assert_eq!(covered(&aggregation).len(), max_votes - 2);
+    assert_eq!(aggregation.core.covered().len(), MAX_RECORDS - 2);
     assert!(aggregation.add(vote(first_votes)));
     assert!(aggregation.add(vote(first_votes + 1)));
     let batch = aggregation.next_batch(Nanos::ZERO).unwrap();
     assert_eq!(batch.indices().len(), 2);
-    let second = aggregation.request(&batch).body();
+    let second = aggregation.core.request(&batch).body();
     assert!(second.windows(5).any(|window| window == b"proof"), "the best proof is the child");
-    aggregation.finish(batch, Some(&answer(0..max_votes as u16))).unwrap();
+    aggregation.finish(batch, Some(&answer(0..MAX_RECORDS as u16))).unwrap();
     assert!(aggregation.next_batch(Nanos::ZERO).is_none(), "nothing waits");
-    assert_eq!(aggregation.covered().count(), max_votes);
-    assert_eq!(aggregation.best.as_ref().map_or(0, |best| best.claims.len()), max_votes);
-    assert!(!aggregation.add(vote(max_votes as u16)), "a position beyond the largest committee");
+    assert_eq!(aggregation.core.covered().len(), MAX_RECORDS);
+    assert_eq!(best_claims(&aggregation.core), MAX_RECORDS);
+    assert!(!aggregation.add(vote(MAX_RECORDS as u16)), "a position beyond the largest committee");
 }
 
 #[test]
 fn a_failure_leaves_the_waiting_claims_where_they_were() {
     let mut aggregation = aggregation(3);
     let batch = aggregation.next_batch(Nanos::ZERO).unwrap();
-    let first = aggregation.request(&batch).body();
+    let first = aggregation.core.request(&batch).body();
     assert_eq!(aggregation.finish(batch, None), Err("no answer"));
     let batch = aggregation.next_batch(Nanos::ZERO).unwrap();
-    assert_eq!(aggregation.request(&batch).body(), first);
+    assert_eq!(aggregation.core.request(&batch).body(), first);
 }
 
 #[test]
@@ -109,7 +111,7 @@ fn nothing_is_sent_at_the_deadline() {
     aggregation.finish(batch, Some(&answer([0]))).unwrap();
     assert!(aggregation.add(vote(1)));
     assert!(aggregation.next_batch(DEADLINE + Nanos(1)).is_none(), "the best proof stays past it");
-    assert!(aggregation.proof().is_some());
+    assert!(aggregation.core.proof().is_some());
 }
 
 #[test]
@@ -118,7 +120,7 @@ fn a_response_with_other_claims_is_refused() {
     for body in [answer([0, 1]), answer([1]), aggregate_response(&[], b"p"), junk] {
         let mut aggregation = aggregation(1);
         assert!(settle(&mut aggregation, Some(&body)).is_err());
-        assert!(aggregation.best.is_none());
+        assert!(aggregation.core.best.is_none());
         assert!(aggregation.next_batch(Nanos::ZERO).is_some(), "the vote goes out again");
     }
 }
@@ -134,37 +136,38 @@ fn the_aggregation_stops_after_three_failures_and_a_success_resets_the_count() {
     for _ in 0..3 {
         settle(&mut aggregation, None).unwrap_err();
     }
-    assert!(aggregation.is_stopped());
+    assert!(aggregation.core.is_stopped());
     assert!(aggregation.priority(Nanos::ZERO).is_none(), "stopped");
     assert!(aggregation.next_batch(Nanos::ZERO).is_none(), "stopped");
 }
 
 #[test]
 fn a_non_contiguous_batch_is_checked_against_exactly_its_claims() {
-    let mut aggregation = merge([child(&[1, 2]), child(&[2, 3]), child(&[4]), child(&[3, 4, 5])]);
-    let batch = aggregation.next_batch(Nanos::ZERO).unwrap();
+    let mut merge = merge([child(&[1, 2]), child(&[2, 3]), child(&[4]), child(&[3, 4, 5])]);
+    let batch = merge.next_batch(Nanos::ZERO).unwrap();
     assert_eq!(batch.indices(), [0, 3], "two children cover 1..=5");
 
-    let refused = aggregation.finish(batch, Some(&answer([1, 2, 3, 4])));
+    let refused = merge.finish(batch, Some(&answer([1, 2, 3, 4])));
     assert_eq!(refused, Err("the proof covers other claims"), "claim 5 is missing");
-    assert!(aggregation.best.is_none());
+    assert!(merge.core.best.is_none());
 
-    settle(&mut aggregation, Some(&answer([1, 2, 3, 4, 5]))).unwrap();
-    assert_eq!(covered(&aggregation), [0, 3]);
-    assert_eq!(aggregation.best.as_ref().map_or(0, |best| best.claims.len()), 5);
-    assert!(aggregation.next_batch(Nanos::ZERO).is_none(), "the others add nothing");
+    let batch = merge.next_batch(Nanos::ZERO).unwrap();
+    merge.finish(batch, Some(&answer([1, 2, 3, 4, 5]))).unwrap();
+    assert_eq!(merge.core.covered(), [0, 3]);
+    assert_eq!(best_claims(&merge.core), 5);
+    assert!(merge.next_batch(Nanos::ZERO).is_none(), "the others add nothing");
 }
 
 #[test]
 fn merge_batches_respect_the_child_limit_with_the_best_proof_as_one() {
-    let mut aggregation = merge((0..40).map(|tag| child(&[tag])));
-    let batch = aggregation.next_batch(Nanos::ZERO).unwrap();
+    let mut merge = merge((0..40).map(|tag| child(&[tag])));
+    let batch = merge.next_batch(Nanos::ZERO).unwrap();
     assert_eq!(batch.indices().len(), 16);
-    assert_eq!(aggregation.request(&batch).children.len(), 16);
-    aggregation.finish(batch, Some(&answer(0..16))).unwrap();
-    let batch = aggregation.next_batch(Nanos::ZERO).unwrap();
+    assert_eq!(merge.core.request(&batch).children.len(), 16);
+    merge.finish(batch, Some(&answer(0..16))).unwrap();
+    let batch = merge.next_batch(Nanos::ZERO).unwrap();
     assert_eq!(batch.indices(), (16..31).collect::<Vec<_>>());
-    assert_eq!(aggregation.request(&batch).children.len(), 16, "the best proof is one");
+    assert_eq!(merge.core.request(&batch).children.len(), 16, "the best proof is one");
 }
 
 #[test]
@@ -178,15 +181,13 @@ fn a_proof_above_1_mib_is_refused() {
 
 #[test]
 fn a_merge_goes_before_any_leaf() {
-    let mut leaf = Aggregation::new(Nanos::from_secs(1));
-    (0..100).for_each(|tag| assert!(leaf.add(vote(tag))));
-    assert!(priority(&merge([child(&[1])])) > priority(&leaf), "despite a later deadline");
+    let merge = merge([child(&[1])]).priority(Nanos::ZERO).unwrap();
+    assert!(merge > priority(&leaf(Nanos::from_secs(1), 100)), "despite a later deadline");
 }
 
 #[test]
 fn then_the_earliest_deadline_goes_first() {
-    let mut early = Aggregation::new(DEADLINE - Nanos(1));
-    assert!(early.add(vote(0)));
+    let early = leaf(DEADLINE - Nanos(1), 1);
     assert!(priority(&early) > priority(&aggregation(100)), "despite fewer votes");
 }
 

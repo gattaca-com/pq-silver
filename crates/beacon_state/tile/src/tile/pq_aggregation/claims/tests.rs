@@ -1,4 +1,9 @@
-use super::{super::attestation, *};
+use silver_common::ssz_view::ATTESTATION_DATA_SIZE;
+
+use super::{
+    super::{attestation, strategy::Bits},
+    *,
+};
 
 fn claims(tags: &[u8]) -> Vec<Claim> {
     tags.iter().map(|&tag| [tag; 64]).collect()
@@ -8,12 +13,10 @@ fn claims(tags: &[u8]) -> Vec<Claim> {
 fn an_aggregate_reads_its_positions_from_its_attestation() {
     let ssz = attestation(3, [1, 5, 2047]);
     let aggregate = Aggregate::new(claims(&[9, 8, 7, 8]), b"proof".to_vec(), ssz).unwrap();
-    let positions = aggregate.positions();
+    let positions = aggregate.positions;
     assert_eq!(positions.committee, Committee { data: [3; ATTESTATION_DATA_SIZE], index: 3 });
     assert_eq!(positions.bits.count(), 3, "a repeated claim counts once");
-    let mut bits = Bits::default();
-    [1, 5, 2047].map(|position| bits.insert(position));
-    assert_eq!(positions.bits, bits);
+    assert_eq!(positions.bits, [1, 5, 2047].into_iter().collect::<Bits>());
 }
 
 #[test]

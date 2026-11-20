@@ -1,9 +1,11 @@
 mod arrival_order;
+mod bits;
 mod marginal_gain;
 
 pub use arrival_order::ArrivalOrder;
+pub use bits::Bits;
 pub(super) use marginal_gain::MAX_GROUPS;
-pub use marginal_gain::MarginalGain;
+pub use marginal_gain::{Committee, MarginalGain, Positions};
 
 const LOG_INV_RATE: u8 = 2;
 

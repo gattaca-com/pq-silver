@@ -198,6 +198,8 @@ fn committee_attestation_round_trips_through_the_view() {
     assert_eq!(AttestationPqView::data(&att).as_bytes(), &data);
     assert_eq!(AttestationPqView::committee_bits(&att), &[0, 0b10]);
     assert_eq!(AttestationPqView::aggregation_bits(&att), [0b0000_1001, 0b110]);
+    let (index, positions) = AttestationPqView::one_committee_positions(&att).unwrap();
+    assert_eq!((index, positions.collect::<Vec<_>>()), (9, vec![0, 3, 9]));
 
     let empty = AttestationPqView::encode_one_committee(&data, 0, 0, []).unwrap();
     assert!(AttestationPqView::check_canonical(&empty));

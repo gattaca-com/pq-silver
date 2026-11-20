@@ -1,15 +1,27 @@
 use std::cmp::Reverse;
 
-use silver_common::ssz_view::MAX_COMMITTEES_PER_SLOT_PQ;
+use silver_common::ssz_view::{ATTESTATION_DATA_SIZE, MAX_COMMITTEES_PER_SLOT_PQ};
 
-use super::{
-    super::claims::{Bits, Committee, Positions},
-    Batch, Strategy,
-};
+use super::{Batch, Bits, Strategy};
 
 /// Most committees one merge tells apart. Honest aggregates of a slot name
 /// few attestation data.
 pub(in super::super) const MAX_GROUPS: usize = 4 * MAX_COMMITTEES_PER_SLOT_PQ;
+
+/// One committee voting for one attestation data. Aggregates of two
+/// committees share no claim.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Committee {
+    pub data: [u8; ATTESTATION_DATA_SIZE],
+    pub index: usize,
+}
+
+/// The committee positions of an aggregate's claims.
+#[derive(Clone, Copy, Debug)]
+pub struct Positions {
+    pub committee: Committee,
+    pub bits: Bits,
+}
 
 /// Marginal-gain greedy: the child that adds the most positions first, ties
 /// to the earlier arrival. Gain is monotone and submodular, so a batch gains

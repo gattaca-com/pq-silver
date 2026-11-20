@@ -1,6 +1,6 @@
 use silver_common::ssz_view::MAX_VALIDATORS_PER_COMMITTEE;
 
-use super::{super::claims::Bits, Batch, Strategy};
+use super::{Batch, Bits, Strategy};
 
 /// Votes in arrival order, the first at each position not covered, up to the
 /// limit.

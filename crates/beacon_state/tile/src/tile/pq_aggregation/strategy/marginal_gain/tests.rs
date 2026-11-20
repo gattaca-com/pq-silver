@@ -1,16 +1,10 @@
 use std::ops::Range;
 
-use silver_common::ssz_view::ATTESTATION_DATA_SIZE;
-
 use super::*;
 
-fn positions(committee: u8, members: Range<usize>) -> Positions {
-    let mut bits = Bits::default();
-    members.for_each(|position| {
-        bits.insert(position);
-    });
+fn positions(committee: usize, members: Range<usize>) -> Positions {
     let committee = Committee { data: [0; ATTESTATION_DATA_SIZE], index: committee };
-    Positions { committee, bits }
+    Positions { committee, bits: members.collect() }
 }
 
 fn strategy(children: &[Positions]) -> MarginalGain {
@@ -26,7 +20,7 @@ fn gain(children: &[Positions], picks: impl IntoIterator<Item = usize>) -> usize
     let mut have = [Bits::default(); 256];
     picks.into_iter().for_each(|pick| {
         let child = &children[pick];
-        have[usize::from(child.committee.index)].union_with(&child.bits)
+        have[child.committee.index].union_with(&child.bits)
     });
     have.iter().map(Bits::count).sum()
 }

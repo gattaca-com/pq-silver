@@ -123,32 +123,50 @@ impl AttestationPqView {
         Some((committees.trailing_zeros() as usize, positions))
     }
 
-    /// An attestation of one committee: `positions` are indices into it.
-    /// `None` if the committee, its size or a position is out of range.
-    pub fn encode_one_committee(
+    /// The size of an attestation of one committee. `None` if the committee
+    /// or its size is out of range.
+    pub fn one_committee_len(committee_index: usize, committee_len: usize) -> Option<usize> {
+        (committee_index < MAX_COMMITTEES_PER_SLOT_PQ &&
+            committee_len <= MAX_VALIDATORS_PER_COMMITTEE)
+            .then_some(ATTESTATION_PQ_FIXED + committee_len / 8 + 1)
+    }
+
+    /// An attestation of one committee into `out`, of
+    /// [`Self::one_committee_len`] bytes: `positions` are indices into the
+    /// committee. False if a position is out of range.
+    pub fn write_one_committee(
+        out: &mut [u8],
         data: &[u8; ATTESTATION_DATA_SIZE],
         committee_index: usize,
         committee_len: usize,
         positions: impl IntoIterator<Item = usize>,
-    ) -> Option<Vec<u8>> {
-        if committee_index >= MAX_COMMITTEES_PER_SLOT_PQ ||
-            committee_len > MAX_VALIDATORS_PER_COMMITTEE
-        {
-            return None;
-        }
-        let mut out = vec![0u8; ATTESTATION_PQ_FIXED + committee_len / 8 + 1];
+    ) -> bool {
+        debug_assert_eq!(Some(out.len()), Self::one_committee_len(committee_index, committee_len));
+        out.fill(0);
         out[..4].copy_from_slice(&(ATTESTATION_PQ_FIXED as u32).to_le_bytes());
         out[4..4 + ATTESTATION_DATA_SIZE].copy_from_slice(data);
         out[4 + ATTESTATION_DATA_SIZE + committee_index / 8] |= 1 << (committee_index % 8);
         let bits = &mut out[ATTESTATION_PQ_FIXED..];
         for position in positions {
             if position >= committee_len {
-                return None;
+                return false;
             }
             bits[position / 8] |= 1 << (position % 8);
         }
         bits[committee_len / 8] |= 1 << (committee_len % 8);
-        Some(out)
+        true
+    }
+
+    /// [`Self::write_one_committee`] into a new buffer.
+    pub fn encode_one_committee(
+        data: &[u8; ATTESTATION_DATA_SIZE],
+        committee_index: usize,
+        committee_len: usize,
+        positions: impl IntoIterator<Item = usize>,
+    ) -> Option<Vec<u8>> {
+        let mut out = vec![0; Self::one_committee_len(committee_index, committee_len)?];
+        Self::write_one_committee(&mut out, data, committee_index, committee_len, positions)
+            .then_some(out)
     }
 }
 

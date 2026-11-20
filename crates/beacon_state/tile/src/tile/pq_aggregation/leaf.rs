@@ -85,14 +85,35 @@ impl LeafAggregation {
 
     /// The `AttestationPq` of the votes the best proof covers. `None` without
     /// a best proof.
-    pub(super) fn attestation(&self, committee_index: u64) -> Option<Vec<u8>> {
+    pub(super) fn attestation(&self, committee_index: u64) -> Option<LeafAttestation<'_>> {
         self.core.best_proof()?;
-        let positions = self.core.covered_indices().iter().map(|&index| self.positions[index]);
-        AttestationPqView::encode_one_committee(
-            &self.data,
-            committee_index as usize,
-            self.committee_len,
+        let committee_index = committee_index as usize;
+        let ssz_len = AttestationPqView::one_committee_len(committee_index, self.committee_len)?;
+        Some(LeafAttestation { leaf: self, committee_index, ssz_len })
+    }
+}
+
+pub struct LeafAttestation<'a> {
+    leaf: &'a LeafAggregation,
+    committee_index: usize,
+    ssz_len: usize,
+}
+
+impl LeafAttestation<'_> {
+    pub fn ssz_len(&self) -> usize {
+        self.ssz_len
+    }
+
+    pub fn write_ssz(&self, out: &mut [u8]) {
+        let leaf = self.leaf;
+        let positions = leaf.core.covered_indices().iter().map(|&index| leaf.positions[index]);
+        let written = AttestationPqView::write_one_committee(
+            out,
+            &leaf.data,
+            self.committee_index,
+            leaf.committee_len,
             positions,
-        )
+        );
+        debug_assert!(written, "votes are checked against their committee on arrival");
     }
 }

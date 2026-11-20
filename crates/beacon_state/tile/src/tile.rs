@@ -713,43 +713,26 @@ impl BeaconStateTile {
         data_root: B256,
         producers: &mut Producers,
     ) {
-        if self.spec.is_pq_at_slot(slot) {
-            return self.serve_pq_aggregate(request_id, slot, committee_index, data_root, producers);
+        let events = &mut self.events_producer;
+        let written = if self.spec.is_pq_at_slot(slot) {
+            let aggregate = self.pq_aggregator.aggregate(slot, committee_index, data_root);
+            aggregate.map(|aggregate| {
+                events.write_with(aggregate.ssz_len(), |buffer| aggregate.write_ssz(buffer))
+            })
+        } else {
+            let aggregate = self.attestation_pool.aggregate(slot, committee_index, data_root);
+            aggregate.map(|aggregate| {
+                events.write_with(aggregate.ssz_len(), |buffer| aggregate.write_ssz(buffer))
+            })
+        };
+        if written == Some(None) {
+            silver_log::error!(
+                slot,
+                committee_index,
+                "beacon_state tcache full; aggregate not served"
+            );
         }
-        let aggregate = self.attestation_pool.aggregate(slot, committee_index, data_root);
-        let ssz = aggregate.and_then(|aggregate| {
-            let written = self
-                .events_producer
-                .write_with(aggregate.ssz_len(), |buffer| aggregate.write_ssz(buffer));
-            if written.is_none() {
-                silver_log::error!(
-                    slot,
-                    committee_index,
-                    "beacon_state tcache full; aggregate not served"
-                );
-            }
-            written
-        });
-        producers.produce(BeaconApiResponse::AggregateAttestation { request_id, ssz });
-    }
-
-    fn serve_pq_aggregate(
-        &mut self,
-        request_id: u64,
-        slot: Slot,
-        committee_index: u64,
-        data_root: B256,
-        producers: &mut Producers,
-    ) {
-        let aggregate = self.pq_aggregator.aggregate_ssz(slot, committee_index, data_root);
-        let ssz = aggregate.and_then(|ssz| {
-            let written =
-                self.events_producer.write_with(ssz.len(), |out| out.copy_from_slice(&ssz));
-            if written.is_none() {
-                silver_log::error!(slot, "beacon_state tcache full; aggregate not served");
-            }
-            written
-        });
+        let ssz = written.flatten();
         producers.produce(BeaconApiResponse::AggregateAttestation { request_id, ssz });
     }
 

@@ -6068,6 +6068,7 @@ dependencies = [
  "silver_config",
  "silver_engine_api",
  "silver_httpcore",
+ "silver_leanvm_api",
  "silver_log",
  "silver_pbs",
  "ureq",
@@ -6404,6 +6405,18 @@ dependencies = [
  "silver_log",
  "tempfile",
  "webpki-roots 1.0.9",
+]
+
+[[package]]
+name = "silver_leanvm_api"
+version = "0.1.0-alpha.17"
+dependencies = [
+ "flux",
+ "mio",
+ "silver_common",
+ "silver_httpcore",
+ "silver_log",
+ "tempfile",
 ]
 
 [[package]]

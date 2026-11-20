@@ -1,0 +1,20 @@
+[package]
+name = "silver_leanvm_api"
+edition.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+version.workspace = true
+
+[dependencies]
+flux.workspace = true
+mio.workspace = true
+silver_common.workspace = true
+silver_httpcore.workspace = true
+silver_log.workspace = true
+
+[dev-dependencies]
+silver_common = { workspace = true, features = ["test-util"] }
+tempfile = "3"
+
+[lints]
+workspace = true

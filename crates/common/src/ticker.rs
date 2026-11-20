@@ -10,10 +10,16 @@ pub const MAXIMUM_GOSSIP_CLOCK_DISPARITY: Duration = Duration::from_millis(500);
 pub const BASIS_POINTS: u64 = 10_000;
 pub const ATTESTATION_DUE_BPS: u64 = 3333;
 pub const ATTESTATION_DUE_BPS_GLOAS: u64 = 2500;
+pub const AGGREGATE_DUE_BPS: u64 = 6667;
+pub const AGGREGATE_DUE_BPS_GLOAS: u64 = 5000;
 pub const PAYLOAD_ATTESTATION_DUE_BPS: u64 = 7500;
 
 pub fn attestation_due_bps(is_gloas: bool) -> u64 {
     if is_gloas { ATTESTATION_DUE_BPS_GLOAS } else { ATTESTATION_DUE_BPS }
+}
+
+pub fn aggregate_due_bps(is_gloas: bool) -> u64 {
+    if is_gloas { AGGREGATE_DUE_BPS_GLOAS } else { AGGREGATE_DUE_BPS }
 }
 
 // slot/24 before next slot = 500ms on mainnet.
@@ -203,6 +209,12 @@ impl SlotTicker {
         if self.is_current_slot_with_disparity(next, disparity) { next } else { wall }
     }
 
+    /// Milliseconds since genesis at which `slot`'s aggregates are due.
+    pub fn aggregate_due_ms(&self, slot: Slot) -> u64 {
+        let is_gloas = slot >= self.gloas_fork_slot;
+        slot * self.slot_ms + self.slot_ms * aggregate_due_bps(is_gloas) / BASIS_POINTS
+    }
+
     pub fn is_before_attesting_interval(&self, is_gloas: bool) -> bool {
         let due_ms = self.slot_ms * attestation_due_bps(is_gloas) / BASIS_POINTS;
         self.millis_since_genesis() % self.slot_ms < due_ms
@@ -282,6 +294,20 @@ mod tests {
         assert!(matches!(t.tick(), TickEvent::SlotStart(1)));
         // Next phase (AnnouncePayload at 4s) is in the future.
         assert!(t.tick() == TickEvent::None);
+    }
+
+    #[test]
+    fn aggregate_due_follows_the_fork_of_the_slot() {
+        let gloas_epoch = 2;
+        let ticker = SlotTicker::new(
+            genesis_secs_ago(20),
+            &spec(12_000, gloas_epoch),
+            Duration::from_secs(4),
+        );
+        let gloas_slot = ticker.gloas_fork_slot;
+        let fulu = gloas_slot - 1;
+        assert_eq!(ticker.aggregate_due_ms(fulu), fulu * 12_000 + 8_000);
+        assert_eq!(ticker.aggregate_due_ms(gloas_slot), gloas_slot * 12_000 + 6_000);
     }
 
     #[test]

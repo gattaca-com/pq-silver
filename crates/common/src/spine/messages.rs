@@ -1756,6 +1756,28 @@ pub struct EngineHealthEvent {
     pub sync_status: ELSyncStatus,
 }
 
+/// A leanVM sidecar request body, op byte onwards and unframed.
+#[derive(Clone, Copy, Debug, TypeHash)]
+#[repr(C)]
+pub struct LeanvmReq {
+    pub request_id: u64,
+    pub body: TCacheRead,
+}
+
+/// A leanVM sidecar response body, status byte included. `None` is no answer.
+#[derive(Clone, Copy, Debug, TypeHash)]
+#[repr(C)]
+pub struct LeanvmResp {
+    pub request_id: u64,
+    pub body: Option<TCacheRead>,
+}
+
+#[derive(Clone, Copy, Debug, TypeHash)]
+#[repr(C)]
+pub struct LeanvmHealthEvent {
+    pub ready: bool,
+}
+
 impl BeaconStateEvent {
     pub fn view(&self) -> SszView {
         match self {

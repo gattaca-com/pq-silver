@@ -1,0 +1,263 @@
+use std::{collections::VecDeque, mem};
+
+use flux::spine::SpineProducers;
+use rustc_hash::FxHashMap;
+use silver_beacon_state_data::{B256, Slot};
+use silver_common::{
+    LeanvmHealthEvent, LeanvmReq, LeanvmResp, Nanos, TCacheProducer, TCacheReader, TProducer,
+    ticker::SlotTicker,
+};
+
+use super::{
+    Aggregate, Aggregation, VerifiedVote,
+    leaf::{LeafAggregation, LeafKey},
+    merge::MergeAggregation,
+    strategy::Batch,
+};
+use crate::tile::Producers;
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum AggregationKey {
+    Leaf(LeafKey),
+    Merge(Slot),
+}
+
+impl AggregationKey {
+    fn slot(&self) -> Slot {
+        match self {
+            Self::Leaf(leaf) => leaf.slot,
+            Self::Merge(slot) => *slot,
+        }
+    }
+}
+
+/// The leanVM sidecar as the aggregator sees it: one request at a time, and
+/// none while it is down.
+#[derive(Default)]
+enum Leanvm {
+    #[default]
+    Down,
+    Idle,
+    Busy {
+        request_id: u64,
+        key: AggregationKey,
+        batch: Batch,
+    },
+}
+
+impl Leanvm {
+    fn up(&mut self) {
+        if let Self::Down = self {
+            *self = Self::Idle;
+        }
+    }
+
+    /// The batch that was in flight, now lost.
+    fn down(&mut self) -> Option<(AggregationKey, Batch)> {
+        match mem::take(self) {
+            Self::Busy { key, batch, .. } => Some((key, batch)),
+            Self::Down | Self::Idle => None,
+        }
+    }
+
+    /// Becomes idle if `request_id` is in flight, handing back its batch.
+    fn take_answered(&mut self, request_id: u64) -> Option<(AggregationKey, Batch)> {
+        match mem::take(self) {
+            Self::Busy { request_id: id, key, batch } if id == request_id => {
+                *self = Self::Idle;
+                Some((key, batch))
+            }
+            other => {
+                *self = other;
+                None
+            }
+        }
+    }
+}
+
+/// Every aggregation this node runs. One `LeanvmReq` is in flight at a time,
+/// across all aggregations.
+#[derive(Default)]
+pub struct PqAggregator {
+    leaves: FxHashMap<LeafKey, LeafAggregation>,
+    merges: FxHashMap<Slot, MergeAggregation>,
+    /// Aggregations that may have a batch, oldest first, each at most once.
+    /// Merges are taken before leaves.
+    queue: VecDeque<AggregationKey>,
+    leanvm: Leanvm,
+    next_request_id: u64,
+}
+
+impl PqAggregator {
+    pub fn add_vote(
+        &mut self,
+        vote: VerifiedVote,
+        ticker: &SlotTicker,
+        tcache: &mut TProducer,
+        producers: &mut Producers,
+    ) {
+        let leaf = LeafKey::new(&vote);
+        if vote.committee_position >= vote.committee_len {
+            let (committee_position, committee_len) = (vote.committee_position, vote.committee_len);
+            silver_log::error!(
+                slot = leaf.slot,
+                committee_position,
+                committee_len,
+                "vote outside committee"
+            );
+            return;
+        }
+        // TODO: the aggregate due time stands in for the VC's pull. A VC that
+        // pulls later gets a proof frozen at the due time. Consider ending on
+        // the last local aggregator's pull instead.
+        let deadline = Nanos::from_millis(ticker.aggregate_due_ms(leaf.slot));
+        if now(ticker) >= deadline {
+            silver_log::debug!(slot = leaf.slot, "vote after the aggregation deadline");
+            return;
+        }
+        let aggregation =
+            self.leaves.entry(leaf).or_insert_with(|| LeafAggregation::new(&vote, deadline));
+        aggregation.add(&vote);
+        self.enqueue(AggregationKey::Leaf(leaf));
+        self.send_next(ticker, tcache, producers);
+    }
+
+    /// `aggregate` is verified, for the block of `slot`.
+    pub fn add_aggregate(
+        &mut self,
+        slot: Slot,
+        aggregate: Aggregate,
+        ticker: &SlotTicker,
+        tcache: &mut TProducer,
+        producers: &mut Producers,
+    ) {
+        self.merges.entry(slot).or_insert_with(MergeAggregation::new).add(aggregate);
+        self.enqueue(AggregationKey::Merge(slot));
+        self.send_next(ticker, tcache, producers);
+    }
+
+    /// A response to a request that is not in flight is ignored. A body that
+    /// cannot be read counts as no answer.
+    pub fn on_response(
+        &mut self,
+        resp: LeanvmResp,
+        reader: &mut TCacheReader,
+        ticker: &SlotTicker,
+        tcache: &mut TProducer,
+        producers: &mut Producers,
+    ) {
+        let acquired = resp.body.map(|read| reader.acquire(read));
+        let body = acquired.as_ref().and_then(|acquired| acquired.buffer().ok());
+        if body.is_none() && acquired.is_some() {
+            silver_log::error!(request_id = resp.request_id, "leanvm response unreadable");
+        }
+        let Some((key, batch)) = self.leanvm.take_answered(resp.request_id) else { return };
+        self.finish(key, batch, body.map(|(body, _)| body));
+        self.enqueue(key);
+        self.send_next(ticker, tcache, producers);
+    }
+
+    /// A leanVM sidecar that goes down fails the batch in flight at once. The
+    /// transport's `None` answer for it comes later and is ignored.
+    pub fn on_health(
+        &mut self,
+        health: LeanvmHealthEvent,
+        ticker: &SlotTicker,
+        tcache: &mut TProducer,
+        producers: &mut Producers,
+    ) {
+        if health.ready {
+            self.leanvm.up();
+        } else if let Some((key, batch)) = self.leanvm.down() {
+            self.finish(key, batch, None);
+            self.enqueue(key);
+        }
+        self.send_next(ticker, tcache, producers);
+    }
+
+    /// Drops the aggregations of slots before `floor`. The request in flight
+    /// for one still occupies the leanVM sidecar until its response arrives.
+    pub fn prune_before(&mut self, floor: Slot) {
+        self.leaves.retain(|leaf, _| leaf.slot >= floor);
+        self.merges.retain(|&slot, _| slot >= floor);
+        self.queue.retain(|key| key.slot() >= floor);
+    }
+
+    pub fn aggregate_ssz(
+        &self,
+        slot: Slot,
+        committee_index: u64,
+        data_root: B256,
+    ) -> Option<Vec<u8>> {
+        self.leaves.get(&LeafKey { slot, committee_index, data_root })?.attestation(committee_index)
+    }
+
+    pub fn block_proof(&self, slot: Slot) -> Option<(Vec<&[u8]>, &[u8])> {
+        self.merges.get(&slot)?.block_proof()
+    }
+
+    fn core_mut(&mut self, key: AggregationKey) -> Option<&mut Aggregation> {
+        match key {
+            AggregationKey::Leaf(leaf) => self.leaves.get_mut(&leaf).map(|leaf| &mut leaf.core),
+            AggregationKey::Merge(slot) => self.merges.get_mut(&slot).map(|merge| &mut merge.core),
+        }
+    }
+
+    fn finish(&mut self, key: AggregationKey, batch: Batch, body: Option<&[u8]>) {
+        let Some(core) = self.core_mut(key) else { return };
+        if let Err(reason) = core.finish(batch, body) {
+            let slot = key.slot();
+            silver_log::warn!(slot, reason, "aggregation batch failed");
+            if core.is_stopped() {
+                silver_log::warn!(slot, "aggregation stopped after repeated failures");
+            }
+        }
+    }
+
+    fn enqueue(&mut self, key: AggregationKey) {
+        if !self.queue.contains(&key) {
+            self.queue.push_back(key);
+        }
+    }
+
+    fn pop_next(&mut self) -> Option<AggregationKey> {
+        let merge = self.queue.iter().position(|key| matches!(key, AggregationKey::Merge(_)));
+        self.queue.remove(merge.unwrap_or(0))
+    }
+
+    /// Sends the first batch the queue offers, if the leanVM sidecar is idle.
+    /// An aggregation without a batch leaves the queue until its next event; a
+    /// pruned one is skipped. One that meets a full tcache keeps its place,
+    /// and the pass stops.
+    fn send_next(
+        &mut self,
+        ticker: &SlotTicker,
+        tcache: &mut TProducer,
+        producers: &mut Producers,
+    ) {
+        if !matches!(self.leanvm, Leanvm::Idle) {
+            return;
+        }
+        let now = now(ticker);
+        while let Some(key) = self.pop_next() {
+            let Some(core) = self.core_mut(key) else { continue };
+            let Some(batch) = core.next_batch(now) else { continue };
+            let request = core.request(&batch);
+            let Some(body) = tcache.write_with(request.len(), |out| request.write(out)) else {
+                silver_log::error!(slot = key.slot(), "beacon_state tcache full; batch not sent");
+                self.finish(key, batch, None);
+                self.queue.push_front(key);
+                return;
+            };
+            let request_id = self.next_request_id;
+            self.next_request_id += 1;
+            self.leanvm = Leanvm::Busy { request_id, key, batch };
+            producers.produce(LeanvmReq { request_id, body });
+            return;
+        }
+    }
+}
+
+fn now(ticker: &SlotTicker) -> Nanos {
+    Nanos::from_millis(ticker.millis_since_genesis())
+}

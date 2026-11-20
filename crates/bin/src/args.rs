@@ -29,6 +29,9 @@ pub struct Args {
     /// Builder API URL of the PBS sidecar, e.g. `http://localhost:18550`.
     #[arg(long)]
     pbs_endpoint: Option<String>,
+    /// Unix socket of the leanVM sidecar, e.g. `/run/leanvm/sidecar.sock`.
+    #[arg(long)]
+    leanvm_socket: Option<String>,
     #[command(subcommand)]
     pub command: Option<ClusterCommand>,
 }
@@ -41,6 +44,7 @@ impl Args {
             jwt_secret: self.jwt_secret,
             unsafe_no_el: self.unsafe_no_el,
             pbs_endpoint: self.pbs_endpoint,
+            leanvm_socket: self.leanvm_socket,
         };
         let config = Config::load(self.config.as_deref(), overrides)?;
 

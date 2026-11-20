@@ -79,6 +79,7 @@ fn boundary_tile_with_spec(
         BeaconStateOwner::published_empty_test(0).reader(),
         engine_config,
         None,
+        None,
         Duration::from_millis(600),
         tcaches,
         resp_p,

@@ -191,6 +191,28 @@ fn attestation_drops_signature_slot() {
 }
 
 #[test]
+fn committee_attestation_round_trips_through_the_view() {
+    let data = [7u8; 128];
+    let att = AttestationPqView::encode_one_committee(&data, 9, 10, [0, 3, 9]).unwrap();
+    assert!(AttestationPqView::check_canonical(&att));
+    assert_eq!(AttestationPqView::data(&att).as_bytes(), &data);
+    assert_eq!(AttestationPqView::committee_bits(&att), &[0, 0b10]);
+    assert_eq!(AttestationPqView::aggregation_bits(&att), [0b0000_1001, 0b110]);
+
+    let empty = AttestationPqView::encode_one_committee(&data, 0, 0, []).unwrap();
+    assert!(AttestationPqView::check_canonical(&empty));
+    assert_eq!(AttestationPqView::aggregation_bits(&empty), [1]);
+}
+
+#[test]
+fn committee_attestation_refuses_out_of_range_input() {
+    let data = [0u8; 128];
+    assert!(AttestationPqView::encode_one_committee(&data, 16, 4, [0]).is_none());
+    assert!(AttestationPqView::encode_one_committee(&data, 0, 2049, [0]).is_none());
+    assert!(AttestationPqView::encode_one_committee(&data, 0, 4, [4]).is_none());
+}
+
+#[test]
 fn attester_slashing_splits_indexed_attestations() {
     let proof = pattern(70, 11);
     let att_1 = indexed_attestation(&[1, 5, 9], &proof);

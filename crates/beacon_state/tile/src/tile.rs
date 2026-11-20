@@ -14,11 +14,11 @@ use silver_beacon_state_data::{
 };
 use silver_common::{
     BeaconApiRequest, BeaconApiResponse, BeaconStateEvent, BlockSource, BuilderBidsResponse,
-    DataColumnsEvent, DataKind, EngineResp, GossipTopic, HeadChange, HeadRoots, NewGossipMsg,
-    Origin, PayloadResolution, PayloadValidationStatus, PtcObservation, ReplayBlock, RequestId,
-    RpcInbound, RpcResponse, RpcResponseInbound, SidecarBidResponse, SilverSpine, SyncNeed,
-    SyncUpdate, TCacheError, TCacheId, TCacheProducer, TCacheRead, TCacheReader, TCacheTable,
-    TProducer, TReadMode, TileId, hex32,
+    DataColumnsEvent, DataKind, EngineResp, GossipTopic, HeadChange, HeadRoots, LeanvmHealthEvent,
+    LeanvmResp, NewGossipMsg, Origin, PayloadResolution, PayloadValidationStatus, PtcObservation,
+    ReplayBlock, RequestId, RpcInbound, RpcResponse, RpcResponseInbound, SidecarBidResponse,
+    SilverSpine, SyncNeed, SyncUpdate, TCacheError, TCacheId, TCacheProducer, TCacheRead,
+    TCacheReader, TCacheTable, TProducer, TReadMode, TileId, hex32,
     ssz_view::{STATUS_V2_SIZE, SYNC_COMMITTEE_CONTRIBUTION_SIZE},
     ticker::{MAXIMUM_GOSSIP_CLOCK_DISPARITY, SlotTicker, TickEvent},
 };
@@ -43,6 +43,7 @@ use crate::{
         payload_attributes::PayloadAttributes,
         payload_execution_requests::PayloadExecutionRequests,
         pending_envelopes::{BLOCK_WAIT_SLOTS, PendingEnvelopes},
+        pq_aggregation::PqAggregator,
         precomputed_epochs::PrecomputedEpochs,
         proposer_preparations::ProposerPreparations,
         seen_aggregates::SeenAggregates,
@@ -75,6 +76,7 @@ mod payload_attributes;
 mod payload_execution_requests;
 mod payload_publication;
 mod pending_envelopes;
+pub mod pq_aggregation;
 mod proposer_preparations;
 mod seen_aggregates;
 mod seen_proposer_preferences;
@@ -267,6 +269,7 @@ pub struct BeaconStateTile {
     payload_bids_pool: BidPool,
     payload_execution_requests: PayloadExecutionRequests,
     payload_attestation_pool: PayloadAttestationPool,
+    pq_aggregator: PqAggregator,
     seen_proposer_preferences: SeenProposerPreferences,
     /// Resolved pending-buffer admission / eviction / fallback bounds.
     pending_bounds: PendingBounds,
@@ -363,6 +366,7 @@ impl BeaconStateTile {
             payload_bids_pool: BidPool::default(),
             payload_execution_requests: PayloadExecutionRequests::default(),
             payload_attestation_pool: PayloadAttestationPool::default(),
+            pq_aggregator: PqAggregator::default(),
             seen_proposer_preferences: SeenProposerPreferences::default(),
             pending_bounds: syncing.pending,
             verify_weak_subjectivity,
@@ -692,6 +696,9 @@ impl BeaconStateTile {
         data_root: B256,
         producers: &mut Producers,
     ) {
+        if self.spec.is_pq_at_slot(slot) {
+            return self.serve_pq_aggregate(request_id, slot, committee_index, data_root, producers);
+        }
         let aggregate = self.attestation_pool.aggregate(slot, committee_index, data_root);
         let ssz = aggregate.and_then(|aggregate| {
             let written = self
@@ -703,6 +710,26 @@ impl BeaconStateTile {
                     committee_index,
                     "beacon_state tcache full; aggregate not served"
                 );
+            }
+            written
+        });
+        producers.produce(BeaconApiResponse::AggregateAttestation { request_id, ssz });
+    }
+
+    fn serve_pq_aggregate(
+        &mut self,
+        request_id: u64,
+        slot: Slot,
+        committee_index: u64,
+        data_root: B256,
+        producers: &mut Producers,
+    ) {
+        let aggregate = self.pq_aggregator.aggregate_ssz(slot, committee_index, data_root);
+        let ssz = aggregate.and_then(|ssz| {
+            let written =
+                self.events_producer.write_with(ssz.len(), |out| out.copy_from_slice(&ssz));
+            if written.is_none() {
+                silver_log::error!(slot, "beacon_state tcache full; aggregate not served");
             }
             written
         });
@@ -884,6 +911,7 @@ impl BeaconStateTile {
         self.payload_attestation_pool.prune_before(floor);
         self.seen_aggregates.prune_before(floor);
         self.attestation_root_memo.prune_before(floor);
+        self.pq_aggregator.prune_before(floor);
         self.payload_bids_pool.on_slot(slot);
         self.seen_proposer_preferences.on_slot(slot);
         self.envelope_arrivals.on_slot(slot);
@@ -1109,6 +1137,17 @@ impl BeaconStateTile {
 
         adapter.consume(|eng_resp: EngineResp, producers| {
             self.handle_engine_response(eng_resp, producers);
+        });
+
+        // Health first: a disconnect then fails the batch in flight once, and
+        // the transport's `None` answer for it is ignored.
+        adapter.consume(|health: LeanvmHealthEvent, producers| {
+            let tcache = &mut self.events_producer;
+            self.pq_aggregator.on_health(health, &self.ticker, tcache, producers);
+        });
+        adapter.consume(|resp: LeanvmResp, producers| {
+            let (reader, tcache) = (&mut self.reader, &mut self.events_producer);
+            self.pq_aggregator.on_response(resp, reader, &self.ticker, tcache, producers);
         });
 
         adapter.consume(|answer: SidecarBidResponse, producers| {

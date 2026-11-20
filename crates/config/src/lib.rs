@@ -215,6 +215,9 @@ pub struct Config {
     suggested_fee_recipient: Option<[u8; 20]>,
     #[serde(default)]
     pbs: Option<PbsConfig>,
+    /// Unix socket of the leanVM sidecar.
+    #[serde(default)]
+    leanvm_socket: Option<String>,
 }
 
 impl Config {
@@ -235,6 +238,9 @@ impl Config {
                 None => self.pbs = Some(PbsConfig::new(endpoint)),
             }
         }
+        if let Some(socket) = overrides.leanvm_socket {
+            self.leanvm_socket = Some(socket);
+        }
     }
 }
 
@@ -246,6 +252,7 @@ pub struct Overrides {
     pub jwt_secret: Option<String>,
     pub unsafe_no_el: bool,
     pub pbs_endpoint: Option<String>,
+    pub leanvm_socket: Option<String>,
 }
 
 impl Config {
@@ -328,6 +335,10 @@ impl Config {
 
     pub fn pbs(&self) -> Option<&PbsConfig> {
         self.pbs.as_ref()
+    }
+
+    pub fn leanvm_socket(&self) -> Option<&str> {
+        self.leanvm_socket.as_deref()
     }
 
     pub fn enr(&self, keypair: &Keypair, enr_fork_id: [u8; 16]) -> Result<Enr, Error> {
@@ -578,6 +589,16 @@ mod tests {
         let cfg = Config::from_toml("", flag).unwrap();
         assert_eq!(cfg.pbs().unwrap().get_header_timeout(), Duration::from_millis(1200));
         assert_eq!(cfg.pbs().unwrap().submit_blinded_block_timeout(), Duration::from_millis(5000));
+    }
+
+    #[test]
+    fn leanvm_socket_comes_from_the_file_or_the_flag() {
+        assert!(Config::from_toml("", Overrides::default()).unwrap().leanvm_socket().is_none());
+        let toml = "leanvm_socket = \"/run/a.sock\"";
+        let cfg = Config::from_toml(toml, Overrides::default()).unwrap();
+        assert_eq!(cfg.leanvm_socket(), Some("/run/a.sock"));
+        let flag = Overrides { leanvm_socket: Some("/run/b.sock".into()), ..Overrides::default() };
+        assert_eq!(Config::from_toml(toml, flag).unwrap().leanvm_socket(), Some("/run/b.sock"));
     }
 
     #[test]

@@ -3,8 +3,10 @@ use silver_common::ssz_view::{
 };
 
 use super::{claims::Claim, strategy::MAX_GROUPS};
+use crate::tile::leanvm_verifier::ProofVerdict;
 
 const OP_AGGREGATE: u8 = 1;
+const OP_VERIFY: u8 = 2;
 const SIGNED_CLAIM_SIZE: usize = 64 + XMSS_SIGNATURE_SIZE;
 
 /// Most leanXMSS signatures in one request.
@@ -65,6 +67,54 @@ impl AggregateRequest<'_> {
         let mut body = vec![0; self.len()];
         self.write(&mut body);
         body
+    }
+}
+
+/// One `verify` request: does `proof` prove exactly `claims`?
+pub(in crate::tile) struct VerifyRequest<'a> {
+    /// Strictly sorted, as the proof's own are.
+    pub claims: &'a [Claim],
+    pub proof: &'a [u8],
+}
+
+impl VerifyRequest<'_> {
+    pub(in crate::tile) fn len(&self) -> usize {
+        1 + proof_len(self.claims.len(), self.proof.len())
+    }
+
+    /// Fills `out`, which must be exactly `len()` bytes.
+    pub(in crate::tile) fn write(&self, mut out: &mut [u8]) {
+        put(&mut out, &[OP_VERIFY]);
+        put_claims(&mut out, self.claims);
+        put_bytes(&mut out, self.proof);
+        assert!(out.is_empty(), "verify request shorter than its slice");
+    }
+
+    #[cfg(test)]
+    pub(super) fn body(&self) -> Vec<u8> {
+        let mut body = vec![0; self.len()];
+        self.write(&mut body);
+        body
+    }
+}
+
+/// Decodes a `verify` response: status 0, then 1 for a proof that proves its
+/// claims, else 0. Anything else leaves the proof unjudged.
+pub(in crate::tile) fn decode_verify_response(body: &[u8]) -> ProofVerdict {
+    match body {
+        [0, 1] => ProofVerdict::Valid,
+        [0, 0] => ProofVerdict::Invalid,
+        [status, rest @ ..] => {
+            let mut rest = rest;
+            let message = take_bytes(&mut rest).unwrap_or_default();
+            let message = String::from_utf8_lossy(message);
+            silver_log::error!(status, %message, "leanvm verify response is not a verdict");
+            ProofVerdict::Unanswered
+        }
+        [] => {
+            silver_log::error!("leanvm sidecar sent an empty verify response");
+            ProofVerdict::Unanswered
+        }
     }
 }
 

@@ -7579,6 +7579,46 @@ fn gloas_head_on_a_pending_full_parent_payload_is_optimistic_until_that_verdict(
     assert_eq!(rig.crank().last_head(), b(false));
 }
 
+mod leanvm_verifier {
+    use silver_common::{LeanVmReq, LeanVmResp};
+
+    use super::*;
+    use crate::tile::leanvm_verifier::{LeanVmVerifier, ProofVerdict};
+
+    /// A verify request goes out under an id whose response the verifier
+    /// claims, while an aggregation's id stays the aggregator's.
+    #[test]
+    fn verify_request_is_answered_under_its_own_id() {
+        let spec = SpecConfig { pq_fork_epoch: 1, ..SpecConfig::mainnet() };
+        let (mut tile, mut gossip, _rpc, mut spine, mut adapter) =
+            tile_with_producers_on(40, BeaconState::empty_test(0), spec);
+        let mut sink = SpineAdapter::connect_tile(&Sink, &mut spine.spine);
+        sink.consume(|_: LeanVmReq, _| {});
+
+        let mut verifier = LeanVmVerifier::default();
+        let claims = [[1; 64], [2; 64]];
+        let tcache = &mut tile.events_producer;
+        let first = verifier.send(&claims, b"proof", tcache, &mut adapter.producers).unwrap();
+        let second = verifier.send(&claims, b"proof", tcache, &mut adapter.producers).unwrap();
+        assert_ne!(first, second);
+        let mut requests = Vec::new();
+        sink.consume(|request: LeanVmReq, _| requests.push(request));
+        assert_eq!(requests.iter().map(|r| r.request_id).collect::<Vec<_>>(), [first, second]);
+        assert_eq!(tile.events_producer.read_buffer(requests[0].body).unwrap()[0], 2, "verify op");
+
+        let mut answer = |request_id, body: Option<&[u8]>| {
+            let body = body.map(|body| {
+                gossip.write_with(body.len(), |out| out.copy_from_slice(body)).unwrap()
+            });
+            LeanVmVerifier::verdict(&LeanVmResp { request_id, body }, &mut tile.reader)
+        };
+        assert_eq!(answer(first, Some(&[0, 1])), Some(ProofVerdict::Valid));
+        assert_eq!(answer(second, Some(&[0, 0])), Some(ProofVerdict::Invalid));
+        assert_eq!(answer(first, None), Some(ProofVerdict::Unanswered), "the sidecar went down");
+        assert_eq!(answer(0, Some(&[0, 1])), None, "an aggregation's response");
+    }
+}
+
 mod pq_aggregator {
     use silver_common::{LeanVmHealthEvent, LeanVmReq, LeanVmResp, TReservation};
     use silver_ssz::ssz_view::{AttestationPqView, SINGLE_ATT_PQ_SIZE};

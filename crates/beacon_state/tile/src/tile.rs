@@ -39,6 +39,7 @@ use crate::{
         fork_data_roots::ForkDataRoots,
         gossip::BatchedVote,
         held_blocks::{HeldBlocks, StagedVerdict},
+        leanvm_verifier::LeanVmVerifier,
         payload_attestation_pool::PayloadAttestationPool,
         payload_attributes::PayloadAttributes,
         payload_execution_requests::PayloadExecutionRequests,
@@ -70,6 +71,7 @@ mod fork_choice;
 mod fork_data_roots;
 mod gossip;
 mod held_blocks;
+pub mod leanvm_verifier;
 mod orphan_pool;
 mod payload_attestation_pool;
 mod payload_attributes;
@@ -1142,8 +1144,14 @@ impl BeaconStateTile {
         // Health first: a disconnect fails the batch in flight once, before
         // its `None` answer arrives.
         adapter.consume(|health: LeanVmHealthEvent, _| self.pq_aggregator.on_health(health));
-        adapter
-            .consume(|resp: LeanVmResp, _| self.pq_aggregator.on_response(resp, &mut self.reader));
+        adapter.consume(|resp: LeanVmResp, _| {
+            if let Some(verdict) = LeanVmVerifier::verdict(&resp, &mut self.reader) {
+                let request_id = resp.request_id;
+                silver_log::debug!(request_id, ?verdict, "leanvm proof verdict");
+                return;
+            }
+            self.pq_aggregator.on_response(resp, &mut self.reader);
+        });
 
         adapter.consume(|answer: SidecarBidResponse, producers| {
             self.on_sidecar_bid(answer, producers);

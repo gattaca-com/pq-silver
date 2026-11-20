@@ -142,6 +142,37 @@ fn a_rejection_is_an_error() {
     assert_eq!(AggregateResponse::decode(&body), Err("rejected by the leanvm sidecar"));
 }
 
+#[test]
+fn verify_request_has_the_protocol_layout() {
+    let claims = [claim(1), claim(2)];
+    let request = VerifyRequest { claims: &claims, proof: b"proof" };
+    let mut out = vec![0xAA; request.len()];
+    request.write(&mut out);
+
+    let mut expected = vec![2];
+    expected.extend(le(8 + 2 * 64 + 8 + 1));
+    expected.extend(le(2));
+    expected.extend(claim(1));
+    expected.extend(claim(2));
+    expected.extend(le(0));
+    expected.push(0);
+    expected.extend(le(5));
+    expected.extend(b"proof");
+    assert_eq!(out, expected);
+}
+
+#[test]
+fn only_a_well_formed_ok_judges_a_proof() {
+    assert_eq!(decode_verify_response(&[0, 1]), ProofVerdict::Valid);
+    assert_eq!(decode_verify_response(&[0, 0]), ProofVerdict::Invalid);
+    let mut malformed = vec![5];
+    malformed.extend(le(3));
+    malformed.extend(b"bad");
+    for body in [&[][..], &[0], &[0, 2], &[0, 1, 0], &malformed] {
+        assert_eq!(decode_verify_response(body), ProofVerdict::Unanswered, "{body:?}");
+    }
+}
+
 fn exchange(stream: &mut UnixStream, request: &[u8]) -> Vec<u8> {
     stream.write_all(&(request.len() as u64).to_le_bytes()).unwrap();
     stream.write_all(request).unwrap();
@@ -160,7 +191,7 @@ fn read_frame(stream: &mut UnixStream) -> Vec<u8> {
 /// leanVM's `bins/leanvm-sidecar/testdata/signatures-24000.bin`.
 #[test]
 #[ignore = "needs a leanvm-sidecar: set LEANVM_SIDECAR_SOCKET and LEANVM_SIGNATURES"]
-fn a_real_sidecar_aggregates_then_extends() {
+fn a_real_sidecar_aggregates_verifies_then_extends() {
     const RECORD: usize = 64 + XMSS_SIGNATURE_SIZE;
     let mut bytes = vec![0; 16 * RECORD];
     let file = std::env::var("LEANVM_SIGNATURES").expect("LEANVM_SIGNATURES");
@@ -186,6 +217,12 @@ fn a_real_sidecar_aggregates_then_extends() {
     let response = exchange(&mut stream, &request(vec![], &signatures[..8]));
     let AggregateResponse { claims, proof } = AggregateResponse::decode(&response).unwrap();
     assert_eq!(claims, sorted(&signatures[..8]));
+
+    let verify = |stream: &mut UnixStream, claims: &[Claim]| {
+        decode_verify_response(&exchange(stream, &VerifyRequest { claims, proof }.body()))
+    };
+    assert_eq!(verify(&mut stream, &claims), ProofVerdict::Valid);
+    assert_eq!(verify(&mut stream, &claims[1..]), ProofVerdict::Invalid, "a claim short");
 
     let child = (claims.as_slice(), proof);
     let response = exchange(&mut stream, &request(vec![child], &signatures[8..]));

@@ -15,15 +15,15 @@ use silver_common::TCacheRead;
 use silver_common::{
     BeaconStateEvent, BlockStage, ColumnOrigin, DataColumnsEvent, DataKind, EngineResp, ForkName,
     GossipTopic, IngestionTime, LockedProposal, NewGossipMsg, Origin, P2pStreamId, PeerEvent,
-    RequestId, RpcInbound, RpcOffence, RpcSeverity, SilverSpine, SilverSpineProducers, SszCache,
-    SyncNeed, SyncUpdate, TCacheError, TCacheId, TCacheProducer, TCacheReader, TCacheTable,
-    TProducer, TRead, TReadMode, TileId, block_root,
+    RequestId, RpcInbound, RpcOffence, RpcSeverity, SignedBlockLayout, SilverSpine,
+    SilverSpineProducers, SszCache, SyncNeed, SyncUpdate, TCacheError, TCacheId, TCacheProducer,
+    TCacheReader, TCacheTable, TProducer, TRead, TReadMode, TileId,
     cell_store::{
         CellStoreConfig, CellStoreEvent, CellValidationOutcome, CommitmentContext, ContextData,
         RetentionEvent, StoreError,
     },
     column_util::{self as util, KzgScratch},
-    ssz_view::{BYTES_PER_KZG_COMMITMENT, SignedBeaconBlockView, StatusView},
+    ssz_view::{BYTES_PER_KZG_COMMITMENT, StatusView},
     ticker::SlotTicker,
 };
 
@@ -178,23 +178,26 @@ impl DataColumnsTile {
             }
         };
 
-        debug_assert!(SignedBeaconBlockView::check_size(buffer));
-
-        let slot = SignedBeaconBlockView::slot(buffer);
+        let Some(layout) = SignedBlockLayout::of(&self.spec, buffer) else {
+            silver_log::warn!(?stream_id, len = buffer.len(), "malformed beacon block");
+            return None;
+        };
+        let slot = layout.slot(buffer);
         if slot <= self.sync_state.data_availability_floor() {
             return None;
         }
 
         let is_gloas = self.spec.is_gloas_at_slot(slot);
-        if is_gloas && !SignedBeaconBlockView::check_gloas_size(buffer) {
+        let commitments = layout.blob_kzg_commitments(buffer);
+        if is_gloas && commitments.is_none() {
             silver_log::warn!(slot, ?stream_id, "beacon block bid out of bounds");
             return None;
         }
-        let has_columns = SignedBeaconBlockView::has_data_columns(buffer, is_gloas);
+        let has_columns = commitments.is_some_and(|commitments| !commitments.is_empty());
 
         silver_log::info!(slot, has_columns, "beacon block recv");
 
-        let block_root = block_root(buffer, is_gloas);
+        let block_root = layout.block_root(buffer);
 
         if !has_columns {
             // recorded once the beacon state accepts the block
@@ -517,13 +520,13 @@ impl DataColumnsTile {
         producers: &mut SilverSpineProducers,
     ) {
         let parent_root = match t_read.buffer() {
-            Ok((buf, _)) if SignedBeaconBlockView::check_size(buf) => {
-                *SignedBeaconBlockView::parent_root(buf)
-            }
-            Ok((buf, _)) => {
-                silver_log::warn!(?stream_id, len = buf.len(), "malformed beacon block");
-                return;
-            }
+            Ok((buf, _)) => match SignedBlockLayout::of(&self.spec, buf) {
+                Some(layout) => layout.parent_root(buf),
+                None => {
+                    silver_log::warn!(?stream_id, len = buf.len(), "malformed beacon block");
+                    return;
+                }
+            },
             Err(e) => {
                 silver_log::error!(?e, ?stream_id, "failed to read beacon block cache buffer");
                 return;
@@ -735,10 +738,12 @@ impl DataColumnsTile {
     /// would have delivered it.
     pub fn ef_block(&mut self, ssz: TCacheRead, producers: &mut SilverSpineProducers) {
         let block = self.reader.acquire(ssz);
-        if let Ok((buf, _)) = block.buffer() {
-            let slot = SignedBeaconBlockView::slot(buf);
+        if let Ok((buf, _)) = block.buffer() &&
+            let Some(layout) = SignedBlockLayout::of(&self.spec, buf)
+        {
+            let slot = layout.slot(buf);
             let is_gloas = self.spec.is_gloas_at_slot(slot);
-            let root = block_root(buf, is_gloas);
+            let root = layout.block_root(buf);
             self.validator.note_validated(root, slot);
             self.validator.cache_parent_state_root(root, buf);
             if is_gloas {
@@ -836,11 +841,18 @@ impl DataColumnsTile {
 
                 match t_read.buffer() {
                     Ok((buf, _)) => {
-                        let slot = SignedBeaconBlockView::slot(buf);
+                        let Some(layout) = SignedBlockLayout::of(&self.spec, buf) else {
+                            silver_log::error!(len = buf.len(), "persisted block is malformed");
+                            return latest_status_event;
+                        };
+                        let slot = layout.slot(buf);
                         let is_gloas = self.spec.is_gloas_at_slot(slot);
-                        let block_root = block_root(buf, is_gloas);
+                        let block_root = layout.block_root(buf);
                         self.validator.cache_parent_state_root(block_root, buf);
-                        if !SignedBeaconBlockView::has_data_columns(buf, is_gloas) {
+                        let has_columns = layout
+                            .blob_kzg_commitments(buf)
+                            .is_some_and(|commitments| !commitments.is_empty());
+                        if !has_columns {
                             self.tracker.record_columnless(block_root, slot, producers);
                         }
 
@@ -1037,11 +1049,11 @@ mod tests {
     use silver_common::{
         BlockSource, BlockStage, EngineGetBlobsResp, EngineReq, HeadChange, LOCAL_GOSSIP_STREAM_ID,
         MESSAGE_ID_LEN, MessageId, Nanos, P2pStreamId, PayloadResolution, StreamProtocol, TCache,
-        TCacheId, TCacheProducer, TCacheRead, TCacheReader, TProducer, block_root_fulu,
+        TCacheId, TCacheProducer, TCacheRead, TCacheReader, TProducer, block_root, block_root_fulu,
         column_util::SidecarIdentity,
         ssz_view::{
             BYTES_PER_KZG_PROOF, DATA_COLUMN_SIDECAR_MIN, DataColumnSidecarFuluView,
-            NUMBER_OF_COLUMNS, SIGNED_BEACON_BLOCK_MIN,
+            NUMBER_OF_COLUMNS, SIGNED_BEACON_BLOCK_MIN, SignedBeaconBlockView,
         },
         test_util::ShmemDir,
     };

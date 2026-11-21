@@ -1,4 +1,8 @@
-use std::{fmt, ops::RangeInclusive};
+use std::{
+    fmt,
+    ops::RangeInclusive,
+    sync::atomic::{AtomicUsize, Ordering},
+};
 
 use flux::type_hash_derive::TypeHash;
 pub use silver_beacon_state_data::SYNC_COMMITTEE_SUBNETS;
@@ -154,7 +158,7 @@ impl GossipTopic {
         )
     }
 
-    pub const fn supports_format(self, format: ForkName) -> bool {
+    pub fn supports_format(self, format: ForkName) -> bool {
         if let Self::BeaconAttestation(id) = self {
             return id < attestation_subnet_count(format) as u64;
         }
@@ -167,16 +171,28 @@ impl GossipTopic {
 }
 
 pub const ATTESTATION_SUBNETS: usize = 64;
+/// The default `ATTESTATION_SUBNET_COUNT_PQ`, and the most a network may set.
 pub const ATTESTATION_SUBNETS_PQ: usize = 16;
 
-pub const fn attestation_subnet_count(format: ForkName) -> usize {
+/// `ATTESTATION_SUBNET_COUNT_PQ` of the network this process runs. Topics and
+/// subnet arithmetic have no configuration in reach, so it is process-wide.
+static CONFIGURED_SUBNETS_PQ: AtomicUsize = AtomicUsize::new(ATTESTATION_SUBNETS_PQ);
+
+/// Call once at startup, before any tile runs. `count` is a power of two, at
+/// most [`ATTESTATION_SUBNETS_PQ`].
+pub fn set_attestation_subnets_pq(count: usize) {
+    assert!(count.is_power_of_two() && count <= ATTESTATION_SUBNETS_PQ, "PQ subnet count {count}");
+    CONFIGURED_SUBNETS_PQ.store(count, Ordering::Relaxed);
+}
+
+pub fn attestation_subnet_count(format: ForkName) -> usize {
     match format {
-        ForkName::Pq => ATTESTATION_SUBNETS_PQ,
+        ForkName::Pq => CONFIGURED_SUBNETS_PQ.load(Ordering::Relaxed),
         _ => ATTESTATION_SUBNETS,
     }
 }
 
-pub const fn attestation_subnet_mask(format: ForkName) -> u64 {
+pub fn attestation_subnet_mask(format: ForkName) -> u64 {
     u64::MAX >> (64 - attestation_subnet_count(format))
 }
 

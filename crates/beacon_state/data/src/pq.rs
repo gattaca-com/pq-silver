@@ -101,26 +101,36 @@ pub fn xmss_pubkey(padded: &BLSPubkey) -> &XMSSPubkey {
     padded[XMSS_DEPOSIT_PREFIX_LEN..].try_into().unwrap()
 }
 
-/// The secret `proof` reveals, which its slot's leaf commits to.
+/// The first element of `proof`, which the RANDAO mix takes in. On devnet-0
+/// it is the slot's leaf itself; under the current spec it is the secret the
+/// leaf commits to.
 pub fn vrf_secret(proof: &VRFProof) -> &B256 {
     proof[..32].try_into().unwrap()
 }
 
-const VRF_LEAF_DOMAIN: &[u8; 8] = b"VRF_LEAF";
+// Spec `compute_vrf_leaf`, from consensus-specs `b5d422b25`. Unused while
+// devnet-0 reveals the leaf; see `is_valid_vrf_proof`.
+//
+// const VRF_LEAF_DOMAIN: &[u8; 8] = b"VRF_LEAF";
+//
+// fn vrf_leaf(secret: &B256, index: Slot) -> B256 {
+//     let mut preimage = [0; VRF_LEAF_DOMAIN.len() + 32 + 8];
+//     preimage[..8].copy_from_slice(VRF_LEAF_DOMAIN);
+//     preimage[8..40].copy_from_slice(secret);
+//     preimage[40..].copy_from_slice(&index.to_le_bytes());
+//     keccak256(&preimage)
+// }
 
-/// Spec `compute_vrf_leaf`.
-fn vrf_leaf(secret: &B256, index: Slot) -> B256 {
-    let mut preimage = [0; VRF_LEAF_DOMAIN.len() + 32 + 8];
-    preimage[..8].copy_from_slice(VRF_LEAF_DOMAIN);
-    preimage[8..40].copy_from_slice(secret);
-    preimage[40..].copy_from_slice(&index.to_le_bytes());
-    keccak256(&preimage)
-}
-
-/// Spec `is_valid_vrf_proof`: `proof` reveals the secret that leaf `slot` of
-/// the tree under `vrf_root` commits to.
+/// Spec `is_valid_vrf_proof` as of consensus-specs `2f43bc0`: `proof` opens
+/// leaf `slot` of the tree under `vrf_root`, and reveals the leaf.
+///
+/// devnet-0 runs this rule: Lighthouse, Prysm and the genesis tool that
+/// writes the VRF roots all build the tree over revealed leaves. The current
+/// spec (`b5d422b25`) has the leaf commit to a secret instead. To follow it,
+/// start from the commented-out `vrf_leaf` line below.
 pub fn is_valid_vrf_proof(proof: &VRFProof, slot: Slot, vrf_root: &B256) -> bool {
-    let mut node = vrf_leaf(vrf_secret(proof), slot);
+    // let mut node = vrf_leaf(vrf_secret(proof), slot);
+    let mut node = *vrf_secret(proof);
     let mut pair = [0; 64];
     for (height, sibling) in proof[32..].chunks_exact(32).enumerate() {
         let (left, right) =
@@ -174,8 +184,9 @@ mod tests {
         assert_eq!(deposit_vrf_root(&fresh, &[0x33; 96]), [0x33; 32]);
     }
 
-    /// The pyspec's `is_valid_vrf_proof` accepts this proof, whose element `i`
-    /// is `[i; 32]`, at slot 1430 under this root, and rejects it at 1431.
+    /// The root of the proof whose element `i` is `[i; 32]`, opened at slot
+    /// 1430 with the leaf revealed. The current spec's rule, where the leaf
+    /// commits to a secret, gives `95a44af3…d4688c` for the same proof.
     #[test]
     fn vrf_proof_opens_only_its_slot() {
         let slot = 1430;
@@ -184,7 +195,7 @@ mod tests {
             node.fill(i as u8);
         }
         let root: B256 =
-            hex::decode("95a44af3d2071823fba9b2329913d39c29ea84da1eb5bca96c429087d9d4688c")
+            hex::decode("0bc38251c5d967c98bcea378bb51c169144b71a89fb11e49fa41f1f0aada8d05")
                 .unwrap()
                 .try_into()
                 .unwrap();

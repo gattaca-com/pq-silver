@@ -5,8 +5,8 @@ use crate::{
     merkle::B256,
     ssz_view::{
         BeaconBlockBodyFuluView, BeaconBlockBodyGloasView, BeaconBlockBodyPqView,
-        ExecutionPayloadEnvelopeView, SIGNED_BLS_FIXED, SIGNED_PQ_FIXED, SignedBeaconBlockPqView,
-        SignedBeaconBlockView, SignedExecutionPayloadEnvelopePqView,
+        ExecutionPayloadBidView, ExecutionPayloadEnvelopeView, SIGNED_BLS_FIXED, SIGNED_PQ_FIXED,
+        SignedBeaconBlockPqView, SignedBeaconBlockView, SignedExecutionPayloadEnvelopePqView,
         SignedExecutionPayloadEnvelopeView,
     },
 };
@@ -146,6 +146,19 @@ impl SignedBlockLayout {
                 .then(|| &SignedExecutionPayloadEnvelopeView::signature(envelope)[..]),
             Self::Pq => SignedExecutionPayloadEnvelopePqView::check_size(envelope)
                 .then(|| &SignedExecutionPayloadEnvelopePqView::signature(envelope)[..]),
+        }
+    }
+
+    /// The block's blob KZG commitments: its body's before Gloas, its bid's
+    /// from Gloas on. `None` when they are out of bounds.
+    pub fn blob_kzg_commitments(self, block: &[u8]) -> Option<&[u8]> {
+        match self {
+            Self::Fulu => {
+                BeaconBlockBodyFuluView::blob_kzg_commitments(SignedBeaconBlockView::body(block))
+            }
+            Self::Gloas | Self::Pq => {
+                self.bid(block).map(ExecutionPayloadBidView::blob_kzg_commitments)
+            }
         }
     }
 

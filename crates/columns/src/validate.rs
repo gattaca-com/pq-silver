@@ -6,11 +6,12 @@ use std::{
 use flux_profiler::timed;
 use silver_beacon_state_data::{BeaconStateReader, SLOTS_PER_EPOCH, SpecConfig};
 use silver_common::{
-    GossipDomain, IngestionTime, P2pStreamId, SszCache, TRead, Wheel, column_util as util,
+    GossipDomain, IngestionTime, P2pStreamId, SignedBlockLayout, SszCache, TRead, Wheel,
+    column_util as util,
     ssz_view::{
         BYTES_PER_CELL, BYTES_PER_KZG_COMMITMENT, BYTES_PER_KZG_PROOF,
         DATA_COLUMN_SIDECAR_GLOAS_MIN, DataColumnSidecarFuluView, DataColumnSidecarGloasView,
-        NUMBER_OF_COLUMNS, SidecarLayout, SignedBeaconBlockView,
+        NUMBER_OF_COLUMNS, SidecarLayout,
     },
     ticker::{MAXIMUM_GOSSIP_CLOCK_DISPARITY, SlotTicker},
 };
@@ -142,7 +143,8 @@ impl ColumnValidator {
     }
 
     pub fn cache_parent_state_root(&mut self, block_root: BlockRoot, buffer: &[u8]) {
-        self.partial_parents.remember(block_root, Some(*SignedBeaconBlockView::state_root(buffer)));
+        let Some(layout) = SignedBlockLayout::of(&self.spec, buffer) else { return };
+        self.partial_parents.remember(block_root, Some(layout.state_root(buffer)));
     }
 
     pub fn is_validated(&self, block_root: &BlockRoot) -> bool {
@@ -171,14 +173,15 @@ impl ColumnValidator {
         {
             return;
         }
-        let commitments = SignedBeaconBlockView::gloas_block_commitments(buffer);
+        let Some(layout) = SignedBlockLayout::of(&self.spec, buffer) else { return };
+        let Some(commitments) = layout.blob_kzg_commitments(buffer) else { return };
+        let slot = layout.slot(buffer);
         if !commitments.is_empty() &&
             commitments.len().is_multiple_of(BYTES_PER_KZG_COMMITMENT) &&
-            commitments.len() / BYTES_PER_KZG_COMMITMENT <=
-                self.max_blobs_at(SignedBeaconBlockView::slot(buffer))
+            commitments.len() / BYTES_PER_KZG_COMMITMENT <= self.max_blobs_at(slot)
         {
             self.gloas_commitments.insert(block_root, GloasBlockCommitments {
-                slot: SignedBeaconBlockView::slot(buffer),
+                slot,
                 commitments: commitments.to_vec().into_boxed_slice(),
             });
         }

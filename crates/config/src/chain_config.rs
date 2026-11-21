@@ -5,7 +5,10 @@ use std::{
 
 use serde::Deserialize;
 use silver_chain_spec::{ForkName, SpecConfig};
-use silver_common::{Enr, Error, NodeChain, SLOTS_PER_EPOCH, ssz_view::MAX_COMMITTEES_PER_SLOT_PQ};
+use silver_common::{
+    ATTESTATION_SUBNETS_PQ, Enr, Error, NodeChain, SLOTS_PER_EPOCH,
+    ssz_view::MAX_COMMITTEES_PER_SLOT_PQ,
+};
 
 use crate::{Genesis, Network};
 
@@ -106,6 +109,20 @@ impl ChainConfig {
             return Err(Error::ConfigError(format!(
                 "{} sets X_MAX_COMMITTEE_COUNT_PER_SLOT {configured}; it must be within \
                  1..={MAX_COMMITTEES_PER_SLOT_PQ}",
+                self.spec.network_name(),
+            )));
+        }
+        Ok(())
+    }
+
+    /// Subnet prefixes take `log2` of the count, and the attnets a node tracks
+    /// per aggregator fit 16 subnets.
+    pub fn require_subnet_count_in_range(&self) -> Result<(), Error> {
+        let configured = self.spec.attestation_subnet_count_pq;
+        if !configured.is_power_of_two() || configured > ATTESTATION_SUBNETS_PQ as u64 {
+            return Err(Error::ConfigError(format!(
+                "{} sets ATTESTATION_SUBNET_COUNT_PQ {configured}; it must be a power of two, at \
+                 most {ATTESTATION_SUBNETS_PQ}",
                 self.spec.network_name(),
             )));
         }

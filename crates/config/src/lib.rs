@@ -781,6 +781,19 @@ mod tests {
     }
 
     #[test]
+    fn pq_subnet_count_must_be_a_power_of_two_within_the_attnets() {
+        let mut chain = Config::mainnet().unwrap().chain().unwrap();
+        for (configured, accepted) in [(0, false), (1, true), (2, true), (3, false), (32, false)] {
+            chain.spec.attestation_subnet_count_pq = configured;
+            let checked = chain.require_subnet_count_in_range();
+            assert_eq!(checked.is_ok(), accepted, "{configured}");
+            if let Err(err) = checked {
+                assert!(format!("{err}").contains("ATTESTATION_SUBNET_COUNT_PQ"));
+            }
+        }
+    }
+
+    #[test]
     fn mainnet_blob_schedule_fits_the_block_capacity() {
         let max_blobs = Network::Mainnet.spec().unwrap().max_scheduled_blobs_per_block();
         assert!(max_blobs <= MAX_BLOBS_PER_BLOCK as u64, "{max_blobs} > {MAX_BLOBS_PER_BLOCK}");

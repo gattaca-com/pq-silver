@@ -265,8 +265,14 @@ fn unknown_root_vote_counts_and_is_aggregated_once_its_block_imports() {
     let late = [0x42; 32];
     let (bytes, subnet) = signed_attestation(&tile, &key, validator, 0, late);
     let mut subscription = [0; SlotSubnets::SIZE];
-    SlotSubnets { slot: wall_slot, attesting: 1 << subnet, aggregating: 1 << subnet }
-        .encode(&mut subscription);
+    let aggregator_positions = SlotSubnets::position_bit(subnet, 0);
+    SlotSubnets {
+        slot: wall_slot,
+        attesting: 1 << subnet,
+        aggregating: 1 << subnet,
+        aggregator_positions,
+    }
+    .encode(&mut subscription);
     tile.aggregator_subnets.record(&subscription);
     tile.pq_aggregator.on_health(LeanVmHealthEvent { ready: true });
 
@@ -284,9 +290,9 @@ fn unknown_root_vote_counts_and_is_aggregated_once_its_block_imports() {
     adapter.consume(|_: LeanVmReq, _| requests += 1);
     assert_eq!(requests, 0);
 
-    // XMSS signing is slow; keep the clock before the aggregation deadline.
-    let before_deadline = tile.ticker.aggregate_due(wall_slot).as_millis_u64() - 1;
-    tile.ticker.set_since_genesis_ms(before_deadline);
+    // XMSS signing is slow; keep the clock before the aggregation cutoff.
+    let before_cutoff = tile.ticker.aggregation_cutoff(wall_slot, 0).as_millis_u64() - 1;
+    tile.ticker.set_since_genesis_ms(before_cutoff);
     tile.fork_choice
         .on_block(BlockImport { slot: wall_slot, ..anchor_child(late, tile.last_applied) });
     tile.promote_unknown_root_votes(&mut adapter.producers);

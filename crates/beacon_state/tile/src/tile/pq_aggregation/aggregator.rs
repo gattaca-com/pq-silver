@@ -94,7 +94,10 @@ pub struct PqAggregator {
 }
 
 impl PqAggregator {
-    pub fn add_vote(&mut self, vote: VerifiedVote, ticker: &SlotTicker) {
+    /// `last_position` is the last place a local aggregator of the vote's
+    /// committee holds in its aggregation committee. Votes are taken until
+    /// its cutoff and proved until its aggregate is due.
+    pub fn add_vote(&mut self, vote: VerifiedVote, last_position: u64, ticker: &SlotTicker) {
         let leaf = LeafKey::new(&vote);
         if vote.committee_position >= vote.committee_len.min(MAX_VALIDATORS_PER_COMMITTEE) {
             let (committee_position, committee_len) = (vote.committee_position, vote.committee_len);
@@ -106,14 +109,14 @@ impl PqAggregator {
             );
             return;
         }
+        if ticker.since_genesis() >= ticker.aggregation_cutoff(leaf.slot, last_position) {
+            silver_log::debug!(slot = leaf.slot, "vote after the aggregation cutoff");
+            return;
+        }
         // TODO: the aggregate due time stands in for the VC's pull. A VC that
         // pulls later gets a proof frozen at the due time. Consider ending on
         // the last local aggregator's pull instead.
-        let deadline = ticker.aggregate_due(leaf.slot);
-        if ticker.since_genesis() >= deadline {
-            silver_log::debug!(slot = leaf.slot, "vote after the aggregation deadline");
-            return;
-        }
+        let deadline = ticker.pq_aggregate_due(leaf.slot, last_position);
         let aggregation = self.leaves.entry(leaf).or_insert_with(|| {
             let data = SingleAttestationPqView::data(vote.single);
             LeafAggregation::new(*data.as_bytes(), vote.committee_len, deadline)

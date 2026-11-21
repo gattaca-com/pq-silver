@@ -182,7 +182,12 @@ mod tests {
     }
 
     fn aggregating(slot: u64, subnets: &[u64]) -> SlotSubnets {
-        SlotSubnets { slot, attesting: mask(subnets), aggregating: mask(subnets) }
+        SlotSubnets {
+            slot,
+            attesting: mask(subnets),
+            aggregating: mask(subnets),
+            aggregator_positions: 0,
+        }
     }
 
     fn changes(join: &[u64], leave: &[u64], attesting: &[u64]) -> Option<SubnetChanges> {
@@ -214,7 +219,7 @@ mod tests {
     #[test]
     fn attester_duty_asks_for_peers_without_joining() {
         let mut duties = SubnetDuties::default();
-        duties.add(SlotSubnets { slot: 110, attesting: 1 << 3, aggregating: 0 }, 100);
+        duties.add(SlotSubnets { slot: 110, attesting: 1 << 3, ..SlotSubnets::default() }, 100);
 
         assert_eq!(duties.advance(106), changes(&[], &[], &[3]));
         assert_eq!(duties.advance(111), None);

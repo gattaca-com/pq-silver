@@ -212,6 +212,7 @@ impl SubnetsBySlot {
         }
         held.attesting |= added.attesting;
         held.aggregating |= added.aggregating;
+        held.aggregator_positions |= added.aggregator_positions;
     }
 
     pub fn held(&self) -> impl Iterator<Item = &SlotSubnets> {

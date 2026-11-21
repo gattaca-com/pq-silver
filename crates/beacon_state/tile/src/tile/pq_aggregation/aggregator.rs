@@ -1,6 +1,6 @@
 use std::{cmp::Reverse, mem};
 
-use flux::spine::SpineProducers;
+use flux::{Timer, spine::SpineProducers};
 use rustc_hash::FxHashMap;
 use silver_beacon_state_data::{B256, Slot};
 use silver_common::{
@@ -44,6 +44,7 @@ enum LeanVm {
         request_id: u64,
         key: AggregationKey,
         batch: Batch,
+        sent: Nanos,
     },
 }
 
@@ -66,12 +67,13 @@ impl LeanVm {
         }
     }
 
-    /// Becomes idle if `request_id` is in flight, handing back its batch.
-    fn take_answered(&mut self, request_id: u64) -> Option<(AggregationKey, Batch)> {
+    /// Becomes idle if `request_id` is in flight, handing back its batch and
+    /// when it went out.
+    fn take_answered(&mut self, request_id: u64) -> Option<(AggregationKey, Batch, Nanos)> {
         match mem::take(self) {
-            Self::Busy { request_id: id, key, batch } if id == request_id => {
+            Self::Busy { request_id: id, key, batch, sent } if id == request_id => {
                 *self = Self::Idle;
-                Some((key, batch))
+                Some((key, batch, sent))
             }
             other => {
                 *self = other;
@@ -83,7 +85,6 @@ impl LeanVm {
 
 /// Every aggregation this node runs. One `LeanVmReq` is in flight at a time,
 /// across all aggregations. Events only change state; `send_next` sends.
-#[derive(Default)]
 pub struct PqAggregator {
     leaves: FxHashMap<LeafKey, LeafAggregation>,
     merges: FxHashMap<Slot, MergeAggregation>,
@@ -91,6 +92,22 @@ pub struct PqAggregator {
     changed: bool,
     leanvm: LeanVm,
     next_request_id: u64,
+    leaf_round_trip: Timer,
+    merge_round_trip: Timer,
+}
+
+impl Default for PqAggregator {
+    fn default() -> Self {
+        Self {
+            leaves: FxHashMap::default(),
+            merges: FxHashMap::default(),
+            changed: false,
+            leanvm: LeanVm::default(),
+            next_request_id: 0,
+            leaf_round_trip: Timer::new("silver", "leanvm_prove"),
+            merge_round_trip: Timer::new("silver", "leanvm_merge"),
+        }
+    }
 }
 
 impl PqAggregator {
@@ -152,7 +169,14 @@ impl PqAggregator {
         if body.is_none() && acquired.is_some() {
             silver_log::error!(request_id = resp.request_id, "leanvm response unreadable");
         }
-        let Some((key, batch)) = self.leanvm.take_answered(resp.request_id) else { return };
+        let Some((key, batch, sent)) = self.leanvm.take_answered(resp.request_id) else { return };
+        if body.is_some() {
+            let round_trip = match key {
+                AggregationKey::Leaf(_) => &mut self.leaf_round_trip,
+                AggregationKey::Merge(_) => &mut self.merge_round_trip,
+            };
+            round_trip.emit_latency_from_nanos(sent, Nanos::now());
+        }
         self.finish(key, batch, body.map(|(body, _)| body));
         self.changed = true;
     }
@@ -199,7 +223,7 @@ impl PqAggregator {
         let Some((batch, body)) = self.write_request(key, now, tcache) else { return };
         let request_id = self.next_request_id;
         self.next_request_id += 1;
-        self.leanvm = LeanVm::Busy { request_id, key, batch };
+        self.leanvm = LeanVm::Busy { request_id, key, batch, sent: Nanos::now() };
         producers.produce(LeanVmReq { request_id, body });
     }
 

@@ -76,7 +76,7 @@ jobs:
           setup_only: true
 
       - name: Build
-        run: cargo build --profile release-prod --locked --bin silver --bin silver_surfer
+        run: cargo build --profile release-prod --locked --features silver/metrics --bin silver --bin silver_surfer
 
       - name: Package
         run: |

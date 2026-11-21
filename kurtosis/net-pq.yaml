@@ -1,0 +1,37 @@
+# PQ-from-genesis devnet: two Lighthouse nodes and one Silver node, four
+# validators each. Run from a checkout of ethereum-package's `pq` branch with
+# the Silver launcher merged in:
+#
+#   kurtosis run --privileged --enclave silver-pq <ethereum-package> --args-file kurtosis/net-pq.yaml
+#
+# `silver:pq-devnet-0` is built from eth-client-docker-image-builder's
+# silver/Dockerfile.pq-devnet-0, with this repository as the build context.
+
+participants:
+  - el_type: geth
+    cl_type: lighthouse
+    cl_image: ethpandaops/lighthouse:pq-devnet-0
+    vc_type: lighthouse
+    vc_image: ethpandaops/lighthouse:pq-devnet-0
+    supernode: true
+    validator_count: 4
+    count: 2
+  - el_type: geth
+    cl_type: silver
+    cl_image: silver:pq-devnet-0
+    vc_type: lighthouse
+    vc_image: ethpandaops/lighthouse:pq-devnet-0
+    validator_count: 4
+    count: 1
+
+network_params:
+  preset: mainnet
+  fulu_fork_epoch: 0
+  gloas_fork_epoch: 0
+  pq_fork_epoch: 0
+  num_validator_keys_per_node: 4
+  attestation_subnet_count_pq: 2
+  genesis_delay: 120
+  xmss_cache_url: https://panda-uploads-production.devops-539.workers.dev/panda/uploads/dd1a1c/b9dec4e1daa17dfe.xmss
+
+global_log_level: info

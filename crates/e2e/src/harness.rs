@@ -23,8 +23,10 @@ use crate::{
 const NO_HANDLE: usize = usize::MAX;
 
 pub struct TwoStackHarness {
-    pub publisher: PublisherStack,
-    pub echo: EchoStack,
+    /// Boxed, as is `echo`: by value the two stacks leave a test thread's
+    /// stack no headroom.
+    pub publisher: Box<PublisherStack>,
+    pub echo: Box<EchoStack>,
     pub fork_digest_hex: String,
 
     /// Publisher's connection-handle for echo, discovered via
@@ -51,7 +53,7 @@ impl TwoStackHarness {
         let echo_kp = keypair_from_seed(2);
 
         let publisher = on_free_loopback_ports(|addr, disc_addr| {
-            PublisherStack::new(tempdir.path(), "_pub", addr, disc_addr, publisher_kp)
+            PublisherStack::new(tempdir.path(), "_pub", addr, disc_addr, publisher_kp).map(Box::new)
         })?;
         let echo = on_free_loopback_ports(|addr, disc_addr| {
             EchoStack::new(
@@ -62,6 +64,7 @@ impl TwoStackHarness {
                 echo_kp,
                 fork_digest_hex.clone(),
             )
+            .map(Box::new)
         })?;
 
         Ok(Self {

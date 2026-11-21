@@ -104,7 +104,8 @@ impl NodeId {
     pub fn attestation_subnets(&self, format: ForkName, epoch: u64, count: u8) -> [u8; 8] {
         // Both counts are powers of two. Mainnet ATTESTATION_SUBNET_EXTRA_BITS is zero.
         let subnet_count = attestation_subnet_count(format) as u64;
-        let prefix = (self.raw[0] >> (8 - subnet_count.ilog2())) as u64;
+        // One subnet has a prefix of no bits.
+        let prefix = self.raw[0].checked_shr(8 - subnet_count.ilog2()).unwrap_or(0) as u64;
         // node_id % EPOCHS_PER_SUBNET_SUBSCRIPTION (raw is big-endian).
         let node_offset = self.raw[31] as u64;
         let period = epoch / EPOCHS_PER_SUBNET_SUBSCRIPTION +

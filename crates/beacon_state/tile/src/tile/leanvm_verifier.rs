@@ -1,5 +1,5 @@
-use flux::spine::SpineProducers;
-use silver_common::{LeanVmReq, LeanVmResp, TCacheProducer, TCacheReader, TProducer};
+use flux::{Timer, spine::SpineProducers};
+use silver_common::{LeanVmReq, LeanVmResp, Nanos, TCacheProducer, TCacheReader, TProducer};
 
 use crate::tile::{
     Producers,
@@ -26,10 +26,23 @@ pub enum ProofVerdict {
 /// Verify requests to the leanVM sidecar. Each is answered once, through
 /// [`Self::verdict`], under the id [`Self::send`] returned; the caller keeps
 /// what waits on it.
-#[derive(Default)]
 pub struct LeanVmVerifier {
     sent: u64,
     claims: Vec<Claim>,
+    /// Each request awaiting its answer, and when it went out.
+    in_flight: Vec<(u64, Nanos)>,
+    round_trip: Timer,
+}
+
+impl Default for LeanVmVerifier {
+    fn default() -> Self {
+        Self {
+            sent: 0,
+            claims: Vec::new(),
+            in_flight: Vec::new(),
+            round_trip: Timer::new("silver", "leanvm_verify"),
+        }
+    }
 }
 
 impl LeanVmVerifier {
@@ -54,6 +67,7 @@ impl LeanVmVerifier {
         };
         let request_id = self.next_request_id();
         self.sent += 1;
+        self.in_flight.push((request_id, Nanos::now()));
         producers.produce(LeanVmReq { request_id, body });
         Some(request_id)
     }
@@ -65,9 +79,19 @@ impl LeanVmVerifier {
     }
 
     /// The verdict `resp` carries, if it answers a verify request.
-    pub fn verdict(resp: &LeanVmResp, reader: &mut TCacheReader) -> Option<ProofVerdict> {
+    pub fn verdict(
+        &mut self,
+        resp: &LeanVmResp,
+        reader: &mut TCacheReader,
+    ) -> Option<ProofVerdict> {
         if resp.request_id & VERIFY_ID_BIT == 0 {
             return None;
+        }
+        if let Some(at) = self.in_flight.iter().position(|&(id, _)| id == resp.request_id) {
+            let (_, sent) = self.in_flight.swap_remove(at);
+            if resp.body.is_some() {
+                self.round_trip.emit_latency_from_nanos(sent, Nanos::now());
+            }
         }
         let Some(body) = resp.body else { return Some(ProofVerdict::Unanswered) };
         let acquired = reader.acquire(body);

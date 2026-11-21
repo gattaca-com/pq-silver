@@ -1,4 +1,11 @@
-use std::{collections::VecDeque, fs::File, io::Read, path::PathBuf, sync::Arc, time::Instant};
+use std::{
+    collections::VecDeque,
+    fs::File,
+    io::Read,
+    path::PathBuf,
+    sync::Arc,
+    time::{Duration, Instant},
+};
 
 use flux::{spine::SpineAdapter, tile::Tile};
 use flux_profiler::timed;
@@ -9,6 +16,7 @@ use silver_common::{
     SignedBlockLayout, SilverSpine, SilverSpineProducers, SyncNeed, SyncUpdate, SyncingStrategy,
     TCacheError, TCacheId, TCacheProducer, TCacheReader, TCacheTable, TProducer, TReadMode, TileId,
     ssz_view::{SignedBeaconBlockView, StatusView},
+    wake_within,
 };
 
 use crate::{
@@ -17,6 +25,8 @@ use crate::{
 };
 
 const MAX_REPLAY_BLOCKS_PER_LOOP: usize = 16;
+/// File i/o in flight advances once per loop, and nothing signals for it.
+const IDLE_WAKE: Duration = Duration::from_millis(20);
 
 enum ReplayStep {
     Block { path: PathBuf, columns_on_disk: bool },
@@ -526,6 +536,8 @@ impl Tile<SilverSpine> for StorageTile {
                 "storage store file i/o failed"
             );
         }
+
+        wake_within(adapter, IDLE_WAKE);
     }
 }
 

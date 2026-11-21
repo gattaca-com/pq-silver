@@ -786,6 +786,7 @@ impl BeaconStateTile {
     fn commit_pq_attestation(&mut self, p: PreparedPqAttestation) -> Feedback {
         let checked = p.checked;
         let target = checked.target;
+        self.arrival_timers.attestation(target.attestation_slot, &self.ticker);
         self.seen_attesters.mark(target.target_epoch, checked.attester as usize);
         let aggregates = self.aggregator_subnets.aggregates(target.attestation_slot, p.subnet);
         if checked.attested.is_ready() {
@@ -2425,6 +2426,7 @@ impl BeaconStateTile {
                     Ok(sent) => sent,
                     Err(feedback) => return Some(feedback),
                 };
+                self.arrival_timers.aggregate(aggregate.target.attestation_slot, &self.ticker);
                 let gossip = GossipAwaitingProof::Aggregate(aggregate);
                 let slot = self.ticker.current_slot();
                 self.gossip_proofs.park(*m, pin.clone(), gossip, slot, request_id..request_id + 1);

@@ -1,0 +1,50 @@
+# PQ-from-genesis devnet: one Silver, one Lighthouse and one Prysm node, four
+# validators each. See net-pq.yaml for how to run it and build silver:pq-devnet-0.
+#
+# Silver is listed last: it opens its ports only at genesis, and Kurtosis
+# starts consensus nodes in order, so nodes after it would start late.
+#
+# `prysm-pq/beacon-chain:leanvm` is ethpandaops/prysm-beacon-chain:pq-devnet-0
+# with a leanvm-sidecar and a wrapper at /beacon-chain that starts it on
+# /leanvm/s.sock. Without --pq-prover-socket Prysm makes proofs no other client
+# accepts.
+
+participants:
+  - el_type: geth
+    cl_type: lighthouse
+    cl_image: ethpandaops/lighthouse:pq-devnet-0
+    vc_type: lighthouse
+    vc_image: ethpandaops/lighthouse:pq-devnet-0
+    supernode: true
+    validator_count: 4
+  - el_type: geth
+    cl_type: prysm
+    cl_image: prysm-pq/beacon-chain:leanvm
+    cl_extra_params:
+      - --pq-prover-socket=/leanvm/s.sock
+    vc_type: prysm
+    vc_image: ethpandaops/prysm-validator:pq-devnet-0
+    vc_extra_params:
+      - --enable-beacon-rest-api
+      - --vrf-state-url=https://raw.githubusercontent.com/ethpandaops/ethereum-package/d4c9a8ace9dd80ca4f9938885345f8f40a646fd0/static_files/xmss-keys/b9dec4e1daa17dfe.vrf
+    use_separate_vc: true
+    supernode: true
+    validator_count: 4
+  - el_type: geth
+    cl_type: silver
+    cl_image: silver:pq-devnet-0
+    vc_type: lighthouse
+    vc_image: ethpandaops/lighthouse:pq-devnet-0
+    validator_count: 4
+
+network_params:
+  preset: mainnet
+  fulu_fork_epoch: 0
+  gloas_fork_epoch: 0
+  pq_fork_epoch: 0
+  num_validator_keys_per_node: 4
+  attestation_subnet_count_pq: 2
+  genesis_delay: 240
+  xmss_cache_url: https://panda-uploads-production.devops-539.workers.dev/panda/uploads/dd1a1c/b9dec4e1daa17dfe.xmss
+
+global_log_level: info

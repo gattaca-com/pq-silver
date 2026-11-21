@@ -25,6 +25,7 @@ use silver_common::{
     column_util::{self as util, KzgScratch},
     ssz_view::{BYTES_PER_KZG_COMMITMENT, StatusView},
     ticker::SlotTicker,
+    wake_within,
 };
 
 use crate::{
@@ -53,6 +54,9 @@ enum ColumnDisposition {
     Ignored,
     Rejected { block_root: BlockRoot, slot: u64, column: Option<u64> },
 }
+
+/// Cell assembly retries every 20 ms.
+const IDLE_WAKE: Duration = Duration::from_millis(10);
 
 pub struct DataColumnsTile {
     spec: Arc<SpecConfig>,
@@ -1038,6 +1042,8 @@ impl Tile<SilverSpine> for DataColumnsTile {
             cells.flush_updates(&mut self.tracker, &mut adapter.producers);
         }
         self.el_fetcher.rotate(now);
+
+        wake_within(adapter, IDLE_WAKE);
     }
 }
 

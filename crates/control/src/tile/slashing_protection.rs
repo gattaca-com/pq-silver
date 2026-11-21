@@ -365,6 +365,10 @@ impl SlashingProtectionHandler {
         })
     }
 
+    pub(super) fn is_clustered(&self) -> bool {
+        self.cluster.is_some()
+    }
+
     /// The wall slot is known from here on, before Beacon State's first
     /// Status: member messages are checked against it.
     pub(super) fn set_clock(&mut self, ticker: SlotTicker) {

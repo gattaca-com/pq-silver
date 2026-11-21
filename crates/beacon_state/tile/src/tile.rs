@@ -22,6 +22,7 @@ use silver_common::{
     hex32,
     ssz_view::{STATUS_V2_SIZE, SYNC_COMMITTEE_CONTRIBUTION_SIZE},
     ticker::{MAXIMUM_GOSSIP_CLOCK_DISPARITY, SlotTicker, TickEvent},
+    wake_within,
 };
 use silver_config::{PendingBounds, SyncingConfig};
 use silver_slashing::SlashingPool;
@@ -31,6 +32,7 @@ use crate::{
     ssz_hash, stf,
     tile::{
         aggregator_subnets::AggregatorSubnets,
+        arrival_timers::ArrivalTimers,
         attestation_pool::{AttestationPool, UnknownRootPqVotes, UnknownRootVotes},
         attestation_root_memo::AttestationRootMemo,
         bid_pool::BidPool,
@@ -60,6 +62,7 @@ use crate::{
 };
 
 mod aggregator_subnets;
+mod arrival_timers;
 mod attestation_pool;
 mod precomputed_epochs;
 // `pub` for the crate's `attestation_root_memo` criterion bench.
@@ -90,6 +93,10 @@ mod seen_proposer_preferences;
 mod seen_validators;
 mod shuffling_cache;
 mod sync_contribution_pool;
+
+/// Longest idle park. Payload, bid and aggregation deadlines are not slot
+/// phases, so the ticker does not bound them.
+const IDLE_WAKE: Duration = Duration::from_millis(5);
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub enum Feedback {
@@ -281,6 +288,7 @@ pub struct BeaconStateTile {
     payload_execution_requests: PayloadExecutionRequests,
     payload_attestation_pool: PayloadAttestationPool,
     pq_aggregator: PqAggregator,
+    arrival_timers: ArrivalTimers,
     aggregator_subnets: AggregatorSubnets,
     leanvm_verifier: LeanVmVerifier,
     gossip_proofs: GossipProofs,
@@ -384,6 +392,7 @@ impl BeaconStateTile {
             payload_execution_requests: PayloadExecutionRequests::default(),
             payload_attestation_pool: PayloadAttestationPool::default(),
             pq_aggregator: PqAggregator::default(),
+            arrival_timers: ArrivalTimers::new(),
             aggregator_subnets: AggregatorSubnets::default(),
             leanvm_verifier: LeanVmVerifier::default(),
             gossip_proofs: GossipProofs::default(),
@@ -1176,7 +1185,7 @@ impl BeaconStateTile {
         // its `None` answer arrives.
         adapter.consume(|health: LeanVmHealthEvent, _| self.pq_aggregator.on_health(health));
         adapter.consume(|resp: LeanVmResp, producers| {
-            if let Some(verdict) = LeanVmVerifier::verdict(&resp, &mut self.reader) {
+            if let Some(verdict) = self.leanvm_verifier.verdict(&resp, &mut self.reader) {
                 let request_id = resp.request_id;
                 silver_log::debug!(request_id, ?verdict, "leanvm proof verdict");
                 if !self.gossip_proofs.awaits(request_id) {
@@ -1572,6 +1581,8 @@ impl Tile<SilverSpine> for BeaconStateTile {
         // After every event, so a request goes out in the iteration that unlocked it.
         let tcache = &mut self.events_producer;
         self.pq_aggregator.send_next(&self.ticker, tcache, &mut adapter.producers);
+
+        wake_within(adapter, self.ticker.until_next_tick().min(IDLE_WAKE));
     }
 }
 

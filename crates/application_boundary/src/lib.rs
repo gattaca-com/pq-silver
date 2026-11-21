@@ -27,6 +27,16 @@ const PBS_HEADER_TOKENS: TokenRange = TokenRange::share(3, TENANTS);
 const PBS_SUBMISSION_TOKENS: TokenRange = TokenRange::share(4, TENANTS);
 const BUILDER_TOKENS: TokenRange = TokenRange::share(5, TENANTS);
 const LEANVM_TOKENS: TokenRange = TokenRange::share(6, TENANTS);
+/// Above every share, so no tenant dispatches it.
+#[cfg(feature = "thread_park")]
+const WAKER_TOKEN: mio::Token = mio::Token(usize::MAX);
+
+/// Bounds the sleep of an idle loop, so request and connection deadlines
+/// still fire with no socket or spine activity.
+#[cfg(feature = "thread_park")]
+const IDLE_WAIT: Duration = Duration::from_millis(10);
+#[cfg(not(feature = "thread_park"))]
+const IDLE_WAIT: Duration = Duration::ZERO;
 
 pub struct ApplicationBoundaryTile {
     readiness: Readiness,
@@ -38,6 +48,7 @@ pub struct ApplicationBoundaryTile {
     /// The tile's one producer, shared by engine responses and the messages
     /// the beacon api publishes.
     processing: TProducer,
+    worked: bool,
 }
 
 impl Tile<SilverSpine> for ApplicationBoundaryTile {
@@ -47,8 +58,18 @@ impl Tile<SilverSpine> for ApplicationBoundaryTile {
         adapter.subscribe_broadcast::<SyncUpdate>();
     }
 
-    fn try_init(&mut self, _adapter: &mut SpineAdapter<SilverSpine>) -> bool {
+    fn try_init(&mut self, adapter: &mut SpineAdapter<SilverSpine>) -> bool {
         self.open_tcaches().expect("tcache wiring");
+        // Without a waker the tile parks on the spine signal alone, and its
+        // sockets cannot end the park.
+        #[cfg(feature = "thread_park")]
+        {
+            let waker =
+                mio::Waker::new(self.readiness.registry(), WAKER_TOKEN).expect("boundary waker");
+            adapter.register_waker(waker);
+        }
+        #[cfg(not(feature = "thread_park"))]
+        let _ = adapter;
         true
     }
 
@@ -56,7 +77,7 @@ impl Tile<SilverSpine> for ApplicationBoundaryTile {
         self.processing.loop_start();
         self.engine.intake(adapter, &mut self.processing);
         self.leanvm.intake(adapter);
-        self.readiness.wait(Duration::ZERO);
+        self.readiness.wait(if self.worked { Duration::ZERO } else { IDLE_WAIT });
 
         self.engine.spin(adapter, self.readiness.events(), &mut self.processing);
         self.leanvm.spin(adapter, self.readiness.events(), &mut self.processing);
@@ -111,6 +132,7 @@ impl Tile<SilverSpine> for ApplicationBoundaryTile {
         if did_work {
             adapter.mark_work();
         }
+        self.worked = adapter.did_work();
     }
 }
 
@@ -182,7 +204,7 @@ impl ApplicationBoundaryTile {
         let builder_bids =
             BuilderBids::new(readiness.registry(), BUILDER_TOKENS, builder_bid_timeout);
         let leanvm = LeanVmApi::new(readiness.registry(), LEANVM_TOKENS, leanvm_socket, tcaches);
-        Self { readiness, beacon, engine, leanvm, pbs, builder_bids, processing }
+        Self { readiness, beacon, engine, leanvm, pbs, builder_bids, processing, worked: false }
     }
 
     pub fn open_tcaches(&mut self) -> Result<(), TCacheError> {

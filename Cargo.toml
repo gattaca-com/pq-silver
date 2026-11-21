@@ -110,14 +110,14 @@ silver_peer = {path = "crates/peer" }
 silver_leanvm_api = { path = "crates/leanvm_api" }
 silver_storage = { path = "crates/storage" }
 silver_engine_api = { path = "crates/engine_api" }
-flux = { git = "https://github.com/gattaca-com/flux", rev = "004884d1e82bb6afb1df81fa70a4c220a10368a0"}
-flux-clickhouse = { git = "https://github.com/gattaca-com/flux", rev = "004884d1e82bb6afb1df81fa70a4c220a10368a0"}
-flux-disk = { git = "https://github.com/gattaca-com/flux", rev = "004884d1e82bb6afb1df81fa70a4c220a10368a0"}
-flux-network = { git = "https://github.com/gattaca-com/flux", rev = "004884d1e82bb6afb1df81fa70a4c220a10368a0"}
-flux-utils = { git = "https://github.com/gattaca-com/flux", rev = "004884d1e82bb6afb1df81fa70a4c220a10368a0", features = ["bytes"]}
-flux-profiler = { git = "https://github.com/gattaca-com/flux", rev = "004884d1e82bb6afb1df81fa70a4c220a10368a0"}
-type-hash = { git = "https://github.com/gattaca-com/flux", rev = "004884d1e82bb6afb1df81fa70a4c220a10368a0"}
-type-hash-derive = { git = "https://github.com/gattaca-com/flux", rev = "004884d1e82bb6afb1df81fa70a4c220a10368a0"}
+flux = { git = "https://github.com/gattaca-com/flux", rev = "539bf86d97f5d56ff5b7f58cfea6c1bbafbe6714"}
+flux-clickhouse = { git = "https://github.com/gattaca-com/flux", rev = "539bf86d97f5d56ff5b7f58cfea6c1bbafbe6714"}
+flux-disk = { git = "https://github.com/gattaca-com/flux", rev = "539bf86d97f5d56ff5b7f58cfea6c1bbafbe6714"}
+flux-network = { git = "https://github.com/gattaca-com/flux", rev = "539bf86d97f5d56ff5b7f58cfea6c1bbafbe6714"}
+flux-utils = { git = "https://github.com/gattaca-com/flux", rev = "539bf86d97f5d56ff5b7f58cfea6c1bbafbe6714", features = ["bytes"]}
+flux-profiler = { git = "https://github.com/gattaca-com/flux", rev = "539bf86d97f5d56ff5b7f58cfea6c1bbafbe6714"}
+type-hash = { git = "https://github.com/gattaca-com/flux", rev = "539bf86d97f5d56ff5b7f58cfea6c1bbafbe6714"}
+type-hash-derive = { git = "https://github.com/gattaca-com/flux", rev = "539bf86d97f5d56ff5b7f58cfea6c1bbafbe6714"}
 
 # External
 backtrace = "0.3"

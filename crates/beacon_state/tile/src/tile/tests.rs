@@ -7770,7 +7770,7 @@ mod leanvm_verifier {
             let body = body.map(|body| {
                 gossip.write_with(body.len(), |out| out.copy_from_slice(body)).unwrap()
             });
-            LeanVmVerifier::verdict(&LeanVmResp { request_id, body }, &mut tile.reader)
+            verifier.verdict(&LeanVmResp { request_id, body }, &mut tile.reader)
         };
         assert_eq!(answer(first, Some(&[0, 1])), Some(ProofVerdict::Valid));
         assert_eq!(answer(second, Some(&[0, 0])), Some(ProofVerdict::Invalid));

@@ -26,6 +26,7 @@ use silver_common::{
         SignedProposerPreferencesView, SignedSyncCommitteeProofView, StatusView, SyncCommitteeView,
     },
     ticker::SlotTicker,
+    wake_within,
 };
 use silver_gossip::{GossipHandler, GossipHandlerEvent};
 use silver_peer::{PeerManager, SweepOutput};
@@ -49,6 +50,11 @@ mod slashing_protection;
 mod subnet_duties;
 
 const PEER_PERSIST_INTERVAL: Duration = Duration::from_secs(300);
+/// The tightest timer an idle loop serves is the 250 ms partial-column request
+/// timeout.
+const IDLE_WAKE: Duration = Duration::from_millis(50);
+/// Raft ticks every 100 ms.
+const CLUSTERED_IDLE_WAKE: Duration = Duration::from_millis(10);
 
 #[cfg(test)]
 mod tests;
@@ -1021,6 +1027,10 @@ impl Tile<SilverSpine> for Controller {
                 adapter.mark_work();
             }
         }
+
+        let idle_wake =
+            if self.slashing_protection.is_clustered() { CLUSTERED_IDLE_WAKE } else { IDLE_WAKE };
+        wake_within(adapter, idle_wake);
     }
 
     fn try_init(&mut self, _adapter: &mut SpineAdapter<SilverSpine>) -> bool {

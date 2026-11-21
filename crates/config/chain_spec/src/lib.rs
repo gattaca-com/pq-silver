@@ -174,6 +174,10 @@ pub struct SpecConfig {
     pub pq_fork_version: [u8; 4],
     #[serde(default = "unscheduled")]
     pub pq_fork_epoch: u64,
+    /// Caps the PQ committees of a slot. A devnet lowers it for larger
+    /// committees; at most `MAX_COMMITTEES_PER_SLOT_PQ`.
+    #[serde(default = "default_u64::<16>")]
+    pub x_max_committee_count_per_slot: u64,
     /// Per-epoch override on `max_blobs_per_block` (EIP-7892). Sorted by
     /// `epoch`; the active entry is the highest-epoch entry whose epoch
     /// <= the queried epoch. Empty ⇒ always fall back to the Electra
@@ -642,6 +646,7 @@ impl SpecConfig {
             eip8483_fork_epoch: unscheduled(),
             pq_fork_version: default_fork_version::<0xe0000000>(),
             pq_fork_epoch: unscheduled(),
+            x_max_committee_count_per_slot: 16,
             blob_schedule: vec![
                 BlobParameters { epoch: 52480, max_blobs_per_block: 15 },
                 BlobParameters { epoch: 54016, max_blobs_per_block: 21 },
@@ -712,6 +717,7 @@ impl SpecConfig {
             eip8483_fork_epoch: unscheduled(),
             pq_fork_version: default_fork_version::<0xe0000000>(),
             pq_fork_epoch: unscheduled(),
+            x_max_committee_count_per_slot: 16,
             blob_schedule: vec![
                 BlobParameters { epoch: 274176, max_blobs_per_block: 15 },
                 BlobParameters { epoch: 275712, max_blobs_per_block: 21 },
@@ -780,6 +786,7 @@ impl SpecConfig {
             eip8483_fork_epoch: unscheduled(),
             pq_fork_version: default_fork_version::<0xe0000000>(),
             pq_fork_epoch: unscheduled(),
+            x_max_committee_count_per_slot: 16,
             blob_schedule: default_blob_schedule(),
             max_blobs_per_block_electra: 9,
             blob_sidecar_subnet_count: 6,

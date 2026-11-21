@@ -84,7 +84,8 @@ impl Shuffling {
     }
 
     pub(crate) fn committees_per_slot(&self) -> usize {
-        committees_per_slot(self.order.len(), self.id.is_some_and(|id| id.is_pq))
+        let max = self.id.map_or(0, |id| id.max_committees_per_slot as usize);
+        committees_per_slot(self.order.len(), max)
     }
 
     pub(crate) fn position(&self, validator_index: u64) -> Option<u32> {
@@ -103,13 +104,19 @@ impl Shuffling {
 #[cfg(test)]
 mod tests {
     use silver_beacon_state_data::SLOTS_PER_EPOCH;
+    use silver_common::ssz_view::MAX_COMMITTEES_PER_SLOT;
 
     use super::*;
 
     const ACTIVE: u32 = 8192;
 
     fn id(epoch: Epoch) -> ShufflingId {
-        ShufflingId { epoch, dependent_root: [0; 32], is_pq: false }
+        ShufflingId {
+            epoch,
+            dependent_root: [0; 32],
+            is_pq: false,
+            max_committees_per_slot: MAX_COMMITTEES_PER_SLOT as u64,
+        }
     }
 
     /// The active set reversed and rotated by `epoch`, so epochs differ.

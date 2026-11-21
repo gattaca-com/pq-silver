@@ -1,6 +1,7 @@
 use std::mem;
 
 use flux_profiler::timed;
+use silver_ssz::ssz_view::{MAX_COMMITTEES_PER_SLOT, MAX_COMMITTEES_PER_SLOT_PQ};
 pub use silver_state_hashing::HashFormat;
 
 use crate::{
@@ -235,9 +236,20 @@ pub struct Immutable {
     pub gloas_fork_version: Version,
     pub pq_fork_version: Version,
     pub pq_fork_epoch: Epoch,
+    pub x_max_committee_count_per_slot: usize,
 }
 
 impl Immutable {
+    /// The cap in spec `get_committee_count_per_slot` for `epoch`.
+    #[inline]
+    pub fn max_committees_per_slot(&self, epoch: Epoch) -> usize {
+        if epoch >= self.pq_fork_epoch {
+            self.x_max_committee_count_per_slot
+        } else {
+            MAX_COMMITTEES_PER_SLOT
+        }
+    }
+
     /// Whether a state at `current_version` carries the Gloas tiers, which PQ
     /// keeps.
     #[inline]
@@ -263,6 +275,7 @@ impl Default for Immutable {
             gloas_fork_version: GLOAS_FORK_VERSION,
             pq_fork_version: PQ_FORK_VERSION,
             pq_fork_epoch: FAR_FUTURE_EPOCH,
+            x_max_committee_count_per_slot: MAX_COMMITTEES_PER_SLOT_PQ,
         }
     }
 }

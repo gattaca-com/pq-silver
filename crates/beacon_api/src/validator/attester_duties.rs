@@ -106,7 +106,7 @@ mod tests {
         SlotStateFinalized, SlotStateGroup, SpecConfig, StateId, ValSeed, committee_range,
         committees_per_slot,
     };
-    use silver_common::SyncUpdate;
+    use silver_common::{SyncUpdate, ssz_view::MAX_COMMITTEES_PER_SLOT};
 
     use super::*;
     use crate::{
@@ -177,7 +177,7 @@ mod tests {
             assert_eq!(duties.len(), ACTIVE as usize);
 
             let order = posted_order(epoch);
-            let per_slot = committees_per_slot(order.len(), false);
+            let per_slot = committees_per_slot(order.len(), MAX_COMMITTEES_PER_SLOT);
             let mut seen = vec![false; ACTIVE as usize];
             for duty in duties {
                 let index = field(duty, "validator_index");

@@ -84,6 +84,7 @@ mod tests {
         SlotStateFinalized, SlotStateGroup, SpecConfig, ValSeed, committee_range,
         committees_per_slot,
     };
+    use silver_common::ssz_view::MAX_COMMITTEES_PER_SLOT;
     use silver_httpcore::ParsedRequest;
 
     use super::*;
@@ -138,7 +139,7 @@ mod tests {
     fn the_state_epoch_partitions_into_ordered_committees() {
         let body = json(&get(&ctx(), "head", ""));
         let committees = body["data"].as_array().unwrap();
-        let per_slot = committees_per_slot(ACTIVE as usize, false);
+        let per_slot = committees_per_slot(ACTIVE as usize, MAX_COMMITTEES_PER_SLOT);
         assert_eq!(committees.len(), SLOTS_PER_EPOCH as usize * per_slot);
         let mut members = Vec::new();
         for (n, committee) in committees.iter().enumerate() {
@@ -162,8 +163,12 @@ mod tests {
         let body = json(&get(&ctx(), "head", &query));
         let [committee] = &body["data"].as_array().unwrap()[..] else { panic!("one committee") };
         let posted = order(epoch);
-        let range =
-            committee_range(posted.len(), committees_per_slot(posted.len(), false), slot, 1);
+        let range = committee_range(
+            posted.len(),
+            committees_per_slot(posted.len(), MAX_COMMITTEES_PER_SLOT),
+            slot,
+            1,
+        );
         let members: Vec<_> =
             committee["validators"].as_array().unwrap().iter().map(|v| uint(v) as u32).collect();
         assert_eq!(members, posted[range]);
@@ -174,7 +179,8 @@ mod tests {
         let ctx = ctx();
         let past = (STATE_EPOCH + 2).to_string();
         let outside = format!("epoch={STATE_EPOCH}&slot={}", (STATE_EPOCH + 1) * SLOTS_PER_EPOCH);
-        let too_high = format!("index={}", committees_per_slot(ACTIVE as usize, false));
+        let too_high =
+            format!("index={}", committees_per_slot(ACTIVE as usize, MAX_COMMITTEES_PER_SLOT));
         for query in [format!("epoch={past}"), outside, too_high, "epoch=x".to_string()] {
             assert_eq!(status_code(&get(&ctx, "head", &query)), "400", "{query}");
         }

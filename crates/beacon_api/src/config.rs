@@ -363,6 +363,7 @@ fn configured(spec: &SpecConfig) -> impl IntoIterator<Item = (&'static str, u64)
         ("MIN_GENESIS_TIME", spec.min_genesis_time),
         ("GENESIS_DELAY", spec.genesis_delay),
         ("TERMINAL_BLOCK_HASH_ACTIVATION_EPOCH", spec.terminal_block_hash_activation_epoch),
+        ("X_MAX_COMMITTEE_COUNT_PER_SLOT", spec.x_max_committee_count_per_slot),
         ("SECONDS_PER_SLOT", spec.seconds_per_slot()),
         // Teku and Nimbus reject a body whose two spellings of the slot length
         // disagree, so this is derived rather than a mainnet literal.

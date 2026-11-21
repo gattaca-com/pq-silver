@@ -814,7 +814,9 @@ impl BeaconStateTile {
     }
 
     fn aggregate_pq_vote(&mut self, p: &PreparedPqAttestation) {
-        self.pq_aggregator.add_vote(p.verified_vote(), &self.ticker);
+        let slot = p.checked.target.attestation_slot;
+        let Some(position) = self.aggregator_subnets.last_position(slot, p.subnet) else { return };
+        self.pq_aggregator.add_vote(p.verified_vote(), position, &self.ticker);
     }
 
     fn record_votes(&mut self, target: stf::VoteTarget, attesters: &[u32]) {

@@ -1,6 +1,6 @@
 use serde::Deserialize;
 use silver_common::{
-    BeaconApiRequest, SlotSubnets, SubnetsBySlot, compute_subnet_for_attestation,
+    BeaconApiRequest, ForkName, SlotSubnets, SubnetsBySlot, compute_subnet_for_attestation,
     json_fields::uint64, ssz_view::MAX_COMMITTEES_PER_SLOT,
 };
 
@@ -17,10 +17,15 @@ pub(crate) fn post_beacon_committee_subscriptions(
     let window = SubnetsBySlot::window(ctx.node_status.wall_slot);
     let mut by_slot = SubnetsBySlot::default();
     let parsed = each_body_entry(req.body, |_, entry: CommitteeSubscription| {
-        if let Some(slot_subnets) = entry
-            .slot_subnets(ctx.spec.fork_at_slot(entry.slot))
-            .filter(|held| window.contains(&held.slot))
+        let format = ctx.spec.fork_at_slot(entry.slot);
+        if let Some(mut slot_subnets) =
+            entry.slot_subnets(format).filter(|held| window.contains(&held.slot))
         {
+            if entry.is_aggregator && format == ForkName::Pq {
+                let subnet = u64::from(slot_subnets.aggregating.trailing_zeros());
+                let position = entry.aggregator_position(ctx);
+                slot_subnets.aggregator_positions = SlotSubnets::position_bit(subnet, position);
+            }
             by_slot.insert(slot_subnets);
         }
     });
@@ -46,6 +51,8 @@ pub(crate) fn post_beacon_committee_subscriptions(
 #[derive(Deserialize)]
 struct CommitteeSubscription {
     #[serde(deserialize_with = "uint64")]
+    validator_index: u64,
+    #[serde(deserialize_with = "uint64")]
     committee_index: u64,
     #[serde(deserialize_with = "uint64")]
     committees_at_slot: u64,
@@ -55,11 +62,23 @@ struct CommitteeSubscription {
 }
 
 impl CommitteeSubscription {
-    fn slot_subnets(&self, format: silver_common::ForkName) -> Option<SlotSubnets> {
+    /// Its place in the committee's aggregation committee. The last place
+    /// when the head state does not show it, so its votes are cut off latest.
+    fn aggregator_position(&self, ctx: &ApiCtx) -> u64 {
+        let position = ctx.read_state(|view| {
+            let window = view.epoch.aggregation_committee_window();
+            let index = usize::try_from(self.committee_index).ok()?;
+            let mut aggregators = window.committee(view.slot.current_epoch(), self.slot, index)?;
+            aggregators.position(|member| member == self.validator_index)
+        });
+        position.map_or(SlotSubnets::POSITIONS_PER_SUBNET - 1, |position| position as u64)
+    }
+
+    fn slot_subnets(&self, format: ForkName) -> Option<SlotSubnets> {
         let committees = self.committees_at_slot;
         if self.committee_index >= committees ||
             committees >
-                (if format == silver_common::ForkName::Pq {
+                (if format == ForkName::Pq {
                     silver_common::ssz_view::MAX_COMMITTEES_PER_SLOT_PQ
                 } else {
                     MAX_COMMITTEES_PER_SLOT
@@ -73,17 +92,19 @@ impl CommitteeSubscription {
             slot: self.slot,
             attesting: subnet,
             aggregating: if self.is_aggregator { subnet } else { 0 },
+            aggregator_positions: 0,
         })
     }
 }
 
 #[cfg(test)]
 mod tests {
+    use silver_beacon_state_data::{BeaconStateOwner, SpecConfig};
     use silver_common::TCacheProducer;
 
     use super::*;
     use crate::{
-        ctx::anchor_ctx,
+        ctx::{anchor_ctx, test_ctx},
         http::router::Outcome,
         testing::{dispatch, dispatch_into, posting, status_code, submissions},
     };
@@ -127,9 +148,36 @@ mod tests {
         };
         let written = submissions.read_buffer(subscriptions).unwrap();
         assert!(SlotSubnets::decode_all(written).eq([
-            SlotSubnets { slot: 32, attesting: 1 << 0 | 1 << 3, aggregating: 1 << 0 },
-            SlotSubnets { slot: 33, attesting: 1 << 5, aggregating: 0 },
+            SlotSubnets {
+                slot: 32,
+                attesting: 1 << 0 | 1 << 3,
+                aggregating: 1 << 0,
+                aggregator_positions: 0,
+            },
+            SlotSubnets { slot: 33, attesting: 1 << 5, ..SlotSubnets::default() },
         ]));
+    }
+
+    #[test]
+    fn a_pq_aggregator_the_state_does_not_place_takes_the_last_position() {
+        let spec = SpecConfig { pq_fork_epoch: 0, ..SpecConfig::mainnet() };
+        let ctx = test_ctx(&spec, BeaconStateOwner::published_empty_test(0).reader());
+        let body = format!("[{},{}]", entry(2, 4, 1, true), entry(3, 4, 1, false));
+        let mut submissions = submissions();
+        let (outcome, _) = dispatch_into(&ctx, &posting(PATH, &body), &mut submissions);
+        let Outcome::Response(Some(BeaconApiRequest::BeaconCommitteeSubscriptions {
+            subscriptions,
+        })) = outcome
+        else {
+            panic!("{outcome:?}")
+        };
+        let written = submissions.read_buffer(subscriptions).unwrap();
+        let [held] = SlotSubnets::decode_all(written).collect::<Vec<_>>()[..] else {
+            panic!("one slot")
+        };
+        let subnet = u64::from(held.aggregating.trailing_zeros());
+        assert_eq!(held.aggregating.count_ones(), 1);
+        assert_eq!(held.aggregator_positions, SlotSubnets::position_bit(subnet, 3));
     }
 
     #[test]

@@ -52,8 +52,9 @@ impl BestProof {
 /// How much an aggregation wants the leanVM sidecar; the highest goes first.
 /// Fields compare in declaration order.
 ///
-/// A leaf of slot `S` ends at `aggregate_due(S)`. A merge for the block of
-/// slot `B` ends at `slot_start(B)`, later than the due time of `B - 1`.
+/// A leaf of slot `S` ends when its last local aggregator's aggregate is due.
+/// A merge for the block of slot `B` ends at `slot_start(B)`, later than the
+/// due time of `B - 1`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub struct Priority {
     /// The earliest deadline first, leaf or merge.

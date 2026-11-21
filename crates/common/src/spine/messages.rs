@@ -214,15 +214,34 @@ pub struct SlotSubnets {
     pub slot: u64,
     pub attesting: u64,
     pub aggregating: u64,
+    /// PQ only: per subnet, one bit per place in its aggregation committee.
+    pub aggregator_positions: u64,
 }
 
 impl SlotSubnets {
-    pub const SIZE: usize = 3 * size_of::<u64>();
+    pub const SIZE: usize = 4 * size_of::<u64>();
+    pub const POSITIONS_PER_SUBNET: u64 = 4;
+
+    /// The `aggregator_positions` bit of `position` on `subnet`. Zero when
+    /// either is out of range.
+    pub fn position_bit(subnet: u64, position: u64) -> u64 {
+        if position >= Self::POSITIONS_PER_SUBNET {
+            return 0;
+        }
+        1u64.checked_shl((subnet * Self::POSITIONS_PER_SUBNET + position) as u32).unwrap_or(0)
+    }
+
+    pub fn last_aggregator_position(positions: u64, subnet: u64) -> Option<u64> {
+        let places = (1 << Self::POSITIONS_PER_SUBNET) - 1;
+        let held = positions.checked_shr((subnet * Self::POSITIONS_PER_SUBNET) as u32)? & places;
+        (held != 0).then(|| u64::from(held.ilog2()))
+    }
 
     pub fn encode(&self, out: &mut [u8]) {
         out[..8].copy_from_slice(&self.slot.to_le_bytes());
         out[8..16].copy_from_slice(&self.attesting.to_le_bytes());
-        out[16..Self::SIZE].copy_from_slice(&self.aggregating.to_le_bytes());
+        out[16..24].copy_from_slice(&self.aggregating.to_le_bytes());
+        out[24..Self::SIZE].copy_from_slice(&self.aggregator_positions.to_le_bytes());
     }
 
     pub fn decode_all(bytes: &[u8]) -> impl Iterator<Item = Self> {
@@ -233,6 +252,7 @@ impl SlotSubnets {
             slot: word(record, 0),
             attesting: word(record, 8),
             aggregating: word(record, 16),
+            aggregator_positions: word(record, 24),
         })
     }
 }

@@ -7856,7 +7856,7 @@ mod pq_aggregator {
                 committee_position: tag as usize,
                 committee_len: COMMITTEE_LEN,
             };
-            self.tile.pq_aggregator.add_vote(vote, &self.tile.ticker);
+            self.tile.pq_aggregator.add_vote(vote, 0, &self.tile.ticker);
             self.send_next();
         }
 
@@ -7957,11 +7957,11 @@ mod pq_aggregator {
     }
 
     #[test]
-    fn a_vote_after_the_deadline_is_dropped() {
+    fn a_vote_after_the_cutoff_is_dropped() {
         let mut rig = Rig::new();
         rig.ready();
-        let due_ms = rig.tile.ticker.aggregate_due(SLOT).as_millis_u64();
-        rig.tile.ticker.set_since_genesis_ms(due_ms);
+        let cutoff_ms = rig.tile.ticker.aggregation_cutoff(SLOT, 0).as_millis_u64();
+        rig.tile.ticker.set_since_genesis_ms(cutoff_ms);
         rig.vote(1);
         assert!(rig.requests().is_empty());
     }

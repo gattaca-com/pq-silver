@@ -5,13 +5,13 @@ use silver_beacon_state_data::{
 };
 use silver_common::{
     BeaconStateEvent, PreparedPayloadAttributes, ProduceBlockFailure, TCacheProducer, TCacheRead,
-    TProducer, ssz_hash_gloas::ExecutionRequestsView, ssz_view::WITHDRAWAL_SIZE,
+    TProducer, ssz_view::WITHDRAWAL_SIZE,
 };
 
 use super::{BeaconStateTile, Producers};
 use crate::{
     fork_choice::FcuExecutionHashes,
-    stf::{self, get_expected_withdrawals},
+    stf::{self, RequestsLayout, get_expected_withdrawals},
 };
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -65,6 +65,16 @@ impl PayloadBasis {
 }
 
 impl BeaconStateTile {
+    /// Whether a validator of this node proposes `slot` on the head: one
+    /// registered here, or whose preferences were submitted here.
+    pub(super) fn proposes_locally(&self, slot: Slot) -> bool {
+        let Some(proposer) = self.proposer_on_head(slot) else { return false };
+        self.proposer_preparations.fee_recipient(proposer).is_some() ||
+            self.fork_choice
+                .shuffling_dependent_root(&self.head_block_root(), slot / SLOTS_PER_EPOCH)
+                .is_some_and(|root| self.seen_proposer_preferences.is_local(slot, &root))
+    }
+
     /// `fallback_fee_recipient` pays when the proposer named none. Who
     /// proposes is resolved first, so a slot with no one to pay is refused
     /// before the execution parent or the head state is read.
@@ -168,8 +178,9 @@ impl BeaconStateTile {
         let withdrawals = match (context.is_gloas, context.full_parent) {
             (false, _) => get_expected_withdrawals(&fork.view).withdrawals,
             (true, true) => {
-                let requests = self.payload_execution_requests.get(&head_root);
-                withdrawals_after_parent_payload(&mut fork, &self.spec, requests, slot)?
+                let layout = RequestsLayout::for_fork(self.spec.is_pq_at_slot(slot));
+                let requests = self.payload_execution_requests.get(&head_root, layout);
+                withdrawals_after_parent_payload(&mut fork, &self.spec, requests, layout, slot)?
             }
             (true, false) => withdrawals_owed_by_empty_parent(&fork),
         };
@@ -270,10 +281,11 @@ fn withdrawals_after_parent_payload(
     fork: &mut ForkWriter<'_>,
     spec: &SpecConfig,
     requests: &[u8],
+    layout: RequestsLayout,
     slot: Slot,
 ) -> Result<PayloadWithdrawals, ProduceBlockFailure> {
     let parent = fork.view.slot.state();
-    if ExecutionRequestsView::hash_tree_root(requests) !=
+    if layout.hash_tree_root(requests) !=
         parent.latest_execution_payload_bid.execution_requests_root
     {
         silver_log::warn!(slot, "parent execution requests unavailable for payload preparation");

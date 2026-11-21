@@ -11,7 +11,7 @@ use silver_beacon_state_data::{
     SyncSubcommittee,
     bls::{self, CheckedSignature, PublicKey, Signature, VerifiedSingleAttestation},
     gloas::PTC_SIZE,
-    pq::xmss_pubkey,
+    pq::{MIN_ATTESTATION_INCLUSION_DELAY_PQ, xmss_pubkey},
     xmss::SignatureCheck,
 };
 use silver_common::{
@@ -49,7 +49,7 @@ use super::{
     held_blocks::BlockSourceMsg,
     leanvm_verifier::ProofVerdict,
     pending_envelopes::{BLOCK_WAIT_SLOTS, ParkedEnvelope, ParkedKind, UnverifiedEnvelope},
-    pq_aggregation::{VerifiedVote, claim},
+    pq_aggregation::{Aggregate, VerifiedVote, claim},
     seen_aggregates::Coverage,
     seen_proposer_preferences::ProposerPreferences,
     shuffling_cache::ShufflingRequest,
@@ -63,7 +63,7 @@ use crate::{
     },
     merkle, ssz_hash,
     stf::{
-        self, decode_bid_message, is_gas_limit_target_compatible,
+        self, RequestsLayout, decode_bid_message, is_gas_limit_target_compatible,
         verify_execution_payload_bid_signature,
     },
     validate,
@@ -1255,7 +1255,7 @@ impl BeaconStateTile {
         if bid.slot <= node.slot {
             return Err(Feedback::reject("bid slot not after parent"));
         }
-        let (parent_state, parent_payload) = (node.state_id, node.payload);
+        let (parent_slot, parent_state, parent_payload) = (node.slot, node.state_id, node.payload);
         let full = self.check_bid_against_parent_payload(
             bid,
             parent_state,
@@ -1291,7 +1291,9 @@ impl BeaconStateTile {
         // The parent payload's exits apply only in the bid's own block, so the
         // state above still shows the builder active.
         if full {
-            let mut exits = self.payload_execution_requests.builder_exits(&bid.parent_block_root);
+            let layout = RequestsLayout::for_fork(self.spec.is_pq_at_slot(parent_slot));
+            let mut exits =
+                self.payload_execution_requests.builder_exits(&bid.parent_block_root, layout);
             if exits.any(|request| {
                 *BuilderExitRequestView::pubkey(request) == builder.pubkey &&
                     *BuilderExitRequestView::source_address(request) == builder.execution_address
@@ -2456,8 +2458,10 @@ impl BeaconStateTile {
         signed: &[u8],
         producers: &mut Producers,
     ) -> Result<(u64, AggregateAwaitingProof), Feedback> {
-        let (state_id, aggregate) = self.check_pq_aggregate(signed)?;
+        let (state_id, mut aggregate) = self.check_pq_aggregate(signed)?;
         self.verify_pq_aggregator(signed, state_id, &aggregate)?;
+        let block_slot = aggregate.target.attestation_slot + MIN_ATTESTATION_INCLUSION_DELAY_PQ;
+        let merges = self.proposes_locally(block_slot);
 
         let data = SignedAggregateAndProofPqView::agg_data(signed);
         let view = self.state.read_view(state_id);
@@ -2466,11 +2470,13 @@ impl BeaconStateTile {
         let claims = aggregate.attesters.iter().map(|&attester| {
             claim(xmss_pubkey(view.validators.pubkey(attester as usize)), &message)
         });
+        let merge_claims = merges.then(|| claims.clone().collect());
         let proof = SignedAggregateAndProofPqView::proof(signed);
         let request_id = self
             .leanvm_verifier
             .send(claims, proof, &mut self.events_producer, producers)
             .ok_or(Feedback::Ignore)?;
+        aggregate.merge_claims = merge_claims;
         Ok((request_id, aggregate))
     }
 
@@ -2554,6 +2560,7 @@ impl BeaconStateTile {
             committee_index: committee_index as u64,
             data_root,
             aggregator_index,
+            merge_claims: None,
         }))
     }
 
@@ -2630,7 +2637,7 @@ impl BeaconStateTile {
             (ProofVerdict::Unanswered, _) => Feedback::Ignore,
             (ProofVerdict::Invalid, _) => Feedback::reject("STARK proof invalid"),
             (ProofVerdict::Valid, GossipAwaitingProof::Aggregate(aggregate)) => {
-                self.commit_pq_aggregate(data, &aggregate)
+                self.commit_pq_aggregate(data, aggregate)
             }
             (ProofVerdict::Valid, GossipAwaitingProof::AttesterSlashing) => {
                 self.commit_pq_attester_slashing(data)
@@ -2649,7 +2656,7 @@ impl BeaconStateTile {
     fn commit_pq_aggregate(
         &mut self,
         signed: &[u8],
-        aggregate: &AggregateAwaitingProof,
+        aggregate: AggregateAwaitingProof,
     ) -> Feedback {
         let target = aggregate.target;
         let (slot, committee_index) = (target.attestation_slot, aggregate.committee_index);
@@ -2675,6 +2682,15 @@ impl BeaconStateTile {
                 self.head_validator_count(),
                 self.ticker.current_slot(),
             );
+        }
+        if let Some(claims) = aggregate.merge_claims {
+            let block_slot = slot + MIN_ATTESTATION_INCLUSION_DELAY_PQ;
+            let proof = SignedAggregateAndProofPqView::proof(signed).to_vec();
+            let attestation = SignedAggregateAndProofPqView::aggregate(signed).to_vec();
+            match Aggregate::new(claims, proof, attestation) {
+                Some(merged) => self.pq_aggregator.add_aggregate(block_slot, merged, &self.ticker),
+                None => silver_log::error!(slot, "verified aggregate does not fit a merge"),
+            }
         }
         Feedback::Accept
     }

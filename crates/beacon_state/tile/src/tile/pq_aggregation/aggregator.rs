@@ -209,7 +209,7 @@ impl PqAggregator {
         self.leaves.get(&LeafKey { slot, committee_index, data_root })?.proved(committee_index)
     }
 
-    pub fn block_proof(&self, slot: Slot) -> Option<(impl Iterator<Item = &[u8]> + Clone, &[u8])> {
+    pub fn block_proof(&self, slot: Slot) -> Option<(Vec<Vec<u8>>, &[u8])> {
         self.merges.get(&slot)?.block_proof()
     }
 

@@ -118,7 +118,7 @@ impl RequestsLayout {
     }
 
     /// The eight PQ request lists; Gloas has no lists past builder exits.
-    fn sections(self, requests: &[u8]) -> [&[u8]; 8] {
+    pub(crate) fn sections(self, requests: &[u8]) -> [&[u8]; 8] {
         match self {
             Self::Gloas => {
                 let [deposits, withdrawals, consolidations, builder_deposits, builder_exits] =

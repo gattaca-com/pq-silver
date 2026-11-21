@@ -11,7 +11,7 @@ use silver_common::{
 };
 
 use super::*;
-use crate::tile::seen_proposer_preferences::ProposerPreferences;
+use crate::{stf::RequestsLayout, tile::seen_proposer_preferences::ProposerPreferences};
 
 const FULL_HASH: B256 = [0x22; 32];
 const EMPTY_HASH: B256 = [0x11; 32];
@@ -301,7 +301,7 @@ fn full_parent_applies_deferred_requests_before_withdrawals() {
         let without_requests = stf::get_expected_withdrawals_gloas(&fork.view).withdrawals;
         assert!(without_requests.iter().any(|w| w.validator_index == 0));
     }
-    rig.tile.payload_execution_requests.insert(parent_root, &requests);
+    rig.tile.payload_execution_requests.insert(parent_root, (&requests, RequestsLayout::Gloas));
     let request = rig.prepare(1);
     assert_eq!(request.head_block_hash, FULL_HASH);
     assert!(request.attrs_withdrawals.iter().all(|w| w.validator_index != 0));

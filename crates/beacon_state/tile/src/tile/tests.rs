@@ -7976,7 +7976,7 @@ mod pq_aggregator {
 
         rig.respond(request.request_id, &[[1; 64], [2; 64]]);
         let (attestations, proof) = rig.tile.pq_aggregator.block_proof(SLOT + 1).unwrap();
-        assert_eq!(attestations.collect::<Vec<_>>(), [attestation(0, 0..2).as_slice()]);
+        assert_eq!(attestations, [attestation(0, 0..2)]);
         assert_eq!(proof, b"proof");
     }
 

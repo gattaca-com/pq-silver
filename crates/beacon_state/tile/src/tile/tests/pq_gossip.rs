@@ -6,7 +6,7 @@ use silver_beacon_state_data::{
     },
 };
 use silver_common::{
-    ForkName, GossipDomain, LeanVmHealthEvent, LeanVmReq, SlotSubnets,
+    ForkName, GossipDomain, LeanVmHealthEvent, LeanVmReq, ProposerPreparation, SlotSubnets,
     compute_subnet_for_attestation,
     ssz_hash::hash_attestation_data,
     ssz_view::{
@@ -310,6 +310,11 @@ struct PqAggregate {
 
 impl PqAggregate {
     fn of_committee_zero(tile: &mut BeaconStateTile) -> Self {
+        Self::of_committee_zero_votes(tile, usize::MAX)
+    }
+
+    /// The first `votes` positions of committee zero, or all it has.
+    fn of_committee_zero_votes(tile: &mut BeaconStateTile, votes: usize) -> Self {
         let anchor = tile.last_applied;
         let state_id = tile.epoch_start_state(anchor, AGGREGATE_SLOT);
         let view = tile.state.read_view(state_id);
@@ -339,9 +344,9 @@ impl PqAggregate {
         data[16..48].copy_from_slice(&root);
         data[88..96].copy_from_slice(&epoch.to_le_bytes());
         data[96..].copy_from_slice(&root);
+        let votes = votes.min(committee_len);
         let aggregate =
-            AttestationPqView::encode_one_committee(&data, 0, committee_len, 0..committee_len)
-                .unwrap();
+            AttestationPqView::encode_one_committee(&data, 0, committee_len, 0..votes).unwrap();
 
         let mut signed = vec![0; SIGNED_PQ_FIXED];
         signed[..4].copy_from_slice(&(SIGNED_PQ_FIXED as u32).to_le_bytes());
@@ -350,12 +355,7 @@ impl PqAggregate {
         signed.extend_from_slice(&(16 + aggregate.len() as u32).to_le_bytes());
         signed.extend_from_slice(&aggregate);
         signed.extend_from_slice(b"proof");
-        Self {
-            signed,
-            aggregator: aggregator as usize,
-            attesters: committee_len as u64,
-            block_root: root,
-        }
+        Self { signed, aggregator: aggregator as usize, attesters: votes as u64, block_root: root }
     }
 
     fn sign(&mut self, key: &SecretKey, leaf_offset: LeafOffset) {
@@ -370,6 +370,46 @@ impl PqAggregate {
             &signing_root,
             leaf as u32,
         ));
+    }
+}
+
+/// A proven aggregate goes to the leanVM sidecar again, as a merge, only
+/// when a validator registered here proposes the first block to include it.
+#[test]
+fn proven_aggregate_is_merged_for_a_local_proposal() {
+    let key = SecretKey::new(&[7; 32]);
+    for local in [false, true] {
+        let (mut tile, mut gossip, _spine, mut adapter) =
+            pq_tile(&key.public_key(), 0, AGGREGATE_SLOT + 1);
+        adapter.consume(|_: LeanVmReq, _| {});
+        // Every validator shares one key, so two votes would be one claim.
+        let mut aggregate = PqAggregate::of_committee_zero_votes(&mut tile, 1);
+        aggregate.sign(&key, LeafOffset::AggregateAndProof);
+        // The proposer lookahead of the anchor state ends before the block.
+        tile.last_applied = tile.epoch_start_state(tile.last_applied, AGGREGATE_SLOT);
+        let proposer = tile.proposer_on_head(AGGREGATE_SLOT + 2).expect("within the lookahead");
+        if local {
+            let mut preparation = [0; ProposerPreparation::SIZE];
+            ProposerPreparation { validator_index: proposer, fee_recipient: [1; 20] }
+                .encode(&mut preparation);
+            tile.proposer_preparations.record(&preparation, 2);
+        }
+        assert_eq!(tile.proposes_locally(AGGREGATE_SLOT + 2), local);
+
+        let signed = &aggregate.signed;
+        let msg = pq_gossip_msg(&tile, &mut gossip, signed, GossipTopic::BeaconAggregateAndProof);
+        let request_id = tile.leanvm_verifier.next_request_id();
+        tile.handle_gossip(msg.ssz, msg, true, false, &mut adapter.producers);
+        let awaiting = tile.gossip_proofs.on_verdict(request_id, ProofVerdict::Valid).unwrap();
+        tile.settle_gossip_proofs(awaiting, ProofVerdict::Valid, &mut adapter.producers);
+        adapter.consume(|_: LeanVmReq, _| {});
+
+        tile.pq_aggregator.on_health(LeanVmHealthEvent { ready: true });
+        let tcache = &mut tile.events_producer;
+        tile.pq_aggregator.send_next(&tile.ticker, tcache, &mut adapter.producers);
+        let mut merges = 0;
+        adapter.consume(|_: LeanVmReq, _| merges += 1);
+        assert_eq!(merges, usize::from(local));
     }
 }
 

@@ -4,7 +4,7 @@ use silver_beacon_state_data::{AGGREGATORS_PER_COMMITTEE, B256, Epoch, Slot};
 use silver_common::{NewGossipMsg, TRead};
 use silver_ssz::ssz_view::MAX_COMMITTEES_PER_SLOT_PQ;
 
-use super::leanvm_verifier::ProofVerdict;
+use super::{leanvm_verifier::ProofVerdict, pq_aggregation::Claim};
 use crate::stf::VoteTarget;
 
 const MAX_AWAITING: usize = 2 * MAX_COMMITTEES_PER_SLOT_PQ * AGGREGATORS_PER_COMMITTEE;
@@ -15,6 +15,8 @@ pub(super) struct AggregateAwaitingProof {
     pub committee_index: u64,
     pub data_root: B256,
     pub aggregator_index: usize,
+    /// Its claims, when this node merges it into a block proof.
+    pub merge_claims: Option<Vec<Claim>>,
 }
 
 pub(super) enum GossipAwaitingProof {

@@ -2364,7 +2364,10 @@ fn pq_rpc_and_gossip_check_the_same_block_and_envelope_framing() {
                 PeerEvent::SendGossip { .. } => panic!("unverified message relayed"),
                 _ => {}
             });
-            assert_eq!(penalties, if valid_framing { (0, 0) } else { (1, 1) });
+            // Gossip goes on to validate a well-framed envelope, and rejects
+            // this zeroed one.
+            let zeroed_envelope = usize::from(topic == GossipTopic::ExecutionPayload);
+            assert_eq!(penalties, if valid_framing { (0, zeroed_envelope) } else { (1, 1) });
         }
     }
 }

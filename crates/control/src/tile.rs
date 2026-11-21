@@ -14,13 +14,15 @@ use silver_common::{
     GossipTopic, IngestionTime, LocalGossipFailure, P2pSend, PeerControl, PeerEvent, PeerStats,
     RpcInbound, RpcOutbound, RpcRequest, RpcRequestOutbound, RpcResponse, RpcResponseInbound,
     SLOTS_PER_EPOCH, SilverSpine, SilverSpineProducers, SlotSubnets, SyncNeed, SyncUpdate,
-    TCacheError, TCacheId, TCacheProducer, TCacheRead, TCacheReader, TCacheTable, TProducer,
+    TCacheError, TCacheId, TCacheProducer, TCacheRead, TCacheReader, TCacheTable, TProducer, TRead,
     TReadMode, TileId,
     cell_store::{CellStoreConfig, CellStoreEvent, PartialColumnsMode, StoreError},
     ssz_view::{
         ExecutionPayloadEnvelopeView, ExecutionPayloadView, METADATA_SIZE,
-        PayloadAttestationDataView, PayloadAttestationMessageView, ProposerPreferencesView,
-        STATUS_V2_SIZE, SignedAggregateAndProofView, SignedExecutionPayloadEnvelopeView,
+        PayloadAttestationDataView, PayloadAttestationMessagePqView, PayloadAttestationMessageView,
+        ProposerPreferencesView, STATUS_V2_SIZE, SignedAggregateAndProofPqView,
+        SignedAggregateAndProofView, SignedExecutionPayloadEnvelopePqView,
+        SignedExecutionPayloadEnvelopeView, SignedProposerPreferencesPqView,
         SignedProposerPreferencesView, SignedSyncCommitteeProofView, StatusView, SyncCommitteeView,
     },
     ticker::SlotTicker,
@@ -170,13 +172,9 @@ impl Controller {
             .current_domain()
             .is_some_and(|domain| domain.format() == silver_common::ForkName::Pq)
         {
-            // Do not commit a lock for a submission the API cannot authenticate.
-            let failure = if topic.check_pq_signed_message(ssz).is_err() {
-                LocalGossipFailure::Invalid
-            } else {
-                LocalGossipFailure::Unverifiable
-            };
-            return produce_response(producers, request_id, Err(failure));
+            return self.on_local_pq_gossip(
+                request_id, topic, acquired, ssz_read, validation, now, producers,
+            );
         }
         // `slot` only labels the logs.
         let (ssz_read, slot) = match topic {
@@ -294,6 +292,80 @@ impl Controller {
             GossipTopic::BlsToExecutionChange |
             GossipTopic::ProposerSlashing |
             GossipTopic::AttesterSlashing => (Some(ssz_read), 0),
+            topic => {
+                silver_log::error!(request_id, ?topic, "no local submission path for the topic");
+                return produce_response(producers, request_id, Err(LocalGossipFailure::Internal));
+            }
+        };
+        self.local_gossip.submit(
+            LocalMessage { request_id, topic, ssz, ssz_read, slot, validation },
+            now,
+            &mut self.gossip_handler,
+            producers,
+        );
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn on_local_pq_gossip(
+        &mut self,
+        request_id: u64,
+        topic: GossipTopic,
+        acquired: TRead,
+        ssz_read: TCacheRead,
+        validation: BroadcastValidation,
+        now: Instant,
+        producers: &mut SilverSpineProducers,
+    ) {
+        let Ok((ssz, _)) = acquired.buffer() else {
+            return produce_response(producers, request_id, Err(LocalGossipFailure::Internal));
+        };
+        if let Err(reason) = topic.check_pq_signed_message(ssz) {
+            silver_log::error!(request_id, ?topic, reason, "submitted PQ message is misframed");
+            return produce_response(producers, request_id, Err(LocalGossipFailure::Invalid));
+        }
+        // `slot` only labels the logs.
+        let (ssz_read, slot) = match topic {
+            GossipTopic::BeaconBlock => {
+                return self.slashing_protection.on_local_block(
+                    request_id,
+                    acquired,
+                    SubmittedBlock::Pq(validation),
+                    now,
+                    &mut self.local_gossip,
+                    &mut self.gossip_handler,
+                    producers,
+                );
+            }
+            GossipTopic::BeaconAttestation(subnet) => {
+                return self.slashing_protection.on_local_xmss_attestation(
+                    request_id,
+                    subnet,
+                    ssz.try_into().expect("checked PQ attestation size"),
+                    now,
+                    &mut self.local_gossip,
+                    &mut self.gossip_handler,
+                    producers,
+                );
+            }
+            GossipTopic::ExecutionPayload => {
+                let envelope = SignedExecutionPayloadEnvelopePqView::message(ssz);
+                let payload = ExecutionPayloadEnvelopeView::payload(envelope);
+                (None, ExecutionPayloadView::slot_number(payload))
+            }
+            GossipTopic::BeaconAggregateAndProof => {
+                (Some(ssz_read), SignedAggregateAndProofPqView::agg_data(ssz).slot())
+            }
+            GossipTopic::PayloadAttestationMessage => {
+                let message = ssz.try_into().expect("checked PQ payload attestation size");
+                let data = PayloadAttestationMessagePqView::data(message);
+                (Some(ssz_read), PayloadAttestationDataView::slot(data))
+            }
+            GossipTopic::ProposerPreferences => {
+                let signed = ssz.try_into().expect("checked PQ proposer preferences size");
+                let preferences = SignedProposerPreferencesPqView::message(signed);
+                (Some(ssz_read), ProposerPreferencesView::proposal_slot(preferences))
+            }
+            GossipTopic::ProposerSlashing | GossipTopic::AttesterSlashing => (Some(ssz_read), 0),
             topic => {
                 silver_log::error!(request_id, ?topic, "no local submission path for the topic");
                 return produce_response(producers, request_id, Err(LocalGossipFailure::Internal));

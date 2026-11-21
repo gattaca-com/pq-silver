@@ -10,7 +10,9 @@ use silver_common::{
     SilverSpine, SilverSpineProducers, TCacheProducer, TCacheReader, TProducer, TRead,
     block_contents::SignedBlockContents,
     ssz_view::{
-        SIGNED_BEACON_BLOCK_MIN, SINGLE_ATT_SIZE, SignedBeaconBlockView, SingleAttestationView,
+        SIGNED_BEACON_BLOCK_MIN, SIGNED_BEACON_BLOCK_PQ_MIN, SINGLE_ATT_PQ_SIZE, SINGLE_ATT_SIZE,
+        SignedBeaconBlockPqView, SignedBeaconBlockView, SingleAttestationPqView,
+        SingleAttestationView, XMSS_SIGNATURE_SIZE,
     },
     ticker::SlotTicker,
 };
@@ -147,9 +149,17 @@ pub(super) enum SubmittedBlock {
     /// A Gloas `SignedBeaconBlock`, published by this node. Its blobs travel
     /// with the payload envelope.
     Gloas(BroadcastValidation),
+    /// A PQ `SignedBeaconBlock`, published by this node.
+    Pq(BroadcastValidation),
     /// A `SignedBlindedBeaconBlock`; the API has the sidecar reveal it once
     /// told the lock is held.
     Blinded,
+}
+
+#[allow(clippy::large_enum_variant)]
+enum BlockLock {
+    Bls(BlockLockCommand),
+    Xmss(BlockLockCommand<XMSS_SIGNATURE_SIZE>),
 }
 
 impl SubmittedBlock {
@@ -166,7 +176,43 @@ impl SubmittedBlock {
     fn signed_block(self, bytes: &[u8]) -> Option<&[u8]> {
         match self {
             Self::Full(_) => SignedBlockContents::signed_block(bytes),
-            Self::Gloas(_) | Self::Blinded => Some(bytes),
+            Self::Gloas(_) | Self::Pq(_) | Self::Blinded => Some(bytes),
+        }
+    }
+
+    fn min_len(self) -> usize {
+        match self {
+            Self::Pq(_) => SIGNED_BEACON_BLOCK_PQ_MIN,
+            _ => SIGNED_BEACON_BLOCK_MIN,
+        }
+    }
+
+    fn lock(self, signed_block: &[u8]) -> BlockLock {
+        debug_assert!(signed_block.len() >= self.min_len());
+        match self {
+            Self::Pq(_) => BlockLock::Xmss(BlockLockCommand {
+                key: BlockKey {
+                    proposer_index: SignedBeaconBlockPqView::proposer_index(signed_block),
+                    slot: SignedBeaconBlockPqView::slot(signed_block),
+                },
+                signature: *SignedBeaconBlockPqView::signature(signed_block),
+            }),
+            _ => BlockLock::Bls(BlockLockCommand {
+                key: BlockKey {
+                    proposer_index: SignedBeaconBlockView::proposer_index(signed_block),
+                    slot: SignedBeaconBlockView::slot(signed_block),
+                },
+                signature: *SignedBeaconBlockView::signature(signed_block),
+            }),
+        }
+    }
+}
+
+impl BlockLock {
+    fn key(&self) -> BlockKey {
+        match self {
+            Self::Bls(command) => command.key,
+            Self::Xmss(command) => command.key,
         }
     }
 }
@@ -218,7 +264,7 @@ impl PendingBlock {
                 producers.produce(LockedProposal { contents: self.contents.to_read() });
                 block_message(self.request.id, block, slot, validation)
             }
-            SubmittedBlock::Gloas(validation) => LocalMessage {
+            SubmittedBlock::Gloas(validation) | SubmittedBlock::Pq(validation) => LocalMessage {
                 request_id: self.request.id,
                 topic: GossipTopic::BeaconBlock,
                 ssz: block,
@@ -474,27 +520,14 @@ impl SlashingProtectionHandler {
         }
 
         let Some(cluster) = self.cluster.as_mut() else {
-            let result = self.local_locks.apply(&attestation.command);
-            result.count_attestation();
-            let response = lock_response(result, LocalGossipFailure::ConflictingAttestation);
-            if response.is_err() {
-                produce_response(producers, attestation.request.id, response);
-                silver_log::warn!(
-                    ?result,
-                    request_id = attestation.request.id,
-                    slot = attestation.command.key.slot,
-                    "local lock rejected attestation"
-                );
-                return;
-            }
-            self.duty_timers.released(ClusterDuty::Attestation, attestation.request.received, now);
-            local_gossip.submit(
-                attestation.command.local_message(attestation.request.id),
+            return self.lock_standalone(
+                attestation.request,
+                &attestation.command,
                 now,
+                local_gossip,
                 gossip_handler,
                 producers,
             );
-            return;
         };
 
         match cluster.propose_attestation(attestation.command, wall_slot, now) {
@@ -518,6 +551,67 @@ impl SlashingProtectionHandler {
     }
 
     #[allow(clippy::too_many_arguments)]
+    pub(super) fn on_local_xmss_attestation(
+        &mut self,
+        request_id: u64,
+        subnet: u64,
+        ssz: &[u8; SINGLE_ATT_PQ_SIZE],
+        now: Instant,
+        local_gossip: &mut LocalGossipHandler,
+        gossip_handler: &mut GossipHandler,
+        producers: &mut SilverSpineProducers,
+    ) {
+        let key = AttestationKey {
+            attester_index: SingleAttestationPqView::attester_index(ssz),
+            slot: SingleAttestationPqView::data(ssz).slot(),
+        };
+        if self.cluster.is_some() {
+            silver_log::error!(request_id, slot = key.slot, "the cluster takes no XMSS lock");
+            return produce_response(producers, request_id, Err(LocalGossipFailure::Internal));
+        }
+        if let Err(error) = self.admission.validate(key.slot, self.current_wall_slot()) {
+            error.count();
+            produce_response(producers, request_id, Err(admission_failure(error)));
+            silver_log::warn!(
+                ?error,
+                request_id,
+                slot = key.slot,
+                "local attestation rejected before its lock"
+            );
+            return;
+        }
+        let command = AttestationLockCommand { key, subnet, ssz: *ssz };
+        let request = PendingRequest::new(request_id, now);
+        self.lock_standalone(request, &command, now, local_gossip, gossip_handler, producers);
+    }
+
+    fn lock_standalone<const N: usize>(
+        &mut self,
+        request: PendingRequest,
+        command: &AttestationLockCommand<N>,
+        now: Instant,
+        local_gossip: &mut LocalGossipHandler,
+        gossip_handler: &mut GossipHandler,
+        producers: &mut SilverSpineProducers,
+    ) {
+        let result = self.local_locks.apply(command);
+        result.count_attestation();
+        let response = lock_response(result, LocalGossipFailure::ConflictingAttestation);
+        if response.is_err() {
+            produce_response(producers, request.id, response);
+            silver_log::warn!(
+                ?result,
+                request_id = request.id,
+                slot = command.key.slot,
+                "local lock rejected attestation"
+            );
+            return;
+        }
+        self.duty_timers.released(ClusterDuty::Attestation, request.received, now);
+        local_gossip.submit(command.local_message(request.id), now, gossip_handler, producers);
+    }
+
+    #[allow(clippy::too_many_arguments)]
     #[timed]
     pub(super) fn on_local_block(
         &mut self,
@@ -533,17 +627,13 @@ impl SlashingProtectionHandler {
             .buffer()
             .ok()
             .and_then(|(bytes, _)| block.signed_block(bytes))
-            .filter(|signed_block| signed_block.len() >= SIGNED_BEACON_BLOCK_MIN)
+            .filter(|signed_block| signed_block.len() >= block.min_len())
         else {
             silver_log::error!(request_id, "submitted block is misframed");
             return produce_response(producers, request_id, Err(LocalGossipFailure::Internal));
         };
-        let key = BlockKey {
-            proposer_index: SignedBeaconBlockView::proposer_index(signed_block),
-            slot: SignedBeaconBlockView::slot(signed_block),
-        };
-        let signature = *SignedBeaconBlockView::signature(signed_block);
-        let command = BlockLockCommand { key, signature };
+        let lock = block.lock(signed_block);
+        let key = lock.key();
         let wall_slot = self.current_wall_slot();
         if let Err(error) = self.admission.validate(key.slot, wall_slot) {
             error.count();
@@ -558,7 +648,10 @@ impl SlashingProtectionHandler {
         }
 
         let Some(cluster) = self.cluster.as_mut() else {
-            let result = self.local_locks.apply_block(&command);
+            let result = match &lock {
+                BlockLock::Bls(command) => self.local_locks.apply_block(command),
+                BlockLock::Xmss(command) => self.local_locks.apply_xmss_block(command),
+            };
             result.count_block();
             if let Err(failure) = lock_response(result, LocalGossipFailure::ConflictingProposal) {
                 produce_response(producers, request_id, Err(failure));
@@ -579,6 +672,10 @@ impl SlashingProtectionHandler {
             );
         };
 
+        let BlockLock::Bls(command) = lock else {
+            silver_log::error!(request_id, slot = key.slot, "the cluster takes no XMSS lock");
+            return produce_response(producers, request_id, Err(LocalGossipFailure::Internal));
+        };
         match cluster.propose_block(command, wall_slot, now) {
             Ok(proposal_id) => {
                 let previous = self
@@ -779,8 +876,8 @@ impl SlashingProtectionHandler {
 mod tests {
     use silver_chain_spec::SpecConfig;
     use silver_common::{
-        ClusterAdminCommand, PeerId, SLOTS_PER_EPOCH, TCache, TCacheId, TCacheProducer, TCacheRead,
-        TCacheTable, TReadMode,
+        ClusterAdminCommand, ForkName, PeerId, SLOTS_PER_EPOCH, TCache, TCacheId, TCacheProducer,
+        TCacheRead, TCacheTable, TReadMode,
     };
     use silver_peer::SyncingConfig;
 
@@ -938,6 +1035,92 @@ mod tests {
         harness.pop_gossip();
         assert_eq!(locked_proposals(harness), 1);
         assert!(harness.responses().is_empty());
+    }
+
+    fn xmss_block_bytes(slot: u64, proposer_index: u64, tag: u8) -> Vec<u8> {
+        let mut block = vec![tag; SIGNED_BEACON_BLOCK_PQ_MIN];
+        block[4 + XMSS_SIGNATURE_SIZE..][..8].copy_from_slice(&slot.to_le_bytes());
+        block[4 + XMSS_SIGNATURE_SIZE + 8..][..8].copy_from_slice(&proposer_index.to_le_bytes());
+        block
+    }
+
+    fn xmss_attestation(slot: u64, validator: u8, tag: u8) -> [u8; SINGLE_ATT_PQ_SIZE] {
+        let mut ssz = [tag; SINGLE_ATT_PQ_SIZE];
+        ssz[..144].copy_from_slice(&attestation(slot, validator)[..144]);
+        ssz
+    }
+
+    fn submit_xmss_attestation(
+        handler: &mut SlashingProtectionHandler,
+        harness: &mut Harness,
+        request_id: u64,
+        ssz: &[u8; SINGLE_ATT_PQ_SIZE],
+        now: Instant,
+    ) {
+        let Harness { local_gossip, gossip, adapter, .. } = harness;
+        let producers = &mut adapter.producers;
+        handler.on_local_xmss_attestation(request_id, 0, ssz, now, local_gossip, gossip, producers);
+    }
+
+    #[test]
+    fn standalone_xmss_locks_admit_one_signature_per_duty() {
+        let now = Instant::now();
+        let mut handler = handler(now);
+        let mut harness = Harness::with_format(ForkName::Pq);
+        let mut submissions = Submissions::new();
+        handler.on_status(10, true);
+        handler.on_status(11, true);
+        let pq_block = SubmittedBlock::Pq(BroadcastValidation::Gossip);
+
+        submit_xmss_attestation(&mut handler, &mut harness, 1, &xmss_attestation(11, 7, 1), now);
+        let vote = harness.pop_gossip();
+        submit_xmss_attestation(&mut handler, &mut harness, 2, &xmss_attestation(11, 7, 1), now);
+        assert_eq!(harness.pop_gossip().msg_hash, vote.msg_hash, "a resubmission rejoins");
+        submit_xmss_attestation(&mut handler, &mut harness, 3, &xmss_attestation(11, 7, 2), now);
+
+        let block = xmss_block_bytes(11, 4, 1);
+        lock_block(&mut handler, &mut harness, &mut submissions, 4, &block, pq_block, now);
+        assert_eq!(harness.pop_gossip().topic, GossipTopic::BeaconBlock);
+        let mut resigned = block.clone();
+        resigned[4] = 2;
+        lock_block(&mut handler, &mut harness, &mut submissions, 5, &resigned, pq_block, now);
+
+        assert_eq!(harness.responses(), [
+            (3, Err(LocalGossipFailure::ConflictingAttestation)),
+            (5, Err(LocalGossipFailure::ConflictingProposal)),
+        ]);
+        assert!(harness.gossip.pop_event().is_none());
+        assert_eq!(locked_proposals(&mut harness), 0);
+    }
+
+    #[test]
+    fn clustered_handler_refuses_xmss_locks() {
+        let now = Instant::now();
+        let config = SlashingProtectionConfig::new(
+            1,
+            [1],
+            test_address(1),
+            ClusterStorageConfig::Create("unused-test-journal".into()),
+        )
+        .unwrap();
+        let mut handler = handler(now);
+        handler.cluster = Some(SlashingProtectionCluster::in_memory(config, now).unwrap());
+        let mut harness = Harness::with_format(ForkName::Pq);
+        let mut submissions = Submissions::new();
+        handler.on_status(10, true);
+        handler.on_status(11, true);
+        let pq_block = SubmittedBlock::Pq(BroadcastValidation::Gossip);
+
+        submit_xmss_attestation(&mut handler, &mut harness, 1, &xmss_attestation(11, 7, 1), now);
+        let block = xmss_block_bytes(11, 4, 1);
+        lock_block(&mut handler, &mut harness, &mut submissions, 2, &block, pq_block, now);
+
+        assert_eq!(harness.responses(), [
+            (1, Err(LocalGossipFailure::Internal)),
+            (2, Err(LocalGossipFailure::Internal)),
+        ]);
+        assert!(harness.gossip.pop_event().is_none());
+        assert!(handler.pending_attestations.is_empty() && handler.pending_blocks.is_empty());
     }
 
     #[test]
@@ -1647,7 +1830,7 @@ fn admission_failure(error: AdmissionError) -> LocalGossipFailure {
     }
 }
 
-impl AttestationLockCommand {
+impl<const N: usize> AttestationLockCommand<N> {
     fn local_message(&self, request_id: u64) -> LocalMessage<'_> {
         LocalMessage {
             request_id,

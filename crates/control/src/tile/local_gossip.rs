@@ -182,6 +182,10 @@ pub(super) mod tests {
 
     impl Harness {
         pub(in crate::tile) fn new() -> Self {
+            Self::with_format(silver_common::ForkName::Fulu)
+        }
+
+        pub(in crate::tile) fn with_format(format: silver_common::ForkName) -> Self {
             let base = TempDir::new().unwrap();
             let mut spine = Box::new(SilverSpine::new_with_base_dir(base.path(), None));
             let mut adapter = SpineAdapter::connect_tile(&TestTile, &mut spine);
@@ -193,7 +197,7 @@ pub(super) mod tests {
                 TCacheTable::from_iter([incoming.cache_ref(), protobuf.cache_ref()]),
                 TCache::producer(TCacheId::ControlProcessing, 1 << 12),
                 protobuf,
-                Some(silver_common::GossipDomain::new([1, 2, 3, 4], silver_common::ForkName::Fulu)),
+                Some(silver_common::GossipDomain::new([1, 2, 3, 4], format)),
             )
             .unwrap();
             gossip.open_tcaches().unwrap();

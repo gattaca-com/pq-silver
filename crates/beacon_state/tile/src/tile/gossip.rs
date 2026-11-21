@@ -2410,6 +2410,12 @@ impl BeaconStateTile {
             GossipTopic::ProposerSlashing => {
                 self.handle_pq_proposer_slashing(data.try_into().expect("checked PQ slashing size"))
             }
+            GossipTopic::ExecutionPayload => self.handle_execution_payload_envelope(
+                pin.clone(),
+                data,
+                BlockSource::Gossip,
+                producers,
+            ),
             GossipTopic::BeaconAggregateAndProof => {
                 let (request_id, aggregate) = match self.send_pq_aggregate_proof(data, producers) {
                     Ok(sent) => sent,

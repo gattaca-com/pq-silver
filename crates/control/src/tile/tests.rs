@@ -4,10 +4,13 @@ use silver_chain_spec::SpecConfig;
 use silver_common::{
     BeaconApiResponse, BroadcastValidation, ColumnOrigin, ForkName, GossipMsgIn, GossipMsgOut,
     GossipTraffic, GossipTrafficBytes, HeadChange, IpBytes, Keypair, LOCAL_GOSSIP_STREAM_ID,
-    MessageId, Nanos, NewGossipMsg, P2pStreamId, PayloadResolution, PeerId, SszCache,
-    StreamProtocol, TCache, TCacheId, TCacheProducer, TCacheRead, TCacheReader, TCacheTable,
-    TProducer, TReadMode,
-    ssz_view::{PAYLOAD_ATTESTATION_MESSAGE_SIZE, SIGNED_PROPOSER_PREFERENCES_SIZE},
+    LocalGossipResult, MessageId, Nanos, NewGossipMsg, P2pStreamId, PayloadResolution, PeerId,
+    SszCache, StreamProtocol, TCache, TCacheId, TCacheProducer, TCacheRead, TCacheReader,
+    TCacheTable, TProducer, TReadMode,
+    ssz_view::{
+        PAYLOAD_ATTESTATION_MESSAGE_PQ_SIZE, PAYLOAD_ATTESTATION_MESSAGE_SIZE,
+        SIGNED_PROPOSER_PREFERENCES_PQ_SIZE, SIGNED_PROPOSER_PREFERENCES_SIZE,
+    },
     test_util::{ShmemDir, empty_signed_envelope},
 };
 use silver_peer::SyncingConfig;
@@ -196,60 +199,87 @@ fn write_bytes(producer: &mut TProducer, bytes: &[u8]) -> TCacheRead {
     reservation.read()
 }
 
+/// Submits `len` zero bytes on `topic` under `format`. With a `verdict`, the
+/// message must reach Beacon State, which then answers with it.
+fn local_submission(
+    format: ForkName,
+    topic: GossipTopic,
+    len: usize,
+    verdict: Option<LocalGossipResult>,
+) -> Vec<(u64, LocalGossipResult)> {
+    let mut capture = GossipPublications::attach(topic, &[]);
+    capture.crank();
+    capture.controller.gossip_handler.set_domains(GossipDomain::new([0; 4], format), None);
+    capture.observer.consume(|_: NewGossipMsg, _| {});
+    capture.observer.consume(|_: BeaconApiResponse, _| {});
+    let ssz = write_bytes(&mut capture.boundary, &vec![0; len]);
+    capture.observer.produce(BeaconApiRequest::LocalGossip {
+        request_id: 7,
+        topic,
+        ssz,
+        validation: BroadcastValidation::Gossip,
+        hashed_body: None,
+    });
+    capture.crank();
+    let mut messages = Vec::new();
+    capture.observer.consume(|msg: NewGossipMsg, _| messages.push(msg));
+    if let Some(result) = verdict {
+        let [msg] = messages[..] else { panic!("one local gossip message") };
+        assert_eq!(msg.topic, topic);
+        assert_eq!(msg.stream_id, LOCAL_GOSSIP_STREAM_ID);
+        assert_eq!(msg.ssz, ssz);
+        capture.observer.consume(|_: BeaconApiResponse, _| panic!("validation is pending"));
+        capture.observer.produce(BeaconStateEvent::LocalGossipVerdict {
+            hash: msg.msg_hash,
+            result,
+            block_root: None,
+        });
+        capture.crank();
+    } else {
+        assert!(messages.is_empty());
+    }
+    let mut responses = Vec::new();
+    capture.observer.consume(|response: BeaconApiResponse, _| {
+        if let BeaconApiResponse::LocalGossipResponse { request_id, response, .. } = response {
+            responses.push((request_id, response));
+        }
+    });
+    responses
+}
+
 #[test]
 fn local_gloas_messages_reach_beacon_state_and_wait_for_its_verdict() {
+    let misframed = Err(LocalGossipFailure::Internal);
     for (topic, size) in [
         (GossipTopic::ProposerPreferences, SIGNED_PROPOSER_PREFERENCES_SIZE),
         (GossipTopic::PayloadAttestationMessage, PAYLOAD_ATTESTATION_MESSAGE_SIZE),
     ] {
-        for (len, expected) in [
-            (size, Ok(())),
-            (size, Err(LocalGossipFailure::Invalid)),
-            (size - 1, Err(LocalGossipFailure::Internal)),
-            (size + 1, Err(LocalGossipFailure::Internal)),
+        for (len, verdict, expected) in [
+            (size, Some(Ok(())), Ok(())),
+            (size, Some(Err(LocalGossipFailure::Invalid)), Err(LocalGossipFailure::Invalid)),
+            (size - 1, None, misframed),
+            (size + 1, None, misframed),
         ] {
-            let mut capture = GossipPublications::attach(topic, &[]);
-            capture.crank();
-            capture
-                .controller
-                .gossip_handler
-                .set_domains(GossipDomain::new([0; 4], ForkName::Gloas), None);
-            capture.observer.consume(|_: NewGossipMsg, _| {});
-            capture.observer.consume(|_: BeaconApiResponse, _| {});
-            let ssz = write_bytes(&mut capture.boundary, &vec![0; len]);
-            capture.observer.produce(BeaconApiRequest::LocalGossip {
-                request_id: 7,
-                topic,
-                ssz,
-                validation: BroadcastValidation::Gossip,
-                hashed_body: None,
-            });
-            capture.crank();
-            let mut messages = Vec::new();
-            capture.observer.consume(|msg: NewGossipMsg, _| messages.push(msg));
-            if len == size {
-                let [msg] = messages[..] else { panic!("one local gossip message") };
-                assert_eq!(msg.topic, topic);
-                assert_eq!(msg.stream_id, LOCAL_GOSSIP_STREAM_ID);
-                assert_eq!(msg.ssz, ssz);
-                capture.observer.consume(|_: BeaconApiResponse, _| panic!("validation is pending"));
-                capture.observer.produce(BeaconStateEvent::LocalGossipVerdict {
-                    hash: msg.msg_hash,
-                    result: expected,
-                    block_root: None,
-                });
-                capture.crank();
-            } else {
-                assert!(messages.is_empty());
-            }
-            let mut responses = Vec::new();
-            capture.observer.consume(|response: BeaconApiResponse, _| {
-                if let BeaconApiResponse::LocalGossipResponse { request_id, response, .. } =
-                    response
-                {
-                    responses.push((request_id, response));
-                }
-            });
+            let responses = local_submission(ForkName::Gloas, topic, len, verdict);
+            assert_eq!(responses, [(7, expected)], "{topic:?}, len={len}");
+        }
+    }
+}
+
+#[test]
+fn local_pq_messages_reach_beacon_state_and_wait_for_its_verdict() {
+    let misframed = Err(LocalGossipFailure::Invalid);
+    for (topic, size) in [
+        (GossipTopic::ProposerPreferences, SIGNED_PROPOSER_PREFERENCES_PQ_SIZE),
+        (GossipTopic::PayloadAttestationMessage, PAYLOAD_ATTESTATION_MESSAGE_PQ_SIZE),
+    ] {
+        for (len, verdict, expected) in [
+            (size, Some(Ok(())), Ok(())),
+            (size, Some(Err(LocalGossipFailure::Invalid)), Err(LocalGossipFailure::Invalid)),
+            (size - 1, None, misframed),
+            (SIGNED_PROPOSER_PREFERENCES_SIZE, None, misframed),
+        ] {
+            let responses = local_submission(ForkName::Pq, topic, len, verdict);
             assert_eq!(responses, [(7, expected)], "{topic:?}, len={len}");
         }
     }

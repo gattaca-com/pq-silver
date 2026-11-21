@@ -294,6 +294,7 @@ impl Immutable {
         self.gloas_fork_version = cfg.gloas_fork_version;
         self.pq_fork_version = cfg.pq_fork_version;
         self.pq_fork_epoch = cfg.pq_fork_epoch;
+        self.x_max_committee_count_per_slot = cfg.x_max_committee_count_per_slot as usize;
     }
 
     #[timed]

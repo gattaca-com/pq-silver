@@ -1,7 +1,6 @@
 use std::ops::Range;
 
 use flux::type_hash_derive::TypeHash;
-use silver_ssz::ssz_view::{MAX_COMMITTEES_PER_SLOT, MAX_COMMITTEES_PER_SLOT_PQ};
 
 use crate::{
     StateReadView,
@@ -16,6 +15,7 @@ pub struct ShufflingId {
     pub epoch: Epoch,
     pub dependent_root: B256,
     pub is_pq: bool,
+    pub max_committees_per_slot: u64,
 }
 
 impl ShufflingId {
@@ -29,7 +29,12 @@ impl ShufflingId {
             slot.latest_block_root,
             slot.slot,
         )?;
-        Some(Self { epoch, dependent_root, is_pq: epoch >= view.imm.pq_fork_epoch })
+        Some(Self {
+            epoch,
+            dependent_root,
+            is_pq: epoch >= view.imm.pq_fork_epoch,
+            max_committees_per_slot: view.imm.max_committees_per_slot(epoch) as u64,
+        })
     }
 
     pub fn decision_slot(&self) -> Slot {
@@ -57,9 +62,10 @@ pub fn committee_range(
     start..end
 }
 
-pub fn committees_per_slot(active_validator_count: usize, is_pq: bool) -> usize {
+/// Spec `get_committee_count_per_slot`.
+pub fn committees_per_slot(active_validator_count: usize, max_committees_per_slot: usize) -> usize {
     let per_slot = active_validator_count / SLOTS_PER_EPOCH as usize / TARGET_COMMITTEE_SIZE;
-    per_slot.clamp(1, if is_pq { MAX_COMMITTEES_PER_SLOT_PQ } else { MAX_COMMITTEES_PER_SLOT })
+    per_slot.min(max_committees_per_slot).max(1)
 }
 
 /// Where one position of the shuffled active set attests.
@@ -84,5 +90,27 @@ pub fn committee_at_position(
         slot_in_epoch,
         committee_index,
         members: committee_range(shuffled_len, committees_per_slot, slot_in_epoch, committee_index),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The table under the spec's `X_MAX_COMMITTEE_COUNT_PER_SLOT`.
+    #[test]
+    fn a_lower_cap_gives_fewer_larger_committees() {
+        for (active, cap, per_slot, committee_len) in [
+            (4_096, 16, 1, 128),
+            (16_384, 16, 4, 128),
+            (16_384, 1, 1, 512),
+            (65_536, 16, 16, 128),
+            (65_536, 4, 4, 512),
+            (65_536, 1, 1, 2_048),
+        ] {
+            assert_eq!(committees_per_slot(active, cap), per_slot, "{active} under {cap}");
+            assert_eq!(committee_range(active, per_slot, 0, 0).len(), committee_len);
+        }
+        assert_eq!(committees_per_slot(0, 16), 1, "never none");
     }
 }

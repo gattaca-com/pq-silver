@@ -75,7 +75,7 @@ impl ShufflingEntry {
         stf::EpochShuffling::new(
             &self.shuffled_indices,
             self.required_validator_count,
-            self.id.is_some_and(|id| id.is_pq),
+            self.id.map_or(0, |id| id.max_committees_per_slot as usize),
         )
         .with_committee_aggs(aggs)
     }
@@ -118,7 +118,7 @@ impl ShufflingEntry {
         let shuffling = stf::EpochShuffling::new(
             &self.shuffled_indices,
             self.required_validator_count,
-            self.id.is_some_and(|id| id.is_pq),
+            self.id.map_or(0, |id| id.max_committees_per_slot as usize),
         );
         for slot_in_epoch in 0..SLOTS_PER_EPOCH {
             for ci in 0..shuffling.committees_per_slot {

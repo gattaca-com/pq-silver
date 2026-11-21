@@ -158,7 +158,7 @@ fn shufflings_are_shared_through_the_decision_block() {
     fc.on_block(block(10, root(2), root(1), fin, fin));
     fc.on_block(block(40, root(3), root(2), fin, fin));
     fc.on_block(block(20, root(4), root(1), fin, fin));
-    let decided_by_root_2 = ShufflingId { epoch: 2, dependent_root: root(2), is_pq: false };
+    let decided_by_root_2 = ShufflingId { epoch: 2, dependent_root: root(2), ..Default::default() };
     assert_eq!(decided_by_root_2.decision_slot(), 31);
 
     assert!(fc.shares_shuffling(&root(2), decided_by_root_2));
@@ -183,7 +183,7 @@ fn decisions_before_the_anchor_are_shared_by_every_branch() {
     );
     fc.on_block(block(101, root(2), root(1), fin, fin));
     fc.on_block(block(102, root(3), root(1), fin, fin));
-    let before_anchor = ShufflingId { epoch: 3, dependent_root: root(7), is_pq: false };
+    let before_anchor = ShufflingId { epoch: 3, dependent_root: root(7), ..Default::default() };
     assert!(before_anchor.decision_slot() < 100);
 
     assert!(fc.shares_shuffling(&root(2), before_anchor));

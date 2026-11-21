@@ -25,7 +25,7 @@ impl<'a> EpochShuffling<'a> {
             &rv.validators,
             &rv.randao_mixes,
             epoch,
-            epoch >= rv.imm.pq_fork_epoch,
+            rv.imm.max_committees_per_slot(epoch),
             buf,
         )
     }
@@ -36,7 +36,7 @@ impl<'a> EpochShuffling<'a> {
             &view.validators.reader(),
             &view.randao_mixes.reader(),
             target_epoch,
-            target_epoch >= view.imm.pq_fork_epoch,
+            view.imm.max_committees_per_slot(target_epoch),
             buf,
         )
     }
@@ -45,20 +45,24 @@ impl<'a> EpochShuffling<'a> {
         validators: &ValidatorsView,
         randao: &RandaoMixesView,
         epoch: Epoch,
-        is_pq: bool,
+        max_committees_per_slot: usize,
         buf: &'a mut Vec<u32>,
     ) -> Self {
         let seed = Seed::from_randao(randao, epoch, DOMAIN_BEACON_ATTESTER);
         validators.active_indices_into(epoch, buf);
         let required_validator_count = buf.last().map_or(0, |&i| i as usize + 1);
         seed.shuffle(buf);
-        Self::new(buf, required_validator_count, is_pq)
+        Self::new(buf, required_validator_count, max_committees_per_slot)
     }
 
-    pub(crate) fn new(shuffled: &'a [u32], required_validator_count: usize, is_pq: bool) -> Self {
+    pub(crate) fn new(
+        shuffled: &'a [u32],
+        required_validator_count: usize,
+        max_committees_per_slot: usize,
+    ) -> Self {
         Self {
             shuffled,
-            committees_per_slot: committees_per_slot(shuffled.len(), is_pq),
+            committees_per_slot: committees_per_slot(shuffled.len(), max_committees_per_slot),
             required_validator_count,
             committee_aggs: None,
         }

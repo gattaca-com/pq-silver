@@ -5,7 +5,7 @@ use std::{
 
 use serde::Deserialize;
 use silver_chain_spec::{ForkName, SpecConfig};
-use silver_common::{Enr, Error, NodeChain, SLOTS_PER_EPOCH};
+use silver_common::{Enr, Error, NodeChain, SLOTS_PER_EPOCH, ssz_view::MAX_COMMITTEES_PER_SLOT_PQ};
 
 use crate::{Genesis, Network};
 
@@ -97,6 +97,19 @@ impl ChainConfig {
             )));
         }
         Ok(self.spec.fork_digest_at(epoch, &genesis.validators_root))
+    }
+
+    /// `CommitteeBits` has `MAX_COMMITTEES_PER_SLOT_PQ` bits.
+    pub fn require_committee_count_in_range(&self) -> Result<(), Error> {
+        let configured = self.spec.x_max_committee_count_per_slot;
+        if !(1..=MAX_COMMITTEES_PER_SLOT_PQ as u64).contains(&configured) {
+            return Err(Error::ConfigError(format!(
+                "{} sets X_MAX_COMMITTEE_COUNT_PER_SLOT {configured}; it must be within \
+                 1..={MAX_COMMITTEES_PER_SLOT_PQ}",
+                self.spec.network_name(),
+            )));
+        }
+        Ok(())
     }
 
     /// This build has no fork-transition logic into PQ, so it runs only

@@ -18,10 +18,10 @@ pub use builders::{
 };
 pub use committee::process_ptc_window;
 pub(crate) use committee::{balance_weighted_draws, fill_epoch_ptc, get_ptc};
-pub(crate) use envelope::payload_withdrawals_match_expected;
+pub(crate) use envelope::{envelope_execution_requests, payload_withdrawals_match_expected};
 pub use envelope::{
-    envelope_execution_requests, envelope_layout, envelope_withdrawals_match_expected,
-    verify_envelope_signature, verify_execution_payload_envelope,
+    envelope_layout, envelope_withdrawals_match_expected, verify_envelope_signature,
+    verify_execution_payload_envelope,
 };
 pub use parent_payload::process_parent_execution_payload;
 pub(crate) use parent_payload::{RequestsLayout, apply_parent_execution_payload};

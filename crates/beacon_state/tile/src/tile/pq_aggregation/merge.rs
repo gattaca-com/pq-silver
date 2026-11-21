@@ -1,4 +1,9 @@
-use silver_common::{Nanos, TCacheRead, TProducer};
+use std::collections::{BTreeMap, btree_map::Entry};
+
+use silver_common::{
+    Nanos, TCacheRead, TProducer,
+    ssz_view::{ATTESTATION_DATA_SIZE, AttestationPqView},
+};
 
 use super::{
     aggregation::{Aggregation, Priority, VerifiedClaims},
@@ -58,12 +63,56 @@ impl MergeAggregation {
         self.core.finish(&batch, body).map(|()| self.strategy.adopted(&batch))
     }
 
-    /// The `AttestationPq` SSZ of each aggregate the best proof covers, and
-    /// the proof, for a block body. `None` without a best proof.
-    pub(super) fn block_proof(&self) -> Option<(impl Iterator<Item = &[u8]> + Clone, &[u8])> {
+    /// The block body's attestations for the aggregates the best proof
+    /// covers, and the proof. `None` without a best proof.
+    pub(super) fn block_proof(&self) -> Option<(Vec<Vec<u8>>, &[u8])> {
         let (_, proof) = self.core.best_proof()?;
-        let attestations =
+        let covered =
             self.core.covered_indices().iter().map(|&index| self.attestations[index].as_slice());
-        Some((attestations, proof))
+        Some((on_chain_aggregates(covered), proof))
     }
 }
+
+/// The block body's attestation for one attestation data.
+struct OnChainAggregate<'a> {
+    data: &'a [u8; ATTESTATION_DATA_SIZE],
+    /// Each committee's votes as a `Bitlist`, by committee index.
+    committees: BTreeMap<usize, Vec<u8>>,
+}
+
+impl OnChainAggregate<'_> {
+    fn encode(&self) -> Vec<u8> {
+        let committees = self.committees.iter().map(|(&index, votes)| (index, votes.as_slice()));
+        AttestationPqView::encode_committees(self.data, committees)
+            .expect("committees ascend in range")
+    }
+}
+
+/// Spec `compute_on_chain_aggregate`, per attestation data in arrival order.
+/// The proof covers the union of a committee's aggregates, so they are united
+/// into one. Each of `aggregates` is an `AttestationPq` of one committee.
+fn on_chain_aggregates<'a>(aggregates: impl Iterator<Item = &'a [u8]>) -> Vec<Vec<u8>> {
+    let mut on_chain: Vec<OnChainAggregate> = Vec::new();
+    for aggregate in aggregates {
+        let data = AttestationPqView::data(aggregate).as_bytes();
+        let committee_bits = u16::from_le_bytes(*AttestationPqView::committee_bits(aggregate));
+        let votes = AttestationPqView::aggregation_bits(aggregate);
+        let at = on_chain.iter().position(|held| held.data == data).unwrap_or_else(|| {
+            on_chain.push(OnChainAggregate { data, committees: BTreeMap::new() });
+            on_chain.len() - 1
+        });
+        match on_chain[at].committees.entry(committee_bits.trailing_zeros() as usize) {
+            Entry::Vacant(committee) => {
+                committee.insert(votes.to_vec());
+            }
+            Entry::Occupied(mut committee) => {
+                debug_assert_eq!(committee.get().len(), votes.len(), "one committee, one length");
+                committee.get_mut().iter_mut().zip(votes).for_each(|(held, votes)| *held |= votes);
+            }
+        }
+    }
+    on_chain.iter().map(OnChainAggregate::encode).collect()
+}
+
+#[cfg(test)]
+mod tests;

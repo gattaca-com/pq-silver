@@ -168,6 +168,37 @@ impl AttestationPqView {
         Self::write_one_committee(&mut out, data, committee_index, committee_len, positions)
             .then_some(out)
     }
+
+    /// An attestation of several committees: each is its index and its votes
+    /// as a `Bitlist`. `None` unless the indices ascend and are in range.
+    pub fn encode_committees<'a>(
+        data: &[u8; ATTESTATION_DATA_SIZE],
+        committees: impl IntoIterator<Item = (usize, &'a [u8])>,
+    ) -> Option<Vec<u8>> {
+        let mut out = vec![0; ATTESTATION_PQ_FIXED];
+        out[..4].copy_from_slice(&(ATTESTATION_PQ_FIXED as u32).to_le_bytes());
+        out[4..4 + ATTESTATION_DATA_SIZE].copy_from_slice(data);
+        let (mut next_index, mut len) = (0, 0);
+        for (index, votes) in committees {
+            if index < next_index || index >= MAX_COMMITTEES_PER_SLOT_PQ {
+                return None;
+            }
+            next_index = index + 1;
+            out[4 + ATTESTATION_DATA_SIZE + index / 8] |= 1 << (index % 8);
+            let committee_len = bitlist_len(votes);
+            out.resize(ATTESTATION_PQ_FIXED + (len + committee_len) / 8 + 1, 0);
+            for position in (0..committee_len).filter(|p| votes[p / 8] >> (p % 8) & 1 == 1) {
+                let at = len + position;
+                out[ATTESTATION_PQ_FIXED + at / 8] |= 1 << (at % 8);
+            }
+            len += committee_len;
+        }
+        if next_index == 0 {
+            return None;
+        }
+        out[ATTESTATION_PQ_FIXED + len / 8] |= 1 << (len % 8);
+        Some(out)
+    }
 }
 
 // -- ProvedAttestation: an aggregate with its proof -------------------

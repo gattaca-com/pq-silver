@@ -113,8 +113,10 @@ fn verified_message(signed: &[u8]) -> &[u8] {
 
 /// Only for an envelope `verify_execution_payload_envelope` accepted, which
 /// bounds and roots its requests.
-pub fn envelope_execution_requests(signed: &[u8]) -> &[u8] {
-    ExecutionPayloadEnvelopeView::execution_requests(verified_message(signed))
+pub(crate) fn envelope_execution_requests(signed: &[u8]) -> (&[u8], RequestsLayout) {
+    let is_pq = SignedExecutionPayloadEnvelopePqView::check_size(signed);
+    let requests = ExecutionPayloadEnvelopeView::execution_requests(verified_message(signed));
+    (requests, RequestsLayout::for_fork(is_pq))
 }
 
 /// `process_execution_payload`'s `payload.withdrawals ==

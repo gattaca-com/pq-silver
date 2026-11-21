@@ -6086,6 +6086,7 @@ dependencies = [
  "silver_httpcore",
  "silver_leanvm_api",
  "silver_log",
+ "silver_observe",
  "silver_pbs",
  "ureq",
 ]

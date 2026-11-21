@@ -24,12 +24,12 @@ pub struct AttestationKey {
 }
 
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
-pub struct AttestationLockCommand {
+pub struct AttestationLockCommand<const N: usize = SINGLE_ATT_SIZE> {
     pub key: AttestationKey,
     pub subnet: u64,
     /// Complete signed attestation selected by Raft. Validation deliberately
     /// happens only after this command commits.
-    pub ssz: [u8; SINGLE_ATT_SIZE],
+    pub ssz: [u8; N],
 }
 
 #[derive(Debug, Clone, Copy, Hash, Eq, PartialEq)]
@@ -39,11 +39,12 @@ pub struct BlockKey {
 }
 
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
-pub struct BlockLockCommand {
+pub struct BlockLockCommand<const N: usize = 96> {
     pub key: BlockKey,
     /// BLS signing is deterministic, so the signature identifies the signed
-    /// block without hashing it.
-    pub signature: [u8; 96],
+    /// block without hashing it. An XMSS signature spends its slot's leaf, so
+    /// a second one is refused even over the same block.
+    pub signature: [u8; N],
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

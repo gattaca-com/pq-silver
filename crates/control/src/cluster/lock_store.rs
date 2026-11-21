@@ -3,7 +3,8 @@ use std::{collections::hash_map::Entry, io};
 use bytes::{BufMut, BytesMut};
 use fxhash::FxHashMap;
 use silver_common::{
-    MAX_CLUSTER_MESSAGE_BYTES, SLOTS_PER_EPOCH, merkle, ssz_view::SingleAttestationView,
+    MAX_CLUSTER_MESSAGE_BYTES, SLOTS_PER_EPOCH, merkle,
+    ssz_view::{AttestationDataView, XMSS_SIGNATURE_SIZE, XMSSSignature},
 };
 
 use super::{
@@ -23,8 +24,8 @@ const SNAPSHOT_BUCKET_LEN: usize = 1 + 8 + 4;
 const SNAPSHOT_VOTE_LEN: usize = 8 + 32 + 8;
 const SNAPSHOT_EVICTED_LEN: usize = 8 + 8;
 /// `committee_index` and `attester_index` precede the signed `data` and
-/// signature. The signature leaves `committee_index` out, so a vote naming
-/// another committee is still the same vote.
+/// signature, BLS or XMSS. The signature leaves `committee_index` out, so a
+/// vote naming another committee is still the same vote.
 const SIGNED_VOTE_START: usize = 8 + 8;
 // `encode_snapshot` checks the size before any count cast, so every count is
 // below this.
@@ -65,6 +66,8 @@ pub(crate) struct SlashingLockStore {
     /// source is lower.
     evicted_sources: FxHashMap<u64, u64>,
     blocks: FxHashMap<BlockKey, [u8; 96]>,
+    /// Standalone only: no Raft command or snapshot carries an XMSS lock.
+    xmss_blocks: FxHashMap<BlockKey, XMSSSignature>,
 }
 
 #[derive(Debug, Default)]
@@ -83,11 +86,13 @@ struct Vote {
 }
 
 impl SlashingLockStore {
-    pub(crate) fn apply(&mut self, cmd: &AttestationLockCommand) -> LockResult {
+    pub(crate) fn apply<const N: usize>(&mut self, cmd: &AttestationLockCommand<N>) -> LockResult {
+        let data = cmd.ssz[SIGNED_VOTE_START..].first_chunk().expect("a vote holds its data");
+        let data = AttestationDataView::new(data);
         let target = cmd.key.slot / SLOTS_PER_EPOCH;
-        let source = SingleAttestationView::source_epoch(&cmd.ssz);
+        let source = data.source_epoch();
         // A malformed source could otherwise block the validator permanently.
-        if SingleAttestationView::target_epoch(&cmd.ssz) != target || source > target {
+        if data.target_epoch() != target || source > target {
             return LockResult::Invalid;
         }
         if cmd.key.slot < self.minimum_slot || target < self.minimum_target {
@@ -150,19 +155,14 @@ impl SlashingLockStore {
     }
 
     pub(crate) fn apply_block(&mut self, cmd: &BlockLockCommand) -> LockResult {
-        if cmd.key.slot < self.minimum_slot {
-            return LockResult::TooOld;
-        }
-        match self.blocks.entry(cmd.key) {
-            Entry::Vacant(entry) => {
-                entry.insert(cmd.signature);
-                LockResult::Accepted
-            }
-            Entry::Occupied(entry) if entry.get() == &cmd.signature => {
-                LockResult::AlreadyAcceptedSame
-            }
-            Entry::Occupied(_) => LockResult::Conflicting,
-        }
+        lock_block(&mut self.blocks, self.minimum_slot, cmd)
+    }
+
+    pub(crate) fn apply_xmss_block(
+        &mut self,
+        cmd: &BlockLockCommand<XMSS_SIGNATURE_SIZE>,
+    ) -> LockResult {
+        lock_block(&mut self.xmss_blocks, self.minimum_slot, cmd)
     }
 
     pub(super) fn minimum_slot(&self) -> u64 {
@@ -335,6 +335,25 @@ impl SlashingLockStore {
         self.minimum_slot = minimum_slot;
         self.evict_below(minimum_slot / SLOTS_PER_EPOCH);
         self.blocks.retain(|key, _| key.slot >= minimum_slot);
+        self.xmss_blocks.retain(|key, _| key.slot >= minimum_slot);
+    }
+}
+
+fn lock_block<const N: usize>(
+    blocks: &mut FxHashMap<BlockKey, [u8; N]>,
+    minimum_slot: u64,
+    cmd: &BlockLockCommand<N>,
+) -> LockResult {
+    if cmd.key.slot < minimum_slot {
+        return LockResult::TooOld;
+    }
+    match blocks.entry(cmd.key) {
+        Entry::Vacant(entry) => {
+            entry.insert(cmd.signature);
+            LockResult::Accepted
+        }
+        Entry::Occupied(entry) if entry.get() == &cmd.signature => LockResult::AlreadyAcceptedSame,
+        Entry::Occupied(_) => LockResult::Conflicting,
     }
 }
 

@@ -22,7 +22,7 @@ fn gain(children: &[Positions], picks: impl IntoIterator<Item = usize>) -> usize
         let child = &children[pick];
         have[child.committee.index].union_with(&child.bits)
     });
-    have.iter().map(Bits::count).sum()
+    have.iter().map(|bits| bits.count_outside(&Bits::default())).sum()
 }
 
 /// The most any `limit` children cover, by enumeration.

@@ -22,6 +22,7 @@ use silver_common::{
     TProducer, TReadMode, TileId, hex32,
     ssz_view::{STATUS_V2_SIZE, SYNC_COMMITTEE_CONTRIBUTION_SIZE},
     ticker::{MAXIMUM_GOSSIP_CLOCK_DISPARITY, SlotTicker, TickEvent},
+    wake_within,
 };
 use silver_config::{PendingBounds, SyncingConfig};
 use silver_slashing::SlashingPool;
@@ -30,6 +31,7 @@ use crate::{
     fork_choice::{ExecutionStatus, FORK_CHOICE_NODES_HINT, ForkChoice},
     ssz_hash, stf,
     tile::{
+        arrival_timers::ArrivalTimers,
         attestation_pool::{AttestationPool, UnknownRootPqVotes, UnknownRootVotes},
         attestation_root_memo::AttestationRootMemo,
         bid_pool::BidPool,
@@ -46,7 +48,7 @@ use crate::{
         payload_attributes::PayloadAttributes,
         payload_execution_requests::PayloadExecutionRequests,
         pending_envelopes::{BLOCK_WAIT_SLOTS, PendingEnvelopes},
-        pq_aggregation::{Claim, PqAggregator, wire::MAX_REQUEST_LEN},
+        pq_aggregation::{PqAggregator, wire::MAX_REQUEST_LEN},
         precomputed_epochs::PrecomputedEpochs,
         proposer_preparations::ProposerPreparations,
         seen_aggregates::SeenAggregates,
@@ -58,6 +60,7 @@ use crate::{
     weak_subjectivity::{weak_subjectivity_period_fulu, weak_subjectivity_period_gloas},
 };
 
+mod arrival_timers;
 mod attestation_pool;
 mod precomputed_epochs;
 // `pub` for the crate's `attestation_root_memo` criterion bench.
@@ -88,6 +91,10 @@ mod seen_proposer_preferences;
 mod seen_validators;
 mod shuffling_cache;
 mod sync_contribution_pool;
+
+/// Longest idle park. Payload, bid and aggregation deadlines are not slot
+/// phases, so the ticker does not bound them.
+const IDLE_WAKE: Duration = Duration::from_millis(5);
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub enum Feedback {
@@ -279,8 +286,7 @@ pub struct BeaconStateTile {
     payload_execution_requests: PayloadExecutionRequests,
     payload_attestation_pool: PayloadAttestationPool,
     pq_aggregator: PqAggregator,
-    /// Reused to build each merged aggregate's claims.
-    pq_merge_claims: Vec<Claim>,
+    arrival_timers: ArrivalTimers,
     /// The VC's committee subscriptions, for its aggregators' subnets.
     aggregator_subnets: SubnetsBySlot,
     leanvm_verifier: LeanVmVerifier,
@@ -385,7 +391,7 @@ impl BeaconStateTile {
             payload_execution_requests: PayloadExecutionRequests::default(),
             payload_attestation_pool: PayloadAttestationPool::default(),
             pq_aggregator: PqAggregator::default(),
-            pq_merge_claims: Vec::new(),
+            arrival_timers: ArrivalTimers::new(),
             aggregator_subnets: SubnetsBySlot::default(),
             leanvm_verifier: LeanVmVerifier::default(),
             gossip_proofs: GossipProofs::default(),
@@ -398,6 +404,12 @@ impl BeaconStateTile {
         tile.seed_anchor(anchor, anchor_header, val_cap);
         silver_log::info!("created BeaconStateTile: head_state_slot is {}", tile.head_state_slot());
         tile
+    }
+
+    /// Keeps a rolling proof of pooled PQ votes for local proposals. Off, a
+    /// proposal includes only the newest slot it may.
+    pub fn enable_pq_rolling_aggregate(&mut self) {
+        self.pq_aggregator.enable_rolling();
     }
 
     pub fn open_tcaches(&mut self) -> Result<(), TCacheError> {
@@ -1179,7 +1191,7 @@ impl BeaconStateTile {
         // its `None` answer arrives.
         adapter.consume(|health: LeanVmHealthEvent, _| self.pq_aggregator.on_health(health));
         adapter.consume(|resp: LeanVmResp, producers| {
-            if let Some(verdict) = LeanVmVerifier::verdict(&resp, &mut self.reader) {
+            if let Some(verdict) = self.leanvm_verifier.verdict(&resp, &mut self.reader) {
                 let request_id = resp.request_id;
                 silver_log::debug!(request_id, ?verdict, "leanvm proof verdict");
                 if !self.gossip_proofs.awaits(request_id) {
@@ -1575,6 +1587,8 @@ impl Tile<SilverSpine> for BeaconStateTile {
         // After every event, so a request goes out in the iteration that unlocked it.
         let tcache = &mut self.events_producer;
         self.pq_aggregator.send_next(&self.ticker, tcache, &mut adapter.producers);
+
+        wake_within(adapter, self.ticker.until_next_tick().min(IDLE_WAKE));
     }
 }
 

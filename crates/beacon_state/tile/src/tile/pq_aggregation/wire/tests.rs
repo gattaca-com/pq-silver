@@ -58,7 +58,7 @@ fn the_length_is_exactly_the_bytes_written() {
         (vec![], signatures[..3].to_vec()),
     ];
     for (proofs, signatures) in shapes {
-        let request = AggregateRequest { log_inv_rate: 2, proofs, signatures };
+        let request = AggregateRequest { log_inv_rate: 2, proofs, signatures, output: None };
         let mut out = vec![0xAA; request.len()];
         request.write(&mut out);
         assert_eq!(out[0], 1, "aggregate op");
@@ -80,7 +80,7 @@ fn the_longest_request_takes_exactly_the_bound() {
         (merge, vec![]),
     ];
     let lens = shapes.map(|(proofs, signatures)| {
-        AggregateRequest { log_inv_rate: 2, proofs, signatures }.body().len()
+        AggregateRequest { log_inv_rate: 2, proofs, signatures, output: None }.body().len()
     });
     assert!(lens.iter().all(|&len| len <= MAX_REQUEST_LEN), "{lens:?}");
     assert_eq!(lens[2], MAX_REQUEST_LEN, "a merge on the largest best proof");
@@ -89,7 +89,8 @@ fn the_longest_request_takes_exactly_the_bound() {
 #[test]
 #[should_panic(expected = "shorter than its slice")]
 fn a_slice_longer_than_the_request_is_a_bug() {
-    let request = AggregateRequest { log_inv_rate: 2, proofs: vec![], signatures: vec![] };
+    let request =
+        AggregateRequest { log_inv_rate: 2, proofs: vec![], signatures: vec![], output: None };
     request.write(&mut vec![0; request.len() + 1]);
 }
 
@@ -212,7 +213,7 @@ fn a_real_sidecar_aggregates_verifies_then_extends() {
 
     let request = |proofs: Vec<_>, signatures: &[(Claim, &[u8; XMSS_SIGNATURE_SIZE])]| {
         let signatures = signatures.iter().map(|(claim, signature)| (claim, *signature)).collect();
-        AggregateRequest { log_inv_rate: 2, proofs, signatures }.body()
+        AggregateRequest { log_inv_rate: 2, proofs, signatures, output: None }.body()
     };
     let response = exchange(&mut stream, &request(vec![], &signatures[..8]));
     let AggregateResponse { claims, proof } = AggregateResponse::decode(&response).unwrap();
@@ -228,4 +229,52 @@ fn a_real_sidecar_aggregates_verifies_then_extends() {
     let response = exchange(&mut stream, &request(vec![child], &signatures[8..]));
     let union = AggregateResponse::decode(&response).unwrap().claims;
     assert_eq!(union, sorted(&signatures));
+}
+
+/// The sidecar re-proves a proof for a declared part of its claims, with no
+/// signature in the request. One key signs four messages at four leaves.
+#[test]
+#[ignore = "needs a leanvm-sidecar: set LEANVM_SIDECAR_SOCKET"]
+fn a_real_sidecar_reduces_a_proof_to_declared_claims() {
+    use silver_crypto_simd::xmss::SecretKey;
+
+    let key = SecretKey::new(&[7; 32]);
+    let bottom = key.bottom_tree(0);
+    let signed: Vec<(Claim, [u8; XMSS_SIGNATURE_SIZE])> = (0..4u8)
+        .map(|leaf| {
+            let message = [leaf + 1; 32];
+            let mut claim = [0; 64];
+            claim[..32].copy_from_slice(&key.public_key());
+            claim[32..].copy_from_slice(&message);
+            (claim, key.sign(&bottom, &message, u32::from(leaf)))
+        })
+        .collect();
+
+    let socket = std::env::var("LEANVM_SIDECAR_SOCKET").expect("LEANVM_SIDECAR_SOCKET");
+    let mut stream = UnixStream::connect(socket).unwrap();
+    assert!(read_frame(&mut stream).starts_with(b"leanvmsc"));
+
+    let signatures = signed.iter().map(|(claim, signature)| (claim, signature)).collect();
+    let all = AggregateRequest { log_inv_rate: 2, proofs: vec![], signatures, output: None };
+    let response = exchange(&mut stream, &all.body());
+    let AggregateResponse { claims, proof } = AggregateResponse::decode(&response).unwrap();
+    assert_eq!(claims.len(), 4);
+
+    let kept = &claims[1..3];
+    let reduce = AggregateRequest {
+        log_inv_rate: 2,
+        proofs: vec![(claims.as_slice(), proof)],
+        signatures: vec![],
+        output: Some(kept),
+    };
+    let response = exchange(&mut stream, &reduce.body());
+    let reduced = AggregateResponse::decode(&response).unwrap();
+    assert_eq!(reduced.claims, kept);
+
+    let verify = |stream: &mut UnixStream, claims: &[Claim], proof: &[u8]| {
+        decode_verify_response(&exchange(stream, &VerifyRequest { claims, proof }.body()))
+    };
+    assert_eq!(verify(&mut stream, kept, reduced.proof), ProofVerdict::Valid);
+    assert_eq!(verify(&mut stream, &claims, reduced.proof), ProofVerdict::Invalid, "the full set");
+    assert_eq!(verify(&mut stream, kept, proof), ProofVerdict::Invalid, "the old proof");
 }

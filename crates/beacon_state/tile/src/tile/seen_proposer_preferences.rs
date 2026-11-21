@@ -25,6 +25,10 @@ impl SeenProposerPreferences {
         self.0.get(&(proposal_slot, *dependent_root)).map(|seen| &seen.preferences)
     }
 
+    pub fn any_local(&self) -> bool {
+        self.0.values().any(|seen| seen.local)
+    }
+
     pub fn is_local(&self, proposal_slot: Slot, dependent_root: &B256) -> bool {
         self.0.get(&(proposal_slot, *dependent_root)).is_some_and(|seen| seen.local)
     }

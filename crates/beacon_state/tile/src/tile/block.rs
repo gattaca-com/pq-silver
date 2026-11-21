@@ -741,6 +741,7 @@ impl BeaconStateTile {
         let n = self.head_validator_count();
         for (target, validators) in votes.votes.iter() {
             self.fork_choice.record_votes(target, validators, n);
+            self.pq_aggregator.on_chain(target.attestation_slot, validators);
         }
 
         // Spec `on_block` takes the head before the new block joins the store.

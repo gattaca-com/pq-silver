@@ -54,15 +54,6 @@ struct Candidate {
     gain: usize,
 }
 
-impl MarginalGain {
-    /// Empty again, keeping its buffers.
-    pub fn clear(&mut self) {
-        self.committees.clear();
-        self.have.clear();
-        self.waiting.clear();
-    }
-}
-
 impl Strategy for MarginalGain {
     type Positions = Positions;
 

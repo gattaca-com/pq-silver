@@ -183,6 +183,9 @@ pub struct SpecConfig {
     /// committees; at most `MAX_COMMITTEES_PER_SLOT_PQ`.
     #[serde(default = "max_committees_per_slot_pq")]
     pub x_max_committee_count_per_slot: u64,
+    /// A power of two, at most 16.
+    #[serde(default = "default_u64::<16>")]
+    pub attestation_subnet_count_pq: u64,
     /// Per-epoch override on `max_blobs_per_block` (EIP-7892). Sorted by
     /// `epoch`; the active entry is the highest-epoch entry whose epoch
     /// <= the queried epoch. Empty ⇒ always fall back to the Electra
@@ -546,12 +549,23 @@ impl SpecConfig {
     /// decrease. Forks are cumulative, so code may test a fork's epoch alone to
     /// mean "this fork or later", which only holds when this is `None`. Earlier
     /// forks are not checked: silver runs from Fulu.
+    ///
+    /// An unscheduled EIP-8483 is left out: a network may go from Gloas to PQ
+    /// directly, and nothing tests its epoch alone.
     pub fn misordered_forks(&self) -> Option<(ForkName, ForkName)> {
-        ForkName::ALL
-            .windows(2)
-            .filter(|pair| pair[0] >= ForkName::Fulu)
-            .find(|pair| self.fork_epoch(pair[0]) > self.fork_epoch(pair[1]))
-            .map(|pair| (pair[0], pair[1]))
+        let mut previous: Option<ForkName> = None;
+        for &fork in ForkName::ALL.iter().filter(|&&fork| fork >= ForkName::Fulu) {
+            if fork == ForkName::Eip8483 && self.fork_epoch(fork) == unscheduled() {
+                continue;
+            }
+            if let Some(previous) = previous &&
+                self.fork_epoch(previous) > self.fork_epoch(fork)
+            {
+                return Some((previous, fork));
+            }
+            previous = Some(fork);
+        }
+        None
     }
 
     /// `(next_fork_version, next_fork_epoch)` for the ENR `eth2` field at
@@ -652,6 +666,7 @@ impl SpecConfig {
             pq_fork_version: default_fork_version::<0xe0000000>(),
             pq_fork_epoch: unscheduled(),
             x_max_committee_count_per_slot: max_committees_per_slot_pq(),
+            attestation_subnet_count_pq: 16,
             blob_schedule: vec![
                 BlobParameters { epoch: 52480, max_blobs_per_block: 15 },
                 BlobParameters { epoch: 54016, max_blobs_per_block: 21 },
@@ -723,6 +738,7 @@ impl SpecConfig {
             pq_fork_version: default_fork_version::<0xe0000000>(),
             pq_fork_epoch: unscheduled(),
             x_max_committee_count_per_slot: max_committees_per_slot_pq(),
+            attestation_subnet_count_pq: 16,
             blob_schedule: vec![
                 BlobParameters { epoch: 274176, max_blobs_per_block: 15 },
                 BlobParameters { epoch: 275712, max_blobs_per_block: 21 },
@@ -792,6 +808,7 @@ impl SpecConfig {
             pq_fork_version: default_fork_version::<0xe0000000>(),
             pq_fork_epoch: unscheduled(),
             x_max_committee_count_per_slot: max_committees_per_slot_pq(),
+            attestation_subnet_count_pq: 16,
             blob_schedule: default_blob_schedule(),
             max_blobs_per_block_electra: 9,
             blob_sidecar_subnet_count: 6,
@@ -1033,8 +1050,13 @@ mod tests {
     #[test]
     fn a_fork_scheduled_before_its_predecessor_is_misordered() {
         assert_eq!(SpecConfig::mainnet().misordered_forks(), None);
-        let pq_without_eip8483 = SpecConfig { pq_fork_epoch: 0, ..SpecConfig::mainnet() };
-        assert_eq!(pq_without_eip8483.misordered_forks(), Some((ForkName::Eip8483, ForkName::Pq)));
+        let pq_without_gloas = SpecConfig { pq_fork_epoch: 0, ..SpecConfig::mainnet() };
+        assert_eq!(pq_without_gloas.misordered_forks(), Some((ForkName::Gloas, ForkName::Pq)));
+        let pq_from_gloas =
+            SpecConfig { fulu_fork_epoch: 0, gloas_fork_epoch: 0, ..pq_without_gloas.clone() };
+        assert_eq!(pq_from_gloas.misordered_forks(), None, "EIP-8483 is not scheduled");
+        let eip8483_after_pq = SpecConfig { eip8483_fork_epoch: 1, ..pq_from_gloas };
+        assert_eq!(eip8483_after_pq.misordered_forks(), Some((ForkName::Eip8483, ForkName::Pq)));
         let fulu_without_deneb = SpecConfig { fulu_fork_epoch: 0, ..SpecConfig::mainnet() };
         assert_eq!(fulu_without_deneb.misordered_forks(), None);
     }

@@ -1503,8 +1503,12 @@ mod tests {
             })
         });
         let parsed: serde_json::Value = serde_json::from_str(&body).unwrap();
+        // serde_json keeps insertion order when another crate of the build
+        // turns on its `preserve_order` feature.
         let keys = |value: &serde_json::Value| -> Vec<String> {
-            value.as_object().unwrap().keys().cloned().collect()
+            let mut keys: Vec<_> = value.as_object().unwrap().keys().cloned().collect();
+            keys.sort();
+            keys
         };
         let sorted = |names: &[&str]| -> Vec<String> {
             let mut names: Vec<_> = names.iter().map(|name| name.to_string()).collect();

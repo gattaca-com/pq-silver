@@ -18,8 +18,7 @@ use silver_beacon_state_data::{
     },
 };
 use silver_common::{
-    ATTESTATION_SUBNETS_PQ, EPOCHS_PER_SUBNET_SUBSCRIPTION, NUMBER_OF_CUSTODY_GROUPS,
-    SAMPLES_PER_SLOT, SUBNETS_PER_NODE,
+    EPOCHS_PER_SUBNET_SUBSCRIPTION, NUMBER_OF_CUSTODY_GROUPS, SAMPLES_PER_SLOT, SUBNETS_PER_NODE,
     ssz_view::{
         ATTESTER_SLASHING_PQ_MAX, MAX_ATTESTATIONS_PQ, MAX_BLOB_COMMITMENTS_PER_BLOCK,
         MAX_BUILDER_PREREGISTRATION_REQUESTS_PER_PAYLOAD, MAX_COMMITTEES_PER_SLOT,
@@ -267,7 +266,6 @@ const NETWORK_CONFIG: &[(&str, u64)] = &[
     ("AGGREGATION_CUTOFF_BPS", AGGREGATION_CUTOFF_BPS),
     ("AGGREGATE_DUE_BPS_PQ", AGGREGATE_DUE_BPS_PQ),
     ("AGGREGATOR_DELAY_BPS", AGGREGATOR_DELAY_BPS),
-    ("ATTESTATION_SUBNET_COUNT_PQ", ATTESTATION_SUBNETS_PQ as u64),
 ];
 
 /// `*_FORK_VERSION` stubs the spec mints for EIPs no fork has scheduled.
@@ -364,6 +362,7 @@ fn configured(spec: &SpecConfig) -> impl IntoIterator<Item = (&'static str, u64)
         ("GENESIS_DELAY", spec.genesis_delay),
         ("TERMINAL_BLOCK_HASH_ACTIVATION_EPOCH", spec.terminal_block_hash_activation_epoch),
         ("X_MAX_COMMITTEE_COUNT_PER_SLOT", spec.x_max_committee_count_per_slot),
+        ("ATTESTATION_SUBNET_COUNT_PQ", spec.attestation_subnet_count_pq),
         ("SECONDS_PER_SLOT", spec.seconds_per_slot()),
         // Teku and Nimbus reject a body whose two spellings of the slot length
         // disagree, so this is derived rather than a mainnet literal.

@@ -14,10 +14,6 @@ impl Bits {
         fresh
     }
 
-    pub fn count(&self) -> usize {
-        self.0.iter().map(|word| word.count_ones() as usize).sum()
-    }
-
     /// How many of these `have` lacks.
     pub fn count_outside(&self, have: &Bits) -> usize {
         let outside = self.0.iter().zip(&have.0).map(|(word, have)| word & !have);

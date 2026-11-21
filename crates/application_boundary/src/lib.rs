@@ -1,4 +1,9 @@
+#[cfg(feature = "metrics")]
+mod metrics;
+
 use std::time::Duration;
+#[cfg(feature = "metrics")]
+use std::{io, net::SocketAddr, path::PathBuf};
 
 use flux::{
     spine::{SpineAdapter, SpineProducers},
@@ -6,6 +11,8 @@ use flux::{
 };
 use silver_beacon_api::BeaconApi;
 use silver_beacon_state_data::{BeaconStateReader, SpecConfig};
+#[cfg(feature = "metrics")]
+use silver_common::SLOTS_PER_EPOCH;
 use silver_common::{
     BeaconApiResponse, BeaconStateEvent, BuilderBidsRequest, BuilderBidsResponse, DataColumnsEvent,
     EngineResp, Enr, Identify, Keypair, PeerEvent, SidecarBidRequest, SidecarBidResponse,
@@ -19,7 +26,7 @@ use silver_pbs::{BuilderBids, BuilderEvent, PbsClient, SidecarEvent};
 
 /// A tenant added here takes the next share of a raised `TENANTS`, which keeps
 /// every share disjoint without a base to compute.
-const TENANTS: usize = 7;
+const TENANTS: usize = 7 + cfg!(feature = "metrics") as usize;
 const BEACON_TOKENS: TokenRange = TokenRange::share(0, TENANTS);
 const ENGINE_TOKENS: TokenRange = TokenRange::share(1, TENANTS);
 const PBS_TOKENS: TokenRange = TokenRange::share(2, TENANTS);
@@ -27,9 +34,21 @@ const PBS_HEADER_TOKENS: TokenRange = TokenRange::share(3, TENANTS);
 const PBS_SUBMISSION_TOKENS: TokenRange = TokenRange::share(4, TENANTS);
 const BUILDER_TOKENS: TokenRange = TokenRange::share(5, TENANTS);
 const LEANVM_TOKENS: TokenRange = TokenRange::share(6, TENANTS);
+/// Above every share, so no tenant dispatches it.
+#[cfg(feature = "thread_park")]
+const WAKER_TOKEN: mio::Token = mio::Token(usize::MAX);
+
+/// Bounds the sleep of an idle loop, so request and connection deadlines
+/// still fire with no socket or spine activity.
+#[cfg(feature = "thread_park")]
+const IDLE_WAIT: Duration = Duration::from_millis(10);
+#[cfg(not(feature = "thread_park"))]
+const IDLE_WAIT: Duration = Duration::ZERO;
 
 pub struct ApplicationBoundaryTile {
     readiness: Readiness,
+    #[cfg(feature = "metrics")]
+    metrics: Option<metrics::MetricsEndpoint>,
     pub beacon: BeaconApi,
     engine: EngineApi,
     leanvm: LeanVmApi,
@@ -38,6 +57,7 @@ pub struct ApplicationBoundaryTile {
     /// The tile's one producer, shared by engine responses and the messages
     /// the beacon api publishes.
     processing: TProducer,
+    worked: bool,
 }
 
 impl Tile<SilverSpine> for ApplicationBoundaryTile {
@@ -47,8 +67,18 @@ impl Tile<SilverSpine> for ApplicationBoundaryTile {
         adapter.subscribe_broadcast::<SyncUpdate>();
     }
 
-    fn try_init(&mut self, _adapter: &mut SpineAdapter<SilverSpine>) -> bool {
+    fn try_init(&mut self, adapter: &mut SpineAdapter<SilverSpine>) -> bool {
         self.open_tcaches().expect("tcache wiring");
+        // Without a waker the tile parks on the spine signal alone, and its
+        // sockets cannot end the park.
+        #[cfg(feature = "thread_park")]
+        {
+            let waker =
+                mio::Waker::new(self.readiness.registry(), WAKER_TOKEN).expect("boundary waker");
+            adapter.register_waker(waker);
+        }
+        #[cfg(not(feature = "thread_park"))]
+        let _ = adapter;
         true
     }
 
@@ -56,7 +86,7 @@ impl Tile<SilverSpine> for ApplicationBoundaryTile {
         self.processing.loop_start();
         self.engine.intake(adapter, &mut self.processing);
         self.leanvm.intake(adapter);
-        self.readiness.wait(Duration::ZERO);
+        self.readiness.wait(if self.worked { Duration::ZERO } else { IDLE_WAIT });
 
         self.engine.spin(adapter, self.readiness.events(), &mut self.processing);
         self.leanvm.spin(adapter, self.readiness.events(), &mut self.processing);
@@ -108,9 +138,12 @@ impl Tile<SilverSpine> for ApplicationBoundaryTile {
             },
             &mut |request_id, body| builder_bids.submit_preferences(request_id, body),
         );
+        #[cfg(feature = "metrics")]
+        let did_work = self.metrics.as_mut().is_some_and(|m| m.pump(readiness)) || did_work;
         if did_work {
             adapter.mark_work();
         }
+        self.worked = adapter.did_work();
     }
 }
 
@@ -141,6 +174,8 @@ impl ApplicationBoundaryTile {
             LeanVmApi::MAX_SOCKETS +
             PbsClient::MAX_SOCKETS +
             BuilderBids::MAX_SOCKETS;
+        #[cfg(feature = "metrics")]
+        let sockets = sockets + metrics::SOCKETS;
 
         let readiness = Readiness::new(sockets);
         let has_sidecar = pbs.is_some();
@@ -182,7 +217,27 @@ impl ApplicationBoundaryTile {
         let builder_bids =
             BuilderBids::new(readiness.registry(), BUILDER_TOKENS, builder_bid_timeout);
         let leanvm = LeanVmApi::new(readiness.registry(), LEANVM_TOKENS, leanvm_socket, tcaches);
-        Self { readiness, beacon, engine, leanvm, pbs, builder_bids, processing }
+        Self {
+            #[cfg(feature = "metrics")]
+            metrics: None,
+            readiness,
+            beacon,
+            engine,
+            leanvm,
+            pbs,
+            builder_bids,
+            processing,
+            worked: false,
+        }
+    }
+
+    #[cfg(feature = "metrics")]
+    pub fn listen_metrics(&mut self, bind: SocketAddr, sources: PathBuf) -> io::Result<SocketAddr> {
+        let endpoint = metrics::MetricsEndpoint::bind(bind, sources, self.readiness.registry())
+            .map_err(|e| io::Error::new(e.kind(), format!("metrics listener {bind}: {e}")))?;
+        let addr = endpoint.local_addr()?;
+        self.metrics = Some(endpoint);
+        Ok(addr)
     }
 
     pub fn open_tcaches(&mut self) -> Result<(), TCacheError> {
@@ -192,9 +247,25 @@ impl ApplicationBoundaryTile {
     }
 
     fn consume_spine_events(&mut self, adapter: &mut SpineAdapter<SilverSpine>) {
-        let Self { beacon, engine, pbs, processing, .. } = self;
+        let Self {
+            beacon,
+            engine,
+            pbs,
+            processing,
+            #[cfg(feature = "metrics")]
+            metrics,
+            ..
+        } = self;
 
-        adapter.consume(|event: BeaconStateEvent, _| beacon.handle_beacon_state_event(event));
+        adapter.consume(|event: BeaconStateEvent, _| {
+            #[cfg(feature = "metrics")]
+            if let (BeaconStateEvent::Status { wall_slot, .. }, Some(metrics)) =
+                (&event, metrics.as_mut())
+            {
+                metrics.discover_sources(wall_slot / SLOTS_PER_EPOCH);
+            }
+            beacon.handle_beacon_state_event(event)
+        });
         adapter.consume(|request: SidecarBidRequest, producers| {
             if !pbs.as_mut().is_some_and(|pbs| pbs.request_bid(&request)) {
                 let SidecarBidRequest { slot, parent_hash, .. } = request;

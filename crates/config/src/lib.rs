@@ -121,7 +121,22 @@ mod optional_address {
 }
 
 #[derive(Debug, Deserialize)]
+#[serde(default)]
+pub struct MetricsConfig {
+    pub enabled: bool,
+    pub bind: SocketAddr,
+}
+
+impl Default for MetricsConfig {
+    fn default() -> Self {
+        Self { enabled: false, bind: ([127, 0, 0, 1], 5054).into() }
+    }
+}
+
+#[derive(Debug, Deserialize)]
 pub struct Config {
+    #[serde(default)]
+    pub metrics: MetricsConfig,
     #[serde(default)]
     network: Network,
     #[serde(default)]
@@ -218,6 +233,11 @@ pub struct Config {
     /// Unix socket of the leanVM sidecar.
     #[serde(default)]
     leanvm_socket: Option<String>,
+    /// Keeps one STARK proof of the pooled PQ votes not yet on chain, so a
+    /// local proposal also includes votes older than the newest slot. Costs
+    /// about two more leanVM sidecar proofs each slot.
+    #[serde(default)]
+    pq_rolling_aggregate: bool,
 }
 
 impl Config {
@@ -340,6 +360,10 @@ impl Config {
 
     pub fn leanvm_socket(&self) -> Option<&str> {
         self.leanvm_socket.as_deref()
+    }
+
+    pub fn pq_rolling_aggregate(&self) -> bool {
+        self.pq_rolling_aggregate
     }
 
     pub fn enr(&self, keypair: &Keypair, enr_fork_id: [u8; 16]) -> Result<Enr, Error> {
@@ -533,6 +557,8 @@ mod tests {
         assert_eq!(cfg.supported_protocols().unwrap().len(), 12);
         assert!(cfg.supported_protocols().unwrap().contains(&StreamProtocol::GossipSubV13));
         assert_eq!(cfg.gossip_topics().unwrap().len(), 7);
+        assert!(!cfg.metrics.enabled);
+        assert_eq!(cfg.metrics.bind.to_string(), "127.0.0.1:5054");
         assert_eq!(cfg.beacon_api_bind(), ["127.0.0.1:5051"]);
         assert!(cfg.beacon_api_allowed_hosts().is_empty());
         assert_eq!(cfg.beacon_api_max_connections(), 1024);
@@ -777,6 +803,19 @@ mod tests {
             assert_eq!(checked.is_ok(), accepted, "{configured}");
             if let Err(err) = checked {
                 assert!(format!("{err}").contains("X_MAX_COMMITTEE_COUNT_PER_SLOT"));
+            }
+        }
+    }
+
+    #[test]
+    fn pq_subnet_count_must_be_a_power_of_two_within_the_attnets() {
+        let mut chain = Config::mainnet().unwrap().chain().unwrap();
+        for (configured, accepted) in [(0, false), (1, true), (2, true), (3, false), (32, false)] {
+            chain.spec.attestation_subnet_count_pq = configured;
+            let checked = chain.require_subnet_count_in_range();
+            assert_eq!(checked.is_ok(), accepted, "{configured}");
+            if let Err(err) = checked {
+                assert!(format!("{err}").contains("ATTESTATION_SUBNET_COUNT_PQ"));
             }
         }
     }

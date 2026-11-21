@@ -12,10 +12,10 @@
 
 mod aggregation;
 mod aggregator;
-mod arena;
 mod claims;
 mod leaf;
 mod merge;
+mod rolling;
 mod strategy;
 #[cfg(test)]
 pub(super) mod test_util;

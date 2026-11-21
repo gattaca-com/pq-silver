@@ -1,7 +1,14 @@
 #![allow(improper_ctypes, improper_ctypes_definitions)]
 
+use std::time::Duration;
+
 pub use cluster_admin::*;
-use flux::{communication::ShmemData, spine::SpineQueue, spine_derive::from_spine, tile::TileInfo};
+use flux::{
+    communication::ShmemData,
+    spine::{SpineAdapter, SpineQueue},
+    spine_derive::from_spine,
+    tile::TileInfo,
+};
 pub use messages::*;
 pub use stream_id::{LOCAL_GOSSIP_STREAM_ID, P2pStreamId};
 pub use stream_protocol::{
@@ -100,4 +107,13 @@ pub struct SilverSpine {
     pub cluster_admin_requests: SpineQueue<ClusterAdminRequest>,
     #[queue(size(2usize.pow(4)))]
     pub cluster_admin_responses: SpineQueue<ClusterAdminResponse>,
+}
+
+/// Bounds the park that may follow this loop: the tile wakes within `timeout`
+/// without a spine signal. Without it, timed work waits for the next signal.
+pub fn wake_within(adapter: &mut SpineAdapter<SilverSpine>, timeout: Duration) {
+    #[cfg(feature = "thread_park")]
+    adapter.set_park_deadline(flux::timing::Instant::now() + flux::timing::Duration::from(timeout));
+    #[cfg(not(feature = "thread_park"))]
+    let _ = (adapter, timeout);
 }

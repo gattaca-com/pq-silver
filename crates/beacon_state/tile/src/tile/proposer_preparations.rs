@@ -33,6 +33,10 @@ impl ProposerPreparations {
         }
     }
 
+    pub(super) fn is_empty(&self) -> bool {
+        self.by_index.is_empty()
+    }
+
     pub(super) fn fee_recipient(&self, validator_index: u64) -> Option<ExecutionAddress> {
         self.by_index.get(&validator_index).map(|preparation| preparation.fee_recipient)
     }

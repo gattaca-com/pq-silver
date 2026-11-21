@@ -255,6 +255,20 @@ impl SlotTicker {
         self.last = None;
     }
 
+    /// Time until [`Self::tick`] next has an event; zero when one is due.
+    pub fn until_next_tick(&self) -> Duration {
+        let ms = self.millis_since_genesis();
+        let (slot, into) = (ms / self.slot_ms, ms % self.slot_ms);
+        let next_offset = match self.last {
+            Some((last_slot, phase)) if last_slot == slot => {
+                PHASES.get(phase + 1).map_or(self.slot_ms, |&next| self.offset(next, slot))
+            }
+            Some((last_slot, _)) if last_slot > slot => self.slot_ms,
+            _ => 0,
+        };
+        Duration::from_millis(next_offset.saturating_sub(into))
+    }
+
     pub fn tick(&mut self) -> TickEvent {
         let ms = self.millis_since_genesis();
         let slot = ms / self.slot_ms;
@@ -314,6 +328,22 @@ mod tests {
         assert!(matches!(t.tick(), TickEvent::SlotStart(1)));
         // Next phase (AnnouncePayload at 4s) is in the future.
         assert!(t.tick() == TickEvent::None);
+    }
+
+    #[test]
+    fn until_next_tick_counts_down_to_each_phase_and_the_next_slot() {
+        let mut ticker =
+            SlotTicker::new(genesis_secs_ago(20), &spec(12_000, 2), Duration::from_secs(4));
+        let slot_start_ms = 70 * 12_000;
+        ticker.set_since_genesis_ms(slot_start_ms + 1_000);
+        assert_eq!(ticker.until_next_tick(), Duration::ZERO, "the slot's start is due");
+        assert_eq!(ticker.tick(), TickEvent::SlotStart(70));
+        // Gloas announces the payload at 25% of the slot.
+        assert_eq!(ticker.until_next_tick(), Duration::from_millis(2_000));
+
+        ticker.set_since_genesis_ms(slot_start_ms + 11_800);
+        while ticker.tick() != TickEvent::None {}
+        assert_eq!(ticker.until_next_tick(), Duration::from_millis(200), "the next slot");
     }
 
     /// The table in the spec's "Construct aggregate", for a 12 s slot.

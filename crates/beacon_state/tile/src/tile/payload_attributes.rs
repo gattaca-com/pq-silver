@@ -75,6 +75,10 @@ impl BeaconStateTile {
                 .is_some_and(|root| self.seen_proposer_preferences.is_local(slot, &root))
     }
 
+    pub(super) fn has_local_proposers(&self) -> bool {
+        !self.proposer_preparations.is_empty() || self.seen_proposer_preferences.any_local()
+    }
+
     /// `fallback_fee_recipient` pays when the proposer named none. Who
     /// proposes is resolved first, so a slot with no one to pay is refused
     /// before the execution parent or the head state is read.

@@ -15,13 +15,12 @@ pub const ATTESTATION_DUE_BPS_GLOAS: u64 = 2500;
 pub const AGGREGATE_DUE_BPS: u64 = 6667;
 pub const AGGREGATE_DUE_BPS_GLOAS: u64 = 5000;
 pub const PAYLOAD_ATTESTATION_DUE_BPS: u64 = 7500;
+pub const AGGREGATION_CUTOFF_BPS: u64 = 4000;
+pub const AGGREGATE_DUE_BPS_PQ: u64 = 6000;
+pub const AGGREGATOR_DELAY_BPS: u64 = 500;
 
 pub fn attestation_due_bps(is_gloas: bool) -> u64 {
     if is_gloas { ATTESTATION_DUE_BPS_GLOAS } else { ATTESTATION_DUE_BPS }
-}
-
-pub fn aggregate_due_bps(is_gloas: bool) -> u64 {
-    if is_gloas { AGGREGATE_DUE_BPS_GLOAS } else { AGGREGATE_DUE_BPS }
 }
 
 // slot/24 before next slot = 500ms on mainnet.
@@ -220,10 +219,20 @@ impl SlotTicker {
         Nanos::from_millis(slot * self.slot_ms)
     }
 
-    /// Time since genesis at which `slot`'s aggregates are due.
-    pub fn aggregate_due(&self, slot: Slot) -> Nanos {
-        let due_ms = self.slot_ms * aggregate_due_bps(slot >= self.gloas_fork_slot) / BASIS_POINTS;
-        self.slot_start(slot) + Nanos::from_millis(due_ms)
+    /// Spec `get_aggregation_cutoff_ms` for `slot`, since genesis.
+    pub fn aggregation_cutoff(&self, slot: Slot, position: u64) -> Nanos {
+        self.staggered(slot, AGGREGATION_CUTOFF_BPS, position)
+    }
+
+    /// Spec PQ `get_aggregate_due_ms` for `slot`, since genesis.
+    pub fn pq_aggregate_due(&self, slot: Slot, position: u64) -> Nanos {
+        self.staggered(slot, AGGREGATE_DUE_BPS_PQ, position)
+    }
+
+    /// `bps` into `slot`, later by one aggregator delay per `position`.
+    fn staggered(&self, slot: Slot, bps: u64, position: u64) -> Nanos {
+        let delay_ms = position * (self.slot_ms * AGGREGATOR_DELAY_BPS / BASIS_POINTS);
+        self.slot_start(slot) + Nanos::from_millis(self.slot_ms * bps / BASIS_POINTS + delay_ms)
     }
 
     pub fn is_before_attesting_interval(&self, is_gloas: bool) -> bool {
@@ -307,32 +316,20 @@ mod tests {
         assert!(t.tick() == TickEvent::None);
     }
 
+    /// The table in the spec's "Construct aggregate", for a 12 s slot.
     #[test]
-    fn aggregate_due_follows_the_fork_of_the_slot() {
-        let gloas_epoch = 2;
-        let ticker = SlotTicker::new(
-            genesis_secs_ago(20),
-            &spec(12_000, gloas_epoch),
-            Duration::from_secs(4),
-        );
-        let gloas_slot = ticker.gloas_fork_slot;
-        let fulu = gloas_slot - 1;
-        assert_eq!(ticker.aggregate_due(fulu), Nanos::from_millis(fulu * 12_000 + 8_000));
-        assert_eq!(
-            ticker.aggregate_due(gloas_slot),
-            Nanos::from_millis(gloas_slot * 12_000 + 6_000)
-        );
-    }
-
-    #[test]
-    fn a_slot_starts_after_the_aggregates_of_the_one_before_are_due() {
+    fn aggregators_cut_off_and_broadcast_staggered_by_position() {
         let ticker =
             SlotTicker::new(genesis_secs_ago(20), &spec(12_000, 2), Duration::from_secs(4));
-        let gloas_slot = ticker.gloas_fork_slot;
-        assert_eq!(ticker.slot_start(gloas_slot), Nanos::from_millis(gloas_slot * 12_000));
-        for slot in [gloas_slot, gloas_slot + 1] {
-            assert!(ticker.slot_start(slot) > ticker.aggregate_due(slot - 1), "slot {slot}");
+        let slot = 7;
+        let into_slot = |at: Nanos| at.as_millis_u64() - slot * 12_000;
+        for (position, cutoff_ms, due_ms) in
+            [(0, 4_800, 7_200), (1, 5_400, 7_800), (2, 6_000, 8_400), (3, 6_600, 9_000)]
+        {
+            assert_eq!(into_slot(ticker.aggregation_cutoff(slot, position)), cutoff_ms);
+            assert_eq!(into_slot(ticker.pq_aggregate_due(slot, position)), due_ms);
         }
+        assert!(ticker.slot_start(slot + 1) > ticker.pq_aggregate_due(slot, 3));
     }
 
     #[test]

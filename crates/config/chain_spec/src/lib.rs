@@ -102,6 +102,10 @@ pub struct SpecConfig {
     /// from `genesis_fork_version` rather than serving none.
     #[serde(default, deserialize_with = "name_unless_empty")]
     pub config_name: Option<String>,
+    /// The preset this network runs. It must be the one silver was built
+    /// with, since preset values size its types.
+    #[serde(default = "mainnet_preset")]
+    pub preset_base: String,
     /// Genesis (phase-0) fork version. Used as the `current_version` in the
     /// genesis fork-data root, which is the domain mixed into deposit
     /// signatures (`DOMAIN_DEPOSIT`). 0x00000000 mainnet, 0x10000910 Hoodi.
@@ -236,9 +240,20 @@ pub struct SpecConfig {
     /// Delay between exit_epoch and withdrawability.
     #[serde(default = "default_u64::<256>")]
     pub min_validator_withdrawability_delay: u64,
+    /// Delay from a builder's exit to its balance becoming withdrawable.
+    #[serde(default = "default_u64::<64>")]
+    pub min_builder_withdrawability_delay: u64,
     /// Seed lookahead for shuffling / activation delay.
     #[serde(default = "default_u64::<4>")]
     pub max_seed_lookahead: u64,
+    /// Pre-Electra churn floor, as a validator count. Only the
+    /// weak-subjectivity period still reads it.
+    #[serde(default = "default_u64::<4>")]
+    pub min_per_epoch_churn_limit: u64,
+    /// Deneb cap on per-epoch activations, as a validator count. Silver
+    /// applies none; it is carried for clients.
+    #[serde(default = "default_u64::<8>")]
+    pub max_per_epoch_activation_churn_limit: u64,
     /// Floor on per-epoch consensus stake churn, in Gwei.
     #[serde(default = "default_u64::<128_000_000_000>")]
     pub min_per_epoch_churn_limit_electra: u64,
@@ -287,6 +302,10 @@ pub struct SpecConfig {
     /// 16 ETH = 16e9 Gwei on mainnet/Hoodi.
     #[serde(default = "default_u64::<16_000_000_000>")]
     pub ejection_balance: u64,
+}
+
+fn mainnet_preset() -> String {
+    "mainnet".to_owned()
 }
 
 /// Mainnet's merge threshold, crossed 2022-09-15.
@@ -635,6 +654,7 @@ impl SpecConfig {
     pub fn hoodi() -> Self {
         Self {
             config_name: None,
+            preset_base: mainnet_preset(),
             // Hoodi fork-version pattern is `0xN0000910`.
             genesis_fork_version: default_fork_version::<0x10000910>(),
             min_genesis_active_validator_count: 16_384,
@@ -683,7 +703,10 @@ impl SpecConfig {
             // Identical to mainnet preset / config below this line.
             shard_committee_period: 256,
             min_validator_withdrawability_delay: 256,
+            min_builder_withdrawability_delay: 64,
             max_seed_lookahead: 4,
+            min_per_epoch_churn_limit: 4,
+            max_per_epoch_activation_churn_limit: 8,
             min_per_epoch_churn_limit_electra: 128_000_000_000,
             max_per_epoch_activation_exit_churn_limit: 256_000_000_000,
             churn_limit_quotient: 1 << 16,
@@ -707,6 +730,7 @@ impl SpecConfig {
     pub fn sepolia() -> Self {
         Self {
             config_name: None,
+            preset_base: mainnet_preset(),
             // Sepolia fork-version pattern is `0x900000NN`.
             genesis_fork_version: default_fork_version::<0x90000069>(),
             min_genesis_active_validator_count: 1300,
@@ -758,7 +782,10 @@ impl SpecConfig {
             // Identical to mainnet preset / config below this line.
             shard_committee_period: 256,
             min_validator_withdrawability_delay: 256,
+            min_builder_withdrawability_delay: 64,
             max_seed_lookahead: 4,
+            min_per_epoch_churn_limit: 4,
+            max_per_epoch_activation_churn_limit: 8,
             min_per_epoch_churn_limit_electra: 128_000_000_000,
             max_per_epoch_activation_exit_churn_limit: 256_000_000_000,
             churn_limit_quotient: 1 << 16,
@@ -778,6 +805,7 @@ impl SpecConfig {
     pub fn mainnet() -> Self {
         Self {
             config_name: None,
+            preset_base: mainnet_preset(),
             genesis_fork_version: default_fork_version::<0x00000000>(),
             min_genesis_active_validator_count: 16_384,
             min_genesis_time: 1_606_824_000,
@@ -821,7 +849,10 @@ impl SpecConfig {
             eth1_follow_distance: 2048,
             shard_committee_period: 256,
             min_validator_withdrawability_delay: 256,
+            min_builder_withdrawability_delay: 64,
             max_seed_lookahead: 4,
+            min_per_epoch_churn_limit: 4,
+            max_per_epoch_activation_churn_limit: 8,
             min_per_epoch_churn_limit_electra: 128_000_000_000,
             max_per_epoch_activation_exit_churn_limit: 256_000_000_000,
             churn_limit_quotient: 1 << 16,

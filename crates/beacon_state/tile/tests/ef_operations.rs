@@ -478,7 +478,8 @@ fn gloas_builder_deposit_request() {
 }
 
 fn run_builder_deposit_request(s: &mut LoadedState, op: &[u8]) -> bool {
-    s.with_view(|view| stf::process_builder_deposit_request(view, op));
+    let cfg = gloas_cfg();
+    s.with_view(|view| stf::process_builder_deposit_request(view, &cfg, op));
     true
 }
 
@@ -499,7 +500,8 @@ fn run_builder_exit_request(s: &mut LoadedState, op: &[u8]) -> bool {
         let (_, epoch, _) = s.view();
         epoch.view_opt(sid.epoch_idx).state().finalized_checkpoint.epoch
     };
-    s.with_view(|view| stf::process_builder_exit_request(view, finalized_epoch, op));
+    let cfg = gloas_cfg();
+    s.with_view(|view| stf::process_builder_exit_request(view, &cfg, finalized_epoch, op));
     true
 }
 

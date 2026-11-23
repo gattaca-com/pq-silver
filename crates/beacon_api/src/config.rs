@@ -214,11 +214,7 @@ const BYTE_CONSTANTS: &[(&str, [u8; 1])] = &[
 /// serves it under the successor's name from [`configured`]; the retired
 /// spelling is frozen at the value it had, since no network silver can join
 /// is on the wrong side of the fork that replaced it.
-const SUPERSEDED_CONFIG: &[(&str, u64)] = &[
-    ("MIN_PER_EPOCH_CHURN_LIMIT", 4),
-    ("MAX_PER_EPOCH_ACTIVATION_CHURN_LIMIT", 8),
-    ("MAX_BLOBS_PER_BLOCK", 6),
-];
+const SUPERSEDED_CONFIG: &[(&str, u64)] = &[("MAX_BLOBS_PER_BLOCK", 6)];
 
 /// Fork-choice, slot-timing and networking parameters. No config file silver
 /// has seen varies them, so the ones silver acts on live as constants of the
@@ -379,7 +375,10 @@ fn configured(spec: &SpecConfig) -> impl IntoIterator<Item = (&'static str, u64)
         ("ETH1_FOLLOW_DISTANCE", spec.eth1_follow_distance),
         ("SHARD_COMMITTEE_PERIOD", spec.shard_committee_period),
         ("MIN_VALIDATOR_WITHDRAWABILITY_DELAY", spec.min_validator_withdrawability_delay),
+        ("MIN_BUILDER_WITHDRAWABILITY_DELAY", spec.min_builder_withdrawability_delay),
         ("MAX_SEED_LOOKAHEAD", spec.max_seed_lookahead),
+        ("MIN_PER_EPOCH_CHURN_LIMIT", spec.min_per_epoch_churn_limit),
+        ("MAX_PER_EPOCH_ACTIVATION_CHURN_LIMIT", spec.max_per_epoch_activation_churn_limit),
         ("MIN_PER_EPOCH_CHURN_LIMIT_ELECTRA", spec.min_per_epoch_churn_limit_electra),
         (
             "MAX_PER_EPOCH_ACTIVATION_EXIT_CHURN_LIMIT",
@@ -729,11 +728,13 @@ mod tests {
 
     /// The fork-suffixed keys carry the scalars silver runs on, so a config
     /// file that overrides one has to move the served value with it. Their
-    /// pre-fork spellings are frozen historical values and must not follow.
+    /// pre-fork spellings are frozen historical values and must not follow,
+    /// except `MIN_PER_EPOCH_CHURN_LIMIT`, which silver still reads.
     #[test]
     fn churn_and_penalty_scalars_are_served_under_their_fork_suffixed_names() {
         let spec: SpecConfig = toml::from_str(
             r#"
+            MIN_PER_EPOCH_CHURN_LIMIT = 2
             MIN_PER_EPOCH_CHURN_LIMIT_ELECTRA = 7
             MIN_SLASHING_PENALTY_QUOTIENT = 64
             INACTIVITY_PENALTY_QUOTIENT = 128
@@ -742,12 +743,12 @@ mod tests {
         )
         .unwrap();
         let served = spec_map(&spec);
+        assert_eq!(served["MIN_PER_EPOCH_CHURN_LIMIT"], "2");
         assert_eq!(served["MIN_PER_EPOCH_CHURN_LIMIT_ELECTRA"], "7");
         assert_eq!(served["MIN_SLASHING_PENALTY_QUOTIENT_ELECTRA"], "64");
         assert_eq!(served["INACTIVITY_PENALTY_QUOTIENT_BELLATRIX"], "128");
         assert_eq!(served["PROPORTIONAL_SLASHING_MULTIPLIER_BELLATRIX"], "5");
 
-        assert_eq!(served["MIN_PER_EPOCH_CHURN_LIMIT"], "4");
         assert_eq!(served["MIN_SLASHING_PENALTY_QUOTIENT"], "128");
         assert_eq!(served["MIN_SLASHING_PENALTY_QUOTIENT_BELLATRIX"], "32");
         assert_eq!(served["INACTIVITY_PENALTY_QUOTIENT"], "67108864");

@@ -100,7 +100,7 @@ impl ChainConfig {
     }
 
     /// `CommitteeBits` has `MAX_COMMITTEES_PER_SLOT_PQ` bits.
-    pub fn require_committee_count_in_range(&self) -> Result<(), Error> {
+    pub(crate) fn require_committee_count_in_range(&self) -> Result<(), Error> {
         let configured = self.spec.x_max_committee_count_per_slot;
         if !(1..=MAX_COMMITTEES_PER_SLOT_PQ as u64).contains(&configured) {
             return Err(Error::ConfigError(format!(

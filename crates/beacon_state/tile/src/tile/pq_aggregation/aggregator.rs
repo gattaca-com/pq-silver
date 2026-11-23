@@ -101,14 +101,18 @@ impl PqAggregator {
     /// its cutoff and proved until its aggregate is due.
     pub fn add_vote(&mut self, vote: VerifiedVote, last_position: u64, ticker: &SlotTicker) {
         let leaf = LeafKey::new(&vote);
-        if vote.committee_position >= vote.committee_len.min(MAX_VALIDATORS_PER_COMMITTEE) {
-            let (committee_position, committee_len) = (vote.committee_position, vote.committee_len);
+        let (committee_position, committee_len) = (vote.committee_position, vote.committee_len);
+        if committee_position >= committee_len {
             silver_log::error!(
                 slot = leaf.slot,
                 committee_position,
                 committee_len,
                 "vote outside committee"
             );
+            return;
+        }
+        if committee_position >= MAX_VALIDATORS_PER_COMMITTEE {
+            silver_log::debug!(slot = leaf.slot, committee_len, "vote beyond aggregation's reach");
             return;
         }
         if vote.received >= ticker.aggregation_cutoff(leaf.slot, last_position) {

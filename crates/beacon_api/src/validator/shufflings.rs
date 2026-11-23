@@ -84,8 +84,8 @@ impl Shuffling {
     }
 
     pub(crate) fn committees_per_slot(&self) -> usize {
-        let max = self.id.map_or(0, |id| id.max_committees_per_slot as usize);
-        committees_per_slot(self.order.len(), max)
+        let id = self.id.expect("only a filled entry is read");
+        committees_per_slot(self.order.len(), id.max_committees_per_slot as usize)
     }
 
     pub(crate) fn position(&self, validator_index: u64) -> Option<u32> {
@@ -167,6 +167,18 @@ mod tests {
         posted.record(id(1), &bytes(1));
         posted.record(id(2), &bytes(2));
         assert!([0, 1, 2].iter().all(|&epoch| posted.get(id(epoch)).is_some()));
+    }
+
+    #[test]
+    fn shuffling_takes_its_committee_cap_from_its_id() {
+        let mut posted = PostedShufflings::default();
+        for (max_committees_per_slot, per_slot) in [(64, 2), (1, 1)] {
+            let id = ShufflingId { max_committees_per_slot, ..id(10) };
+            posted.record(id, &bytes(10));
+            let shuffling = posted.get(id).unwrap();
+            assert_eq!(shuffling.committees_per_slot(), per_slot);
+            assert_eq!(shuffling.committee(0, 0).len(), ACTIVE as usize / 32 / per_slot);
+        }
     }
 
     /// The committees of an epoch partition the posted order, slot by slot

@@ -1,7 +1,9 @@
 use blst::min_pk::PublicKey;
 use flux_profiler::timed;
 use silver_beacon_state_data::{B256, Epoch, SLOTS_PER_EPOCH, ShufflingId, StateReadView, bls};
-use silver_common::{BeaconStateEvent, TCacheProducer, TProducer};
+use silver_common::{
+    BeaconStateEvent, TCacheProducer, TProducer, ssz_view::MAX_VALIDATORS_PER_COMMITTEE,
+};
 
 use crate::stf;
 
@@ -71,11 +73,12 @@ impl ShufflingEntry {
     }
 
     fn shuffling(&self) -> stf::EpochShuffling<'_> {
+        let id = self.id.expect("only a filled entry is read");
         let aggs = (!self.committee_aggs.is_empty()).then_some(self.committee_aggs.as_slice());
         stf::EpochShuffling::new(
             &self.shuffled_indices,
             self.required_validator_count,
-            self.id.map_or(0, |id| id.max_committees_per_slot as usize),
+            id.max_committees_per_slot as usize,
         )
         .with_committee_aggs(aggs)
     }
@@ -92,6 +95,16 @@ impl ShufflingEntry {
         )
         .required_validator_count;
         self.id = Some(request.id);
+
+        let largest = self.shuffling().largest_committee_len();
+        if request.id.is_pq && largest > MAX_VALIDATORS_PER_COMMITTEE {
+            silver_log::warn!(
+                epoch = request.id.epoch,
+                largest,
+                max_committees_per_slot = request.id.max_committees_per_slot,
+                "PQ committees outgrow aggregation; raise X_MAX_COMMITTEE_COUNT_PER_SLOT"
+            );
+        }
     }
 
     /// No-op once filled, or while the entry holds no shuffling.
@@ -100,11 +113,9 @@ impl ShufflingEntry {
         view: &StateReadView,
         aggregator: &mut bls::PubkeyAggregator,
     ) {
-        if !self.id.is_some_and(|id| id.is_pq) &&
-            self.committee_aggs.is_empty() &&
-            !self.shuffled_indices.is_empty()
-        {
-            self.compute_committee_aggs(view, aggregator);
+        let Some(id) = self.id.filter(|id| !id.is_pq) else { return };
+        if self.committee_aggs.is_empty() && !self.shuffled_indices.is_empty() {
+            self.compute_committee_aggs(id, view, aggregator);
         }
     }
 
@@ -112,13 +123,14 @@ impl ShufflingEntry {
     #[timed]
     fn compute_committee_aggs(
         &mut self,
+        id: ShufflingId,
         view: &StateReadView,
         aggregator: &mut bls::PubkeyAggregator,
     ) {
         let shuffling = stf::EpochShuffling::new(
             &self.shuffled_indices,
             self.required_validator_count,
-            self.id.map_or(0, |id| id.max_committees_per_slot as usize),
+            id.max_committees_per_slot as usize,
         );
         for slot_in_epoch in 0..SLOTS_PER_EPOCH {
             for ci in 0..shuffling.committees_per_slot {

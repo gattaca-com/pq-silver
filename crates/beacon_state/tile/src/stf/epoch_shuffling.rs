@@ -1,7 +1,7 @@
 use blst::min_pk::PublicKey;
 use silver_beacon_state_data::{
-    Epoch, MIN_SEED_LOOKAHEAD, RandaoMixesView, Slot, StateReadView, StateWriterView,
-    ValidatorsView, committee_range, committees_per_slot,
+    Epoch, MIN_SEED_LOOKAHEAD, RandaoMixesView, SLOTS_PER_EPOCH, Slot, StateReadView,
+    StateWriterView, ValidatorsView, committee_range, committees_per_slot,
 };
 
 use crate::shuffling::{DOMAIN_BEACON_ATTESTER, Seed};
@@ -93,6 +93,10 @@ impl<'a> EpochShuffling<'a> {
         self.shuffled.is_empty() || self.committees_per_slot == 0
     }
 
+    pub fn largest_committee_len(&self) -> usize {
+        self.shuffled.len().div_ceil(SLOTS_PER_EPOCH as usize * self.committees_per_slot)
+    }
+
     /// Proportional split, so sizes differ by at most one and the committees
     /// partition `shuffled` exactly — every active validator lands in one.
     pub fn committee(&self, slot: Slot, committee_index: usize) -> &'a [u32] {
@@ -144,5 +148,17 @@ mod tests {
 
         let c_last = shuffling.committee(31, 1);
         assert_eq!(c_last.len(), 10);
+    }
+
+    #[test]
+    fn largest_committee_len_bounds_every_committee() {
+        for (active, per_slot) in [(640, 2), (641, 2), (65_536, 1), (65_537, 1)] {
+            let shuffled: Vec<u32> = (0..active).collect();
+            let shuffling = &EpochShuffling::with_committees_per_slot(&shuffled, per_slot);
+            let lengths = (0..32).flat_map(|slot| {
+                (0..per_slot).map(move |index| shuffling.committee(slot, index).len())
+            });
+            assert_eq!(lengths.max(), Some(shuffling.largest_committee_len()), "{active}");
+        }
     }
 }

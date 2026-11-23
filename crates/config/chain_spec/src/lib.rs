@@ -2,6 +2,7 @@ use serde::{Deserialize, Deserializer, Serialize};
 use silver_ssz::{
     merkle::{B256, sha256},
     ssz_hash::hash_tree_root_fork_data,
+    ssz_view::MAX_COMMITTEES_PER_SLOT_PQ,
 };
 use type_hash_derive::TypeHash;
 
@@ -14,6 +15,10 @@ const fn default_u64<const V: u64>() -> u64 {
 /// config file does.
 const fn default_fork_version<const V: u32>() -> [u8; 4] {
     V.to_be_bytes()
+}
+
+const fn max_committees_per_slot_pq() -> u64 {
+    MAX_COMMITTEES_PER_SLOT_PQ as u64
 }
 
 /// `FAR_FUTURE_EPOCH`: a fork with no scheduled activation.
@@ -176,7 +181,7 @@ pub struct SpecConfig {
     pub pq_fork_epoch: u64,
     /// Caps the PQ committees of a slot. A devnet lowers it for larger
     /// committees; at most `MAX_COMMITTEES_PER_SLOT_PQ`.
-    #[serde(default = "default_u64::<16>")]
+    #[serde(default = "max_committees_per_slot_pq")]
     pub x_max_committee_count_per_slot: u64,
     /// Per-epoch override on `max_blobs_per_block` (EIP-7892). Sorted by
     /// `epoch`; the active entry is the highest-epoch entry whose epoch
@@ -646,7 +651,7 @@ impl SpecConfig {
             eip8483_fork_epoch: unscheduled(),
             pq_fork_version: default_fork_version::<0xe0000000>(),
             pq_fork_epoch: unscheduled(),
-            x_max_committee_count_per_slot: 16,
+            x_max_committee_count_per_slot: max_committees_per_slot_pq(),
             blob_schedule: vec![
                 BlobParameters { epoch: 52480, max_blobs_per_block: 15 },
                 BlobParameters { epoch: 54016, max_blobs_per_block: 21 },
@@ -717,7 +722,7 @@ impl SpecConfig {
             eip8483_fork_epoch: unscheduled(),
             pq_fork_version: default_fork_version::<0xe0000000>(),
             pq_fork_epoch: unscheduled(),
-            x_max_committee_count_per_slot: 16,
+            x_max_committee_count_per_slot: max_committees_per_slot_pq(),
             blob_schedule: vec![
                 BlobParameters { epoch: 274176, max_blobs_per_block: 15 },
                 BlobParameters { epoch: 275712, max_blobs_per_block: 21 },
@@ -786,7 +791,7 @@ impl SpecConfig {
             eip8483_fork_epoch: unscheduled(),
             pq_fork_version: default_fork_version::<0xe0000000>(),
             pq_fork_epoch: unscheduled(),
-            x_max_committee_count_per_slot: 16,
+            x_max_committee_count_per_slot: max_committees_per_slot_pq(),
             blob_schedule: default_blob_schedule(),
             max_blobs_per_block_electra: 9,
             blob_sidecar_subnet_count: 6,

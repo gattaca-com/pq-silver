@@ -316,6 +316,7 @@ impl Config {
                 spec.fork_epoch(earlier),
             )));
         }
+        chain.require_committee_count_in_range()?;
 
         let max_blobs = spec.max_scheduled_blobs_per_block();
         if max_blobs > MAX_BLOBS_PER_BLOCK as u64 {

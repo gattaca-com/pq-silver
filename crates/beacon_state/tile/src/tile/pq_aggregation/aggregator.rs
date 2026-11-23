@@ -18,7 +18,7 @@ use super::{
     rolling::{POOL_SLOTS, Rolling, RollingJob, claims_of},
     strategy::Batch,
 };
-use crate::tile::Producers;
+use crate::{counters::BeaconStateCounters, tile::Producers};
 
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 enum AggregationKey {
@@ -175,6 +175,7 @@ impl PqAggregator {
     /// the slot when the rolling proof takes it in. A merge refuses it once
     /// it holds too many committees.
     pub fn add_aggregate(&mut self, aggregate: Aggregate, ticker: &SlotTicker) {
+        BeaconStateCounters::PqMergeClaimsOffered.add(aggregate.claims.len() as u64);
         let slot = aggregate.group.slot;
         let (deadline, awaited) = match &self.rolling {
             Some(rolling) => (ticker.slot_start(slot + 1), rolling.awaits(slot)),
@@ -270,7 +271,11 @@ impl PqAggregator {
             return;
         }
         let now = ticker.since_genesis();
-        let (job, body) = if let Some((job, body)) = self.next_rolling_request(ticker, tcache) {
+        let rolling_request = self.next_rolling_request(ticker, tcache);
+        if let Some(rolling) = &self.rolling {
+            BeaconStateCounters::PqMergedClaims.set(rolling.claims_len() as u64);
+        }
+        let (job, body) = if let Some((job, body)) = rolling_request {
             // `None`: the tcache is full. The next loop retries.
             let Some(body) = body else { return };
             (Job::Rolling(job), body)
@@ -356,11 +361,17 @@ impl PqAggregator {
                 return;
             }
         };
+        let rolls = self.rolling.is_some();
         let settled = match key {
             AggregationKey::Leaf(leaf) => (self.leaves.get_mut(&leaf))
                 .map(|leaf| (leaf.finish(batch, body), leaf.core.is_stopped())),
-            AggregationKey::Merge(slot) => (self.merges.get_mut(&slot))
-                .map(|merge| (merge.finish(batch, body), merge.core.is_stopped())),
+            AggregationKey::Merge(slot) => self.merges.get_mut(&slot).map(|merge| {
+                let finished = merge.finish(batch, body);
+                if let (false, Some((claims, _))) = (rolls, merge.core.best_proof()) {
+                    BeaconStateCounters::PqMergedClaims.set(claims.len() as u64);
+                }
+                (finished, merge.core.is_stopped())
+            }),
         };
         let Some((Err(reason), stopped)) = settled else { return };
         let slot = key.slot();

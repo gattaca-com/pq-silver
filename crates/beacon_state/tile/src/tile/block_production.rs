@@ -227,7 +227,10 @@ impl PackedOperations {
         rewards: &AttestationRewards<'_>,
         block_slot: Slot,
     ) {
-        let Some((attestations, proof)) = aggregator.block_proof(block_slot) else { return };
+        let Some((attestations, proof)) = aggregator.block_proof(block_slot) else {
+            silver_log::warn!(slot = block_slot, "no merged proof; packed no attestations");
+            return;
+        };
         if attestations.len() > MAX_ATTESTATIONS_PQ {
             silver_log::warn!(
                 slot = block_slot,
@@ -238,7 +241,15 @@ impl PackedOperations {
         }
         let value: Option<u64> =
             attestations.iter().map(|attestation| rewards.attestation_value(attestation)).sum();
-        if value.is_none_or(|value| value == 0) {
+        let Some(value) = value else {
+            silver_log::warn!(
+                slot = block_slot,
+                attestations = attestations.len(),
+                "merge holds an attestation the block may not include; packed no attestations"
+            );
+            return;
+        };
+        if value == 0 {
             return;
         }
         let mut at = 4 * attestations.len();

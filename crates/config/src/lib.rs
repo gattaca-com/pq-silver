@@ -34,6 +34,10 @@ const fn default_usize<const N: usize>() -> usize {
     N
 }
 
+const fn default_bool<const V: bool>() -> bool {
+    V
+}
+
 const fn default_u8<const V: u8>() -> u8 {
     V
 }
@@ -236,7 +240,7 @@ pub struct Config {
     /// Keeps one STARK proof of the pooled PQ votes not yet on chain, so a
     /// local proposal also includes votes older than the newest slot. Costs
     /// about two more leanVM sidecar proofs each slot.
-    #[serde(default)]
+    #[serde(default = "default_bool::<true>")]
     pq_rolling_aggregate: bool,
 }
 
@@ -615,6 +619,13 @@ mod tests {
         let cfg = Config::from_toml("", flag).unwrap();
         assert_eq!(cfg.pbs().unwrap().get_header_timeout(), Duration::from_millis(1200));
         assert_eq!(cfg.pbs().unwrap().submit_blinded_block_timeout(), Duration::from_millis(5000));
+    }
+
+    #[test]
+    fn pq_rolling_aggregate_is_on_unless_the_file_turns_it_off() {
+        assert!(Config::from_toml("", Overrides::default()).unwrap().pq_rolling_aggregate());
+        let off = Config::from_toml("pq_rolling_aggregate = false", Overrides::default());
+        assert!(!off.unwrap().pq_rolling_aggregate());
     }
 
     #[test]

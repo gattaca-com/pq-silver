@@ -129,6 +129,10 @@ impl Rolling {
         self.on_chain.retain(|&slot, _| slot >= self.floor);
     }
 
+    pub(super) fn claims_len(&self) -> usize {
+        self.current.as_ref().map_or(0, |current| current.claims.len())
+    }
+
     /// Whether the proof of attestation slot `slot` is still to take in.
     pub(super) fn awaits(&self, slot: Slot) -> bool {
         slot >= self.floor && self.rolled_through.is_none_or(|through| through < slot)

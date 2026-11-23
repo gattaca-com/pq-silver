@@ -38,5 +38,11 @@ silver_common::declare_counters! {
         // buffer, expiry, an evicted shuffling or a failed check.
         UnknownRootVotesPromoted,
         UnknownRootVotesDropped,
+        // PQ block proof. Offered: claims of every verified aggregate handed
+        // to a merge, late and refused ones included; aggregates of one
+        // committee repeat claims. Merged: distinct claims in the proof last
+        // updated, the rolling proof when that is on.
+        PqMergeClaimsOffered,
+        PqMergedClaims: gauge,
     }
 }

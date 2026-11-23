@@ -7864,7 +7864,8 @@ mod pq_aggregator {
 
         fn aggregate(&mut self, slot: Slot, claims: &[Claim]) {
             let attestation = attestation(0, 0..claims.len());
-            let aggregate = Aggregate::new(claims.to_vec(), b"child".to_vec(), attestation);
+            let mut claims = claims.to_vec();
+            let aggregate = Aggregate::new(&mut claims, b"child", &attestation);
             self.tile.pq_aggregator.add_aggregate(slot, aggregate.unwrap(), &self.tile.ticker);
             self.send_next();
         }
@@ -7979,10 +7980,30 @@ mod pq_aggregator {
         rig.respond(request.request_id, &[[1; 64], [2; 64]]);
         let (on_chain, proof) = rig.tile.pq_aggregator.block_proof(SLOT + 1).unwrap();
         let mut list = Vec::new();
-        on_chain.write_list(&mut list);
+        on_chain.write_list(&mut list).unwrap();
         let attestations: Vec<_> = variable_list_items(&list).collect();
         assert_eq!(attestations, [attestation(0, 0..2).as_slice()]);
         assert_eq!(proof, b"proof");
+    }
+
+    #[test]
+    fn a_merge_reusing_a_pruned_one_starts_empty() {
+        let mut rig = Rig::new();
+        rig.ready();
+        rig.aggregate(SLOT + 1, &[[1; 64], [2; 64]]);
+        let request = rig.request();
+        rig.respond(request.request_id, &[[1; 64], [2; 64]]);
+        rig.tile.pq_aggregator.prune_before(SLOT + 2);
+
+        rig.aggregate(SLOT + 2, &[[3; 64]]);
+        let request = rig.request();
+        assert!(rig.tile.pq_aggregator.block_proof(SLOT + 2).is_none(), "no proof carried over");
+        rig.respond(request.request_id, &[[3; 64]]);
+        let (on_chain, _) = rig.tile.pq_aggregator.block_proof(SLOT + 2).unwrap();
+        let mut list = Vec::new();
+        on_chain.write_list(&mut list).unwrap();
+        let attestations: Vec<_> = variable_list_items(&list).collect();
+        assert_eq!(attestations, [attestation(0, 0..1).as_slice()]);
     }
 
     #[test]

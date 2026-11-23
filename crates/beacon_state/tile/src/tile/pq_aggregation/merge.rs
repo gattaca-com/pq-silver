@@ -4,7 +4,8 @@ use silver_common::{
 };
 
 use super::{
-    aggregation::{Aggregation, Priority, VerifiedClaims},
+    aggregation::{Aggregation, Priority},
+    arena::Arena,
     claims::Aggregate,
     strategy::{Batch, MarginalGain, Strategy},
     wire::MAX_PROOFS,
@@ -14,23 +15,30 @@ use super::{
 /// It ends at the block request, when the proposer reads the best proof.
 pub(super) struct MergeAggregation {
     /// The `AttestationPq` SSZ of each aggregate, for the block body.
-    attestations: Vec<Vec<u8>>,
+    attestations: Arena<u8>,
     strategy: MarginalGain,
     pub(super) core: Aggregation,
 }
 
 impl MergeAggregation {
     pub(super) fn new(deadline: Nanos) -> Self {
-        let (attestations, strategy) = (Vec::new(), MarginalGain::default());
+        let (attestations, strategy) = (Arena::default(), MarginalGain::default());
         Self { attestations, strategy, core: Aggregation::new(deadline) }
     }
 
+    /// Empty again for another slot, keeping its buffers.
+    pub(super) fn reset(&mut self, deadline: Nanos) {
+        self.attestations.clear();
+        self.strategy.clear();
+        self.core.reset(deadline);
+    }
+
     /// `false` once the merge holds too many committees for another.
-    pub(super) fn add(&mut self, aggregate: Aggregate) -> bool {
+    pub(super) fn add(&mut self, aggregate: Aggregate<'_>) -> bool {
         let fits = self.strategy.arrived(self.attestations.len(), aggregate.positions);
         if fits {
             self.attestations.push(aggregate.attestation);
-            self.core.add(VerifiedClaims::Proof(aggregate.claims, aggregate.proof));
+            self.core.add_proof(aggregate.claims, aggregate.proof);
         }
         fits
     }
@@ -75,7 +83,7 @@ impl MergeAggregation {
 /// united into one.
 pub struct OnChainAggregates<'a> {
     /// Each an `AttestationPq` of one committee.
-    attestations: &'a [Vec<u8>],
+    attestations: &'a Arena<u8>,
     covered: &'a [usize],
 }
 
@@ -84,8 +92,10 @@ impl<'a> OnChainAggregates<'a> {
         self.first_of_each_data().count()
     }
 
-    /// Appends them to `out` as an SSZ `List[AttestationPq]`.
-    pub fn write_list(&self, out: &mut Vec<u8>) {
+    /// Appends them to `out` as an SSZ `List[AttestationPq]`. `None`, with
+    /// `out` partly written, when aggregates of one committee disagree on its
+    /// size.
+    pub fn write_list(&self, out: &mut Vec<u8>) -> Option<()> {
         let start = out.len();
         out.resize(start + 4 * self.len(), 0);
         for (i, first) in self.first_of_each_data().enumerate() {
@@ -99,14 +109,14 @@ impl<'a> OnChainAggregates<'a> {
                     .filter(move |aggregate| committee_of(aggregate) == index)
                     .map(move |aggregate| (index, AttestationPqView::aggregation_bits(aggregate)))
             });
-            let written = AttestationPqView::write_committees(out, data, committees);
-            assert!(written, "a committee's aggregates agree on its size");
+            AttestationPqView::write_committees(out, data, committees)?;
         }
+        Some(())
     }
 
     fn aggregates(&self) -> impl Iterator<Item = &'a [u8]> + Clone {
         let attestations = self.attestations;
-        self.covered.iter().map(move |&index| attestations[index].as_slice())
+        self.covered.iter().map(move |&index| attestations.get(index))
     }
 
     fn first_of_each_data(&self) -> impl Iterator<Item = &'a [u8]> {

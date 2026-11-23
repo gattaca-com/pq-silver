@@ -46,17 +46,16 @@ fn best_claims(core: &Aggregation) -> usize {
     core.best.as_ref().map_or(0, |best| best.claims.len())
 }
 
-fn merge(children: impl IntoIterator<Item = Aggregate>) -> MergeAggregation {
+/// Each child's claim `tag` sits at position `tag` of committee 0.
+fn merge(children: impl IntoIterator<Item = impl AsRef<[u16]>>) -> MergeAggregation {
     let mut merge = MergeAggregation::new(DEADLINE);
-    children.into_iter().for_each(|child| assert!(merge.add(child)));
+    for tags in children {
+        let tags = tags.as_ref();
+        let mut claims = tags.iter().copied().map(claim).collect();
+        let ssz = attestation(0, tags.iter().map(|&tag| tag as usize));
+        assert!(merge.add(Aggregate::new(&mut claims, b"child", &ssz).unwrap()));
+    }
     merge
-}
-
-/// Claim `tag` sits at position `tag` of committee 0.
-fn child(tags: &[u16]) -> Aggregate {
-    let claims = tags.iter().copied().map(claim).collect();
-    let ssz = attestation(0, tags.iter().map(|&tag| tag as usize));
-    Aggregate::new(claims, b"child".to_vec(), ssz).unwrap()
 }
 
 fn priority(leaf: &LeafAggregation) -> Priority {
@@ -149,7 +148,7 @@ fn the_aggregation_stops_after_three_failures_and_a_success_resets_the_count() {
 
 #[test]
 fn a_non_contiguous_batch_is_checked_against_exactly_its_claims() {
-    let mut merge = merge([child(&[1, 2]), child(&[2, 3]), child(&[4]), child(&[3, 4, 5])]);
+    let mut merge = merge([vec![1, 2], vec![2, 3], vec![4], vec![3, 4, 5]]);
     let batch = merge.next_batch(Nanos::ZERO).unwrap();
     assert_eq!(batch.indices(), [0, 3], "two children cover 1..=5");
 
@@ -166,7 +165,7 @@ fn a_non_contiguous_batch_is_checked_against_exactly_its_claims() {
 
 #[test]
 fn merge_batches_respect_the_child_limit_with_the_best_proof_as_one() {
-    let mut merge = merge((0..40).map(|tag| child(&[tag])));
+    let mut merge = merge((0..40).map(|tag| [tag]));
     let batch = merge.next_batch(Nanos::ZERO).unwrap();
     assert_eq!(batch.indices().len(), 16);
     assert_eq!(merge.core.request(&batch).proofs.len(), 16);
@@ -187,7 +186,7 @@ fn a_proof_above_1_mib_is_refused() {
 
 #[test]
 fn the_earliest_deadline_goes_first_whatever_the_kind() {
-    let merge = merge([child(&[1])]).priority(Nanos::ZERO).unwrap();
+    let merge = merge([[1]]).priority(Nanos::ZERO).unwrap();
     assert!(priority(&leaf(DEADLINE - Nanos(1), 1)) > merge, "a leaf before a merge");
     assert!(merge > priority(&leaf(DEADLINE + Nanos(1), 100)), "despite fewer claims");
 }
@@ -196,7 +195,7 @@ fn the_earliest_deadline_goes_first_whatever_the_kind() {
 fn then_the_most_new_claims_go_first() {
     let mut leaf = aggregation(3);
     assert!(priority(&leaf) > priority(&aggregation(2)));
-    let merge = merge([child(&[1])]).priority(Nanos::ZERO).unwrap();
+    let merge = merge([[1]]).priority(Nanos::ZERO).unwrap();
     assert!(priority(&aggregation(2)) > merge, "whatever the kind");
     settle(&mut leaf, Some(&answer(0..3))).unwrap();
     assert!(leaf.priority(Nanos::ZERO).is_none(), "nothing new waits");
@@ -206,7 +205,7 @@ fn then_the_most_new_claims_go_first() {
 
 #[test]
 fn a_response_must_hold_exactly_the_union_of_its_claims() {
-    let mut merge = merge([child(&[1, 3]), child(&[2, 3])]);
+    let mut merge = merge([[1, 3], [2, 3]]);
     let batch = merge.next_batch(Nanos::ZERO).unwrap();
     assert_eq!(batch.indices(), [0, 1]);
     let proves = |tags: &[u16]| {

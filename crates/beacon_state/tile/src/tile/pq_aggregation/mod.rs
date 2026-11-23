@@ -12,6 +12,7 @@
 
 mod aggregation;
 mod aggregator;
+mod arena;
 mod claims;
 mod leaf;
 mod merge;

@@ -171,22 +171,9 @@ impl AttestationPqView {
 
     /// Appends an attestation of several committees to `out`: each is its
     /// index and its votes as a `Bitlist`. A repeated index unites its votes.
-    /// False, leaving `out` as it was, unless the indices are in range and
+    /// `None`, with `out` partly written, unless the indices are in range and
     /// never descend, and repeats agree on length.
     pub fn write_committees<'a>(
-        out: &mut Vec<u8>,
-        data: &[u8; ATTESTATION_DATA_SIZE],
-        committees: impl IntoIterator<Item = (usize, &'a [u8])>,
-    ) -> bool {
-        let start = out.len();
-        let written = Self::try_write_committees(out, data, committees);
-        if written.is_none() {
-            out.truncate(start);
-        }
-        written.is_some()
-    }
-
-    fn try_write_committees<'a>(
         out: &mut Vec<u8>,
         data: &[u8; ATTESTATION_DATA_SIZE],
         committees: impl IntoIterator<Item = (usize, &'a [u8])>,
@@ -201,7 +188,10 @@ impl AttestationPqView {
             let committee_len = bitlist_len(votes);
             let at = match last {
                 Some((last_index, last_len)) if index == last_index => {
-                    (committee_len == last_len).then_some(len - committee_len)?
+                    if committee_len != last_len {
+                        return None;
+                    }
+                    len - last_len
                 }
                 Some((last_index, _)) if index < last_index => return None,
                 _ if index >= MAX_COMMITTEES_PER_SLOT_PQ => return None,
@@ -894,5 +884,20 @@ mod tests {
                 assert_eq!(out, expected, "len {len} at {at}");
             }
         }
+    }
+
+    #[test]
+    fn write_committees_refuses_bad_committees() {
+        let data = [7; ATTESTATION_DATA_SIZE];
+        let nine = [0, 0b11];
+        let ten = [0, 0b110];
+        let write = |committees: &[(usize, &[u8])]| {
+            AttestationPqView::write_committees(&mut Vec::new(), &data, committees.iter().copied())
+        };
+        assert!(write(&[(1, &nine), (1, &nine), (4, &ten)]).is_some());
+        assert!(write(&[]).is_none(), "no committee");
+        assert!(write(&[(4, &nine), (1, &nine)]).is_none(), "descending");
+        assert!(write(&[(MAX_COMMITTEES_PER_SLOT_PQ, &nine)]).is_none(), "out of range");
+        assert!(write(&[(1, &nine), (1, &ten)]).is_none(), "a repeat of another length");
     }
 }

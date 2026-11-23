@@ -239,7 +239,14 @@ impl PackedOperations {
             return;
         }
         debug_assert!(self.attestations.is_empty(), "the merge is the only attestation source");
-        on_chain.write_list(&mut self.attestations);
+        if on_chain.write_list(&mut self.attestations).is_none() {
+            self.attestations.clear();
+            silver_log::warn!(
+                slot = block_slot,
+                "merged aggregates disagree on a committee size; packed no attestations"
+            );
+            return;
+        }
         let value: Option<u64> = variable_list_items(&self.attestations)
             .map(|attestation| rewards.attestation_value(attestation))
             .sum();

@@ -2697,12 +2697,13 @@ impl BeaconStateTile {
         message: &[u8; 32],
     ) {
         let view = self.state.read_view(self.canonical_state_id());
-        let claims = attesters
-            .iter()
-            .map(|&attester| claim(xmss_pubkey(view.validators.pubkey(attester as usize)), message))
-            .collect();
-        let proof = SignedAggregateAndProofPqView::proof(signed).to_vec();
-        let attestation = SignedAggregateAndProofPqView::aggregate(signed).to_vec();
+        let claims = &mut self.pq_merge_claims;
+        claims.clear();
+        claims.extend(attesters.iter().map(|&attester| {
+            claim(xmss_pubkey(view.validators.pubkey(attester as usize)), message)
+        }));
+        let proof = SignedAggregateAndProofPqView::proof(signed);
+        let attestation = SignedAggregateAndProofPqView::aggregate(signed);
         match Aggregate::new(claims, proof, attestation) {
             Some(merged) => {
                 let block_slot = slot + MIN_ATTESTATION_INCLUSION_DELAY_PQ;

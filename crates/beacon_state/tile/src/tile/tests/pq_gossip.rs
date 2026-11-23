@@ -402,14 +402,25 @@ fn proven_aggregate_is_merged_for_a_local_proposal() {
         tile.handle_gossip(msg.ssz, msg, true, false, &mut adapter.producers);
         let awaiting = tile.gossip_proofs.on_verdict(request_id, ProofVerdict::Valid).unwrap();
         tile.settle_gossip_proofs(awaiting, ProofVerdict::Valid, &mut adapter.producers);
-        adapter.consume(|_: LeanVmReq, _| {});
+        let mut verifies = Vec::new();
+        adapter.consume(|request: LeanVmReq, _| verifies.push(request));
+        let [verify] = verifies[..] else { panic!("one verify request") };
+        let verify = tile.events_producer.read_buffer(verify.body).unwrap().to_vec();
 
         tile.pq_aggregator.on_health(LeanVmHealthEvent { ready: true });
         let tcache = &mut tile.events_producer;
         tile.pq_aggregator.send_next(&tile.ticker, tcache, &mut adapter.producers);
-        let mut merges = 0;
-        adapter.consume(|_: LeanVmReq, _| merges += 1);
-        assert_eq!(merges, usize::from(local));
+        let mut merges = Vec::new();
+        adapter.consume(|request: LeanVmReq, _| merges.push(request));
+        assert_eq!(merges.len(), usize::from(local));
+        for merge in merges {
+            let merge = tile.events_producer.read_buffer(merge.body).unwrap();
+            let claims_and_proof = &verify[1..];
+            assert!(
+                merge.windows(claims_and_proof.len()).any(|window| window == claims_and_proof),
+                "the merge proves the verified claims with the verified proof"
+            );
+        }
     }
 }
 

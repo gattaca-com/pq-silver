@@ -46,26 +46,27 @@ impl Vote {
     }
 }
 
-pub struct Aggregate {
+pub struct Aggregate<'a> {
     /// Sorted, without repeats.
-    pub(super) claims: Vec<Claim>,
-    pub(super) proof: Vec<u8>,
+    pub(super) claims: &'a [Claim],
+    pub(super) proof: &'a [u8],
     /// The aggregate's `AttestationPq` SSZ, for the block body.
-    pub(super) attestation: Vec<u8>,
+    pub(super) attestation: &'a [u8],
     /// Read from `attestation`; as many as `claims`.
     pub(super) positions: Positions,
 }
 
-impl Aggregate {
+impl<'a> Aggregate<'a> {
     /// The caller has verified `proof` for `claims`: our own proof, or a
-    /// received one that a leanVM sidecar `verify` accepted. `None` for no
-    /// claims, a proof above the size bound, or an `attestation` that is not
-    /// of one committee or names another number of positions than claims.
-    pub fn new(mut claims: Vec<Claim>, proof: Vec<u8>, attestation: Vec<u8>) -> Option<Self> {
+    /// received one that a leanVM sidecar `verify` accepted. `claims` is
+    /// sorted and loses its repeats. `None` for no claims, a proof above the
+    /// size bound, or an `attestation` that is not of one committee or names
+    /// another number of positions than claims.
+    pub fn new(claims: &'a mut Vec<Claim>, proof: &'a [u8], attestation: &'a [u8]) -> Option<Self> {
         claims.sort_unstable();
         claims.dedup();
-        let (index, bits) = AttestationPqView::one_committee_positions(&attestation)?;
-        let data = *AttestationPqView::data(&attestation).as_bytes();
+        let (index, bits) = AttestationPqView::one_committee_positions(attestation)?;
+        let data = *AttestationPqView::data(attestation).as_bytes();
         let positions = Positions { committee: Committee { data, index }, bits: bits.collect() };
         let consistent = positions.bits.count() == claims.len();
         (consistent && !claims.is_empty() && proof.len() <= MAX_STARK_PROOF_SIZE).then_some(Self {

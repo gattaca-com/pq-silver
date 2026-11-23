@@ -7,7 +7,7 @@ use silver_common::{
 };
 
 use super::{
-    aggregation::{Aggregation, Priority, VerifiedClaims},
+    aggregation::{Aggregation, Priority},
     claims::{VerifiedVote, Vote},
     strategy::{ArrivalOrder, Batch, Strategy},
     wire::MAX_SIGNATURES,
@@ -56,7 +56,7 @@ impl LeafAggregation {
         let fits = self.strategy.arrived(self.positions.len(), vote.committee_position);
         if fits {
             self.positions.push(vote.committee_position);
-            self.core.add(VerifiedClaims::Signature(vote.claim, vote.signature));
+            self.core.add_signature(vote.claim, vote.signature);
         }
         fits
     }

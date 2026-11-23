@@ -3,6 +3,7 @@ use std::cmp::Reverse;
 use silver_common::{Nanos, TCacheProducer, TCacheRead, TProducer, ssz_view::XMSS_SIGNATURE_SIZE};
 
 use super::{
+    arena::Arena,
     claims::Claim,
     strategy::Batch,
     wire::{AggregateRequest, AggregateResponse, MAX_REQUEST_LEN},
@@ -10,28 +11,20 @@ use super::{
 
 const MAX_FAILURES: u8 = 3;
 
-/// Claims verified by a signature or a proof, and what they add to a request.
-pub enum VerifiedClaims {
+/// Claims verified by a signature or a proof.
+enum VerifiedClaims {
     /// A vote: its claim and leanXMSS signature.
     Signature(Claim, Box<[u8; XMSS_SIGNATURE_SIZE]>),
-    /// An aggregate: its claims, sorted without repeats, and their proof.
-    Proof(Vec<Claim>, Vec<u8>),
+    /// An aggregate: its index in the proof arenas.
+    Proof(usize),
 }
 
-impl VerifiedClaims {
-    fn claims(&self) -> &[Claim] {
-        match self {
-            Self::Signature(claim, _) => std::slice::from_ref(claim),
-            Self::Proof(claims, _) => claims,
-        }
-    }
-
-    fn add_to<'a>(&'a self, request: &mut AggregateRequest<'a>) {
-        match self {
-            Self::Signature(claim, signature) => request.signatures.push((claim, signature)),
-            Self::Proof(claims, proof) => request.proofs.push((claims, proof)),
-        }
-    }
+/// The aggregates' claims and proofs, one run each per aggregate.
+#[derive(Default)]
+struct ProofArenas {
+    /// Each run sorted, without repeats.
+    claims: Arena<Claim>,
+    proofs: Arena<u8>,
 }
 
 /// `claims` is exactly the union of the verified claims at `covered_indices`.
@@ -67,6 +60,7 @@ pub struct Priority {
 pub struct Aggregation {
     deadline: Nanos,
     verified: Vec<VerifiedClaims>,
+    proofs: ProofArenas,
     best: Option<BestProof>,
     /// Failed batches since the best proof last grew.
     failures: u8,
@@ -74,12 +68,32 @@ pub struct Aggregation {
 
 impl Aggregation {
     pub fn new(deadline: Nanos) -> Self {
-        Self { deadline, verified: Vec::new(), best: None, failures: 0 }
+        let (verified, proofs) = (Vec::new(), ProofArenas::default());
+        Self { deadline, verified, proofs, best: None, failures: 0 }
     }
 
-    /// The verified claims take the next index.
-    pub fn add(&mut self, verified: VerifiedClaims) {
-        self.verified.push(verified);
+    /// Empty again, keeping its buffers.
+    pub fn reset(&mut self, deadline: Nanos) {
+        self.deadline = deadline;
+        self.verified.clear();
+        self.proofs.claims.clear();
+        self.proofs.proofs.clear();
+        self.best = None;
+        self.failures = 0;
+    }
+
+    /// The vote takes the next index.
+    pub fn add_signature(&mut self, claim: Claim, signature: Box<[u8; XMSS_SIGNATURE_SIZE]>) {
+        self.verified.push(VerifiedClaims::Signature(claim, signature));
+    }
+
+    /// The aggregate takes the next index. `claims` are sorted, without
+    /// repeats.
+    pub fn add_proof(&mut self, claims: &[Claim], proof: &[u8]) {
+        debug_assert!(claims.is_sorted_by(|a, b| a < b), "claims sorted, without repeats");
+        self.verified.push(VerifiedClaims::Proof(self.proofs.claims.len()));
+        self.proofs.claims.push(claims);
+        self.proofs.proofs.push(proof);
     }
 
     /// Indices of the verified claims the best proof covers, ascending.
@@ -134,9 +148,23 @@ impl Aggregation {
         let log_inv_rate = batch.log_inv_rate();
         let mut request = AggregateRequest { log_inv_rate, proofs, signatures: Vec::new() };
         for &index in batch.indices() {
-            self.verified[index].add_to(&mut request);
+            match &self.verified[index] {
+                VerifiedClaims::Signature(claim, signature) => {
+                    request.signatures.push((claim, signature))
+                }
+                &VerifiedClaims::Proof(at) => {
+                    request.proofs.push((self.proofs.claims.get(at), self.proofs.proofs.get(at)))
+                }
+            }
         }
         request
+    }
+
+    fn claims(&self, index: usize) -> &[Claim] {
+        match &self.verified[index] {
+            VerifiedClaims::Signature(claim, _) => std::slice::from_ref(claim),
+            &VerifiedClaims::Proof(at) => self.proofs.claims.get(at),
+        }
     }
 
     /// Settles `batch` with the leanVM sidecar's response body, or `None`
@@ -178,7 +206,7 @@ impl Aggregation {
     /// all must be marked.
     fn proves_exactly(&self, claims: &[Claim], batch: &Batch) -> bool {
         let best = self.best.iter().map(|best| best.claims.as_slice());
-        let batch_claims = batch.indices().iter().map(|&index| self.verified[index].claims());
+        let batch_claims = batch.indices().iter().map(|&index| self.claims(index));
         let mut seen = vec![false; claims.len()];
         for set in best.chain(batch_claims) {
             let mut index = 0;

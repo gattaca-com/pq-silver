@@ -8,7 +8,7 @@ use silver_beacon_state_data::{
     bls::{self, SigBatch},
 };
 use silver_common::ssz_view::{
-    ATTESTATION_FIXED, AttestationDataView, AttestationPqView, AttestationView,
+    ATTESTATION_FIXED, AttestationDataView, AttestationPqView, AttestationView, bitvector_word,
 };
 
 use crate::{
@@ -111,7 +111,7 @@ impl<'a> Attestation<'a> {
         debug_assert!(att.len() >= ATTESTATION_FIXED);
         Self {
             data: AttestationView::data(att),
-            committee_bits: u64::from_le_bytes(*AttestationView::committee_bits(att)),
+            committee_bits: bitvector_word(AttestationView::committee_bits(att)),
             aggregation_bits: AttestationView::aggregation_bits(att),
             may_name_no_committee: false,
         }

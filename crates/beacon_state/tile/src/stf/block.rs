@@ -14,14 +14,15 @@ use silver_beacon_state_data::{
 use silver_common::ssz_view::{BeaconBlockBodyPqView, ETH1_DATA_SIZE, Eth1DataView};
 #[cfg(feature = "ef_tests")]
 use silver_common::{SignedBlockLayout, ssz_hash::HashedBody, ssz_view::SignedBeaconBlockView};
+use silver_preset::EPOCHS_PER_ETH1_VOTING_PERIOD;
 
 use crate::{
     error::{BlockError, Error, Result},
     merkle,
     ssz_hash::{self, BlockFork},
     stf::{
-        BlockAttestations, BlockVotes, EPOCHS_PER_ETH1_VOTING_PERIOD, ShufflingRef, StarkClaims,
-        StfScratch, collect_sigs_attestations, collect_sigs_attester_slashings,
+        BlockAttestations, BlockVotes, ShufflingRef, StarkClaims, StfScratch,
+        collect_sigs_attestations, collect_sigs_attester_slashings,
         collect_sigs_bls_to_execution_changes, collect_sigs_execution_payload_bid,
         collect_sigs_proposer_slashings, collect_sigs_sync_aggregate, collect_sigs_voluntary_exits,
         gloas::collect_sigs_payload_attestations, process_attester_slashings,

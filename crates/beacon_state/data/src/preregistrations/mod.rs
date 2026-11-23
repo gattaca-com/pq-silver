@@ -5,9 +5,7 @@ mod tests;
 
 use flux_profiler::timed;
 use list::ListDelta;
-pub use list::{
-    FinalizedList, ListView, ListWriter, PREREGISTRATION_EXPIRY_SLOTS, PREREGISTRATIONS_LIMIT,
-};
+pub use list::{FinalizedList, ListView, ListWriter};
 pub use records::{BuilderPreregistration, Preregistration, ValidatorPreregistration};
 
 use crate::{

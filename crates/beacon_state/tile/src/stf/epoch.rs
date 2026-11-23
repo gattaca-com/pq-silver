@@ -12,6 +12,7 @@ use silver_beacon_state_data::{
     ValidatorsView, bls,
     pq::{KeyScheme, deposit_vrf_root, xmss_pubkey},
 };
+use silver_preset::EPOCHS_PER_ETH1_VOTING_PERIOD;
 
 use crate::{
     merkle,
@@ -26,8 +27,6 @@ use crate::{
         },
     },
 };
-
-pub const EPOCHS_PER_ETH1_VOTING_PERIOD: u64 = 64;
 
 pub(crate) const WEIGHT_DENOMINATOR: u64 = 64;
 pub(crate) const PROPOSER_WEIGHT: u64 = 8;

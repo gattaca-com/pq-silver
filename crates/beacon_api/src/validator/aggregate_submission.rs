@@ -3,8 +3,9 @@ use silver_common::{
     GossipTopic,
     json_fields::{BoundedHex, HexBytes, bytes, uint64},
     ssz_view::{
-        ATTESTATION_PQ_FIXED, MAX_STARK_PROOF_SIZE, MAX_VALIDATORS_PER_COMMITTEE,
-        SIGNED_AGG_PROOF_PQ_MIN, SIGNED_PQ_FIXED, XMSSSignature,
+        ATTESTATION_PQ_FIXED, COMMITTEE_BITS_SIZE_PQ, MAX_STARK_PROOF_SIZE,
+        MAX_VALIDATORS_PER_COMMITTEE, SIGNED_AGG_PROOF_PQ_MIN, SIGNED_PQ_FIXED, XMSSSignature,
+        bitvector_word,
     },
     xmss::SlotDuty,
 };
@@ -52,7 +53,7 @@ struct SubmittedAggregateAttestation {
     aggregation_bits: BoundedHex<MAX_AGGREGATION_BITS_LEN>,
     data: AttestationData,
     #[serde(deserialize_with = "bytes")]
-    committee_bits: [u8; 2],
+    committee_bits: [u8; COMMITTEE_BITS_SIZE_PQ],
 }
 
 impl SubmittedAggregate<'_> {
@@ -64,7 +65,7 @@ impl SubmittedAggregate<'_> {
 impl SubmittedEntry for SubmittedAggregate<'_> {
     fn accept(&self, _ctx: &ApiCtx) -> Result<impl IntoIterator<Item = GossipTopic>, &'static str> {
         let aggregate = &self.message.aggregate;
-        if u16::from_le_bytes(aggregate.committee_bits).count_ones() != 1 {
+        if bitvector_word(&aggregate.committee_bits).count_ones() != 1 {
             return Err("committee_bits must name exactly one committee");
         }
         let bits = aggregate.aggregation_bits.as_bytes();

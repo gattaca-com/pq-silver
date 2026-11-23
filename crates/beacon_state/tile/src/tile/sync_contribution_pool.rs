@@ -1,18 +1,16 @@
 use blst::min_pk::{AggregateSignature, Signature};
 use rustc_hash::FxHashMap;
-use silver_beacon_state_data::{
-    B256, SYNC_COMMITTEE_SIZE, SYNC_SUBCOMMITTEE_MASK_WORDS, SYNC_SUBCOMMITTEE_SIZE, Slot,
-};
+use silver_beacon_state_data::{B256, SYNC_COMMITTEE_SIZE, SYNC_SUBCOMMITTEE_MASK_WORDS, Slot};
 use silver_common::{
     SYNC_COMMITTEE_SUBNETS,
     metrics::timed,
-    ssz_view::{BLOCK_SYNC_AGGREGATE_SIZE, SYNC_COMMITTEE_CONTRIBUTION_SIZE},
+    ssz_view::{
+        SYNC_AGGREGATE_SIZE, SYNC_COMMITTEE_CONTRIBUTION_SIZE, SYNC_SUBCOMMITTEE_BITS_SIZE,
+    },
 };
 use silver_ssz::block_body::EMPTY_SYNC_AGGREGATE;
 
 use super::attestation_pool::InsertOutcome;
-
-const AGGREGATION_BITS_BYTES: usize = SYNC_SUBCOMMITTEE_SIZE.div_ceil(8);
 
 /// Retention is two slots (current + previous), with four subcommittees
 /// per slot. The x4 leaves room for competing beacon-block roots; each
@@ -97,7 +95,7 @@ impl SyncContributionPool {
         slot: Slot,
         subcommittee_index: u64,
         beacon_block_root: B256,
-        aggregation_bits: &[u8; AGGREGATION_BITS_BYTES],
+        aggregation_bits: &[u8; SYNC_SUBCOMMITTEE_BITS_SIZE],
         signature: &[u8; 96],
     ) -> InsertOutcome {
         if subcommittee_index >= SYNC_COMMITTEE_SUBNETS as u64 {
@@ -141,7 +139,7 @@ impl SyncContributionPool {
         &self,
         slot: Slot,
         beacon_block_root: B256,
-        out: &mut [u8; BLOCK_SYNC_AGGREGATE_SIZE],
+        out: &mut [u8; SYNC_AGGREGATE_SIZE],
     ) {
         *out = EMPTY_SYNC_AGGREGATE;
         let mut signature: Option<AggregateSignature> = None;
@@ -156,7 +154,7 @@ impl SyncContributionPool {
             else {
                 continue;
             };
-            let bits = &mut out[subcommittee_index * AGGREGATION_BITS_BYTES..];
+            let bits = &mut out[subcommittee_index * SYNC_SUBCOMMITTEE_BITS_SIZE..];
             for (word, bytes) in aggregation_bits.iter().zip(bits.as_chunks_mut().0) {
                 *bytes = word.to_le_bytes();
             }
@@ -216,7 +214,7 @@ impl SyncContributionPool {
     }
 }
 
-fn bit_words(bytes: &[u8; AGGREGATION_BITS_BYTES]) -> [u64; SYNC_SUBCOMMITTEE_MASK_WORDS] {
+fn bit_words(bytes: &[u8; SYNC_SUBCOMMITTEE_BITS_SIZE]) -> [u64; SYNC_SUBCOMMITTEE_MASK_WORDS] {
     let mut words = [0; SYNC_SUBCOMMITTEE_MASK_WORDS];
     for (word, chunk) in words.iter_mut().zip(bytes.as_chunks::<8>().0) {
         *word = u64::from_le_bytes(*chunk);
@@ -244,7 +242,7 @@ impl PooledContribution<'_> {
             let start = 48 + i * 8;
             out[start..start + 8].copy_from_slice(&word.to_le_bytes());
         }
-        let signature_offset = 48 + AGGREGATION_BITS_BYTES;
+        let signature_offset = 48 + SYNC_SUBCOMMITTEE_BITS_SIZE;
         out[signature_offset..].copy_from_slice(&self.entry.signature.to_signature().to_bytes());
     }
 }
@@ -417,7 +415,7 @@ mod tests {
         let (bits, sig) = out.split_at(SYNC_COMMITTEE_SIZE / 8);
         let mut expected_bits = [0u8; SYNC_COMMITTEE_SIZE / 8];
         expected_bits[0] = 0b0000_0010;
-        expected_bits[2 * AGGREGATION_BITS_BYTES + 8] = 0b0000_0001;
+        expected_bits[2 * SYNC_SUBCOMMITTEE_BITS_SIZE + 8] = 0b0000_0001;
         assert_eq!(bits, expected_bits);
 
         let sig = Signature::from_bytes(sig).unwrap();
@@ -450,10 +448,10 @@ mod tests {
         pool: &SyncContributionPool,
         index: usize,
         signers: &[usize],
-    ) -> ([u8; AGGREGATION_BITS_BYTES], bool) {
+    ) -> ([u8; SYNC_SUBCOMMITTEE_BITS_SIZE], bool) {
         let out = pool_aggregate(pool);
-        let start = index * AGGREGATION_BITS_BYTES;
-        let bits = out[start..start + AGGREGATION_BITS_BYTES].try_into().unwrap();
+        let start = index * SYNC_SUBCOMMITTEE_BITS_SIZE;
+        let bits = out[start..start + SYNC_SUBCOMMITTEE_BITS_SIZE].try_into().unwrap();
         let sig = Signature::from_bytes(&out[SYNC_COMMITTEE_SIZE / 8..]).unwrap();
         let pks: Vec<_> = signers.iter().map(|&i| test_signing::pubkey_pk(i)).collect();
         let pks: Vec<_> = pks.iter().collect();
@@ -462,8 +460,8 @@ mod tests {
         (bits, verifies)
     }
 
-    fn bits_of(positions: &[usize]) -> [u8; AGGREGATION_BITS_BYTES] {
-        let mut bits = [0u8; AGGREGATION_BITS_BYTES];
+    fn bits_of(positions: &[usize]) -> [u8; SYNC_SUBCOMMITTEE_BITS_SIZE] {
+        let mut bits = [0u8; SYNC_SUBCOMMITTEE_BITS_SIZE];
         for &position in positions {
             bits[position / 8] |= 1 << (position % 8);
         }
@@ -554,8 +552,8 @@ mod tests {
         );
     }
 
-    fn pool_aggregate(pool: &SyncContributionPool) -> [u8; BLOCK_SYNC_AGGREGATE_SIZE] {
-        let mut out = [0; BLOCK_SYNC_AGGREGATE_SIZE];
+    fn pool_aggregate(pool: &SyncContributionPool) -> [u8; SYNC_AGGREGATE_SIZE] {
+        let mut out = [0; SYNC_AGGREGATE_SIZE];
         pool.write_sync_aggregate(SLOT, BLOCK_ROOT, &mut out);
         out
     }

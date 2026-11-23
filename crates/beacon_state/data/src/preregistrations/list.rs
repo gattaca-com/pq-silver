@@ -9,11 +9,8 @@ use crate::{
     DecomposeError,
     decompose::common::checked_count,
     tree::{TreeView, TreeWriteView},
-    types::{B256, Slot},
+    types::{B256, PREREGISTRATIONS_LIMIT, Slot},
 };
-
-pub const PREREGISTRATIONS_LIMIT: usize = 1 << 19;
-pub const PREREGISTRATION_EXPIRY_SLOTS: Slot = 1 << 18;
 
 pub struct FinalizedList<T: Preregistration> {
     records: RetainedVec<T>,

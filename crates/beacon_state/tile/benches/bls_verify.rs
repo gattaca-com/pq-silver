@@ -21,7 +21,7 @@ use silver_beacon_state_data::{
     bls::{self, CheckedSignature, DOMAIN_BEACON_ATTESTER, DST, SigBatch, SignatureChecker},
 };
 use silver_common::ssz_view::{
-    BLOCK_SYNC_AGGREGATE_SIZE, BeaconBlockBodyFuluView, SINGLE_ATT_SIZE, SignedBeaconBlockView,
+    BeaconBlockBodyFuluView, SINGLE_ATT_SIZE, SYNC_AGGREGATE_SIZE, SignedBeaconBlockView,
 };
 
 fn keypair(seed: u64) -> (SecretKey, PublicKey) {
@@ -193,7 +193,7 @@ fn build_ef_block() -> SigBatch {
     let _ = collect_sigs_bls_to_execution_changes(imm, &validators, &body[bls_..blob], &mut batch);
     collect_sigs_sync_aggregate(
         &rv,
-        &body[220..220 + BLOCK_SYNC_AGGREGATE_SIZE],
+        &body[220..220 + SYNC_AGGREGATE_SIZE],
         block_slot,
         &mut scratch,
         &mut batch,

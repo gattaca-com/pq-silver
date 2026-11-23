@@ -1,4 +1,5 @@
 use serde::{Deserialize, Deserializer, Serialize};
+use silver_preset::SLOTS_PER_EPOCH;
 use silver_ssz::{
     merkle::{B256, sha256},
     ssz_hash::hash_tree_root_fork_data,
@@ -25,9 +26,6 @@ const fn max_committees_per_slot_pq() -> u64 {
 const fn unscheduled() -> u64 {
     u64::MAX
 }
-
-/// Mainnet preset; every network we support uses it.
-const SLOTS_PER_EPOCH: u64 = 32;
 
 /// Fulu `BLOB_SCHEDULE` entry (EIP-7892). Per-epoch override on
 /// `max_blobs_per_block`. Network-specific.
@@ -92,10 +90,8 @@ impl ForkName {
 
 /// Per-network spec parameters that vary across mainnet / testnets / devnets.
 ///
-/// Compile-time array dimensions (`SLOTS_PER_EPOCH`,
-/// `SYNC_COMMITTEE_SIZE`, etc.) stay hardcoded — every real testnet uses
-/// the mainnet preset; only the spec "minimal" preset differs and we don't
-/// support running it.
+/// Preset values (`SLOTS_PER_EPOCH`, `SYNC_COMMITTEE_SIZE`, …) are not here:
+/// they size arrays, so `silver_preset` fixes them at compile time.
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
 #[serde(rename_all = "SCREAMING_SNAKE_CASE")]
 pub struct SpecConfig {

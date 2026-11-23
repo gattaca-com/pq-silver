@@ -5,8 +5,7 @@ pub use builder_registry::{
 pub use builders::{BuildersGroup, BuildersId, BuildersView, BuildersWriteView, FinalizedBuilders};
 pub use checkpoint_state::CheckpointState;
 pub use committee::{
-    CommitteeSlot, ShufflingId, TARGET_COMMITTEE_SIZE, committee_at_position, committee_range,
-    committees_per_slot,
+    CommitteeSlot, ShufflingId, committee_at_position, committee_range, committees_per_slot,
 };
 pub use decompose::DecomposeError;
 pub use delta_view::{StateView, StateWriterView};
@@ -31,9 +30,9 @@ pub use pending::{
     PendingGroup, PendingId, PendingView, PendingWriteView, QueueItem, QueueView, QueueWriteView,
 };
 pub use preregistrations::{
-    BuilderPreregistration, FinalizedList, ListView, ListWriter, PREREGISTRATION_EXPIRY_SLOTS,
-    PREREGISTRATIONS_LIMIT, Preregistration, Preregistrations, PreregistrationsGroup,
-    PreregistrationsId, PreregistrationsView, PreregistrationsWriteView, ValidatorPreregistration,
+    BuilderPreregistration, FinalizedList, ListView, ListWriter, Preregistration, Preregistrations,
+    PreregistrationsGroup, PreregistrationsId, PreregistrationsView, PreregistrationsWriteView,
+    ValidatorPreregistration,
 };
 pub use silver_chain_spec::{BlobParameters, ForkName, SpecConfig};
 pub use silver_ssz::body_offsets::{BlockBodyError, BodyFork, BodyOffsets, OperationKind, Payload};

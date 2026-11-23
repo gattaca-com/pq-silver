@@ -20,10 +20,10 @@ use silver_common::{
     block_contents::BLOCK_CONTENTS_FIXED,
     ssz_hash::{BlockFork, HashedBody},
     ssz_view::{
-        BEACON_BLOCK_BODY_FIXED, BEACON_BLOCK_FIXED, BLOCK_SYNC_AGGREGATE_SIZE, BuilderBidFuluView,
+        BEACON_BLOCK_BODY_FIXED, BEACON_BLOCK_FIXED, BuilderBidFuluView,
         ExecutionPayloadEnvelopeView, ExecutionPayloadView, MAX_ATTESTATIONS_PQ,
-        SignedBuilderBidFuluView, SignedExecutionPayloadBidView, VRFProof, XMSS_SIGNATURE_SIZE,
-        variable_list_items,
+        SYNC_AGGREGATE_SIZE, SignedBuilderBidFuluView, SignedExecutionPayloadBidView, VRFProof,
+        XMSS_SIGNATURE_SIZE, variable_list_items,
     },
     wei_saturating,
 };
@@ -164,7 +164,7 @@ pub(super) struct Operations<'a> {
     pub(super) attester_slashings: &'a [u8],
     pub(super) attestations: &'a [u8],
     pub(super) voluntary_exits: &'a [u8],
-    pub(super) sync_aggregate: &'a [u8; BLOCK_SYNC_AGGREGATE_SIZE],
+    pub(super) sync_aggregate: &'a [u8; SYNC_AGGREGATE_SIZE],
     pub(super) bls_to_execution_changes: &'a [u8],
     /// Gloas only.
     pub(super) payload_attestations: &'a [u8],
@@ -189,7 +189,7 @@ pub(super) struct PackedOperations {
     slashings: Selection,
     attestations: Vec<u8>,
     voluntary_exits: Vec<u8>,
-    sync_aggregate: [u8; BLOCK_SYNC_AGGREGATE_SIZE],
+    sync_aggregate: [u8; SYNC_AGGREGATE_SIZE],
     bls_to_execution_changes: Vec<u8>,
     payload_attestations: Vec<u8>,
     proof: Vec<u8>,

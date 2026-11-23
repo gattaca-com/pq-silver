@@ -20,10 +20,11 @@ use super::{
     BeaconStateTile, MAXIMUM_GOSSIP_CLOCK_DISPARITY, Producers, fork_data_roots::ForkDataRoots,
 };
 use crate::{
+    fork_choice::PTC_MASK_WORDS,
     stf,
     tile::{
         Feedback,
-        gossip::{PTC_MASK_WORDS, PreparedPqPtc, PreparedPtc, PtcVote},
+        gossip::{PreparedPqPtc, PreparedPtc, PtcVote},
     },
 };
 

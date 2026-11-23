@@ -10,7 +10,6 @@ use silver_beacon_state_data::{
     SYNC_SUBCOMMITTEE_SIZE, ShufflingId, Slot, SpecConfig, StateId, StateReadView,
     SyncSubcommittee,
     bls::{self, CheckedSignature, PublicKey, Signature, VerifiedSingleAttestation},
-    gloas::PTC_SIZE,
     pq::{MIN_ATTESTATION_INCLUSION_DELAY_PQ, xmss_pubkey},
     xmss::SignatureCheck,
 };
@@ -37,7 +36,7 @@ use silver_common::{
 use silver_ssz::ssz_view::{
     PAYLOAD_ATTESTATION_MESSAGE_PQ_SIZE, SINGLE_ATT_PQ_SIZE, SignedAggregateAndProofPqView,
     SignedExecutionPayloadBidPqView, SignedExecutionPayloadBidView, SingleAttestationPqView,
-    XMSSPubkey,
+    XMSSPubkey, bitvector_word,
 };
 
 use super::{
@@ -58,7 +57,7 @@ use crate::{
     counters::BeaconStateCounters,
     error::{EnvelopeError, VoluntaryExitError},
     fork_choice::{
-        ExecutionStatus, PayloadAxis, compute_shuffling_dependent_slot,
+        ExecutionStatus, PTC_MASK_WORDS, PayloadAxis, compute_shuffling_dependent_slot,
         compute_shuffling_lookahead_start_slot,
     },
     merkle, ssz_hash,
@@ -70,8 +69,6 @@ use crate::{
 };
 
 pub(super) const VOTE_BATCH_CAP: usize = 1024;
-
-pub(super) const PTC_MASK_WORDS: usize = PTC_SIZE.div_ceil(64);
 
 #[derive(Clone, Copy)]
 pub(super) enum BidSignature<'a> {
@@ -2379,7 +2376,7 @@ impl BeaconStateTile {
                 if Aggregate::agg_data(bytes).index() > 1 {
                     return Err(Feedback::reject("aggregate data index"));
                 }
-                if u16::from_le_bytes(*Aggregate::agg_committee_bits(bytes)).count_ones() != 1 {
+                if bitvector_word(Aggregate::agg_committee_bits(bytes)).count_ones() != 1 {
                     return Err(Feedback::reject("aggregate committee bits"));
                 }
             }
@@ -2519,7 +2516,7 @@ impl BeaconStateTile {
         }
 
         let committee_bits =
-            u16::from_le_bytes(*SignedAggregateAndProofPqView::agg_committee_bits(signed));
+            bitvector_word(SignedAggregateAndProofPqView::agg_committee_bits(signed));
         let committee_index = committee_bits.trailing_zeros() as usize;
         let bits = SignedAggregateAndProofPqView::agg_aggregation_bits(signed);
         let data_root = self.attestation_root_memo.data_root(data.as_bytes());

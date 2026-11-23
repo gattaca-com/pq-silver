@@ -19,13 +19,12 @@ use silver_common::{
     TCacheTable, TProducer, block_root_fulu,
     ssz_hash::{BlockFork, HashedBody},
     ssz_view::{
-        ATTESTATION_DATA_SIZE, AttestationView, BEACON_BLOCK_BODY_FIXED, BLOCK_SYNC_AGGREGATE_SIZE,
-        BYTES_PER_KZG_COMMITMENT, EXECUTION_PAYLOAD_FIXED, EXECUTION_REQUESTS_FULU_FIXED,
-        PROPOSER_SLASHING_SIZE, ProposerSlashingView, SIGNED_AGG_PROOF_MIN,
-        SIGNED_BEACON_BLOCK_MIN, SIGNED_BLS_CHANGE_SIZE, SIGNED_EXECUTION_PAYLOAD_ENVELOPE_MIN,
-        SIGNED_VOLUNTARY_EXIT_SIZE, SINGLE_ATT_SIZE, SignedAggregateAndProofView,
-        SignedBeaconBlockView, SignedSyncCommitteeProofView, SignedVoluntaryExitView,
-        SingleAttestationView, StatusView,
+        ATTESTATION_DATA_SIZE, AttestationView, BEACON_BLOCK_BODY_FIXED, BYTES_PER_KZG_COMMITMENT,
+        EXECUTION_PAYLOAD_FIXED, EXECUTION_REQUESTS_FULU_FIXED, PROPOSER_SLASHING_SIZE,
+        ProposerSlashingView, SIGNED_AGG_PROOF_MIN, SIGNED_BEACON_BLOCK_MIN,
+        SIGNED_BLS_CHANGE_SIZE, SIGNED_EXECUTION_PAYLOAD_ENVELOPE_MIN, SIGNED_VOLUNTARY_EXIT_SIZE,
+        SINGLE_ATT_SIZE, SYNC_AGGREGATE_SIZE, SignedAggregateAndProofView, SignedBeaconBlockView,
+        SignedSyncCommitteeProofView, SignedVoluntaryExitView, SingleAttestationView, StatusView,
     },
     test_util::ShmemDir,
 };
@@ -4019,7 +4018,7 @@ fn sync_contribution_accepted_then_superset_ignored() {
     assert!(matches!(tile.handle_sync_contribution(&buf), Feedback::AlreadySeen));
 
     // No messages were seen, so a block on `bbr` carries the contribution alone.
-    let mut aggregate = [0; BLOCK_SYNC_AGGREGATE_SIZE];
+    let mut aggregate = [0; SYNC_AGGREGATE_SIZE];
     tile.sync_contribution_pool.write_sync_aggregate(slot, bbr, &mut aggregate);
     let bits_at = sub as usize * SYNC_SUBCOMMITTEE_SIZE / 8;
     let signed = buf[..].try_into().unwrap();

@@ -1,15 +1,15 @@
 use crate::{
     body_offsets::{BlockBodyError, BodyFork, BodyOffsets},
     ssz_view::{
-        BEACON_BLOCK_BODY_FIXED, BEACON_BLOCK_BODY_PQ_FIXED, BLOCK_SYNC_AGGREGATE_SIZE,
-        ETH1_DATA_SIZE, VRFProof,
+        BEACON_BLOCK_BODY_FIXED, BEACON_BLOCK_BODY_PQ_FIXED, ETH1_DATA_SIZE, SYNC_AGGREGATE_SIZE,
+        SYNC_COMMITTEE_BITS_SIZE, VRFProof,
     },
 };
 
 /// Zero participation bits and the G2 point at infinity.
-pub const EMPTY_SYNC_AGGREGATE: [u8; BLOCK_SYNC_AGGREGATE_SIZE] = {
-    let mut aggregate = [0; BLOCK_SYNC_AGGREGATE_SIZE];
-    aggregate[64] = 0xc0;
+pub const EMPTY_SYNC_AGGREGATE: [u8; SYNC_AGGREGATE_SIZE] = {
+    let mut aggregate = [0; SYNC_AGGREGATE_SIZE];
+    aggregate[SYNC_COMMITTEE_BITS_SIZE] = 0xc0;
     aggregate
 };
 
@@ -22,7 +22,7 @@ pub struct BeaconBlockBodyFulu<'a> {
     pub attestations: &'a [u8],
     pub deposits: &'a [u8],
     pub voluntary_exits: &'a [u8],
-    pub sync_aggregate: &'a [u8; BLOCK_SYNC_AGGREGATE_SIZE],
+    pub sync_aggregate: &'a [u8; SYNC_AGGREGATE_SIZE],
     pub execution_payload: &'a [u8],
     pub bls_to_execution_changes: &'a [u8],
     pub blob_kzg_commitments: &'a [u8],
@@ -100,7 +100,7 @@ pub struct BeaconBlockBodyGloas<'a> {
     pub attestations: &'a [u8],
     pub deposits: &'a [u8],
     pub voluntary_exits: &'a [u8],
-    pub sync_aggregate: &'a [u8; BLOCK_SYNC_AGGREGATE_SIZE],
+    pub sync_aggregate: &'a [u8; SYNC_AGGREGATE_SIZE],
     pub bls_to_execution_changes: &'a [u8],
     pub signed_execution_payload_bid: &'a [u8],
     pub payload_attestations: &'a [u8],
@@ -208,7 +208,7 @@ fn encode_fixed(
     randao_reveal: &[u8; 96],
     eth1_data: &[u8; 72],
     graffiti: &[u8; 32],
-    sync_aggregate: &[u8; BLOCK_SYNC_AGGREGATE_SIZE],
+    sync_aggregate: &[u8; SYNC_AGGREGATE_SIZE],
     fields: &[&[u8]; 9],
 ) {
     let mut offsets = [0u32; 9];

@@ -1,5 +1,5 @@
 //! Every value the spec calls a preset is a constant here, because silver
-//! runs the mainnet preset only; every config-file key a network can vary
+//! fixes its preset at compile time; every config-file key a network can vary
 //! comes from [`SpecConfig`] — including the genesis, merge and eth1
 //! parameters silver itself never reads. What is left are the fork-choice and
 //! networking parameters silver fixes in its own tiles.
@@ -34,22 +34,27 @@ use silver_common::{
         MAXIMUM_GOSSIP_CLOCK_DISPARITY,
     },
 };
+use silver_preset::{
+    EPOCHS_PER_ETH1_VOTING_PERIOD, INACTIVITY_PENALTY_QUOTIENT,
+    MAX_PENDING_PARTIALS_PER_WITHDRAWALS_SWEEP, MAX_VALIDATORS_PER_WITHDRAWALS_SWEEP,
+    MAX_WITHDRAWALS_PER_PAYLOAD, MIN_SLASHING_PENALTY_QUOTIENT, PRESET_BASE,
+    PROPORTIONAL_SLASHING_MULTIPLIER, SHUFFLE_ROUND_COUNT, UPDATE_TIMEOUT,
+};
 
 use crate::{
     ctx::ApiCtx,
     http::{json::Json, response::Response, router::Request},
 };
 
-const PRESET_BASE: &str = "mainnet";
-
-/// `presets/mainnet/*.yaml` (consensus-specs v1.6.0), in fork order. Values
-/// silver itself computes with are imported rather than respelled.
+/// `presets/<PRESET_BASE>/*.yaml` (consensus-specs v1.6.0), in fork order.
+/// Values that differ between presets, or that silver computes with, are
+/// imported rather than respelled.
 const PRESET: &[(&str, u64)] = &[
     // phase0.yaml
     ("MAX_COMMITTEES_PER_SLOT", MAX_COMMITTEES_PER_SLOT as u64),
     ("TARGET_COMMITTEE_SIZE", TARGET_COMMITTEE_SIZE as u64),
     ("MAX_VALIDATORS_PER_COMMITTEE", MAX_VALIDATORS_PER_COMMITTEE as u64),
-    ("SHUFFLE_ROUND_COUNT", 90),
+    ("SHUFFLE_ROUND_COUNT", SHUFFLE_ROUND_COUNT as u64),
     ("HYSTERESIS_QUOTIENT", 4),
     ("HYSTERESIS_DOWNWARD_MULTIPLIER", 1),
     ("HYSTERESIS_UPWARD_MULTIPLIER", 5),
@@ -59,7 +64,7 @@ const PRESET: &[(&str, u64)] = &[
     ("MIN_ATTESTATION_INCLUSION_DELAY", 1),
     ("SLOTS_PER_EPOCH", SLOTS_PER_EPOCH),
     ("MIN_SEED_LOOKAHEAD", MIN_SEED_LOOKAHEAD),
-    ("EPOCHS_PER_ETH1_VOTING_PERIOD", 64),
+    ("EPOCHS_PER_ETH1_VOTING_PERIOD", EPOCHS_PER_ETH1_VOTING_PERIOD),
     ("SLOTS_PER_HISTORICAL_ROOT", SLOTS_PER_HISTORICAL_ROOT as u64),
     ("EPOCHS_PER_HISTORICAL_VECTOR", EPOCHS_PER_HISTORICAL_VECTOR as u64),
     ("EPOCHS_PER_SLASHINGS_VECTOR", EPOCHS_PER_SLASHINGS_VECTOR as u64),
@@ -68,9 +73,9 @@ const PRESET: &[(&str, u64)] = &[
     ("BASE_REWARD_FACTOR", 64),
     ("WHISTLEBLOWER_REWARD_QUOTIENT", 512),
     ("PROPOSER_REWARD_QUOTIENT", 8),
-    ("INACTIVITY_PENALTY_QUOTIENT", 67_108_864),
-    ("MIN_SLASHING_PENALTY_QUOTIENT", 128),
-    ("PROPORTIONAL_SLASHING_MULTIPLIER", 1),
+    ("INACTIVITY_PENALTY_QUOTIENT", INACTIVITY_PENALTY_QUOTIENT),
+    ("MIN_SLASHING_PENALTY_QUOTIENT", MIN_SLASHING_PENALTY_QUOTIENT),
+    ("PROPORTIONAL_SLASHING_MULTIPLIER", PROPORTIONAL_SLASHING_MULTIPLIER),
     ("MAX_PROPOSER_SLASHINGS", 16),
     ("MAX_ATTESTER_SLASHINGS", 2),
     ("MAX_ATTESTATIONS", 128),
@@ -83,7 +88,7 @@ const PRESET: &[(&str, u64)] = &[
     ("SYNC_COMMITTEE_SIZE", SYNC_COMMITTEE_SIZE as u64),
     ("EPOCHS_PER_SYNC_COMMITTEE_PERIOD", EPOCHS_PER_SYNC_COMMITTEE_PERIOD),
     ("MIN_SYNC_COMMITTEE_PARTICIPANTS", 1),
-    ("UPDATE_TIMEOUT", 8192),
+    ("UPDATE_TIMEOUT", UPDATE_TIMEOUT),
     // bellatrix.yaml
     ("MIN_SLASHING_PENALTY_QUOTIENT_BELLATRIX", 32),
     ("MAX_BYTES_PER_TRANSACTION", 1_073_741_824),
@@ -92,8 +97,8 @@ const PRESET: &[(&str, u64)] = &[
     ("MAX_EXTRA_DATA_BYTES", MAX_EXTRA_DATA_BYTES as u64),
     // capella.yaml
     ("MAX_BLS_TO_EXECUTION_CHANGES", 16),
-    ("MAX_WITHDRAWALS_PER_PAYLOAD", 16),
-    ("MAX_VALIDATORS_PER_WITHDRAWALS_SWEEP", 16_384),
+    ("MAX_WITHDRAWALS_PER_PAYLOAD", MAX_WITHDRAWALS_PER_PAYLOAD as u64),
+    ("MAX_VALIDATORS_PER_WITHDRAWALS_SWEEP", MAX_VALIDATORS_PER_WITHDRAWALS_SWEEP),
     // deneb.yaml
     ("FIELD_ELEMENTS_PER_BLOB", 4096),
     ("MAX_BLOB_COMMITMENTS_PER_BLOCK", MAX_BLOB_COMMITMENTS_PER_BLOCK as u64),
@@ -110,7 +115,10 @@ const PRESET: &[(&str, u64)] = &[
     ("MAX_DEPOSIT_REQUESTS_PER_PAYLOAD", 8192),
     ("MAX_WITHDRAWAL_REQUESTS_PER_PAYLOAD", 16),
     ("MAX_CONSOLIDATION_REQUESTS_PER_PAYLOAD", 2),
-    ("MAX_PENDING_PARTIALS_PER_WITHDRAWALS_SWEEP", 8),
+    (
+        "MAX_PENDING_PARTIALS_PER_WITHDRAWALS_SWEEP",
+        MAX_PENDING_PARTIALS_PER_WITHDRAWALS_SWEEP as u64,
+    ),
     ("MAX_PENDING_DEPOSITS_PER_EPOCH", 16),
     // fulu.yaml
     ("FIELD_ELEMENTS_PER_CELL", 64),

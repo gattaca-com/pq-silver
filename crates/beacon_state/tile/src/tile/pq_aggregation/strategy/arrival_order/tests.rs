@@ -13,7 +13,6 @@ fn votes_are_taken_in_arrival_order_up_to_the_limit() {
     let strategy = strategy(&(0..256).rev().collect::<Vec<_>>());
     let batch = strategy.next_batch(100).unwrap();
     assert_eq!(batch.indices, (0..100).collect::<Vec<_>>());
-    assert_eq!(batch.log_inv_rate, 2);
 
     let all = strategy.next_batch(2048).unwrap();
     assert_eq!(all.indices.len(), 256, "all waiting votes under the limit");

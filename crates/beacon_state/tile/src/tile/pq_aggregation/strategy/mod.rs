@@ -7,8 +7,6 @@ pub use bits::Bits;
 pub(super) use marginal_gain::MAX_GROUPS;
 pub use marginal_gain::{Committee, MarginalGain, Positions};
 
-const LOG_INV_RATE: u8 = 2;
-
 /// Picks the batches of one aggregation. It keeps its own view of committee
 /// positions, fed by events, and never sees claim bytes.
 pub trait Strategy: Default {
@@ -36,25 +34,21 @@ pub trait Strategy: Default {
 #[derive(Debug)]
 pub struct Batch {
     indices: Vec<usize>,
-    log_inv_rate: u8,
 }
 
 impl Batch {
     /// `None` when `indices` is empty.
     fn new(mut indices: Vec<usize>) -> Option<Self> {
         indices.sort_unstable();
-        let picked = indices.len();
-        indices.dedup();
-        debug_assert_eq!(indices.len(), picked, "a strategy repeated an index");
-        (!indices.is_empty()).then_some(Self { indices, log_inv_rate: LOG_INV_RATE })
+        debug_assert!(
+            indices.windows(2).all(|pair| pair[0] < pair[1]),
+            "a strategy repeated an index"
+        );
+        (!indices.is_empty()).then_some(Self { indices })
     }
 
     pub fn indices(&self) -> &[usize] {
         &self.indices
-    }
-
-    pub fn log_inv_rate(&self) -> u8 {
-        self.log_inv_rate
     }
 }
 

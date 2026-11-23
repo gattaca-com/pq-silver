@@ -22,7 +22,7 @@ fn le(value: usize) -> [u8; 8] {
 
 /// The protocol's `aggregate` layout, appended field by field.
 fn naive_body(request: &AggregateRequest) -> Vec<u8> {
-    let mut body = vec![OP_AGGREGATE, request.log_inv_rate];
+    let mut body = vec![OP_AGGREGATE, LOG_INV_RATE];
     body.extend(le(request.proofs.len()));
     for (claims, proof) in &request.proofs {
         body.extend(le(8 + claims.len() * 64 + 8 + 1));
@@ -58,7 +58,7 @@ fn the_length_is_exactly_the_bytes_written() {
         (vec![], signatures[..3].to_vec()),
     ];
     for (proofs, signatures) in shapes {
-        let request = AggregateRequest { log_inv_rate: 2, proofs, signatures, output: None };
+        let request = AggregateRequest { proofs, signatures, output: None };
         let mut out = vec![0xAA; request.len()];
         request.write(&mut out);
         assert_eq!(out[0], 1, "aggregate op");
@@ -80,7 +80,7 @@ fn the_longest_request_takes_exactly_the_bound() {
         (merge, vec![]),
     ];
     let lens = shapes.map(|(proofs, signatures)| {
-        AggregateRequest { log_inv_rate: 2, proofs, signatures, output: None }.body().len()
+        AggregateRequest { proofs, signatures, output: None }.body().len()
     });
     assert!(lens.iter().all(|&len| len <= MAX_REQUEST_LEN), "{lens:?}");
     assert_eq!(lens[2], MAX_REQUEST_LEN, "a merge on the largest best proof");
@@ -89,8 +89,7 @@ fn the_longest_request_takes_exactly_the_bound() {
 #[test]
 #[should_panic(expected = "shorter than its slice")]
 fn a_slice_longer_than_the_request_is_a_bug() {
-    let request =
-        AggregateRequest { log_inv_rate: 2, proofs: vec![], signatures: vec![], output: None };
+    let request = AggregateRequest { proofs: vec![], signatures: vec![], output: None };
     request.write(&mut vec![0; request.len() + 1]);
 }
 
@@ -213,7 +212,7 @@ fn a_real_sidecar_aggregates_verifies_then_extends() {
 
     let request = |proofs: Vec<_>, signatures: &[(Claim, &[u8; XMSS_SIGNATURE_SIZE])]| {
         let signatures = signatures.iter().map(|(claim, signature)| (claim, *signature)).collect();
-        AggregateRequest { log_inv_rate: 2, proofs, signatures, output: None }.body()
+        AggregateRequest { proofs, signatures, output: None }.body()
     };
     let response = exchange(&mut stream, &request(vec![], &signatures[..8]));
     let AggregateResponse { claims, proof } = AggregateResponse::decode(&response).unwrap();
@@ -255,14 +254,13 @@ fn a_real_sidecar_reduces_a_proof_to_declared_claims() {
     assert!(read_frame(&mut stream).starts_with(b"leanvmsc"));
 
     let signatures = signed.iter().map(|(claim, signature)| (claim, signature)).collect();
-    let all = AggregateRequest { log_inv_rate: 2, proofs: vec![], signatures, output: None };
+    let all = AggregateRequest { proofs: vec![], signatures, output: None };
     let response = exchange(&mut stream, &all.body());
     let AggregateResponse { claims, proof } = AggregateResponse::decode(&response).unwrap();
     assert_eq!(claims.len(), 4);
 
     let kept = &claims[1..3];
     let reduce = AggregateRequest {
-        log_inv_rate: 2,
         proofs: vec![(claims.as_slice(), proof)],
         signatures: vec![],
         output: Some(kept),

@@ -8,6 +8,7 @@ use crate::tile::leanvm_verifier::ProofVerdict;
 const OP_AGGREGATE: u8 = 1;
 const OP_VERIFY: u8 = 2;
 const SIGNED_CLAIM_SIZE: usize = 64 + XMSS_SIGNATURE_SIZE;
+const LOG_INV_RATE: u8 = 2;
 
 /// Most leanXMSS signatures in one request.
 pub(super) const MAX_SIGNATURES: usize = 2048;
@@ -30,7 +31,6 @@ pub(in crate::tile) const MAX_REQUEST_LEN: usize = {
 /// One `aggregate` request, borrowed from its aggregation: proofs with their
 /// claims, and leanXMSS signatures with theirs. No leanSPHINCS, no blobs.
 pub(super) struct AggregateRequest<'a> {
-    pub log_inv_rate: u8,
     pub proofs: Vec<(&'a [Claim], &'a [u8])>,
     pub signatures: Vec<(&'a Claim, &'a [u8; XMSS_SIGNATURE_SIZE])>,
     /// The claims the new proof proves, each covered by a proof or a
@@ -48,7 +48,7 @@ impl AggregateRequest<'_> {
     /// Fills `out`, which must be exactly `len()` bytes: a gap would send
     /// whatever `out` held before.
     pub(super) fn write(&self, mut out: &mut [u8]) {
-        put(&mut out, &[OP_AGGREGATE, self.log_inv_rate]);
+        put(&mut out, &[OP_AGGREGATE, LOG_INV_RATE]);
         put_u64(&mut out, self.proofs.len());
         for (claims, proof) in &self.proofs {
             put_claims(&mut out, claims);

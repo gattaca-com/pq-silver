@@ -169,58 +169,25 @@ impl AttestationPqView {
             .then_some(out)
     }
 
-    /// Appends an attestation of several committees to `out`: each is its
-    /// index and its votes as a `Bitlist`. A repeated index unites its votes.
-    /// `None`, with `out` partly written, unless the indices are in range and
-    /// never descend, and repeats agree on length.
-    pub fn write_committees<'a>(
+    /// Appends an attestation of `data` for the committees set in
+    /// `committee_bits`, with `bits_len` aggregation bits all clear. Returns
+    /// where in `out` those bits start, for the caller to set its votes.
+    pub fn append_unvoted(
         out: &mut Vec<u8>,
         data: &[u8; ATTESTATION_DATA_SIZE],
-        committees: impl IntoIterator<Item = (usize, &'a [u8])>,
-    ) -> Option<()> {
+        committee_bits: u16,
+        bits_len: usize,
+    ) -> usize {
+        debug_assert!(committee_bits != 0 && bits_len <= MAX_ATTESTING_INDICES_PQ);
         let start = out.len();
         let bits_start = start + ATTESTATION_PQ_FIXED;
-        out.resize(bits_start, 0);
+        out.resize(bits_start + bits_len / 8 + 1, 0);
         out[start..start + 4].copy_from_slice(&(ATTESTATION_PQ_FIXED as u32).to_le_bytes());
         out[start + 4..start + 4 + ATTESTATION_DATA_SIZE].copy_from_slice(data);
-        let (mut last, mut len) = (None, 0);
-        for (index, votes) in committees {
-            let committee_len = bitlist_len(votes);
-            let at = match last {
-                Some((last_index, last_len)) if index == last_index => {
-                    if committee_len != last_len {
-                        return None;
-                    }
-                    len - last_len
-                }
-                Some((last_index, _)) if index < last_index => return None,
-                _ if index >= MAX_COMMITTEES_PER_SLOT_PQ => return None,
-                _ => {
-                    out[start + 4 + ATTESTATION_DATA_SIZE + index / 8] |= 1 << (index % 8);
-                    len += committee_len;
-                    out.resize(bits_start + len / 8 + 1, 0);
-                    len - committee_len
-                }
-            };
-            or_bits_at(&mut out[bits_start..], at, votes, committee_len);
-            last = Some((index, committee_len));
-        }
-        last?;
-        out[bits_start + len / 8] |= 1 << (len % 8);
-        Some(())
-    }
-}
-
-/// ORs the first `len` bits of `bits` into `out` from bit `at` on.
-fn or_bits_at(out: &mut [u8], at: usize, bits: &[u8], len: usize) {
-    let (base, shift) = (at / 8, at % 8);
-    for (i, &byte) in bits[..len.div_ceil(8)].iter().enumerate() {
-        let remaining = len - 8 * i;
-        let byte = if remaining < 8 { byte & ((1u16 << remaining) - 1) as u8 } else { byte };
-        out[base + i] |= byte << shift;
-        if shift != 0 && byte >> (8 - shift) != 0 {
-            out[base + i + 1] |= byte >> (8 - shift);
-        }
+        out[start + 4 + ATTESTATION_DATA_SIZE..bits_start]
+            .copy_from_slice(&committee_bits.to_le_bytes());
+        out[bits_start + bits_len / 8] |= 1 << (bits_len % 8);
+        bits_start
     }
 }
 
@@ -871,33 +838,15 @@ mod tests {
     use super::*;
 
     #[test]
-    fn or_bits_at_matches_bit_by_bit_at_every_offset() {
-        let bits = [0b1011_0110, 0xff, 0b1111_0101];
-        for len in 0..=20 {
-            for at in 0..16 {
-                let mut out = vec![0; (at + len) / 8 + 1];
-                or_bits_at(&mut out, at, &bits, len);
-                let mut expected = vec![0; out.len()];
-                for p in (0..len).filter(|p| bits[p / 8] >> (p % 8) & 1 == 1) {
-                    expected[(at + p) / 8] |= 1 << ((at + p) % 8);
-                }
-                assert_eq!(out, expected, "len {len} at {at}");
-            }
-        }
-    }
-
-    #[test]
-    fn write_committees_refuses_bad_committees() {
-        let data = [7; ATTESTATION_DATA_SIZE];
-        let nine = [0, 0b11];
-        let ten = [0, 0b110];
-        let write = |committees: &[(usize, &[u8])]| {
-            AttestationPqView::write_committees(&mut Vec::new(), &data, committees.iter().copied())
-        };
-        assert!(write(&[(1, &nine), (1, &nine), (4, &ten)]).is_some());
-        assert!(write(&[]).is_none(), "no committee");
-        assert!(write(&[(4, &nine), (1, &nine)]).is_none(), "descending");
-        assert!(write(&[(MAX_COMMITTEES_PER_SLOT_PQ, &nine)]).is_none(), "out of range");
-        assert!(write(&[(1, &nine), (1, &ten)]).is_none(), "a repeat of another length");
+    fn an_unvoted_attestation_is_canonical_once_voted() {
+        let mut out = vec![0xaa];
+        let bits =
+            AttestationPqView::append_unvoted(&mut out, &[7; ATTESTATION_DATA_SIZE], 0b101, 13);
+        out[bits + 12 / 8] |= 1 << (12 % 8);
+        let attestation = &out[1..];
+        assert!(AttestationPqView::check_canonical(attestation));
+        assert_eq!(AttestationPqView::committee_bits(attestation), &[0b101, 0]);
+        assert_eq!(bitlist_len(AttestationPqView::aggregation_bits(attestation)), 13);
+        assert_eq!(AttestationPqView::aggregation_bits(attestation)[1], 0b0011_0000);
     }
 }

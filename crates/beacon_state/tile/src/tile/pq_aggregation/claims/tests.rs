@@ -14,8 +14,7 @@ fn claims(tags: &[u8]) -> Vec<Claim> {
 #[test]
 fn an_aggregate_reads_its_group_from_its_attestation() {
     let ssz = attestation_in(SLOT, 3, [1, 5, 2047]);
-    let aggregate =
-        Aggregate::new(&ssz, &[70, 80, 90], claims(&[9, 8, 7]), b"proof".to_vec()).unwrap();
+    let aggregate = Aggregate::new(&ssz, &[70, 80, 90], claims(&[9, 8, 7]), b"proof").unwrap();
     assert_eq!(aggregate.claims, claims(&[7, 8, 9]), "sorted for the leanVM sidecar");
 
     let group = aggregate.group;
@@ -27,14 +26,13 @@ fn an_aggregate_reads_its_group_from_its_attestation() {
         group.members.iter().map(|member| (member.position, member.validator)).collect();
     assert_eq!(members, [(1, 70), (5, 80), (2047, 90)], "voters keep committee order");
     assert_eq!(group.members[0].claim, [9; 64]);
-    assert_eq!(group.bitlist(), AttestationPqView::aggregation_bits(&ssz));
 }
 
 #[test]
 fn an_aggregate_with_inconsistent_voters_is_refused() {
     let new = |tags: &[u8], ssz: Vec<u8>| {
         let attesters: Vec<u32> = (0..tags.len() as u32).collect();
-        Aggregate::new(&ssz, &attesters, claims(tags), b"proof".to_vec())
+        Aggregate::new(&ssz, &attesters, claims(tags), b"proof")
     };
     let attestation = |positions: &[usize]| attestation_in(SLOT, 0, positions.iter().copied());
     assert!(new(&[1, 2], attestation(&[0])).is_none(), "fewer positions than claims");
@@ -42,7 +40,7 @@ fn an_aggregate_with_inconsistent_voters_is_refused() {
     assert!(new(&[1, 1], attestation(&[0, 1])).is_none(), "two voters with one claim");
     assert!(new(&[], attestation(&[])).is_none(), "no claims");
     assert!(new(&[1], vec![7]).is_none(), "not canonical");
-    let one_attester = Aggregate::new(&attestation(&[0, 1]), &[4], claims(&[1, 2]), Vec::new());
+    let one_attester = Aggregate::new(&attestation(&[0, 1]), &[4], claims(&[1, 2]), &[]);
     assert!(one_attester.is_none(), "fewer attesters than claims");
 
     let mut two_committees = attestation(&[0]);

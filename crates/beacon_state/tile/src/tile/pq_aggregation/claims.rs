@@ -31,22 +31,22 @@ pub struct VerifiedVote<'a> {
     pub received: Nanos,
 }
 
-pub struct Vote {
+pub struct Vote<'a> {
     pub(super) committee_position: usize,
     pub(super) claim: Claim,
-    pub(super) signature: Box<[u8; XMSS_SIGNATURE_SIZE]>,
+    pub(super) signature: &'a [u8; XMSS_SIGNATURE_SIZE],
 }
 
-impl Vote {
+impl<'a> Vote<'a> {
     /// The caller has verified `signature` over `message` for `pubkey`.
     pub fn new(
         committee_position: usize,
         pubkey: [u8; 32],
         message: [u8; 32],
-        signature: &[u8; XMSS_SIGNATURE_SIZE],
+        signature: &'a [u8; XMSS_SIGNATURE_SIZE],
     ) -> Self {
         let claim = claim(&pubkey, &message);
-        Self { committee_position, claim, signature: Box::new(*signature) }
+        Self { committee_position, claim, signature }
     }
 }
 
@@ -73,16 +73,6 @@ impl Group {
         let bits = self.members.iter().map(|member| member.position).collect();
         Positions { committee: self.committee, bits }
     }
-
-    /// The votes as an SSZ `Bitlist` of the committee's length.
-    pub(super) fn bitlist(&self) -> Vec<u8> {
-        let mut bits = vec![0; self.committee_len / 8 + 1];
-        for member in &self.members {
-            bits[member.position / 8] |= 1 << (member.position % 8);
-        }
-        bits[self.committee_len / 8] |= 1 << (self.committee_len % 8);
-        bits
-    }
 }
 
 pub struct Aggregate {
@@ -102,20 +92,26 @@ impl Aggregate {
     pub fn new(
         attestation: &[u8],
         attesters: &[u32],
-        mut claims: Vec<Claim>,
-        proof: Vec<u8>,
+        claims: impl IntoIterator<Item = Claim>,
+        proof: &[u8],
     ) -> Option<Self> {
-        let (index, positions) = AttestationPqView::one_committee_positions(attestation)?;
-        let positions: Vec<usize> = positions.collect();
-        let voters = positions.len();
-        if voters == 0 || attesters.len() != voters || claims.len() != voters {
+        if proof.len() > MAX_STARK_PROOF_SIZE {
             return None;
         }
-        let members = (positions.iter().zip(attesters).zip(&claims))
-            .map(|((&position, &validator), &claim)| Member { position, validator, claim })
-            .collect();
+        let (index, mut positions) = AttestationPqView::one_committee_positions(attestation)?;
+        let mut members = Vec::with_capacity(attesters.len());
+        for (&validator, claim) in attesters.iter().zip(claims) {
+            members.push(Member { position: positions.next()?, validator, claim });
+        }
+        if members.is_empty() || members.len() != attesters.len() || positions.next().is_some() {
+            return None;
+        }
+        let mut claims: Vec<_> = members.iter().map(|member| member.claim).collect();
         claims.sort_unstable();
         claims.dedup();
+        if claims.len() != members.len() {
+            return None;
+        }
         let data = AttestationPqView::data(attestation);
         let group = Group {
             committee: Committee { data: *data.as_bytes(), index },
@@ -123,11 +119,7 @@ impl Aggregate {
             committee_len: bitlist_len(AttestationPqView::aggregation_bits(attestation)),
             members,
         };
-        (claims.len() == voters && proof.len() <= MAX_STARK_PROOF_SIZE).then_some(Self {
-            claims,
-            proof,
-            group,
-        })
+        Some(Self { claims, proof: proof.to_vec(), group })
     }
 }
 

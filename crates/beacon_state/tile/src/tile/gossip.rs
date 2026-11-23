@@ -2489,13 +2489,12 @@ impl BeaconStateTile {
         let claims = aggregate.attesters.iter().map(|&attester| {
             claim(xmss_pubkey(view.validators.pubkey(attester as usize)), &message)
         });
-        let merge_claims = merges.then(|| claims.clone().collect());
         let proof = SignedAggregateAndProofPqView::proof(signed);
         let request_id = self
             .leanvm_verifier
             .send(claims, proof, &mut self.events_producer, producers)
             .ok_or(Feedback::Ignore)?;
-        aggregate.merge_claims = merge_claims;
+        aggregate.merge_message = merges.then_some(message);
         Ok((request_id, aggregate))
     }
 
@@ -2579,7 +2578,7 @@ impl BeaconStateTile {
             committee_index: committee_index as u64,
             data_root,
             aggregator_index,
-            merge_claims: None,
+            merge_message: None,
         }))
     }
 
@@ -2702,8 +2701,13 @@ impl BeaconStateTile {
                 self.ticker.current_slot(),
             );
         }
-        if let Some(claims) = aggregate.merge_claims {
-            let proof = SignedAggregateAndProofPqView::proof(signed).to_vec();
+        if let Some(message) = aggregate.merge_message {
+            // The attesters are active, so the head holds their pubkeys.
+            let view = self.state.read_view(self.canonical_state_id());
+            let claims = aggregate.attesters.iter().map(|&attester| {
+                claim(xmss_pubkey(view.validators.pubkey(attester as usize)), &message)
+            });
+            let proof = SignedAggregateAndProofPqView::proof(signed);
             let attestation = SignedAggregateAndProofPqView::aggregate(signed);
             match Aggregate::new(attestation, &aggregate.attesters, claims, proof) {
                 Some(merged) => self.pq_aggregator.add_aggregate(merged, &self.ticker),

@@ -15,7 +15,7 @@ use super::{
     claims::Vote,
     leaf::{LeafAggregation, LeafKey, ProvedAggregate},
     merge::MergeAggregation,
-    rolling::{POOL_SLOTS, Rolling, RollingJob, claims_of},
+    rolling::{OnChainAttestations, POOL_SLOTS, Proved, Rolling, RollingJob, claims_of},
     strategy::Batch,
 };
 use crate::tile::Producers;
@@ -274,9 +274,9 @@ impl PqAggregator {
             return;
         }
         let now = ticker.since_genesis();
-        let (job, body) = if let Some((job, body)) = self.next_rolling_request(ticker, tcache) {
+        let (job, body) = if let Some(request) = self.next_rolling_request(ticker, tcache) {
             // `None`: the tcache is full. The next loop retries.
-            let Some(body) = body else { return };
+            let Some((job, body)) = request else { return };
             (Job::Rolling(job), body)
         } else {
             let Some(key) = self.highest_priority(now) else {
@@ -295,36 +295,41 @@ impl PqAggregator {
     }
 
     /// The next change to the rolling proof that needs the leanVM sidecar,
-    /// with its request written to `tcache`, or `None` for a full tcache.
-    /// Changes that need no proof are made here. It goes ahead of every
-    /// batch: there are at most two a slot, and a proposal waits on them.
+    /// with its request written to `tcache`. `Some(None)` for a full tcache,
+    /// which leaves every merge in place. Changes that need no proof are
+    /// made here. It goes ahead of every batch: there are at most two a
+    /// slot, and a proposal waits on them.
     fn next_rolling_request(
         &mut self,
         ticker: &SlotTicker,
         tcache: &mut TProducer,
-    ) -> Option<(RollingJob, Option<TCacheRead>)> {
+    ) -> Option<Option<(RollingJob, TCacheRead)>> {
         let now = ticker.since_genesis();
         let rolling = self.rolling.as_mut()?;
         loop {
             if let Some(groups) = rolling.next_reduction() {
-                let kept = claims_of(&groups);
-                let request = rolling.reduce_request(&kept)?;
+                let claims = claims_of(&groups);
+                let request = rolling.reduce_request(&claims)?;
                 let body = tcache.write_with(request.len(), |out| request.write(out));
-                return Some((RollingJob::Reduce { groups }, body));
+                return Some(body.map(|body| (RollingJob::Reduce { groups, claims }, body)));
             }
             let ended = |slot: &Slot| now >= ticker.slot_start(slot + 1);
             let slot = (self.merges.keys().copied())
                 .filter(|slot| ended(slot) && rolling.awaits(*slot))
                 .min()?;
-            let Some(taken) = self.merges.remove(&slot).and_then(|merge| merge.proved()) else {
+            let Some((claims, proof)) = self.merges[&slot].core.best_proof() else {
+                self.merges.remove(&slot);
                 continue;
             };
-            let Some(request) = rolling.roll_request(&taken) else {
-                rolling.start_with(slot, taken);
+            let Some(request) = rolling.roll_request(claims, proof) else {
+                rolling.start_with(slot, take_proved(&mut self.merges, slot));
                 continue;
             };
-            let body = tcache.write_with(request.len(), |out| request.write(out));
-            return Some((RollingJob::Roll { slot, taken }, body));
+            let Some(body) = tcache.write_with(request.len(), |out| request.write(out)) else {
+                return Some(None);
+            };
+            let taken = take_proved(&mut self.merges, slot);
+            return Some(Some((RollingJob::Roll { slot, taken }, body)));
         }
     }
 
@@ -338,7 +343,7 @@ impl PqAggregator {
     }
 
     /// The attestations and proof for the body of the block at `slot`.
-    pub fn block_proof(&self, slot: Slot) -> Option<(Vec<Vec<u8>>, &[u8])> {
+    pub fn block_proof(&self, slot: Slot) -> Option<(OnChainAttestations<'_>, &[u8])> {
         match &self.rolling {
             Some(rolling) => rolling.block_proof(slot),
             None => {
@@ -362,9 +367,9 @@ impl PqAggregator {
         };
         let settled = match key {
             AggregationKey::Leaf(leaf) => (self.leaves.get_mut(&leaf))
-                .map(|leaf| (leaf.finish(batch, body), leaf.core.is_stopped())),
+                .map(|leaf| (leaf.core.finish(batch, body), leaf.core.is_stopped())),
             AggregationKey::Merge(slot) => (self.merges.get_mut(&slot))
-                .map(|merge| (merge.finish(batch, body), merge.core.is_stopped())),
+                .map(|merge| (merge.core.finish(batch, body), merge.core.is_stopped())),
         };
         let Some((Err(reason), stopped)) = settled else { return };
         let slot = key.slot();
@@ -390,11 +395,17 @@ impl PqAggregator {
     /// Ties go to the lower key, so the order is total and deterministic.
     fn highest_priority(&self, now: Nanos) -> Option<AggregationKey> {
         let leaves = self.leaves.iter().filter_map(|(&leaf, aggregation)| {
-            Some((aggregation.priority(now)?, Reverse(AggregationKey::Leaf(leaf))))
+            Some((aggregation.core.priority(now)?, Reverse(AggregationKey::Leaf(leaf))))
         });
         let merges = self.merges.iter().filter_map(|(&slot, aggregation)| {
-            Some((aggregation.priority(now)?, Reverse(AggregationKey::Merge(slot))))
+            Some((aggregation.core.priority(now)?, Reverse(AggregationKey::Merge(slot))))
         });
         leaves.chain(merges).max().map(|(_, Reverse(key))| key)
     }
+}
+
+/// The proof of the merge of `slot`, which has a best proof.
+fn take_proved(merges: &mut FxHashMap<Slot, MergeAggregation>, slot: Slot) -> Proved {
+    (merges.remove(&slot).and_then(MergeAggregation::into_proved))
+        .expect("the merge has a best proof")
 }

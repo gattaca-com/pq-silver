@@ -7876,7 +7876,7 @@ mod pq_aggregator {
             let attestation = attestation_in(slot, 0, 0..claims.len());
             let attesters: Vec<u32> = (0..claims.len() as u32).collect();
             let aggregate =
-                Aggregate::new(&attestation, &attesters, claims.to_vec(), b"child".to_vec());
+                Aggregate::new(&attestation, &attesters, claims.iter().copied(), b"child");
             self.tile.pq_aggregator.add_aggregate(aggregate.unwrap(), &self.tile.ticker);
             self.send_next();
         }
@@ -8016,7 +8016,8 @@ mod pq_aggregator {
 
         rig.respond(request.request_id, &[[1; 64], [2; 64]]);
         assert!(rig.tile.pq_aggregator.block_proof(SLOT + 2).is_none(), "only the newest slot");
-        let (attestations, proof) = rig.tile.pq_aggregator.block_proof(SLOT + 1).unwrap();
+        let (on_chain, proof) = rig.tile.pq_aggregator.block_proof(SLOT + 1).unwrap();
+        let attestations = on_chain.encoded();
         assert_eq!(attestations, [attestation_in(SLOT - 1, 0, 0..2)]);
         assert_eq!(proof, b"proof");
     }
@@ -8034,7 +8035,8 @@ mod pq_aggregator {
         rig.start_slot(SLOT + 1);
         assert!(rig.requests().is_empty(), "the first proof needs no roll");
         assert!(rig.tile.pq_aggregator.block_proof(SLOT + 1).is_none(), "too new to include");
-        let (attestations, proof) = rig.tile.pq_aggregator.block_proof(SLOT + 2).unwrap();
+        let (on_chain, proof) = rig.tile.pq_aggregator.block_proof(SLOT + 2).unwrap();
+        let attestations = on_chain.encoded();
         assert_eq!(attestations, [attestation_in(SLOT, 0, 0..2)]);
         assert_eq!(proof, b"proof");
     }
@@ -8056,20 +8058,23 @@ mod pq_aggregator {
         let roll = rig.request();
         assert!([1, 2, 3].into_iter().all(|tag| rig.carries(&roll, tag)));
         rig.respond(roll.request_id, &[[1; 64], [2; 64], [3; 64]]);
-        let (attestations, _) = rig.tile.pq_aggregator.block_proof(SLOT + 3).unwrap();
+        let (on_chain, _) = rig.tile.pq_aggregator.block_proof(SLOT + 3).unwrap();
+        let attestations = on_chain.encoded();
         assert_eq!(attestations.len(), 2, "one per slot");
 
         rig.tile.pq_aggregator.on_chain(SLOT, &[0]);
         rig.send_next();
         let reduce = rig.request();
         rig.respond(reduce.request_id, &[[2; 64], [3; 64]]);
-        let (attestations, _) = rig.tile.pq_aggregator.block_proof(SLOT + 3).unwrap();
+        let (on_chain, _) = rig.tile.pq_aggregator.block_proof(SLOT + 3).unwrap();
+        let attestations = on_chain.encoded();
         assert_eq!(attestations[0], attestation_in(SLOT, 0, [1]), "validator 0 is on chain");
 
         rig.start_slot(SLOT + 6);
         let expire = rig.request();
         rig.respond(expire.request_id, &[[3; 64]]);
-        let (attestations, _) = rig.tile.pq_aggregator.block_proof(SLOT + 6).unwrap();
+        let (on_chain, _) = rig.tile.pq_aggregator.block_proof(SLOT + 6).unwrap();
+        let attestations = on_chain.encoded();
         assert_eq!(attestations, [attestation_in(SLOT + 1, 0, [0])], "slot SLOT grew too old");
     }
 

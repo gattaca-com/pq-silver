@@ -1,10 +1,10 @@
 use silver_common::{Nanos, TCacheRead, TProducer};
 
 use super::{
-    aggregation::{Aggregation, Priority, VerifiedClaims},
+    aggregation::Aggregation,
     claims::{Aggregate, Group},
-    rolling::{Proved, on_chain_attestations, united},
-    strategy::{Batch, MarginalGain, Strategy},
+    rolling::{OnChainAttestations, Proved},
+    strategy::{Batch, MarginalGain},
     wire::MAX_PROOFS,
 };
 
@@ -13,38 +13,28 @@ use super::{
 pub(super) struct MergeAggregation {
     /// The votes of each aggregate.
     groups: Vec<Group>,
-    strategy: MarginalGain,
-    pub(super) core: Aggregation,
+    pub(super) core: Aggregation<MarginalGain>,
 }
 
 impl MergeAggregation {
     pub(super) fn new(deadline: Nanos) -> Self {
-        let (groups, strategy) = (Vec::new(), MarginalGain::default());
-        Self { groups, strategy, core: Aggregation::new(deadline) }
+        Self { groups: Vec::new(), core: Aggregation::new(deadline) }
     }
 
     /// `false` once the merge holds too many committees for another.
     pub(super) fn add(&mut self, aggregate: Aggregate) -> bool {
-        let fits = self.strategy.arrived(self.groups.len(), aggregate.group.positions());
+        let positions = aggregate.group.positions();
+        let fits = self.core.add_proof(positions, aggregate.claims, aggregate.proof);
         if fits {
             self.groups.push(aggregate.group);
-            self.core.add(VerifiedClaims::Proof(aggregate.claims, aggregate.proof));
         }
         fits
     }
 
-    /// `None` when it has nothing to send: past its deadline, stopped, or no
-    /// waiting aggregate adds a position.
-    pub(super) fn priority(&self, now: Nanos) -> Option<Priority> {
-        self.core.priority(now, self.strategy.waiting())
-    }
-
-    /// `None` exactly when `priority` is, unless the strategy has a bug. The
-    /// best proof counts as one of `MAX_PROOFS`.
-    pub(super) fn next_batch(&mut self, now: Nanos) -> Option<Batch> {
-        self.priority(now)?;
+    /// The best proof counts as one of `MAX_PROOFS`.
+    pub(super) fn next_batch(&self, now: Nanos) -> Option<Batch> {
         let limit = MAX_PROOFS - usize::from(self.core.best_proof().is_some());
-        self.core.check_batch(self.strategy.next_batch(limit), limit)
+        self.core.next_batch(now, limit)
     }
 
     pub(super) fn next_request(
@@ -55,23 +45,19 @@ impl MergeAggregation {
         self.next_batch(now).and_then(|batch| self.core.write_request(batch, tcache))
     }
 
-    pub(super) fn finish(&mut self, batch: Batch, body: Option<&[u8]>) -> Result<(), &'static str> {
-        self.core.finish(&batch, body).map(|()| self.strategy.adopted(&batch))
-    }
-
-    fn covered_groups(&self) -> impl Iterator<Item = Group> + '_ {
-        self.core.covered_indices().iter().map(|&index| self.groups[index].clone())
-    }
-
     /// The best proof and the votes it covers. `None` without a best proof.
-    pub(super) fn proved(&self) -> Option<Proved> {
-        let (claims, proof) = self.core.best_proof()?;
-        Some(Proved::new(self.covered_groups(), claims.to_vec(), proof.to_vec()))
+    pub(super) fn into_proved(self) -> Option<Proved> {
+        let (claims, proof, covered) = self.core.into_best()?;
+        let groups = (self.groups.into_iter().enumerate())
+            .filter(|(index, _)| covered.binary_search(index).is_ok())
+            .map(|(_, group)| group);
+        Some(Proved::new(groups, claims, proof))
     }
 
     /// The attestations the best proof covers, with it, for a block body.
-    pub(super) fn block_proof(&self) -> Option<(Vec<Vec<u8>>, &[u8])> {
+    pub(super) fn block_proof(&self) -> Option<(OnChainAttestations<'_>, &[u8])> {
         let (_, proof) = self.core.best_proof()?;
-        Some((on_chain_attestations(&united(self.covered_groups())), proof))
+        let covered = Some(self.core.covered_indices());
+        Some((OnChainAttestations { groups: &self.groups, covered }, proof))
     }
 }

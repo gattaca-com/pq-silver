@@ -848,7 +848,10 @@ impl Store {
                         Some((parent_root, block_root)) => {
                             QueryUnit::UnfinalizedBlock { slot, parent_root, block_root }
                         }
-                        None => QueryUnit::Block { slot },
+                        // A skipped slot sends nothing; only a block we hold
+                        // but cannot read answers `ResourceUnavailable`.
+                        None if self.finalized.root_at(slot).is_some() => QueryUnit::Block { slot },
+                        None => return,
                     });
                 });
             }

@@ -115,9 +115,7 @@ impl History {
         if let Some(claim) = self.claim(finalized, head.finalized_slot, missing_from) {
             emit(IoEvent::PeerEvent(PeerEvent::EarliestSlot(claim)));
         }
-        if !following {
-            return;
-        }
+
         if finalized.coverage().unexamined_above(missing_from) {
             // One group per step, so nothing is published or claimed from the
             // index alone while a group that could need is still unread.
@@ -131,6 +129,10 @@ impl History {
                 finalized_block,
                 &mut self.block_scratch,
             );
+            return;
+        }
+
+        if !following {
             return;
         }
         let Some(end) = finalized.coverage().next_window_end(floors, head.finalized_slot) else {

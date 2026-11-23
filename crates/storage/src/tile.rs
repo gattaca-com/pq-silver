@@ -37,17 +37,22 @@ impl ReplayStep {
     /// Block-then-envelope steps in slot order, from the anchor block up.
     /// Unfinalized leftovers below it would be ignored as pre-finalized,
     /// leaving their envelopes without a block.
+    /// Also returns how many leading steps are the anchor block's own.
     fn sequence(
         mut entries: Vec<ReplayEntry>,
         anchor_block_slot: u64,
         anchor_envelope: Option<PathBuf>,
-    ) -> VecDeque<Self> {
+    ) -> (VecDeque<Self>, usize) {
         entries.retain(|e| e.slot >= anchor_block_slot);
         entries.sort_unstable_by_key(|e| e.slot);
-        let entries_replay_anchor = entries.first().is_some_and(|e| e.slot == anchor_block_slot);
-        let anchor_envelope = anchor_envelope.filter(|_| !entries_replay_anchor);
+        let anchor_entry = entries.first().filter(|e| e.slot == anchor_block_slot);
+        let anchor_steps = match anchor_entry {
+            Some(entry) => 1 + usize::from(entry.envelope.is_some()),
+            None => usize::from(anchor_envelope.is_some()),
+        };
+        let anchor_envelope = anchor_envelope.filter(|_| anchor_entry.is_none());
 
-        anchor_envelope
+        let steps = anchor_envelope
             .map(|path| Self::Envelope { path })
             .into_iter()
             .chain(entries.into_iter().flat_map(|e| {
@@ -56,7 +61,8 @@ impl ReplayStep {
                     .chain([e.envelope.map(|path| Self::Envelope { path })])
                     .flatten()
             }))
-            .collect()
+            .collect();
+        (steps, anchor_steps)
     }
 
     fn path(&self) -> &PathBuf {
@@ -92,6 +98,9 @@ pub struct StorageTile {
     /// Flattened replay stream: each block is immediately followed by its
     /// envelope, so a gloas child's precheck sees the parent payload verified.
     replay_steps: VecDeque<ReplayStep>,
+    /// Leading `replay_steps` of the anchor block itself. Peers serve ranges
+    /// from the next slot, so these replay even when syncing from peers.
+    anchor_steps: usize,
     replay_done: bool,
     /// Boot decision from control: `None` = waiting; gates `drive_replay` so we
     /// don't replay the on-disk fork tree before learning whether peers are
@@ -119,7 +128,7 @@ impl StorageTile {
         let store = Store::load(data_store_dir, spec.clone(), custody_group_columns)
             .expect("failed to load storage store");
         let checkpointed_epoch = store.last_persisted_finalized_slot() / SLOTS_PER_EPOCH;
-        let replay_steps = if replay_from_disk {
+        let (replay_steps, anchor_steps) = if replay_from_disk {
             let anchor_block_slot =
                 beacon_state.read(|v| v.slot.state().latest_block_header.slot).unwrap_or(0);
             ReplayStep::sequence(
@@ -128,7 +137,7 @@ impl StorageTile {
                 store.finalized_envelope(anchor_block_slot),
             )
         } else {
-            VecDeque::new()
+            (VecDeque::new(), 0)
         };
         silver_log::info!("have {} replay steps", replay_steps.len());
 
@@ -142,6 +151,7 @@ impl StorageTile {
             wall_slot: u64::MAX,
             persist_pending: false,
             replay_steps,
+            anchor_steps,
             replay_done: !replay_from_disk,
             syncing_strategy: None,
             peers_loaded: false,
@@ -195,15 +205,15 @@ impl StorageTile {
         }
 
         let Some(strategy) = self.syncing_strategy else { return };
-        if matches!(strategy, SyncingStrategy::SyncFromPeers) {
+        if matches!(strategy, SyncingStrategy::SyncFromPeers) &&
+            self.replay_steps.len() > self.anchor_steps
+        {
             silver_log::info!(
                 staged = self.replay_steps.len(),
-                "skipping on-disk replay; peers finalized ahead — syncing from peers"
+                anchor_steps = self.anchor_steps,
+                "skipping on-disk replay past the anchor; peers finalized ahead — syncing from peers"
             );
-            self.replay_steps.clear();
-            adapter.produce(ReplayBlock::Done);
-            self.replay_done = true;
-            return;
+            self.replay_steps.truncate(self.anchor_steps);
         }
 
         let mut sent = 0;
@@ -584,9 +594,11 @@ mod tests {
             envelope: Some(PathBuf::from(format!("e{slot}"))),
         };
         let anchor = Some(PathBuf::from("finalized-e10"));
-        let steps = ReplayStep::sequence(vec![entry(12), entry(5), entry(10)], 10, anchor);
+        let (steps, anchor_steps) =
+            ReplayStep::sequence(vec![entry(12), entry(5), entry(10)], 10, anchor);
         let paths: Vec<_> = steps.iter().map(|s| s.path().to_str().unwrap()).collect();
         assert_eq!(paths, ["b10", "e10", "b12", "e12"]);
+        assert_eq!(anchor_steps, 2, "the anchor block and its envelope");
     }
 
     /// A persisted-checkpoint anchor is no replay entry: its finalized
@@ -600,9 +612,10 @@ mod tests {
             envelope: Some(PathBuf::from(format!("e{slot}"))),
         };
         let anchor = Some(PathBuf::from("e10"));
-        let steps = ReplayStep::sequence(vec![entry(12), entry(11)], 10, anchor);
+        let (steps, anchor_steps) = ReplayStep::sequence(vec![entry(12), entry(11)], 10, anchor);
         let paths: Vec<_> = steps.iter().map(|s| s.path().to_str().unwrap()).collect();
         assert_eq!(paths, ["e10", "b11", "e11", "b12", "e12"]);
+        assert_eq!(anchor_steps, 1, "the anchor envelope");
     }
 
     /// Synthetic SignedBeaconBlock: message at 100, slot at [100..108), body
@@ -786,6 +799,61 @@ mod tests {
         assert_eq!(das, 0, "replay emits no separate DataColumnsAvailable event");
         assert_eq!(blocks, 2, "slots 33 and 35 replayed; 34 skipped");
         assert_eq!(done, 1, "replay terminated with Done");
+        assert!(tile.replay_done);
+    }
+
+    /// Syncing from peers still replays the anchor's envelope: peers serve
+    /// ranges from the next slot, so it is owed and only the disk has it.
+    #[test]
+    fn syncing_from_peers_replays_only_the_anchor_steps() {
+        let store_dir = TempDir::new().unwrap();
+        let tcaches = [
+            TCache::producer(TCacheId::ControlProcessing, 1 << 20),
+            TCache::producer(TCacheId::ControlSlot, 1 << 20),
+            TCache::producer(TCacheId::NetworkProcessing, 1 << 20),
+            TCache::producer(TCacheId::BoundaryProcessing, 1 << 20),
+            TCache::producer(TCacheId::ProposedColumns, 1 << 12),
+        ];
+        let mut tile = StorageTile::new(
+            TCacheTable::from_iter(tcaches.iter().map(|p| p.cache_ref())),
+            TCache::producer(TCacheId::StorageDelivery, 1 << 20),
+            BeaconStateOwner::empty_test(0).reader(),
+            0,
+            Arc::new(SpecConfig::mainnet()),
+            store_dir.path().to_str().unwrap().to_owned(),
+            true,
+        );
+        tile.open_tcaches().unwrap();
+        let file = |name: &str| {
+            let path = store_dir.path().join(name);
+            std::fs::write(&path, make_block(11, false)).unwrap();
+            path
+        };
+        tile.replay_steps = VecDeque::from([
+            ReplayStep::Envelope { path: file("e10") },
+            ReplayStep::Block { path: file("b11"), columns_on_disk: true },
+            ReplayStep::Envelope { path: file("e11") },
+        ]);
+        tile.anchor_steps = 1;
+
+        let base = ShmemDir::new().unwrap();
+        let mut spine = Box::new(SilverSpine::new_with_base_dir(base.path(), None));
+        let mut tile_adapter = SpineAdapter::connect_tile(&tile, &mut spine);
+        let mut inj_adapter = SpineAdapter::connect_tile(&Injector, &mut spine);
+        inj_adapter.consume(|_: ReplayBlock, _| {});
+
+        tile.syncing_strategy = Some(SyncingStrategy::SyncFromPeers);
+        tile.drive_replay(&mut tile_adapter);
+
+        let mut replayed = Vec::new();
+        inj_adapter.consume(|m: ReplayBlock, _| {
+            replayed.push(match m {
+                ReplayBlock::Block { .. } => "block",
+                ReplayBlock::Envelope { .. } => "envelope",
+                ReplayBlock::Done => "done",
+            })
+        });
+        assert_eq!(replayed, ["envelope", "done"]);
         assert!(tile.replay_done);
     }
 

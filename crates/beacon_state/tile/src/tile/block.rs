@@ -573,9 +573,20 @@ impl BeaconStateTile {
             VerifyProgress::Unanswered(block) => {
                 silver_log::warn!(
                     block = hex32(&block.parsed.block_root),
-                    "leanVM did not judge the block's STARK proofs; dropped"
+                    "leanVM did not judge the block's STARK proofs; re-requesting once it answers"
                 );
                 self.stf_scratch.votes.recycle(block.applied.votes);
+            }
+        }
+    }
+
+    /// Fetches again each block dropped for an unjudged STARK proof that
+    /// nothing else has delivered since.
+    pub(super) fn rerequest_unanswered_blocks(&mut self, producers: &mut Producers) {
+        for (block_root, slot) in self.held.take_unanswered() {
+            let known = self.fork_choice.find_node_idx(&block_root).is_some();
+            if !known && !self.held.holds(&block_root) {
+                producers.produce(SyncNeed::missing_block(block_root, slot));
             }
         }
     }

@@ -229,6 +229,19 @@ fn cold_start_stays_idle_until_a_peer_has_spoken() {
     assert!(matches!(e.phase, Phase::Idle), "no peer heard from: still Idle");
 }
 
+/// Validator clients ask for their indices in the first seconds after
+/// genesis, before any peer has connected.
+#[test]
+fn head_at_the_wall_clock_follows_before_any_peer_speaks() {
+    let mut e = engine();
+    local_status(&mut e, 0, 0);
+    assert_eq!(e.advance(), Some(SyncUpdate::Following), "genesis: nothing to sync");
+
+    let mut e = engine();
+    local_status(&mut e, 100, 100 + head_lag());
+    assert_eq!(e.advance(), Some(SyncUpdate::Following), "within the lag of the clock");
+}
+
 /// Slots go unproposed, so a wall-clock gap is not evidence of anything.
 /// Gating cold start on one stranded us in `Idle` on a quiet chain.
 #[test]

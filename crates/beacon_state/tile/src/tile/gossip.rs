@@ -1747,7 +1747,10 @@ impl BeaconStateTile {
         if SignedBlockLayout::at_slot(&self.spec, node.slot) != layout {
             return EnvelopeCheck::Reject;
         }
-        if node.slot < self.fork_choice.finalized_checkpoint().epoch * SLOTS_PER_EPOCH {
+        // The finalized block sits below its epoch's start when the slots up to
+        // it were skipped, and its children still build on its payload.
+        let finalized = self.fork_choice.finalized_checkpoint();
+        if block_root != finalized.root && node.slot < finalized.epoch * SLOTS_PER_EPOCH {
             return EnvelopeCheck::Ignore;
         }
         let state_id = node.state_id;

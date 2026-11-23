@@ -1534,3 +1534,135 @@ fn backfilled_blob_block_under_the_column_floor_owes_no_columns() {
     assert_eq!(store.finalized.slot_of(&root), Some(slot), "the block landed");
     assert_eq!(store.finalized.coverage().columns_missing(slot), 0);
 }
+
+/// A skipped slot holds no block, so a range across it sends the blocks around
+/// it and completes. `ResourceUnavailable` there gets a peer banned for
+/// serving everything it has.
+#[test]
+fn block_range_steps_over_skipped_slots() {
+    use silver_common::{
+        P2pSend, P2pStreamId, RpcOutbound, RpcRequest, RpcRequestInbound, RpcResponse,
+        RpcResponseOutbound, StreamProtocol, TCache, TCacheProducer,
+    };
+
+    let dir = TempDir::new().unwrap();
+    let store_path = dir.path().to_str().unwrap().to_owned();
+    let (root_10, root_12) = ([0x10; 32], [0x12; 32]);
+    place_block(&store_path, 10, &[0x10; 40], root_10);
+    place_block(&store_path, 12, &[0x12; 40], root_12);
+    let mut store = load_fulu(store_path);
+
+    let (root_14, root_16) = ([0x14; 32], [0x16; 32]);
+    let mut blocks = TCache::producer(TCacheId::NetworkIngress, 1 << 20);
+    let mut stage = |bytes: &[u8]| {
+        let mut res = blocks.reserve(bytes.len(), true).unwrap();
+        res.write_all(bytes).unwrap();
+        res.flush().unwrap();
+        res.read()
+    };
+    let (ssz_14, ssz_16) = (stage(&[0x14; 40]), stage(&[0x16; 40]));
+    let mut consumer =
+        TCacheReader::single(blocks.cache_ref(), "skip_cons", TReadMode::Sliding).unwrap();
+    store.add_block(root_14, consumer.acquire(ssz_14), 14, root_12);
+    store.add_block(root_16, consumer.acquire(ssz_16), 16, root_14);
+    store.update_head(16, root_16, PayloadResolution::Full, 12, root_12);
+
+    let mut producer = TCache::producer(TCacheId::NetworkProcessing, 1 << 20);
+    store.file_io(|_| [0; 4], &mut producer, &mut |_| {}).unwrap();
+
+    let req_producer = TCache::producer(TCacheId::NetworkIngress, 1 << 20);
+    let mut req_consumer =
+        TCacheReader::single(req_producer.cache_ref(), "skip_req", TReadMode::Sliding).unwrap();
+    let mut read_back =
+        TCacheReader::single(producer.cache_ref(), "skip_read", TReadMode::Sliding).unwrap();
+    let mut serve = |start: u64, count: u64| {
+        let mut range = [0u8; 24];
+        range[0..8].copy_from_slice(&start.to_le_bytes());
+        range[8..16].copy_from_slice(&count.to_le_bytes());
+        range[16..24].copy_from_slice(&1u64.to_le_bytes());
+        let stream_id = P2pStreamId::new(1, 1, StreamProtocol::BeaconBlocksByRange, false);
+        store.rpc_request(&mut req_consumer, RpcRequestInbound {
+            stream_id,
+            request: RpcRequest::BlocksByRange(range),
+        });
+        let mut served = Vec::new();
+        store
+            .file_io(|_| [0; 4], &mut producer, &mut |event| {
+                let IoEvent::P2pSend(P2pSend::Rpc(RpcOutbound::Response(RpcResponseOutbound {
+                    response,
+                    ..
+                }))) = event
+                else {
+                    return;
+                };
+                served.push(match response {
+                    RpcResponse::BeaconBlock { ssz, .. } => {
+                        let acquired = read_back.acquire(ssz);
+                        format!("block {:#x}", acquired.buffer().unwrap().0[0])
+                    }
+                    RpcResponse::Complete => "complete".to_owned(),
+                    other => format!("{other:?}"),
+                });
+            })
+            .unwrap();
+        served
+    };
+
+    assert_eq!(serve(10, 3), ["block 0x10", "block 0x12", "complete"], "finalized slot 11");
+    assert_eq!(serve(13, 4), ["block 0x14", "block 0x16", "complete"], "unfinalized 13 and 15");
+}
+
+/// A restarted node claims the history on its disk while it still syncs. Held
+/// at the finalized slot until it follows, two restarted nodes each wait on
+/// the other's history and never follow.
+#[test]
+fn syncing_node_claims_the_history_it_holds() {
+    use silver_beacon_state_data::SpecConfig;
+    use silver_common::{PeerEvent, TCache, block_root_pq};
+
+    use super::backfill::fixtures::{envelope_for, gloas_chain_block, pq_chain_block, xmss_signed};
+
+    let dir = TempDir::new().unwrap();
+    let store_path = dir.path().to_str().unwrap().to_owned();
+    let spec = std::sync::Arc::new(SpecConfig {
+        gloas_fork_epoch: 0,
+        pq_fork_epoch: 1,
+        ..SpecConfig::mainnet()
+    });
+    let gloas = gloas_chain_block(31, [0x31; 32], &[]);
+    let root_gloas = block_root(&gloas, true);
+    let pq_a = pq_chain_block(32, root_gloas, &[]);
+    let root_a = block_root_pq(&pq_a);
+    let pq_b = pq_chain_block(34, root_a, &[]);
+    let root_b = block_root_pq(&pq_b);
+    let envelopes = [
+        (31, &gloas, root_gloas, envelope_for(root_gloas)),
+        (32, &pq_a, root_a, xmss_signed(&envelope_for(root_a))),
+        (34, &pq_b, root_b, xmss_signed(&envelope_for(root_b))),
+    ];
+    for (slot, block, root, envelope) in envelopes {
+        place_block(&store_path, slot, block, root);
+        let path = envelope_path(&store_path, slot);
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(path, envelope).unwrap();
+    }
+
+    let mut store = super::Store::load(store_path, spec, 0).unwrap();
+    store.head.root = [1u8; 32];
+    store.head.finalized_slot = 34;
+    store.head.finalized_root = root_b;
+    store.sync_update(SyncUpdate::SyncingFinalized { target_epoch: 9, target_root: [9; 32] });
+
+    let mut producer = TCache::producer(TCacheId::NetworkProcessing, 1 << 20);
+    let mut claims = Vec::new();
+    for _ in 0..32 {
+        store
+            .file_io(|_| [0; 4], &mut producer, &mut |event| {
+                if let IoEvent::PeerEvent(PeerEvent::EarliestSlot(slot)) = event {
+                    claims.push(slot);
+                }
+            })
+            .unwrap();
+    }
+    assert_eq!(claims.last(), Some(&31), "claimed from its oldest held block: {claims:?}");
+}

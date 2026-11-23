@@ -52,7 +52,9 @@ pub(super) fn select_target(
     }
 
     if current.is_none() && !ctx.peers.received_statuses() {
-        return None;
+        let at_wall_clock =
+            wall_slot <= local_head_slot.saturating_add(ctx.cfg.head_lag_threshold_slots);
+        return at_wall_clock.then_some(SyncUpdate::Following);
     }
 
     // No usable sync target was found above, so if we are behind, we are stalled.

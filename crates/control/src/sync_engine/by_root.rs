@@ -15,6 +15,9 @@ const PARENT_CHASE_BACKOFF: Duration = Duration::from_millis(500);
 const COLUMN_GOSSIP_WAIT_PERIOD: Duration = Duration::from_millis(400);
 
 const ATTEMPTS_BEFORE_REPORT: u32 = 8;
+/// Untuned: long enough that a root no peer serves well costs a request every
+/// half minute, short enough that a peer joining later is found soon.
+const MAX_BACKOFF: Duration = Duration::from_secs(32);
 
 /// A root's block and its columns are chased independently: either may lap
 /// while the other is wanted.
@@ -37,10 +40,12 @@ struct Need {
 
 impl Need {
     fn backoff(&self) -> Duration {
-        match self.kind {
+        let base = match self.kind {
             DataKind::Columns => COLUMN_RETRY,
             DataKind::Block | DataKind::Envelope => PARENT_CHASE_BACKOFF,
-        }
+        };
+        let doublings = self.attempts.saturating_sub(ATTEMPTS_BEFORE_REPORT).min(16);
+        base.saturating_mul(1 << doublings).min(MAX_BACKOFF)
     }
 
     fn due_in(&self) -> Duration {
@@ -247,8 +252,8 @@ fn report_unplaced(placed: bool, need: &Need, root: &[u8; 32]) {
 
 fn offer(need: &mut Need, root: [u8; 32], next_id: &mut u64, now: Instant) -> SyncAction {
     let request_id = RequestId::next(need.kind, need.origin, next_id);
-    need.due = now + need.backoff();
     need.attempts += 1;
+    need.due = now + need.backoff();
     if need.attempts == 1 {
         silver_log::debug!(
             root = hex32(&root),
@@ -493,8 +498,30 @@ mod tests {
 
         for _ in 0..ATTEMPTS_BEFORE_REPORT * 3 {
             assert_eq!(drive(&mut needs, &mut next_id, now, true).len(), 1, "still asking");
-            now += PARENT_CHASE_BACKOFF;
+            now += MAX_BACKOFF;
         }
+    }
+
+    /// Past the first attempts the wait doubles up to its cap.
+    #[test]
+    fn unanswered_need_backs_off_exponentially() {
+        let mut now = Instant::now();
+        let (mut needs, mut next_id) = (ByRootRequests::new(BY_ROOT_CAP), 0);
+        want_block(&mut needs, ROOT, 9, now);
+
+        let mut asked_at = Vec::new();
+        let start = now;
+        while asked_at.len() < ATTEMPTS_BEFORE_REPORT as usize + 10 {
+            if !drive(&mut needs, &mut next_id, now, true).is_empty() {
+                asked_at.push(now - start);
+            }
+            now += Duration::from_millis(100);
+        }
+        let gaps: Vec<_> = asked_at.windows(2).map(|pair| pair[1] - pair[0]).collect();
+        let fast = ATTEMPTS_BEFORE_REPORT as usize;
+        assert!(gaps[..fast].iter().all(|&gap| gap == PARENT_CHASE_BACKOFF), "flat at first");
+        assert_eq!(gaps[fast], PARENT_CHASE_BACKOFF * 2, "then doubling");
+        assert_eq!(*gaps.last().unwrap(), MAX_BACKOFF, "up to the cap");
     }
 
     /// `pending_blocks` keys children by parent root, so several blocks at

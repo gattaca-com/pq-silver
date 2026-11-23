@@ -159,7 +159,7 @@ pub(super) enum VerifyProgress {
     Verified(StagedBlock),
     /// The proofs are part of the transition, so the block failed it.
     Rejected(StagedBlock),
-    /// Dropped, not rejected: the block may yet verify when re-delivered.
+    /// Dropped, not rejected: it is re-requested once leanVM answers again.
     Unanswered(StagedBlock),
 }
 
@@ -176,6 +176,10 @@ pub(super) struct HeldBlocks {
     /// Roots whose block failed the state transition or the EL, so a re-fetch
     /// or a child's parent chase does not run the same block again.
     rejected: FxHashMap<B256, Rejected>,
+    /// Blocks dropped because leanVM did not judge their STARK proofs. The
+    /// claims are rebuilt only by running the block again, so it is fetched
+    /// again.
+    unanswered: Vec<(B256, Slot)>,
 }
 
 impl HeldBlocks {
@@ -187,7 +191,12 @@ impl HeldBlocks {
             awaiting_verify: FxHashMap::default(),
             available: FxHashMap::default(),
             rejected: FxHashMap::default(),
+            unanswered: Vec::new(),
         }
+    }
+
+    pub(super) fn take_unanswered(&mut self) -> Vec<(B256, Slot)> {
+        std::mem::take(&mut self.unanswered)
     }
 
     pub(super) fn staged_len(&self) -> usize {
@@ -284,7 +293,10 @@ impl HeldBlocks {
                 self.orphans.drop_children(&block_root);
                 VerifyProgress::Rejected(block)
             }
-            ProofVerdict::Unanswered => VerifyProgress::Unanswered(block),
+            ProofVerdict::Unanswered => {
+                self.unanswered.push((block_root, block.parsed.header.slot));
+                VerifyProgress::Unanswered(block)
+            }
         }
     }
 

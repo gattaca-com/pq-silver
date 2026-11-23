@@ -622,7 +622,10 @@ impl BeaconStateTile {
 
         let mut buf = [0u8; STATUS_V2_SIZE];
         buf[0..4].copy_from_slice(&fork_digest);
-        buf[4..36].copy_from_slice(&finalized.root);
+        // Spec: the genesis finalized checkpoint goes out with a zero root.
+        // Peers past genesis check any other root against their own chain.
+        let finalized_root = if finalized.epoch == 0 { [0; 32] } else { finalized.root };
+        buf[4..36].copy_from_slice(&finalized_root);
         buf[36..44].copy_from_slice(&finalized.epoch.to_le_bytes());
         buf[44..76].copy_from_slice(&head_root);
         buf[76..84].copy_from_slice(&slot.to_le_bytes());
@@ -954,6 +957,9 @@ impl BeaconStateTile {
         self.attestation_root_memo.prune_before(floor);
         self.pq_aggregator.prune_before(floor);
         self.gossip_proofs.prune_before(floor);
+        if self.pq_aggregator.is_leanvm_up() {
+            self.rerequest_unanswered_blocks(producers);
+        }
         self.payload_bids_pool.on_slot(slot);
         self.seen_proposer_preferences.on_slot(slot);
         self.envelope_arrivals.on_slot(slot);
@@ -1189,7 +1195,12 @@ impl BeaconStateTile {
 
         // Health first: a disconnect fails the batch in flight once, before
         // its `None` answer arrives.
-        adapter.consume(|health: LeanVmHealthEvent, _| self.pq_aggregator.on_health(health));
+        adapter.consume(|health: LeanVmHealthEvent, producers| {
+            if health.ready {
+                self.rerequest_unanswered_blocks(producers);
+            }
+            self.pq_aggregator.on_health(health);
+        });
         adapter.consume(|resp: LeanVmResp, producers| {
             if let Some(verdict) = self.leanvm_verifier.verdict(&resp, &mut self.reader) {
                 let request_id = resp.request_id;
@@ -1254,7 +1265,20 @@ impl BeaconStateTile {
         if let Some((topic, ssz)) = pq {
             let acquired = self.reader.acquire(ssz);
             let Ok((data, _)) = acquired.buffer() else { return };
-            if topic.check_pq_signed_message(data).is_err() {
+            if let Err(reason) = topic.check_pq_signed_message(data) {
+                // A lapping writer tears the bytes; that is no fault of the peer.
+                if acquired.revalidate().is_err() {
+                    silver_log::warn!(?stream_id, ?topic, "PQ rpc response lapped in the tcache");
+                    return;
+                }
+                silver_log::warn!(
+                    ?stream_id,
+                    ?topic,
+                    len = data.len(),
+                    reason,
+                    "PQ rpc response failed its format check"
+                );
+                silver_log::debug!(head = ?&data[..data.len().min(128)], "failed PQ rpc response");
                 producers.produce(silver_common::PeerEvent::RpcMisbehaviour {
                     p2p_peer: stream_id.peer(),
                     severity: silver_common::RpcSeverity::LowTolerance,

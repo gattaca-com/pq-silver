@@ -136,6 +136,10 @@ impl PqAggregator {
         self.rolling.is_some()
     }
 
+    pub fn is_leanvm_up(&self) -> bool {
+        !matches!(self.leanvm, LeanVm::Down)
+    }
+
     /// `last_position` is the last place a local aggregator of the vote's
     /// committee holds in its aggregation committee. Votes are taken until
     /// its cutoff and proved until its aggregate is due.

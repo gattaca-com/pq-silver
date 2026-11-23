@@ -40,6 +40,7 @@ use super::block_production::Operations;
 use super::{
     block::{ParsedBlock, StagedBlock},
     block_production::Proposal,
+    gossip::EnvelopeCheck,
     held_blocks::{BlockSourceMsg, ORPHAN_TIMEOUT_SLOTS},
     leanvm_verifier::ProofVerdict,
     pending_envelopes::{ParkedEnvelope, ParkedKind, UnverifiedEnvelope},
@@ -539,6 +540,22 @@ fn slot_advance_crosses_two_epoch_boundaries() {
     seed_tile(&mut tile, 4, 30);
     tile.on_slot_start(66, |_| {});
     assert_eq!(tile.head_state_slot(), 66);
+}
+
+/// Prysm refuses a genesis finalized checkpoint with any root but zero once it
+/// has finalized past genesis.
+#[test]
+fn status_sends_the_genesis_finalized_checkpoint_with_a_zero_root() {
+    let mut tile = make_tile();
+    seed_tile(&mut tile, 4, 10);
+    assert_eq!(tile.fork_choice.finalized_checkpoint().epoch, 0);
+    match tile.status_event(tile.selected_head()) {
+        BeaconStateEvent::Status { ssz, .. } => {
+            assert_eq!(StatusView::finalized_epoch(&ssz), 0);
+            assert_eq!(*StatusView::finalized_root(&ssz), [0; 32]);
+        }
+        ev => panic!("status_event produced {ev:?}"),
+    }
 }
 
 /// Every status event carries the execution status of the head its `ssz`
@@ -2410,6 +2427,26 @@ fn replayed_envelope_before_its_block_imports_parks() {
     let waiting_root = [0xE6u8; 32];
     tile.replay_envelope(rpc_envelope(&mut rp, waiting_root), |_| {});
     assert!(tile.pending_envelopes.holds(&waiting_root));
+}
+
+/// A checkpoint block below its epoch's start, after skipped slots, still
+/// owes its payload: its children build on it.
+#[test]
+fn envelope_of_a_finalized_block_below_its_epoch_start_is_judged() {
+    let spec = SpecConfig { gloas_fork_epoch: 0, ..SpecConfig::mainnet() };
+    let (mut tile, _gp, mut rp, _spine, _adapter) =
+        tile_with_producers_on(200, BeaconState::empty_test(0), spec);
+    seed_tile(&mut tile, 4, 30);
+    let cp = Checkpoint { epoch: 1, root: ANCHOR_ROOT };
+    let anchor = tile.last_applied;
+    tile.fork_choice =
+        ForkChoice::init(cp, cp, 30, ANCHOR_ROOT, ANCHOR_STATE_ROOT, [0; 32], false, anchor, 4);
+
+    let read = rpc_envelope(&mut rp, ANCHOR_ROOT);
+    let acquired = tile.reader.acquire(read);
+    let (data, _) = acquired.buffer().unwrap();
+    let check = tile.validate_execution_payload_envelope(data);
+    assert!(!matches!(check, EnvelopeCheck::Ignore), "verified, not ignored as pre-finalized");
 }
 
 #[test]
@@ -5486,21 +5523,27 @@ fn stark_invalid_rejects_parked_block() {
     assert_eq!(rejected, [S_ROOT], "the peer that served it is told");
 }
 
-/// A proof leanVM never judged says nothing about the block, so a
-/// re-delivered copy runs again.
+/// A proof leanVM never judged says nothing about the block, so it is dropped
+/// unrejected and fetched again: its claims come only from running it.
 #[test]
-fn stark_unanswered_drops_parked_block_without_rejecting_it() {
+fn stark_unanswered_drops_parked_block_and_fetches_it_again() {
     const S_ROOT: B256 = [0x05; 32];
     let mut forks = ThreeForks::new();
-    let (_spine, mut adapter) = spine_adapter(&forks.tile);
+    let (mut spine, mut adapter) = spine_adapter(&forks.tile);
+    let mut sink = SpineAdapter::connect_tile(&Sink, &mut spine.spine);
+    sink.consume(|_: SyncNeed, _| {});
     let mut producer = TCache::producer(TCacheId::ControlProcessing, 1 << 12);
     forks.park_for_verify(&mut producer, S_ROOT, D_ROOT, forks.d_id, 3, 1);
 
     forks.tile.handle_stark_verdict(30, ProofVerdict::Unanswered, &mut adapter.producers);
-
     assert!(!forks.tile.held.is_awaiting_verify(&S_ROOT));
     assert!(forks.tile.fork_choice.find_node_idx(&S_ROOT).is_none());
     assert_eq!(forks.tile.held.rejected_reason(&S_ROOT), None);
+
+    forks.tile.rerequest_unanswered_blocks(&mut adapter.producers);
+    assert_eq!(missing_blocks(&mut sink), [(S_ROOT, 3)], "fetched again");
+    forks.tile.rerequest_unanswered_blocks(&mut adapter.producers);
+    assert!(missing_blocks(&mut sink).is_empty(), "once per drop");
 }
 
 /// A block parked on its verdict holds a committed state, so finalization

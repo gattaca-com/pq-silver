@@ -6065,6 +6065,7 @@ dependencies = [
  "silver_log",
  "silver_network",
  "silver_peer",
+ "silver_preset",
  "silver_storage",
  "tempfile",
  "ureq",
@@ -6198,6 +6199,7 @@ dependencies = [
  "silver_common",
  "silver_control",
  "silver_log",
+ "silver_preset",
  "slab",
  "snap 1.1.2",
 ]

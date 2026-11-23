@@ -1525,7 +1525,7 @@ impl LightClientOptimisticUpdateView {
     }
     #[inline]
     pub fn signature_slot(buf: &[u8]) -> u64 {
-        u64_le(buf, 164)
+        u64_le(buf, 4 + SYNC_AGGREGATE_SIZE)
     }
     /// Raw LightClientHeader bytes for `attested_header` — feed to
     /// `LightClientHeaderView`.

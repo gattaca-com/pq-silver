@@ -178,17 +178,18 @@ impl AttestationPqView {
     pub fn append_unvoted(
         out: &mut Vec<u8>,
         data: &[u8; ATTESTATION_DATA_SIZE],
-        committee_bits: u16,
+        committee_bits: u64,
         bits_len: usize,
     ) -> usize {
         debug_assert!(committee_bits != 0 && bits_len <= MAX_ATTESTING_INDICES_PQ);
+        debug_assert!(committee_bits >> MAX_COMMITTEES_PER_SLOT_PQ == 0);
         let start = out.len();
         let bits_start = start + ATTESTATION_PQ_FIXED;
         out.resize(bits_start + bits_len / 8 + 1, 0);
         out[start..start + 4].copy_from_slice(&(ATTESTATION_PQ_FIXED as u32).to_le_bytes());
         out[start + 4..start + 4 + ATTESTATION_DATA_SIZE].copy_from_slice(data);
         out[start + 4 + ATTESTATION_DATA_SIZE..bits_start]
-            .copy_from_slice(&committee_bits.to_le_bytes());
+            .copy_from_slice(&committee_bits.to_le_bytes()[..COMMITTEE_BITS_SIZE_PQ]);
         out[bits_start + bits_len / 8] |= 1 << (bits_len % 8);
         bits_start
     }
@@ -847,7 +848,7 @@ mod tests {
         out[bits + 12 / 8] |= 1 << (12 % 8);
         let attestation = &out[1..];
         assert!(AttestationPqView::check_canonical(attestation));
-        assert_eq!(AttestationPqView::committee_bits(attestation), &[0b101, 0]);
+        assert_eq!(bitvector_word(AttestationPqView::committee_bits(attestation)), 0b101);
         assert_eq!(bitlist_len(AttestationPqView::aggregation_bits(attestation)), 13);
         assert_eq!(AttestationPqView::aggregation_bits(attestation)[1], 0b0011_0000);
     }

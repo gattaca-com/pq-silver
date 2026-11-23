@@ -32,7 +32,10 @@ use silver_common::{
 use silver_common::{ProducedBlock, SidecarBidRequest, SidecarBidResponse};
 use silver_config::EngineConfig;
 use silver_slashing::{Admission, Selection};
-use silver_ssz::ssz_view::{EXECUTION_PAYLOAD_ENVELOPE_MIN, SyncCommitteeContributionView};
+use silver_ssz::ssz_view::{
+    EXECUTION_PAYLOAD_ENVELOPE_MIN, SYNC_SUBCOMMITTEE_BITS_SIZE, SyncCommitteeContributionView,
+    bitvector_word,
+};
 
 #[cfg(feature = "ef_tests")]
 use super::block_production::Operations;
@@ -48,7 +51,9 @@ use super::{
 };
 use crate::{
     error::{PrecheckError, RejectReason},
-    fork_choice::{BlockImport, PROPOSER_SCORE_BOOST_PERCENT, PayloadAxis, PayloadStatus},
+    fork_choice::{
+        BlockImport, PROPOSER_SCORE_BOOST_PERCENT, PTC_MASK_WORDS, PayloadAxis, PayloadStatus,
+    },
     merkle, ssz_hash,
     stf::{self, VoteTarget},
     test_signing,
@@ -925,7 +930,12 @@ impl HeadRig {
     /// Bypasses gossip validation and supplies the recomputation normally
     /// performed after committing PTC votes.
     fn ptc_majority(&mut self, block_root: B256) {
-        self.tile.fork_choice.record_ptc_votes(&block_root, &[u64::MAX; 8], true, true);
+        self.tile.fork_choice.record_ptc_votes(
+            &block_root,
+            &[u64::MAX; PTC_MASK_WORDS],
+            true,
+            true,
+        );
         self.tile.recompute_head(|_| {});
     }
 
@@ -1612,7 +1622,8 @@ fn sanity_fixture(name: &str) -> (Vec<u8>, Vec<u8>, Vec<u8>) {
 #[cfg(feature = "ef_tests")]
 fn sanity_fixture_of(fork: &str, name: &str) -> (Vec<u8>, Vec<u8>, Vec<u8>) {
     let dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .join("consensus-spec-tests/tests/mainnet")
+        .join("consensus-spec-tests/tests")
+        .join(silver_preset::PRESET_BASE)
         .join(fork)
         .join("sanity/blocks/pyspec_tests")
         .join(name);
@@ -1773,9 +1784,10 @@ fn a_replayed_block_publishes_its_own_head_metadata() {
 #[cfg(feature = "ef_tests")]
 #[test]
 fn the_anchor_reports_its_block_slot_not_the_checkpoint_state_slot() {
-    let path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join(
-        "consensus-spec-tests/tests/mainnet/fulu/sanity/slots/pyspec_tests/slots_2/post.ssz_snappy",
-    );
+    let path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("consensus-spec-tests/tests")
+        .join(silver_preset::PRESET_BASE)
+        .join("fulu/sanity/slots/pyspec_tests/slots_2/post.ssz_snappy");
     let raw = fs::read(&path)
         .unwrap_or_else(|e| panic!("{}: {e} (run `just ef-tests-download`)", path.display()));
     let ssz = snap::Decoder::new().decompress_vec(&raw).expect("snappy post");
@@ -3833,9 +3845,12 @@ fn sync_message_batch_applies_and_marks_seen() {
     assert!(tile.seen_sync_msgs[1].contains(wall, 0));
     let contribution =
         tile.sync_contribution_pool.contribution_ssz(wall, 1, bbr).expect("pooled contribution");
-    // The test state's default current committee repeats validator 0 in all
-    // 128 positions of each subcommittee.
-    assert_eq!(SyncCommitteeContributionView::aggregation_bits(&contribution), &[0xff; 16]);
+    // The test state's default current committee repeats validator 0 in every
+    // position of each subcommittee.
+    assert_eq!(
+        SyncCommitteeContributionView::aggregation_bits(&contribution),
+        &[0xff; SYNC_SUBCOMMITTEE_BITS_SIZE]
+    );
     assert!(tile.votes.batch.is_empty() && tile.votes.pending.is_empty());
     assert_eq!(non_block_relays(&mut adapter), [GossipTopic::SyncCommittee(1)]);
 }
@@ -7454,7 +7469,7 @@ fn pooled_attestations_land_in_the_produced_block() {
     let attestation = &attestations[4..];
     assert_eq!(&attestations[..4], &4u32.to_le_bytes(), "one attestation");
     assert_eq!(AttestationView::data(attestation).as_bytes(), &data, "not the wrong source");
-    assert_eq!(AttestationView::committee_bits(attestation), &1u64.to_le_bytes());
+    assert_eq!(bitvector_word(AttestationView::committee_bits(attestation)), 1);
 
     let view = tile.state.read_view(parent);
     let shuffling = tile.shuffling_cache.for_block(&view, epoch).unwrap();
@@ -8005,7 +8020,7 @@ mod pq_aggregator {
         let ssz = rig.served().expect("a best proof");
         let attestation = ProvedAttestationView::attestation(&ssz);
         assert!(AttestationPqView::check_canonical(attestation));
-        assert_eq!(AttestationPqView::committee_bits(attestation), &[1, 0]);
+        assert_eq!(bitvector_word(AttestationPqView::committee_bits(attestation)), 1);
         let bits = AttestationPqView::aggregation_bits(attestation);
         assert_eq!(bits, [0b10, 1], "only position 1 is set");
         assert!(!ProvedAttestationView::proof(&ssz).is_empty());

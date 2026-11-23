@@ -73,7 +73,7 @@ pub fn hash_attestation_data(d: &[u8]) -> B256 {
 
 #[timed]
 pub fn hash_indexed_attestation(d: &[u8]) -> B256 {
-    const INDEX_CAPACITY: usize = (64 * 2048usize).div_ceil(4);
+    const INDEX_CAPACITY: usize = MAX_ATTESTING_INDICES.div_ceil(4);
     if d.len() < 228 {
         // Empty IA: zero attesting_indices, zero AttestationData, zero sig.
         const EMPTY_INDICES_ROOT: B256 = MerkleStack::empty_root(INDEX_CAPACITY);

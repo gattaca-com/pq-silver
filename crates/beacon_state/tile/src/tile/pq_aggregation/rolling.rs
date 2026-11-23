@@ -115,7 +115,7 @@ impl<'a> OnChainAttestations<'a> {
         let of_data = self.groups().filter(move |group| group.committee.data == *data);
         let of_committee =
             move |index| of_data.clone().filter(move |group| group.committee.index == index);
-        let (mut committee_bits, mut bits_len) = (0u16, 0);
+        let (mut committee_bits, mut bits_len) = (0u64, 0);
         for index in 0..MAX_COMMITTEES_PER_SLOT_PQ {
             let mut lens = of_committee(index).map(|group| group.committee_len);
             let Some(len) = lens.next() else { continue };

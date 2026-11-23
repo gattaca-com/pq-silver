@@ -40,7 +40,7 @@ fn state_root_matches_reference() {
 #[test]
 fn state_encodes_back_to_its_ssz() {
     let ssz = snappy_decode(Path::new(FIXTURE));
-    let state = BeaconState::decompose(&ssz, &SpecConfig::mainnet(), None).unwrap();
+    let state = BeaconState::decompose(&ssz, &SpecConfig::reference(), None).unwrap();
     assert_eq!(state.ssz_len(), ssz.len());
     let mut encoded = Vec::with_capacity(ssz.len());
     state.encode_ssz(&mut encoded).unwrap();
@@ -56,7 +56,7 @@ fn epoch_transitions_match_the_spec() {
         gloas_fork_epoch: 0,
         eip8483_fork_epoch: 0,
         pq_fork_epoch: 0,
-        ..SpecConfig::mainnet()
+        ..SpecConfig::reference()
     };
     let mut scratch = stf::StfScratch::new(0);
     for (slot, expected) in EPOCH_ROOTS {

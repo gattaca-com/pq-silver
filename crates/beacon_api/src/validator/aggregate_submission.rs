@@ -173,7 +173,7 @@ mod tests {
         assert_eq!(data.beacon_block_root(), &[0x11; 32]);
         assert_eq!(data.source_root(), &[0x22; 32]);
         assert_eq!(data.target_epoch(), 300);
-        assert_eq!(SignedAggregateAndProofPqView::agg_committee_bits(ssz), &[0x04, 0]);
+        assert_eq!(bitvector_word(SignedAggregateAndProofPqView::agg_committee_bits(ssz)), 0x04);
         assert_eq!(SignedAggregateAndProofPqView::agg_aggregation_bits(ssz), &[0x1a, 0x05]);
         assert_eq!(SignedAggregateAndProofPqView::proof(ssz), &[0xab, 0xcd, 0xef]);
     }

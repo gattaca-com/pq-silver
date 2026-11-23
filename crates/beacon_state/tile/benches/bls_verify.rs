@@ -130,7 +130,10 @@ fn load_pre_at(dir: &Path) -> loaded_state::LoadedState {
 }
 
 fn build_ef_block() -> SigBatch {
-    let dir = spec_tests_dir().join("tests/mainnet/fulu/sanity/blocks/pyspec_tests/attestation");
+    let dir = spec_tests_dir()
+        .join("tests")
+        .join(silver_preset::PRESET_BASE)
+        .join("fulu/sanity/blocks/pyspec_tests/attestation");
     let mut s = load_pre_at(&dir);
     let block = snappy_decode(&dir.join("blocks_0.ssz_snappy"));
 
@@ -138,7 +141,7 @@ fn build_ef_block() -> SigBatch {
     let proposer_index = SignedBeaconBlockView::proposer_index(&block);
     let body = SignedBeaconBlockView::body(&block);
 
-    let cfg = SpecConfig::mainnet();
+    let cfg = SpecConfig::reference();
     let mut fork = s.bs.fork_writer(s.state_id);
 
     let mut scratch = stf::StfScratch::new(0);

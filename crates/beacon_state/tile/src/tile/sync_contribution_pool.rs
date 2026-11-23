@@ -292,11 +292,13 @@ impl ContributionEntry {
 #[cfg(test)]
 mod tests {
     use blst::BLST_ERROR;
-    use silver_beacon_state_data::bls;
+    use silver_beacon_state_data::{SYNC_SUBCOMMITTEE_SIZE, bls};
     use silver_common::ssz_view::SyncCommitteeContributionView;
 
     use super::*;
     use crate::test_signing;
+
+    const LAST_POSITION: usize = SYNC_SUBCOMMITTEE_SIZE - 1;
 
     impl SyncContributionPool {
         pub(in crate::tile) fn contribution_ssz(
@@ -337,7 +339,13 @@ mod tests {
             InsertOutcome::Inserted
         );
         assert_eq!(
-            pool.insert_verified(SLOT, SUBCOMMITTEE, BLOCK_ROOT, &positions(&[65]), &signature(1)),
+            pool.insert_verified(
+                SLOT,
+                SUBCOMMITTEE,
+                BLOCK_ROOT,
+                &positions(&[LAST_POSITION]),
+                &signature(1)
+            ),
             InsertOutcome::Inserted
         );
 
@@ -347,7 +355,7 @@ mod tests {
         assert_eq!(SyncCommitteeContributionView::subcommittee_index(&out), SUBCOMMITTEE);
         let bits = SyncCommitteeContributionView::aggregation_bits(&out);
         assert_eq!(bits[0], 0b0000_0010);
-        assert_eq!(bits[8], 0b0000_0010);
+        assert_eq!(bits[LAST_POSITION / 8], 1 << (LAST_POSITION % 8));
 
         let sig = Signature::from_bytes(SyncCommitteeContributionView::signature(&out)).unwrap();
         let pks = [&test_signing::pubkey_pk(0), &test_signing::pubkey_pk(1)];
@@ -407,7 +415,7 @@ mod tests {
         assert_eq!(pool_aggregate(&pool), EMPTY_SYNC_AGGREGATE);
 
         pool.insert_verified(SLOT, 0, BLOCK_ROOT, &positions(&[1]), &signature(0));
-        pool.insert_verified(SLOT, 2, BLOCK_ROOT, &positions(&[64]), &signature(1));
+        pool.insert_verified(SLOT, 2, BLOCK_ROOT, &positions(&[LAST_POSITION]), &signature(1));
         pool.insert_verified(SLOT, 1, [0xBC; 32], &positions(&[0]), &signature(2));
         pool.insert_verified(SLOT + 1, 3, BLOCK_ROOT, &positions(&[0]), &signature(2));
 
@@ -415,7 +423,8 @@ mod tests {
         let (bits, sig) = out.split_at(SYNC_COMMITTEE_SIZE / 8);
         let mut expected_bits = [0u8; SYNC_COMMITTEE_SIZE / 8];
         expected_bits[0] = 0b0000_0010;
-        expected_bits[2 * SYNC_SUBCOMMITTEE_BITS_SIZE + 8] = 0b0000_0001;
+        expected_bits[2 * SYNC_SUBCOMMITTEE_BITS_SIZE + LAST_POSITION / 8] =
+            1 << (LAST_POSITION % 8);
         assert_eq!(bits, expected_bits);
 
         let sig = Signature::from_bytes(sig).unwrap();

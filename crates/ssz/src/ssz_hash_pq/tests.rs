@@ -10,10 +10,11 @@ use crate::{
     ssz_hash_gloas::RequestCountOutOfBounds,
     ssz_view::{
         AttestationPqView, AttesterSlashingPqView, BEACON_BLOCK_BODY_PQ_FIXED,
-        BeaconBlockBodyPqView, EXECUTION_PAYLOAD_BID_MIN, ExecutionPayloadBidView,
-        IndexedAttestationPqView, PROPOSER_SLASHING_PQ_SIZE, ProposerSlashingPqView,
-        SignedAggregateAndProofPqView, SignedExecutionPayloadBidPqView, VRF_PROOF_SIZE,
-        VoluntaryExitRequestView, XMSS_SIGNATURE_SIZE,
+        BeaconBlockBodyPqView, COMMITTEE_BITS_SIZE_PQ, EXECUTION_PAYLOAD_BID_MIN,
+        ExecutionPayloadBidView, IndexedAttestationPqView, MAX_COMMITTEES_PER_SLOT_PQ,
+        PROPOSER_SLASHING_PQ_SIZE, ProposerSlashingPqView, SignedAggregateAndProofPqView,
+        SignedExecutionPayloadBidPqView, VRF_PROOF_SIZE, VoluntaryExitRequestView,
+        XMSS_SIGNATURE_SIZE,
     },
 };
 
@@ -100,11 +101,18 @@ fn proof_root_ref(proof: &[u8]) -> B256 {
     mix_in_length(&root, proof.len())
 }
 
+/// Names committee 1.
+fn committee_bits() -> Vec<u8> {
+    let mut bits = vec![0; COMMITTEE_BITS_SIZE_PQ];
+    bits[0] = 0b10;
+    bits
+}
+
 fn attestation(bits: &[u8]) -> Vec<u8> {
     encode(&[
         Field::Variable(bits.to_vec()),
         Field::Fixed(pattern(128, 1)),
-        Field::Fixed(pattern(2, 2)),
+        Field::Fixed(committee_bits()),
     ])
 }
 
@@ -175,15 +183,15 @@ fn attestation_drops_signature_slot() {
     assert!(AttestationPqView::check_canonical(&att));
     assert_eq!(AttestationPqView::aggregation_bits(&att), bits);
 
-    let mut committee_bits = ZERO_HASH;
-    committee_bits[..2].copy_from_slice(&pattern(2, 2));
+    let mut committee_chunk = ZERO_HASH;
+    committee_chunk[..COMMITTEE_BITS_SIZE_PQ].copy_from_slice(&committee_bits());
     let mut bits_chunk = ZERO_HASH;
     bits_chunk[0] = 0xFF;
     let bits_root = mix_in_length(&merkleize_progressive_ref(&[bits_chunk], 1), 9);
     let expected = progressive_container_ref(4, &[0, 1, 3], &[
         bits_root,
         hash_attestation_data(&pattern(128, 1)),
-        committee_bits,
+        committee_chunk,
     ]);
     assert_eq!(AttestationPqView::hash_tree_root(&att), expected);
 
@@ -193,13 +201,16 @@ fn attestation_drops_signature_slot() {
 #[test]
 fn committee_attestation_round_trips_through_the_view() {
     let data = [7u8; 128];
-    let att = AttestationPqView::encode_one_committee(&data, 9, 10, [0, 3, 9]).unwrap();
+    let committee = MAX_COMMITTEES_PER_SLOT_PQ - 1;
+    let att = AttestationPqView::encode_one_committee(&data, committee, 10, [0, 3, 9]).unwrap();
     assert!(AttestationPqView::check_canonical(&att));
     assert_eq!(AttestationPqView::data(&att).as_bytes(), &data);
-    assert_eq!(AttestationPqView::committee_bits(&att), &[0, 0b10]);
+    let mut expected_committee_bits = [0; COMMITTEE_BITS_SIZE_PQ];
+    expected_committee_bits[committee / 8] = 1 << (committee % 8);
+    assert_eq!(AttestationPqView::committee_bits(&att), &expected_committee_bits);
     assert_eq!(AttestationPqView::aggregation_bits(&att), [0b0000_1001, 0b110]);
     let (index, positions) = AttestationPqView::one_committee_positions(&att).unwrap();
-    assert_eq!((index, positions.collect::<Vec<_>>()), (9, vec![0, 3, 9]));
+    assert_eq!((index, positions.collect::<Vec<_>>()), (committee, vec![0, 3, 9]));
 
     let empty = AttestationPqView::encode_one_committee(&data, 0, 0, []).unwrap();
     assert!(AttestationPqView::check_canonical(&empty));
@@ -209,7 +220,10 @@ fn committee_attestation_round_trips_through_the_view() {
 #[test]
 fn committee_attestation_refuses_out_of_range_input() {
     let data = [0u8; 128];
-    assert!(AttestationPqView::encode_one_committee(&data, 16, 4, [0]).is_none());
+    assert!(
+        AttestationPqView::encode_one_committee(&data, MAX_COMMITTEES_PER_SLOT_PQ, 4, [0])
+            .is_none()
+    );
     assert!(AttestationPqView::encode_one_committee(&data, 0, 2049, [0]).is_none());
     assert!(AttestationPqView::encode_one_committee(&data, 0, 4, [4]).is_none());
 }
@@ -270,7 +284,7 @@ fn signed_aggregate_and_proof_reads_its_fields() {
     assert_eq!(SignedAggregateAndProofPqView::aggregator_index(&signed), 42);
     assert_eq!(SignedAggregateAndProofPqView::aggregate(&signed), att);
     assert_eq!(SignedAggregateAndProofPqView::agg_aggregation_bits(&signed), [0b1100_0001, 1]);
-    assert_eq!(SignedAggregateAndProofPqView::agg_committee_bits(&signed)[..], pattern(2, 2));
+    assert_eq!(SignedAggregateAndProofPqView::agg_committee_bits(&signed)[..], committee_bits());
     assert_eq!(SignedAggregateAndProofPqView::proof(&signed), proof);
 
     let expected = merkleize_padded(

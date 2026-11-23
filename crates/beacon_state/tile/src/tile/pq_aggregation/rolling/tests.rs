@@ -2,7 +2,7 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use silver_common::{
     merkle::bitlist_len,
-    ssz_view::{ATTESTATION_PQ_FIXED, variable_list_items},
+    ssz_view::{ATTESTATION_PQ_FIXED, COMMITTEE_BITS_SIZE_PQ, bitvector_word, variable_list_items},
 };
 
 use super::{super::strategy::Committee, *};
@@ -72,7 +72,7 @@ fn groups_of_one_data_become_one_attestation_in_committee_order() {
 
     let [first, second] = &attestations[..] else { panic!("one attestation per data") };
     assert_eq!(AttestationPqView::data(first).as_bytes()[8..], [1; ATTESTATION_DATA_SIZE - 8]);
-    assert_eq!(AttestationPqView::committee_bits(first), &[0b101, 0]);
+    assert_eq!(bitvector_word(AttestationPqView::committee_bits(first)), 0b101);
     assert_eq!(bitlist_len(AttestationPqView::aggregation_bits(first)), 2 * COMMITTEE_LEN);
     let committee_2 = COMMITTEE_LEN;
     assert_eq!(votes(first), [1, committee_2, committee_2 + 3, committee_2 + 8]);
@@ -173,8 +173,8 @@ fn reference(groups: &[&Group]) -> Vec<Vec<u8>> {
     let encode = |(data, committees): &(&[u8; ATTESTATION_DATA_SIZE], Committees)| {
         let mut out = (ATTESTATION_PQ_FIXED as u32).to_le_bytes().to_vec();
         out.extend_from_slice(*data);
-        let committee_bits = committees.keys().fold(0u16, |bits, &index| bits | 1 << index);
-        out.extend_from_slice(&committee_bits.to_le_bytes());
+        let committee_bits = committees.keys().fold(0u64, |bits, &index| bits | 1 << index);
+        out.extend_from_slice(&committee_bits.to_le_bytes()[..COMMITTEE_BITS_SIZE_PQ]);
         let total: usize = committees.values().map(|(len, _)| len).sum();
         let mut bits = vec![0u8; total / 8 + 1];
         let mut offset = 0;

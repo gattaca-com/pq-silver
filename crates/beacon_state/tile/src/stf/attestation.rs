@@ -694,7 +694,7 @@ impl<'a> ParsedAttestationData<'a> {
         }
         let inclusion_delay = current_slot.saturating_sub(self.att_slot);
 
-        Ok((u8::from(inclusion_delay <= 5) * TIMELY_SOURCE_FLAG) |
+        Ok((u8::from(inclusion_delay <= SLOTS_PER_EPOCH.isqrt()) * TIMELY_SOURCE_FLAG) |
             (u8::from(is_matching_target) * TIMELY_TARGET_FLAG) |
             (u8::from(is_matching_head && inclusion_delay == min_inclusion_delay) *
                 TIMELY_HEAD_FLAG))

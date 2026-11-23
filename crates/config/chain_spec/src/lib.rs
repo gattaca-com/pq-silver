@@ -1,5 +1,5 @@
 use serde::{Deserialize, Deserializer, Serialize};
-use silver_preset::SLOTS_PER_EPOCH;
+use silver_preset::{PRESET_BASE, SLOTS_PER_EPOCH};
 use silver_ssz::{
     merkle::{B256, sha256},
     ssz_hash::hash_tree_root_fork_data,
@@ -25,6 +25,24 @@ const fn max_committees_per_slot_pq() -> u64 {
 /// `FAR_FUTURE_EPOCH`: a fork with no scheduled activation.
 const fn unscheduled() -> u64 {
     u64::MAX
+}
+
+/// A consensus-specs preset, as a config file's `PRESET_BASE` names it.
+#[derive(Clone, Copy, Debug, Default, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum Preset {
+    #[default]
+    Mainnet,
+    Minimal,
+}
+
+impl Preset {
+    pub fn name(self) -> &'static str {
+        match self {
+            Self::Mainnet => "mainnet",
+            Self::Minimal => "minimal",
+        }
+    }
 }
 
 /// Fulu `BLOB_SCHEDULE` entry (EIP-7892). Per-epoch override on
@@ -104,8 +122,8 @@ pub struct SpecConfig {
     pub config_name: Option<String>,
     /// The preset this network runs. It must be the one silver was built
     /// with, since preset values size its types.
-    #[serde(default = "mainnet_preset")]
-    pub preset_base: String,
+    #[serde(default)]
+    pub preset_base: Preset,
     /// Genesis (phase-0) fork version. Used as the `current_version` in the
     /// genesis fork-data root, which is the domain mixed into deposit
     /// signatures (`DOMAIN_DEPOSIT`). 0x00000000 mainnet, 0x10000910 Hoodi.
@@ -302,10 +320,6 @@ pub struct SpecConfig {
     /// 16 ETH = 16e9 Gwei on mainnet/Hoodi.
     #[serde(default = "default_u64::<16_000_000_000>")]
     pub ejection_balance: u64,
-}
-
-fn mainnet_preset() -> String {
-    "mainnet".to_owned()
 }
 
 /// Mainnet's merge threshold, crossed 2022-09-15.
@@ -654,7 +668,7 @@ impl SpecConfig {
     pub fn hoodi() -> Self {
         Self {
             config_name: None,
-            preset_base: mainnet_preset(),
+            preset_base: Preset::Mainnet,
             // Hoodi fork-version pattern is `0xN0000910`.
             genesis_fork_version: default_fork_version::<0x10000910>(),
             min_genesis_active_validator_count: 16_384,
@@ -730,7 +744,7 @@ impl SpecConfig {
     pub fn sepolia() -> Self {
         Self {
             config_name: None,
-            preset_base: mainnet_preset(),
+            preset_base: Preset::Mainnet,
             // Sepolia fork-version pattern is `0x900000NN`.
             genesis_fork_version: default_fork_version::<0x90000069>(),
             min_genesis_active_validator_count: 1300,
@@ -805,7 +819,7 @@ impl SpecConfig {
     pub fn mainnet() -> Self {
         Self {
             config_name: None,
-            preset_base: mainnet_preset(),
+            preset_base: Preset::Mainnet,
             genesis_fork_version: default_fork_version::<0x00000000>(),
             min_genesis_active_validator_count: 16_384,
             min_genesis_time: 1_606_824_000,
@@ -866,6 +880,68 @@ impl SpecConfig {
             proportional_slashing_multiplier: 3,
             min_slashing_penalty_quotient: 4096,
             ejection_balance: 16_000_000_000,
+        }
+    }
+
+    /// The consensus-specs config of the compiled preset: the one its EF
+    /// vectors were generated under.
+    pub fn reference() -> Self {
+        match PRESET_BASE {
+            "minimal" => Self::minimal(),
+            _ => Self::mainnet(),
+        }
+    }
+
+    /// `consensus-specs/configs/minimal.yaml`, the network every
+    /// minimal-preset EF vector runs on. Its `TERMINAL_TOTAL_DIFFICULTY` of
+    /// `2**256 - 2**10` overflows the field; no vector reads it.
+    pub fn minimal() -> Self {
+        let fork_version = |ordinal: u8| [ordinal, 0x00, 0x00, 0x01];
+        Self {
+            config_name: Some("minimal".to_owned()),
+            preset_base: Preset::Minimal,
+            genesis_fork_version: fork_version(0x00),
+            min_genesis_active_validator_count: 64,
+            min_genesis_time: 1_578_009_600,
+            genesis_delay: 300,
+            altair_fork_version: fork_version(0x01),
+            altair_fork_epoch: unscheduled(),
+            bellatrix_fork_version: fork_version(0x02),
+            bellatrix_fork_epoch: unscheduled(),
+            capella_fork_version: fork_version(0x03),
+            capella_fork_epoch: unscheduled(),
+            deneb_fork_version: fork_version(0x04),
+            deneb_fork_epoch: unscheduled(),
+            electra_fork_version: fork_version(0x05),
+            electra_fork_epoch: unscheduled(),
+            fulu_fork_version: fork_version(0x06),
+            fulu_fork_epoch: unscheduled(),
+            gloas_fork_version: fork_version(0x07),
+            gloas_fork_epoch: unscheduled(),
+            eip8483_fork_version: [0xe8, 0x48, 0x30, 0x01],
+            eip8483_fork_epoch: unscheduled(),
+            pq_fork_version: [0xe0, 0x00, 0x00, 0x01],
+            pq_fork_epoch: unscheduled(),
+            blob_schedule: Vec::new(),
+            deposit_chain_id: 5,
+            deposit_network_id: 5,
+            deposit_contract_address: [
+                0x12, 0x34, 0x56, 0x78, 0x90, 0x12, 0x34, 0x56, 0x78, 0x90, 0x12, 0x34, 0x56, 0x78,
+                0x90, 0x12, 0x34, 0x56, 0x78, 0x90,
+            ],
+            slot_duration_ms: Some(6000),
+            eth1_follow_distance: 16,
+            shard_committee_period: 64,
+            min_builder_withdrawability_delay: 2,
+            min_per_epoch_churn_limit: 2,
+            max_per_epoch_activation_churn_limit: 4,
+            min_per_epoch_churn_limit_electra: 64_000_000_000,
+            max_per_epoch_activation_exit_churn_limit: 128_000_000_000,
+            churn_limit_quotient: 32,
+            churn_limit_quotient_gloas: 16,
+            consolidation_churn_limit_quotient: 32,
+            max_per_epoch_activation_churn_limit_gloas: 128_000_000_000,
+            ..Self::mainnet()
         }
     }
 }

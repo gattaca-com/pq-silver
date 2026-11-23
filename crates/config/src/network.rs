@@ -112,11 +112,11 @@ impl Network {
                 })?
             }
         };
-        if spec.preset_base != PRESET_BASE {
+        if spec.preset_base.name() != PRESET_BASE {
             return Err(Error::ConfigError(format!(
                 "{} runs the {} preset, but this silver is built for {PRESET_BASE}",
                 spec.network_name(),
-                spec.preset_base,
+                spec.preset_base.name(),
             )));
         }
         Ok(spec)

@@ -1,4 +1,4 @@
-use silver_common::merkle::bitlist_len;
+use silver_common::{merkle::bitlist_len, ssz_view::variable_list_items};
 
 use super::*;
 
@@ -21,14 +21,20 @@ fn aggregates_of_one_data_become_one_attestation_in_committee_order() {
         aggregate(2, 0, 5, &[4]),
         aggregate(1, 2, 9, &[3, 8]),
     ];
-    let on_chain = on_chain_aggregates(aggregates.iter().map(Vec::as_slice));
+    let covered: Vec<_> = (0..aggregates.len()).collect();
+    let on_chain = OnChainAggregates { attestations: &aggregates, covered: &covered };
+    assert_eq!(on_chain.len(), 2, "one attestation per data");
+    let mut list = Vec::new();
+    on_chain.write_list(&mut list);
 
-    let [first, second] = &on_chain[..] else { panic!("one attestation per data") };
+    let [first, second] = &variable_list_items(&list).collect::<Vec<_>>()[..] else {
+        panic!("one attestation per data")
+    };
     assert_eq!(AttestationPqView::data(first).as_bytes(), &[1; ATTESTATION_DATA_SIZE]);
     assert_eq!(AttestationPqView::committee_bits(first), &[0b101, 0]);
     assert_eq!(bitlist_len(AttestationPqView::aggregation_bits(first)), 5 + 9);
     assert_eq!(votes(first), [1, 5, 5 + 3, 5 + 8], "committee 0, then the union of committee 2");
     assert!(AttestationPqView::check_canonical(first));
 
-    assert_eq!(second, &aggregates[2], "a lone aggregate is unchanged");
+    assert_eq!(*second, aggregates[2], "a lone aggregate is unchanged");
 }

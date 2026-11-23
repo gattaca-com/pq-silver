@@ -2470,13 +2470,12 @@ impl BeaconStateTile {
         let claims = aggregate.attesters.iter().map(|&attester| {
             claim(xmss_pubkey(view.validators.pubkey(attester as usize)), &message)
         });
-        let merge_claims = merges.then(|| claims.clone().collect());
         let proof = SignedAggregateAndProofPqView::proof(signed);
         let request_id = self
             .leanvm_verifier
             .send(claims, proof, &mut self.events_producer, producers)
             .ok_or(Feedback::Ignore)?;
-        aggregate.merge_claims = merge_claims;
+        aggregate.merge_message = merges.then_some(message);
         Ok((request_id, aggregate))
     }
 
@@ -2560,7 +2559,7 @@ impl BeaconStateTile {
             committee_index: committee_index as u64,
             data_root,
             aggregator_index,
-            merge_claims: None,
+            merge_message: None,
         }))
     }
 
@@ -2683,16 +2682,34 @@ impl BeaconStateTile {
                 self.ticker.current_slot(),
             );
         }
-        if let Some(claims) = aggregate.merge_claims {
-            let block_slot = slot + MIN_ATTESTATION_INCLUSION_DELAY_PQ;
-            let proof = SignedAggregateAndProofPqView::proof(signed).to_vec();
-            let attestation = SignedAggregateAndProofPqView::aggregate(signed).to_vec();
-            match Aggregate::new(claims, proof, attestation) {
-                Some(merged) => self.pq_aggregator.add_aggregate(block_slot, merged, &self.ticker),
-                None => silver_log::error!(slot, "verified aggregate does not fit a merge"),
-            }
+        if let Some(message) = aggregate.merge_message {
+            self.merge_pq_aggregate(signed, slot, &aggregate.attesters, &message);
         }
         Feedback::Accept
+    }
+
+    /// The attesters are active, so the head holds their pubkeys.
+    fn merge_pq_aggregate(
+        &mut self,
+        signed: &[u8],
+        slot: Slot,
+        attesters: &[u32],
+        message: &[u8; 32],
+    ) {
+        let view = self.state.read_view(self.canonical_state_id());
+        let claims = attesters
+            .iter()
+            .map(|&attester| claim(xmss_pubkey(view.validators.pubkey(attester as usize)), message))
+            .collect();
+        let proof = SignedAggregateAndProofPqView::proof(signed).to_vec();
+        let attestation = SignedAggregateAndProofPqView::aggregate(signed).to_vec();
+        match Aggregate::new(claims, proof, attestation) {
+            Some(merged) => {
+                let block_slot = slot + MIN_ATTESTATION_INCLUSION_DELAY_PQ;
+                self.pq_aggregator.add_aggregate(block_slot, merged, &self.ticker);
+            }
+            None => silver_log::error!(slot, "verified aggregate does not fit a merge"),
+        }
     }
 
     fn commit_pq_attester_slashing(&mut self, slashing: &[u8]) -> Feedback {

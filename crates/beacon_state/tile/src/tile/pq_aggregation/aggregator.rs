@@ -13,7 +13,7 @@ use super::{
     Aggregate, VerifiedVote,
     claims::Vote,
     leaf::{LeafAggregation, LeafKey, ProvedAggregate},
-    merge::MergeAggregation,
+    merge::{MergeAggregation, OnChainAggregates},
     strategy::Batch,
 };
 use crate::tile::Producers;
@@ -209,7 +209,7 @@ impl PqAggregator {
         self.leaves.get(&LeafKey { slot, committee_index, data_root })?.proved(committee_index)
     }
 
-    pub fn block_proof(&self, slot: Slot) -> Option<(Vec<Vec<u8>>, &[u8])> {
+    pub fn block_proof(&self, slot: Slot) -> Option<(OnChainAggregates<'_>, &[u8])> {
         self.merges.get(&slot)?.block_proof()
     }
 

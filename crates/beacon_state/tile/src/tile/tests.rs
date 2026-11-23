@@ -7781,7 +7781,9 @@ mod leanvm_verifier {
 
 mod pq_aggregator {
     use silver_common::{LeanVmHealthEvent, LeanVmReq, LeanVmResp, TReservation};
-    use silver_ssz::ssz_view::{AttestationPqView, ProvedAttestationView, SINGLE_ATT_PQ_SIZE};
+    use silver_ssz::ssz_view::{
+        AttestationPqView, ProvedAttestationView, SINGLE_ATT_PQ_SIZE, variable_list_items,
+    };
 
     use super::*;
     use crate::tile::pq_aggregation::{
@@ -7975,8 +7977,11 @@ mod pq_aggregator {
         assert!(rig.tile.pq_aggregator.block_proof(SLOT + 1).is_none(), "no proof yet");
 
         rig.respond(request.request_id, &[[1; 64], [2; 64]]);
-        let (attestations, proof) = rig.tile.pq_aggregator.block_proof(SLOT + 1).unwrap();
-        assert_eq!(attestations, [attestation(0, 0..2)]);
+        let (on_chain, proof) = rig.tile.pq_aggregator.block_proof(SLOT + 1).unwrap();
+        let mut list = Vec::new();
+        on_chain.write_list(&mut list);
+        let attestations: Vec<_> = variable_list_items(&list).collect();
+        assert_eq!(attestations, [attestation(0, 0..2).as_slice()]);
         assert_eq!(proof, b"proof");
     }
 

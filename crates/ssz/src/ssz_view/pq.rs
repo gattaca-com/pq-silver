@@ -169,35 +169,68 @@ impl AttestationPqView {
             .then_some(out)
     }
 
-    /// An attestation of several committees: each is its index and its votes
-    /// as a `Bitlist`. `None` unless the indices ascend and are in range.
-    pub fn encode_committees<'a>(
+    /// Appends an attestation of several committees to `out`: each is its
+    /// index and its votes as a `Bitlist`. A repeated index unites its votes.
+    /// False, leaving `out` as it was, unless the indices are in range and
+    /// never descend, and repeats agree on length.
+    pub fn write_committees<'a>(
+        out: &mut Vec<u8>,
         data: &[u8; ATTESTATION_DATA_SIZE],
         committees: impl IntoIterator<Item = (usize, &'a [u8])>,
-    ) -> Option<Vec<u8>> {
-        let mut out = vec![0; ATTESTATION_PQ_FIXED];
-        out[..4].copy_from_slice(&(ATTESTATION_PQ_FIXED as u32).to_le_bytes());
-        out[4..4 + ATTESTATION_DATA_SIZE].copy_from_slice(data);
-        let (mut next_index, mut len) = (0, 0);
+    ) -> bool {
+        let start = out.len();
+        let written = Self::try_write_committees(out, data, committees);
+        if written.is_none() {
+            out.truncate(start);
+        }
+        written.is_some()
+    }
+
+    fn try_write_committees<'a>(
+        out: &mut Vec<u8>,
+        data: &[u8; ATTESTATION_DATA_SIZE],
+        committees: impl IntoIterator<Item = (usize, &'a [u8])>,
+    ) -> Option<()> {
+        let start = out.len();
+        let bits_start = start + ATTESTATION_PQ_FIXED;
+        out.resize(bits_start, 0);
+        out[start..start + 4].copy_from_slice(&(ATTESTATION_PQ_FIXED as u32).to_le_bytes());
+        out[start + 4..start + 4 + ATTESTATION_DATA_SIZE].copy_from_slice(data);
+        let (mut last, mut len) = (None, 0);
         for (index, votes) in committees {
-            if index < next_index || index >= MAX_COMMITTEES_PER_SLOT_PQ {
-                return None;
-            }
-            next_index = index + 1;
-            out[4 + ATTESTATION_DATA_SIZE + index / 8] |= 1 << (index % 8);
             let committee_len = bitlist_len(votes);
-            out.resize(ATTESTATION_PQ_FIXED + (len + committee_len) / 8 + 1, 0);
-            for position in (0..committee_len).filter(|p| votes[p / 8] >> (p % 8) & 1 == 1) {
-                let at = len + position;
-                out[ATTESTATION_PQ_FIXED + at / 8] |= 1 << (at % 8);
-            }
-            len += committee_len;
+            let at = match last {
+                Some((last_index, last_len)) if index == last_index => {
+                    (committee_len == last_len).then_some(len - committee_len)?
+                }
+                Some((last_index, _)) if index < last_index => return None,
+                _ if index >= MAX_COMMITTEES_PER_SLOT_PQ => return None,
+                _ => {
+                    out[start + 4 + ATTESTATION_DATA_SIZE + index / 8] |= 1 << (index % 8);
+                    len += committee_len;
+                    out.resize(bits_start + len / 8 + 1, 0);
+                    len - committee_len
+                }
+            };
+            or_bits_at(&mut out[bits_start..], at, votes, committee_len);
+            last = Some((index, committee_len));
         }
-        if next_index == 0 {
-            return None;
+        last?;
+        out[bits_start + len / 8] |= 1 << (len % 8);
+        Some(())
+    }
+}
+
+/// ORs the first `len` bits of `bits` into `out` from bit `at` on.
+fn or_bits_at(out: &mut [u8], at: usize, bits: &[u8], len: usize) {
+    let (base, shift) = (at / 8, at % 8);
+    for (i, &byte) in bits[..len.div_ceil(8)].iter().enumerate() {
+        let remaining = len - 8 * i;
+        let byte = if remaining < 8 { byte & ((1u16 << remaining) - 1) as u8 } else { byte };
+        out[base + i] |= byte << shift;
+        if shift != 0 && byte >> (8 - shift) != 0 {
+            out[base + i + 1] |= byte >> (8 - shift);
         }
-        out[ATTESTATION_PQ_FIXED + len / 8] |= 1 << (len % 8);
-        Some(out)
     }
 }
 
@@ -840,5 +873,26 @@ impl VoluntaryExitRequestView {
     #[inline]
     pub fn pubkey(buf: &[u8; VOLUNTARY_EXIT_REQUEST_SIZE]) -> &XMSSPubkey {
         buf
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn or_bits_at_matches_bit_by_bit_at_every_offset() {
+        let bits = [0b1011_0110, 0xff, 0b1111_0101];
+        for len in 0..=20 {
+            for at in 0..16 {
+                let mut out = vec![0; (at + len) / 8 + 1];
+                or_bits_at(&mut out, at, &bits, len);
+                let mut expected = vec![0; out.len()];
+                for p in (0..len).filter(|p| bits[p / 8] >> (p % 8) & 1 == 1) {
+                    expected[(at + p) / 8] |= 1 << ((at + p) % 8);
+                }
+                assert_eq!(out, expected, "len {len} at {at}");
+            }
+        }
     }
 }

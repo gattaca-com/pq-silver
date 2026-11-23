@@ -1,8 +1,6 @@
-use std::collections::{BTreeMap, btree_map::Entry};
-
 use silver_common::{
     Nanos, TCacheRead, TProducer,
-    ssz_view::{ATTESTATION_DATA_SIZE, AttestationPqView},
+    ssz_view::{ATTESTATION_DATA_SIZE, AttestationPqView, MAX_COMMITTEES_PER_SLOT_PQ},
 };
 
 use super::{
@@ -63,55 +61,70 @@ impl MergeAggregation {
         self.core.finish(&batch, body).map(|()| self.strategy.adopted(&batch))
     }
 
-    /// The block body's attestations for the aggregates the best proof
-    /// covers, and the proof. `None` without a best proof.
-    pub(super) fn block_proof(&self) -> Option<(Vec<Vec<u8>>, &[u8])> {
+    /// `None` without a best proof.
+    pub(super) fn block_proof(&self) -> Option<(OnChainAggregates<'_>, &[u8])> {
         let (_, proof) = self.core.best_proof()?;
-        let covered =
-            self.core.covered_indices().iter().map(|&index| self.attestations[index].as_slice());
-        Some((on_chain_aggregates(covered), proof))
+        let covered = self.core.covered_indices();
+        Some((OnChainAggregates { attestations: &self.attestations, covered }, proof))
     }
 }
 
-/// The block body's attestation for one attestation data.
-struct OnChainAggregate<'a> {
-    data: &'a [u8; ATTESTATION_DATA_SIZE],
-    /// Each committee's votes as a `Bitlist`, by committee index.
-    committees: BTreeMap<usize, Vec<u8>>,
+/// The block body's attestations for the aggregates the best proof covers:
+/// spec `compute_on_chain_aggregate`, one per attestation data in arrival
+/// order. The proof covers the union of a committee's aggregates, so they are
+/// united into one.
+pub struct OnChainAggregates<'a> {
+    /// Each an `AttestationPq` of one committee.
+    attestations: &'a [Vec<u8>],
+    covered: &'a [usize],
 }
 
-impl OnChainAggregate<'_> {
-    fn encode(&self) -> Vec<u8> {
-        let committees = self.committees.iter().map(|(&index, votes)| (index, votes.as_slice()));
-        AttestationPqView::encode_committees(self.data, committees)
-            .expect("committees ascend in range")
+impl<'a> OnChainAggregates<'a> {
+    pub fn len(&self) -> usize {
+        self.first_of_each_data().count()
     }
-}
 
-/// Spec `compute_on_chain_aggregate`, per attestation data in arrival order.
-/// The proof covers the union of a committee's aggregates, so they are united
-/// into one. Each of `aggregates` is an `AttestationPq` of one committee.
-fn on_chain_aggregates<'a>(aggregates: impl Iterator<Item = &'a [u8]>) -> Vec<Vec<u8>> {
-    let mut on_chain: Vec<OnChainAggregate> = Vec::new();
-    for aggregate in aggregates {
-        let data = AttestationPqView::data(aggregate).as_bytes();
-        let committee_bits = u16::from_le_bytes(*AttestationPqView::committee_bits(aggregate));
-        let votes = AttestationPqView::aggregation_bits(aggregate);
-        let at = on_chain.iter().position(|held| held.data == data).unwrap_or_else(|| {
-            on_chain.push(OnChainAggregate { data, committees: BTreeMap::new() });
-            on_chain.len() - 1
-        });
-        match on_chain[at].committees.entry(committee_bits.trailing_zeros() as usize) {
-            Entry::Vacant(committee) => {
-                committee.insert(votes.to_vec());
-            }
-            Entry::Occupied(mut committee) => {
-                debug_assert_eq!(committee.get().len(), votes.len(), "one committee, one length");
-                committee.get_mut().iter_mut().zip(votes).for_each(|(held, votes)| *held |= votes);
-            }
+    /// Appends them to `out` as an SSZ `List[AttestationPq]`.
+    pub fn write_list(&self, out: &mut Vec<u8>) {
+        let start = out.len();
+        out.resize(start + 4 * self.len(), 0);
+        for (i, first) in self.first_of_each_data().enumerate() {
+            let offset = (out.len() - start) as u32;
+            out[start + 4 * i..start + 4 * (i + 1)].copy_from_slice(&offset.to_le_bytes());
+            let data = data_of(first);
+            let of_data = self.aggregates().filter(move |other| data_of(other) == data);
+            let committees = (0..MAX_COMMITTEES_PER_SLOT_PQ).flat_map(|index| {
+                of_data
+                    .clone()
+                    .filter(move |aggregate| committee_of(aggregate) == index)
+                    .map(move |aggregate| (index, AttestationPqView::aggregation_bits(aggregate)))
+            });
+            let written = AttestationPqView::write_committees(out, data, committees);
+            assert!(written, "a committee's aggregates agree on its size");
         }
     }
-    on_chain.iter().map(OnChainAggregate::encode).collect()
+
+    fn aggregates(&self) -> impl Iterator<Item = &'a [u8]> + Clone {
+        let attestations = self.attestations;
+        self.covered.iter().map(move |&index| attestations[index].as_slice())
+    }
+
+    fn first_of_each_data(&self) -> impl Iterator<Item = &'a [u8]> {
+        let aggregates = self.aggregates();
+        aggregates.clone().enumerate().filter_map(move |(at, aggregate)| {
+            let data = data_of(aggregate);
+            let seen = aggregates.clone().take(at).any(|earlier| data_of(earlier) == data);
+            (!seen).then_some(aggregate)
+        })
+    }
+}
+
+fn data_of(aggregate: &[u8]) -> &[u8; ATTESTATION_DATA_SIZE] {
+    AttestationPqView::data(aggregate).as_bytes()
+}
+
+fn committee_of(aggregate: &[u8]) -> usize {
+    u16::from_le_bytes(*AttestationPqView::committee_bits(aggregate)).trailing_zeros() as usize
 }
 
 #[cfg(test)]

@@ -23,6 +23,7 @@ use silver_common::{
         BEACON_BLOCK_BODY_FIXED, BEACON_BLOCK_FIXED, BLOCK_SYNC_AGGREGATE_SIZE, BuilderBidFuluView,
         ExecutionPayloadEnvelopeView, ExecutionPayloadView, MAX_ATTESTATIONS_PQ,
         SignedBuilderBidFuluView, SignedExecutionPayloadBidView, VRFProof, XMSS_SIGNATURE_SIZE,
+        variable_list_items,
     },
     wei_saturating,
 };
@@ -227,28 +228,25 @@ impl PackedOperations {
         rewards: &AttestationRewards<'_>,
         block_slot: Slot,
     ) {
-        let Some((attestations, proof)) = aggregator.block_proof(block_slot) else { return };
-        if attestations.len() > MAX_ATTESTATIONS_PQ {
+        let Some((on_chain, proof)) = aggregator.block_proof(block_slot) else { return };
+        let count = on_chain.len();
+        if count > MAX_ATTESTATIONS_PQ {
             silver_log::warn!(
                 slot = block_slot,
-                attestations = attestations.len(),
+                attestations = count,
                 "merge covers too many attestation data; packed no attestations"
             );
             return;
         }
-        let value: Option<u64> =
-            attestations.iter().map(|attestation| rewards.attestation_value(attestation)).sum();
+        debug_assert!(self.attestations.is_empty(), "the merge is the only attestation source");
+        on_chain.write_list(&mut self.attestations);
+        let value: Option<u64> = variable_list_items(&self.attestations)
+            .map(|attestation| rewards.attestation_value(attestation))
+            .sum();
         if value.is_none_or(|value| value == 0) {
+            self.attestations.clear();
             return;
         }
-        let mut at = 4 * attestations.len();
-        for attestation in &attestations {
-            self.attestations.extend_from_slice(&(at as u32).to_le_bytes());
-            at += attestation.len();
-        }
-        attestations
-            .iter()
-            .for_each(|attestation| self.attestations.extend_from_slice(attestation));
         self.proof.extend_from_slice(proof);
     }
 

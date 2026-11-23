@@ -1553,6 +1553,9 @@ impl Tile<SilverSpine> for BeaconStateTile {
         adapter.subscribe_broadcast::<ReplayBlock>();
         // Read only once Following; requests made while syncing must wait.
         adapter.subscribe_broadcast::<BeaconApiRequest>();
+        // Readiness is published once per change, possibly before this
+        // tile's first loop. A missed `ready` would keep the aggregator down.
+        adapter.subscribe_broadcast::<LeanVmHealthEvent>();
     }
 
     fn try_init(&mut self, adapter: &mut SpineAdapter<SilverSpine>) -> bool {

@@ -1,6 +1,7 @@
 use silver_beacon_state_data::B256;
-use silver_common::ssz_view::{
-    AttestationPqView, MAX_STARK_PROOF_SIZE, SINGLE_ATT_PQ_SIZE, XMSS_SIGNATURE_SIZE,
+use silver_common::{
+    Nanos,
+    ssz_view::{AttestationPqView, MAX_STARK_PROOF_SIZE, SINGLE_ATT_PQ_SIZE, XMSS_SIGNATURE_SIZE},
 };
 
 use super::strategy::{Committee, Positions};
@@ -25,6 +26,8 @@ pub struct VerifiedVote<'a> {
     /// Index in the committee, which has `committee_len` members.
     pub committee_position: usize,
     pub committee_len: usize,
+    /// Since genesis. A vote buffered for its block keeps its arrival.
+    pub received: Nanos,
 }
 
 pub struct Vote {

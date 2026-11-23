@@ -17,9 +17,9 @@ use silver_common::{
     DataColumnsEvent, DataKind, EngineResp, GossipTopic, HeadChange, HeadRoots, LeanVmHealthEvent,
     LeanVmResp, NewGossipMsg, Origin, PayloadResolution, PayloadValidationStatus,
     ProduceBlockFailure, PtcObservation, ReplayBlock, RequestId, RpcInbound, RpcResponse,
-    RpcResponseInbound, SidecarBidResponse, SilverSpine, SyncNeed, SyncUpdate, TCacheError,
-    TCacheId, TCacheProducer, TCacheRead, TCacheReader, TCacheTable, TProducer, TReadMode, TileId,
-    hex32,
+    RpcResponseInbound, SidecarBidResponse, SilverSpine, SlotSubnets, SubnetsBySlot, SyncNeed,
+    SyncUpdate, TCacheError, TCacheId, TCacheProducer, TCacheRead, TCacheReader, TCacheTable,
+    TProducer, TReadMode, TileId, hex32,
     ssz_view::{STATUS_V2_SIZE, SYNC_COMMITTEE_CONTRIBUTION_SIZE},
     ticker::{MAXIMUM_GOSSIP_CLOCK_DISPARITY, SlotTicker, TickEvent},
 };
@@ -30,7 +30,6 @@ use crate::{
     fork_choice::{ExecutionStatus, FORK_CHOICE_NODES_HINT, ForkChoice},
     ssz_hash, stf,
     tile::{
-        aggregator_subnets::AggregatorSubnets,
         attestation_pool::{AttestationPool, UnknownRootPqVotes, UnknownRootVotes},
         attestation_root_memo::AttestationRootMemo,
         bid_pool::BidPool,
@@ -59,7 +58,6 @@ use crate::{
     weak_subjectivity::{weak_subjectivity_period_fulu, weak_subjectivity_period_gloas},
 };
 
-mod aggregator_subnets;
 mod attestation_pool;
 mod precomputed_epochs;
 // `pub` for the crate's `attestation_root_memo` criterion bench.
@@ -283,7 +281,8 @@ pub struct BeaconStateTile {
     pq_aggregator: PqAggregator,
     /// Reused to build each merged aggregate's claims.
     pq_merge_claims: Vec<Claim>,
-    aggregator_subnets: AggregatorSubnets,
+    /// The VC's committee subscriptions, for its aggregators' subnets.
+    aggregator_subnets: SubnetsBySlot,
     leanvm_verifier: LeanVmVerifier,
     gossip_proofs: GossipProofs,
     seen_proposer_preferences: SeenProposerPreferences,
@@ -387,7 +386,7 @@ impl BeaconStateTile {
             payload_attestation_pool: PayloadAttestationPool::default(),
             pq_aggregator: PqAggregator::default(),
             pq_merge_claims: Vec::new(),
-            aggregator_subnets: AggregatorSubnets::default(),
+            aggregator_subnets: SubnetsBySlot::default(),
             leanvm_verifier: LeanVmVerifier::default(),
             gossip_proofs: GossipProofs::default(),
             seen_proposer_preferences: SeenProposerPreferences::default(),
@@ -806,7 +805,9 @@ impl BeaconStateTile {
             );
             return;
         };
-        self.aggregator_subnets.record(encoded);
+        for subscription in SlotSubnets::decode_all(encoded) {
+            self.aggregator_subnets.insert(subscription);
+        }
     }
 
     fn post_shufflings(&mut self, emit: impl FnMut(BeaconStateEvent)) {
@@ -935,7 +936,6 @@ impl BeaconStateTile {
         self.attestation_pool.collapse_before(floor);
         self.unknown_root_votes.on_slot(slot);
         self.unknown_root_pq_votes.on_slot(slot);
-        self.aggregator_subnets.prune_before(floor);
         self.sync_contribution_pool.prune_before(floor);
         self.payload_attestation_pool.prune_before(floor);
         self.seen_aggregates.prune_before(floor);

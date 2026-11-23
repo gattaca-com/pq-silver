@@ -16,9 +16,9 @@ use silver_beacon_state_data::{
 };
 use silver_common::{
     BeaconStateEvent, BlockSource, BroadcastValidation, EngineNewPayloadEnvelopeReq, EngineReq,
-    GossipTopic, LOCAL_GOSSIP_STREAM_ID, LocalGossipFailure, MAX_BLOBS_PER_BLOCK, NewGossipMsg,
-    PayloadValidationStatus, PeerEvent, SignedBlockLayout, SyncNeed, TCacheRead, TRead,
-    compute_subnet_for_attestation, hex32,
+    GossipTopic, LOCAL_GOSSIP_STREAM_ID, LocalGossipFailure, MAX_BLOBS_PER_BLOCK, Nanos,
+    NewGossipMsg, PayloadValidationStatus, PeerEvent, SignedBlockLayout, SyncNeed, TCacheRead,
+    TRead, compute_subnet_for_attestation, hex32,
     metrics::timed,
     ssz_view::{
         AttestationDataView, AttesterSlashingView, BeaconBlockHeaderView, BuilderExitRequestView,
@@ -173,6 +173,7 @@ pub(crate) struct PreparedPqAttestation {
     data_root: B256,
     subnet: u64,
     checked: CheckedAttestation,
+    received: Nanos,
 }
 
 impl PreparedPqAttestation {
@@ -184,6 +185,7 @@ impl PreparedPqAttestation {
             pubkey: self.pubkey,
             committee_position: self.checked.committee_position,
             committee_len: self.checked.committee_len,
+            received: self.received,
         }
     }
 }
@@ -393,6 +395,7 @@ impl BeaconStateTile {
         &mut self,
         data: &[u8],
         subnet: u64,
+        received: Nanos,
     ) -> Result<PreparedPqAttestation, Feedback> {
         let buf: &[u8; SINGLE_ATT_PQ_SIZE] = data.try_into().expect("checked PQ attestation size");
         let data = SingleAttestationPqView::data(buf);
@@ -421,6 +424,7 @@ impl BeaconStateTile {
             data_root,
             subnet,
             checked,
+            received,
         })
     }
 
@@ -755,6 +759,7 @@ impl BeaconStateTile {
     fn prepare_pq_votes(&mut self, producers: &mut Producers) {
         debug_assert!(self.votes.pq_prepared.is_empty());
         let mut batch = std::mem::take(&mut self.votes.pq_batch);
+        let received = self.ticker.since_genesis();
         for BatchedVote { vote, pin } in batch.drain(..) {
             let Some(data) = pin.buffer().ok().map(|(d, _)| d) else {
                 Self::local_verdict(&vote, Feedback::Ignore, producers);
@@ -762,9 +767,9 @@ impl BeaconStateTile {
             };
             let prepared =
                 self.precheck_pq_gossip(vote.topic, data).and_then(|()| match vote.topic {
-                    GossipTopic::BeaconAttestation(subnet) => {
-                        self.prepare_pq_attestation(data, subnet).map(PreparedPqVote::Attestation)
-                    }
+                    GossipTopic::BeaconAttestation(subnet) => self
+                        .prepare_pq_attestation(data, subnet, received)
+                        .map(PreparedPqVote::Attestation),
                     GossipTopic::PayloadAttestationMessage => {
                         self.prepare_pq_ptc(data).map(PreparedPqVote::Ptc)
                     }
@@ -787,11 +792,12 @@ impl BeaconStateTile {
         let checked = p.checked;
         let target = checked.target;
         self.seen_attesters.mark(target.target_epoch, checked.attester as usize);
-        let aggregates = self.aggregator_subnets.aggregates(target.attestation_slot, p.subnet);
+        let position = (self.aggregator_subnets.get(target.attestation_slot))
+            .and_then(|held| held.last_aggregator_position(p.subnet));
         if checked.attested.is_ready() {
             self.record_votes(target, std::slice::from_ref(&checked.attester));
-            if aggregates {
-                self.aggregate_pq_vote(&p);
+            if let Some(position) = position {
+                self.pq_aggregator.add_vote(p.verified_vote(), position, &self.ticker);
             }
             return Feedback::Accept;
         }
@@ -803,7 +809,7 @@ impl BeaconStateTile {
             data_root,
             checked.shuffling,
             checked.attester,
-            aggregates.then_some(p),
+            position.is_some().then_some(p),
         );
         self.buffered_vote_feedback(
             new_data,
@@ -813,9 +819,12 @@ impl BeaconStateTile {
         )
     }
 
-    fn aggregate_pq_vote(&mut self, p: &PreparedPqAttestation) {
+    fn aggregate_buffered_pq_vote(&mut self, p: &PreparedPqAttestation) {
         let slot = p.checked.target.attestation_slot;
-        let Some(position) = self.aggregator_subnets.last_position(slot, p.subnet) else { return };
+        let held = self.aggregator_subnets.get(slot);
+        let Some(position) = held.and_then(|held| held.last_aggregator_position(p.subnet)) else {
+            return;
+        };
         self.pq_aggregator.add_vote(p.verified_vote(), position, &self.ticker);
     }
 
@@ -860,7 +869,7 @@ impl BeaconStateTile {
                     BeaconStateCounters::UnknownRootVotesPromoted.add(count);
                     self.record_votes(target, &votes.attesters);
                     for vote in &votes.aggregated {
-                        self.aggregate_pq_vote(vote);
+                        self.aggregate_buffered_pq_vote(vote);
                     }
                 }
                 Err(_) => BeaconStateCounters::UnknownRootVotesDropped.add(count),

@@ -73,6 +73,11 @@ impl Aggregation {
         Self { deadline, verified, proofs, best: None, failures: 0 }
     }
 
+    /// A later local aggregator keeps it open longer; it never closes earlier.
+    pub fn extend_deadline(&mut self, deadline: Nanos) {
+        self.deadline = self.deadline.max(deadline);
+    }
+
     /// Empty again, keeping its buffers.
     pub fn reset(&mut self, deadline: Nanos) {
         self.deadline = deadline;

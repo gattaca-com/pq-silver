@@ -7848,6 +7848,16 @@ mod pq_aggregator {
         }
 
         fn vote_in(&mut self, slot: Slot, data_root: B256, tag: u8) {
+            self.vote_for_aggregator(slot, data_root, tag, 0);
+        }
+
+        fn vote_for_aggregator(
+            &mut self,
+            slot: Slot,
+            data_root: B256,
+            tag: u8,
+            last_position: u64,
+        ) {
             let mut single = [0u8; SINGLE_ATT_PQ_SIZE];
             single[16..24].copy_from_slice(&slot.to_le_bytes());
             let vote = VerifiedVote {
@@ -7857,8 +7867,9 @@ mod pq_aggregator {
                 pubkey: [tag; 32],
                 committee_position: tag as usize,
                 committee_len: COMMITTEE_LEN,
+                received: self.tile.ticker.since_genesis(),
             };
-            self.tile.pq_aggregator.add_vote(vote, 0, &self.tile.ticker);
+            self.tile.pq_aggregator.add_vote(vote, last_position, &self.tile.ticker);
             self.send_next();
         }
 
@@ -7967,6 +7978,25 @@ mod pq_aggregator {
         rig.tile.ticker.set_since_genesis_ms(cutoff_ms);
         rig.vote(1);
         assert!(rig.requests().is_empty());
+    }
+
+    /// The leaf opened for the aggregator at position 0 stays open until the
+    /// later aggregator's aggregate is due.
+    #[test]
+    fn later_local_aggregator_keeps_the_leaf_open() {
+        let mut rig = Rig::new();
+        rig.ready();
+        rig.vote(1);
+        let first = rig.request();
+        rig.vote_for_aggregator(SLOT, DATA_ROOT, 2, 3);
+        let ticker = &rig.tile.ticker;
+        let between = ticker.pq_aggregate_due(SLOT, 0).as_millis_u64() + 1;
+        assert!(between < ticker.pq_aggregate_due(SLOT, 3).as_millis_u64());
+
+        rig.tile.ticker.set_since_genesis_ms(between);
+        rig.respond(first.request_id, &[[1; 64]]);
+        let second = rig.request();
+        assert_eq!(rig.tags(&second), [1, 2]);
     }
 
     #[test]

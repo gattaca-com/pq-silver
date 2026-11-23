@@ -215,6 +215,10 @@ impl SubnetsBySlot {
         held.aggregator_positions |= added.aggregator_positions;
     }
 
+    pub fn get(&self, slot: u64) -> Option<&SlotSubnets> {
+        Some(&self.slots[slot as usize % Self::SLOTS]).filter(|held| held.slot == slot)
+    }
+
     pub fn held(&self) -> impl Iterator<Item = &SlotSubnets> {
         self.slots.iter().filter(|held| held.attesting != 0)
     }
@@ -224,11 +228,7 @@ impl SubnetsBySlot {
         slots: RangeInclusive<u64>,
         subnets: impl Fn(&SlotSubnets) -> u64,
     ) -> u64 {
-        slots
-            .filter_map(|slot| {
-                Some(&self.slots[slot as usize % Self::SLOTS]).filter(|held| held.slot == slot)
-            })
-            .fold(0, |mask, held| mask | subnets(held))
+        slots.filter_map(|slot| self.get(slot)).fold(0, |mask, held| mask | subnets(held))
     }
 }
 
@@ -488,6 +488,36 @@ fn parse_subnet(id: &str, count: u64) -> Result<u64, Error> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn subscriptions_add_up_per_slot_and_name_the_last_aggregator() {
+        let aggregating = |slot, subnet, position: Option<u64>| SlotSubnets {
+            slot,
+            attesting: 1u64 << subnet,
+            aggregating: 1u64 << subnet,
+            aggregator_positions: position
+                .map_or(0, |position| SlotSubnets::position_bit(subnet, position)),
+        };
+        let mut by_slot = SubnetsBySlot::default();
+        by_slot.insert(aggregating(7, 2, Some(1)));
+        by_slot.insert(SlotSubnets { slot: 7, attesting: 1 << 3, ..SlotSubnets::default() });
+        by_slot.insert(aggregating(8, 5, None));
+        by_slot.insert(aggregating(7, 0, Some(0)));
+        by_slot.insert(aggregating(7, 0, Some(2)));
+
+        let last = |by_slot: &SubnetsBySlot, slot, subnet| {
+            by_slot.get(slot)?.last_aggregator_position(subnet)
+        };
+        assert_eq!(last(&by_slot, 7, 0), Some(2), "the later of two aggregators");
+        assert_eq!(last(&by_slot, 7, 2), Some(1));
+        assert_eq!(last(&by_slot, 7, 3), None, "attesting only");
+        assert_eq!(last(&by_slot, 7, 64), None, "past the mask");
+        assert_eq!(last(&by_slot, 8, 5), Some(3), "no place named: the last");
+        assert_eq!(last(&by_slot, 9, 5), None, "no subscription");
+
+        by_slot.insert(aggregating(7 + SubnetsBySlot::SLOTS as u64, 1, Some(0)));
+        assert_eq!(last(&by_slot, 7, 2), None, "evicted by the slot sharing its entry");
+    }
 
     #[test]
     fn roundtrip_unit() {

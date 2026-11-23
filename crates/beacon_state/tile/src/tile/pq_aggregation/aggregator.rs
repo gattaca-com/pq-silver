@@ -111,18 +111,18 @@ impl PqAggregator {
             );
             return;
         }
-        if ticker.since_genesis() >= ticker.aggregation_cutoff(leaf.slot, last_position) {
+        if vote.received >= ticker.aggregation_cutoff(leaf.slot, last_position) {
             silver_log::debug!(slot = leaf.slot, "vote after the aggregation cutoff");
             return;
         }
-        // TODO: the aggregate due time stands in for the VC's pull. A VC that
-        // pulls later gets a proof frozen at the due time. Consider ending on
-        // the last local aggregator's pull instead.
+        // TODO: the due time stands in for the VC's pull. A VC that pulls
+        // later gets a proof frozen at the due time.
         let deadline = ticker.pq_aggregate_due(leaf.slot, last_position);
         let aggregation = self.leaves.entry(leaf).or_insert_with(|| {
             let data = SingleAttestationPqView::data(vote.single);
             LeafAggregation::new(*data.as_bytes(), vote.committee_len, deadline)
         });
+        aggregation.core.extend_deadline(deadline);
         let (position, signature) =
             (vote.committee_position, SingleAttestationPqView::signature(vote.single));
         let added = aggregation.add(Vote::new(position, vote.pubkey, vote.message, signature));

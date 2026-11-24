@@ -19,7 +19,7 @@ pub const DDL: &str = "CREATE TABLE IF NOT EXISTS block_events (
     slot_start_date_time Nullable(DateTime)               COMMENT 'Wall clock the slot started at',
     time_into_slot_ms    Nullable(Float64)                COMMENT 'Milliseconds from slot start; NULL outside the live window (replay or backfill)',
     block_root           String                           COMMENT '0x-prefixed beacon block root; rows written before 2026-08-18 lack the prefix',
-    source               LowCardinality(String)           COMMENT 'How the node obtained the block',
+    source               LowCardinality(String)           COMMENT 'How the node obtained the block; on stf_done rows, what the import waited on',
     verdict              LowCardinality(Nullable(String)) COMMENT 'Execution payload status; set on el_verdict rows only',
     column_index         Nullable(UInt64)                 COMMENT 'Data-column index; set on column_* rows only',
     meta_client_name     LowCardinality(String)           COMMENT 'Hostname of the node that produced the row',
@@ -52,7 +52,9 @@ impl<'a> BlockEventRow<'a> {
                 (format!("{origin:?}"), None, Some(index))
             }
             Stage::ElVerdict { verdict } => (String::new(), Some(format!("{verdict:?}")), None),
-            Stage::StfDone |
+            Stage::StfDone { gate } => (format!("{gate:?}"), None, None),
+            Stage::Validated |
+            Stage::Rejected |
             Stage::Attestable |
             Stage::DaAvailable |
             Stage::CustodyDone |
@@ -79,7 +81,7 @@ impl<'a> BlockEventRow<'a> {
 
 #[cfg(test)]
 mod tests {
-    use silver_common::{BlockSource, ColumnOrigin, Nanos, PayloadValidationStatus};
+    use silver_common::{BlockSource, ColumnOrigin, Nanos, PayloadValidationStatus, StfGate};
     use silver_stages::SlotClock;
 
     use super::*;
@@ -127,6 +129,11 @@ mod tests {
         assert_eq!(r["stage"], "column_recv");
         assert_eq!(r["source"], "El");
         assert_eq!(r["column_index"], 48);
+
+        let stf_done = Stage::StfDone { gate: StfGate::Verify };
+        let r = json(&event(stf_done, at(3, 1_450), Some(3)));
+        assert_eq!(r["stage"], "stf_done");
+        assert_eq!(r["source"], "Verify");
 
         let verdict = Stage::ElVerdict { verdict: PayloadValidationStatus::Valid };
         let r = json(&event(verdict, at(3, 1_500), None));

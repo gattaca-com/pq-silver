@@ -33,14 +33,18 @@ arrival to the moment it was ready, on a time-into-slot axis.
 
 `Enter` splits a block into its stages: `data available`, `stf` (state
 transition) and `el` (execution client verdict: valid, syncing or invalid).
-`stf` opens further into `validate`, `apply` and `da wait`: the time spent
-waiting for the block's data columns to arrive.
+`stf` opens further into `validate` (CL checks), `apply` (the state
+transition) and, when the block was held before import, one wait row:
+
+- `da wait`: the time spent waiting for the block's data columns to arrive.
+- `pq att verify`: on a PQ block, the time leanVM took to verify the block's
+  attestation proof. It reads `no attestations` or `own block` when nothing
+  was sent to leanVM, and `invalid` when leanVM rejected the proof.
 
 From Gloas the payload travels in its own envelope, after the block. A block
-is ready at import, so `stf` has no `validate` / `apply` split. Its `payload`
-row holds `data available` and `el` instead. The payload's `deadline` is the
-9 s payload attestation deadline: by then it must be valid and its data
-available.
+is ready at import, and its `payload` row holds `data available`, `custody`
+and `el`. The payload's `deadline` is the 9 s payload attestation deadline: by
+then it must be valid and its data available.
 
 **Look for:** a new row every 12 s, durations in tens of milliseconds, and
 green deadlines. A slow `el` stage points at the execution client.

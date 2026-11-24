@@ -140,8 +140,10 @@ pub(super) fn stage_record(e: &StageEvent) -> StageRecord {
         Stage::ElVerdict { verdict } => (StageCode::ElVerdict, verdict as u8, None),
         Stage::DaAvailable => (StageCode::DaAvailable, 0, None),
         Stage::CustodyDone => (StageCode::CustodyDone, 0, None),
-        Stage::StfDone => (StageCode::StfDone, 0, None),
+        Stage::Validated => (StageCode::Validated, 0, None),
+        Stage::StfDone { gate } => (StageCode::StfDone, gate as u8, None),
         Stage::Attestable => (StageCode::Attestable, 0, None),
+        Stage::Rejected => (StageCode::Rejected, 0, None),
         Stage::LocalAttestation => (StageCode::LocalAttestation, 0, None),
     };
     StageRecord {

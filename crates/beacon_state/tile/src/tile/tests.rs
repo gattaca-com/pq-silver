@@ -15,8 +15,8 @@ use silver_common::{
     EngineNewPayloadResp, EnginePreparePayloadResp, EngineReq, ForkName, GossipTopic, HeadChange,
     LOCAL_GOSSIP_STREAM_ID, LocalGossipFailure, MessageId, P2pStreamId, PayloadResolution,
     PayloadValidationStatus, PeerEvent, PoolChange, ProduceBlockFailure, ProposerPreparation,
-    SignedBlockLayout, StreamProtocol, SyncNeed, TCache, TCacheId, TCacheProducer, TCacheRead,
-    TCacheTable, TProducer, block_root_fulu,
+    SignedBlockLayout, StfGate, StreamProtocol, SyncNeed, TCache, TCacheId, TCacheProducer,
+    TCacheRead, TCacheTable, TProducer, block_root_fulu,
     ssz_hash::{BlockFork, HashedBody},
     ssz_view::{
         ATTESTATION_DATA_SIZE, AttestationView, BEACON_BLOCK_BODY_FIXED, BLOCK_SYNC_AGGREGATE_SIZE,
@@ -1517,11 +1517,13 @@ impl Tile<SilverSpine> for Sink {
     fn loop_body(&mut self, _: &mut SpineAdapter<SilverSpine>) {}
 }
 
-fn block_stages(sink: &mut SpineAdapter<SilverSpine>) -> Vec<(B256, BlockStage)> {
+/// Each announcement's root, stage and, on the one that ran the
+/// transition, its gate.
+fn block_stages(sink: &mut SpineAdapter<SilverSpine>) -> Vec<(B256, BlockStage, Option<StfGate>)> {
     let mut stages = Vec::new();
     sink.consume(|event: BeaconStateEvent, _| {
-        if let BeaconStateEvent::BlockReceived { block_root, stage, .. } = event {
-            stages.push((block_root, stage));
+        if let BeaconStateEvent::BlockReceived { block_root, stage, stf, .. } = event {
+            stages.push((block_root, stage, stf.map(|stf| stf.gate)));
         }
     });
     stages
@@ -1577,7 +1579,7 @@ fn a_block_already_in_fork_choice_is_reported_already_known() {
         |_, _| panic!("a repeat is never relayed"),
     );
     assert_eq!(feedback, Feedback::BlockKnown(block_root));
-    assert_eq!(block_stages(&mut sink), [(block_root, BlockStage::AlreadyKnown)]);
+    assert_eq!(block_stages(&mut sink), [(block_root, BlockStage::AlreadyKnown, None)]);
 }
 
 /// The fixtures sign under Fulu from genesis; mainnet's fork schedule would
@@ -1653,7 +1655,7 @@ fn a_block_is_applied_once_and_already_known_on_repeat() {
         |_, _| {},
     );
     let Feedback::BlockImported(block_root) = feedback else { panic!("{feedback:?}") };
-    assert_eq!(block_stages(&mut sink), [(block_root, BlockStage::Applied)]);
+    assert_eq!(block_stages(&mut sink), [(block_root, BlockStage::Applied, Some(StfGate::Now))]);
 
     let (data, read) = publish_block_bytes(&mut gp, &block_ssz);
     let pinned = tile.reader.acquire(read);
@@ -1666,7 +1668,7 @@ fn a_block_is_applied_once_and_already_known_on_repeat() {
         |_, _| panic!("a repeat is never relayed"),
     );
     assert_eq!(feedback, Feedback::BlockKnown(block_root));
-    assert_eq!(block_stages(&mut sink), [(block_root, BlockStage::AlreadyKnown)]);
+    assert_eq!(block_stages(&mut sink), [(block_root, BlockStage::AlreadyKnown, None)]);
 }
 
 /// A timely block imported before its slot's tick still takes the proposer

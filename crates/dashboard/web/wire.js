@@ -36,7 +36,12 @@ export const Stage = {
   CustodyDone: 6,
   StfDone: 7,
   Attestable: 8,
+  LocalAttestation: 9,
+  Validated: 10,
+  Rejected: 11,
 };
+/** `StfDone` detail: what the import waited on. */
+export const StfGate = { Now: 0, Data: 1, Verify: 2, NoAttestations: 3, OwnBlock: 4 };
 export const BLOCK_SOURCE = ['gossip', 'rpc'];
 export const COLUMN_ORIGIN = ['gossip', 'rpc', 'el', 'assembly'];
 export const EL_VERDICT = ['valid', 'invalid', 'syncing', 'accepted'];

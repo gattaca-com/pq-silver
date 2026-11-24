@@ -3756,6 +3756,7 @@ mod tests {
             source: BlockSource::Gossip,
             parent_slot: None,
             parent_empty: false,
+            stf: None,
         };
         let rejected =
             BeaconStateEvent::BlockRejected { block_root: root, source: BlockSource::Gossip };

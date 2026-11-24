@@ -6,7 +6,9 @@ use ratatui::{
     style::Style,
     text::{Line, Span as TextSpan},
 };
-use silver_common::{BlockSource, Nanos, PayloadValidationStatus, ssz_view::NUMBER_OF_COLUMNS};
+use silver_common::{
+    BlockSource, Nanos, PayloadValidationStatus, StfGate, ssz_view::NUMBER_OF_COLUMNS,
+};
 use silver_stages::SlotClock;
 
 use super::{
@@ -16,7 +18,7 @@ use super::{
 };
 use crate::{
     render::fmt::{fmt_nanos, root_prefix, wall_time},
-    sources::events::{BlockTrace, DaSpan, Interval, Margin, Span},
+    sources::events::{BlockTrace, DaSpan, Interval, Margin, Span, StfSpan},
 };
 
 const HEADINGS: [&str; 8] =
@@ -301,6 +303,13 @@ fn attributes(trace: &BlockTrace, node: Node) -> String {
         Node::Span(Span::El) => {
             trace.el.status().map_or_else(String::new, |v| status_label(v).to_string())
         }
+        Node::Span(Span::Stf(StfSpan::PqVerify)) => match trace.stf.gate() {
+            Some(StfGate::NoAttestations) => "no attestations".to_string(),
+            Some(StfGate::OwnBlock) => "own block".to_string(),
+            _ if trace.stf.is_rejected() => "invalid".to_string(),
+            _ => String::new(),
+        },
+        Node::Span(Span::Strip) if trace.stf.is_rejected() => "rejected".to_string(),
         _ => String::new(),
     }
 }
@@ -326,7 +335,7 @@ fn status_label(status: PayloadValidationStatus) -> &'static str {
 
 #[cfg(test)]
 mod tests {
-    use silver_common::{BlockSource, ColumnOrigin};
+    use silver_common::{BlockSource, ColumnOrigin, StfGate};
     use silver_stages::Stage;
 
     use super::*;
@@ -335,8 +344,8 @@ mod tests {
         sources::events::{
             BlockTraces,
             trace_tests::{
-                APPLY, DA, GENESIS_SECS, SLOT_MS, el_sent, gloas_trace, received, received_from,
-                trace, valid,
+                APPLY, DA, GENESIS_SECS, PQ_VERIFY, SLOT_MS, el_sent, gloas_trace, received,
+                received_from, trace, valid,
             },
         },
     };
@@ -451,7 +460,12 @@ mod tests {
     fn bars_take_the_component_colour() {
         let theme = Theme::default();
         let cells = all_rows(
-            trace(&[(received(), 300), (el_sent(), 320), (Stage::Attestable, 460)]),
+            trace(&[
+                (received(), 300),
+                (Stage::Validated, 320),
+                (Stage::StfDone { gate: StfGate::Now }, 460),
+                (Stage::Attestable, 460),
+            ]),
             &theme,
         );
         let grid = Grid::fit(cells.iter().map(|(_, c)| c), INNER_WIDTH, &theme);
@@ -463,6 +477,33 @@ mod tests {
         let duration = line.spans.iter().find(|s| s.content == "140ms").unwrap();
         assert_eq!(duration.style.fg, Some(theme.components.apply), "duration matches its bar");
         assert!(line.spans.iter().any(|s| s.content == theme.symbols.separator));
+    }
+
+    /// Like `no blobs`, a verify leanVM never ran is an instant that names
+    /// its reason; a rejected verify says so in the verdict colour.
+    #[test]
+    fn pq_verify_names_why_it_took_no_time() {
+        let theme = Theme::default();
+        let pq_verify = |end: (Stage, u64), gate| {
+            let block = gloas_trace(&[
+                (received(), 405),
+                (Stage::Validated, 419),
+                (Stage::StfDone { gate }, 426),
+                end,
+            ]);
+            let cells = all_rows(block, &theme);
+            cells.into_iter().find(|(d, _)| d.node == Node::Span(PQ_VERIFY)).unwrap().1
+        };
+        let imported = (Stage::Attestable, 426);
+
+        let skipped = pq_verify(imported, StfGate::NoAttestations);
+        assert_eq!(skipped.duration, "no attestations", "no duration on an instant");
+        assert_eq!(skipped.len, Nanos(0));
+        assert_eq!(pq_verify(imported, StfGate::OwnBlock).duration, "own block");
+
+        let rejected = pq_verify((Stage::Rejected, 830), StfGate::Verify);
+        assert_eq!(rejected.duration, "404ms invalid");
+        assert_eq!(rejected.bar.0.fg, Some(theme.verdicts.invalid));
     }
 
     /// A folded block still shows when this node's validators voted for it.

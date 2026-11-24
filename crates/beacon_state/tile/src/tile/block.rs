@@ -1,6 +1,6 @@
 use std::ops::Range;
 
-use flux::spine::SpineProducers;
+use flux::{spine::SpineProducers, timing::Nanos};
 use flux_profiler::timed;
 use silver_beacon_state_data::{
     B256, BeaconBlockHeader, BodyFork, BodyOffsets, Checkpoint, Epoch, ForkWriter, SLOTS_PER_EPOCH,
@@ -10,7 +10,7 @@ use silver_beacon_state_data::{
 };
 use silver_common::{
     BeaconStateEvent, BlockSource, BlockStage, EngineFcuReq, EngineNewPayloadReq, EngineReq,
-    SignedBlockLayout, SyncNeed, SyncUpdate, TCacheRead, TRead, hex32,
+    SignedBlockLayout, StfGate, StfStamp, SyncNeed, SyncUpdate, TCacheRead, TRead, hex32,
     ssz_hash::{BlockFork, HashedBody},
     ssz_view::{self, SignedBeaconBlockPqView, SignedBeaconBlockView},
 };
@@ -195,8 +195,10 @@ impl BeaconStateTile {
         }
 
         let slot = layout.slot(data);
+        let validated_at;
         let parsed = match self.parse_and_verify_block(data, pre_verified) {
             Ok(parsed) => {
+                validated_at = Nanos::now();
                 if parsed.relay_eligible {
                     send_gossip(parsed.block_root, producers);
                 }
@@ -216,6 +218,7 @@ impl BeaconStateTile {
                         block_root,
                         BlockStage::AlreadyKnown,
                         source,
+                        None,
                         producers,
                     );
                     producers.produce(BeaconStateEvent::PersistBlock {
@@ -250,19 +253,31 @@ impl BeaconStateTile {
         }
 
         let block_root = parsed.block_root;
+        // A STARK-gated block imported at once had nothing for leanVM: it is
+        // this node's own, or carries no aggregate to prove.
+        let unverified = match gate {
+            ImportGate::StarkVerdict(..) if self.block_production.holds_state_of(&block_root) => {
+                StfGate::OwnBlock
+            }
+            ImportGate::StarkVerdict(..) => StfGate::NoAttestations,
+            _ => StfGate::Now,
+        };
         let f = self.apply_and_import(parsed, data, gate, producers);
+        let mut announce = |stage, gate| {
+            let stf = Some(StfStamp { validated_at, gate });
+            self.emit_block_received(data, block_root, stage, source, stf, producers)
+        };
         match f {
             Feedback::BlockImported(_) => {
-                self.announce_imported(block_root, slot, data, ssz.to_read(), source, producers)
+                announce(BlockStage::Applied, unverified);
+                self.announce_imported(block_root, slot, ssz.to_read(), source, producers)
             }
+            Feedback::AwaitData(_) => announce(BlockStage::AwaitData, StfGate::Data),
+            Feedback::AwaitVerify(_) => announce(BlockStage::AwaitVerify, StfGate::Verify),
             Feedback::Reject { .. } => {
                 producers.produce(BeaconStateEvent::BlockRejected { block_root, source })
             }
-            _ => {
-                if let Some((root, stage)) = held_stage(f) {
-                    self.emit_block_received(data, root, stage, source, producers)
-                }
-            }
+            _ => {}
         }
         silver_log::info!(
             ?source,
@@ -293,29 +308,27 @@ impl BeaconStateTile {
         producers: &mut Producers,
     ) -> Feedback {
         if let (BlockSource::Rpc, Some((root, stage))) = (source, held_stage(feedback)) {
-            self.emit_block_received(data, root, stage, source, producers);
+            self.emit_block_received(data, root, stage, source, None, producers);
         }
         feedback
     }
 
-    /// Everything the rest of the node learns from an import, in the order it
-    /// needs it: the stage, the bytes to persist, the FCU, the head, the
-    /// storage rebase onto new finality (before any other block imports, so
-    /// pruned branches can no longer be built on), the blocks that waited on
-    /// this one, and last the work the next block would otherwise do inline.
-    /// A parked envelope decides the head's payload
+    /// Everything the rest of the node learns from an import after its
+    /// `Applied` stage, in the order it needs it: the bytes to persist, the
+    /// FCU, the head, the storage rebase onto new finality (before any other
+    /// block imports, so pruned branches can no longer be built on), the
+    /// blocks that waited on this one, and last the work the next block would
+    /// otherwise do inline. A parked envelope decides the head's payload
     /// resolution, so it is applied before the Status that carries it; orphans
     /// only extend beyond the head, so they follow it.
     fn announce_imported(
         &mut self,
         block_root: B256,
         slot: Slot,
-        data: &[u8],
         ssz: TCacheRead,
         source: BlockSource,
         producers: &mut Producers,
     ) {
-        self.emit_block_received(data, block_root, BlockStage::Applied, source, producers);
         producers.produce(BeaconStateEvent::PersistBlock { ssz, source, slot, block_root });
 
         producers.produce(EngineReq::Fcu(self.fork_choice_update()));
@@ -638,7 +651,8 @@ impl BeaconStateTile {
         if el_valid {
             self.fork_choice.on_payload_valid(&block_root);
         }
-        self.announce_imported(block_root, slot, data, ssz.to_read(), source, producers);
+        self.emit_block_received(data, block_root, BlockStage::Applied, source, None, producers);
+        self.announce_imported(block_root, slot, ssz.to_read(), source, producers);
     }
 
     /// Run the per-block STF against a COW child of the parent post-state and

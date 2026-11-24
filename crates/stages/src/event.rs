@@ -1,5 +1,5 @@
 use flux::timing::Nanos;
-use silver_common::{BlockSource, ColumnOrigin, PayloadValidationStatus};
+use silver_common::{BlockSource, ColumnOrigin, PayloadValidationStatus, StfGate};
 
 #[derive(Clone, Copy, Debug)]
 pub enum Stage {
@@ -28,12 +28,18 @@ pub enum Stage {
     /// Every column this node custodies is held: the 64 → 128 tail past the
     /// gate, a duty of the node rather than a wait of the block.
     CustodyDone,
-    /// Post-state committed: publish of the root's first `BlockReceived`
-    /// past `AwaitParent`. Precedes `Attestable` when data gated the import.
-    StfDone,
+    /// CL validation passed; the transition starts.
+    Validated,
+    /// Post-state committed: publish of the announcement that ran the
+    /// transition. Precedes `Attestable` when `gate` held the import.
+    StfDone {
+        gate: StfGate,
+    },
     /// In fork choice with the new head published: publish of the
     /// root's first `BlockReceived { stage: Applied }`, ahead of the FCU.
     Attestable,
+    /// The transition, leanVM or the EL rejected the block.
+    Rejected,
     /// A local validator's vote for the block passed gossip validation. The
     /// event's slot is the vote's, which is later than the block's when the
     /// vote's own slot had no block.
@@ -50,8 +56,10 @@ impl Stage {
             Self::ElVerdict { .. } => "el_verdict",
             Self::DaAvailable => "da_available",
             Self::CustodyDone => "custody_done",
-            Self::StfDone => "stf_done",
+            Self::Validated => "validated",
+            Self::StfDone { .. } => "stf_done",
             Self::Attestable => "attestable",
+            Self::Rejected => "rejected",
             Self::LocalAttestation => "local_attestation",
         }
     }

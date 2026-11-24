@@ -461,6 +461,12 @@ impl BlockProduction {
         }
     }
 
+    pub(super) fn holds_state_of(&self, block_root: &B256) -> bool {
+        self.built
+            .as_ref()
+            .is_some_and(|built| built.block_root == *block_root && built.post_state.is_some())
+    }
+
     pub(super) fn take_produced_state(&mut self, block_root: &B256) -> Option<AppliedBlock> {
         self.built.as_mut().filter(|built| built.block_root == *block_root)?.post_state.take()
     }

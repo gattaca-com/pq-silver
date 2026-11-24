@@ -57,8 +57,9 @@ impl BlockTraces {
             // only while live, so early columns land but backfill's
             // historical-slot events cannot churn the pane.
             None => {
-                // A vote's slot is not its block's, so it cannot place a trace.
-                if matches!(event.stage, Stage::LocalAttestation) {
+                // A vote's slot is not its block's, so it cannot place a trace;
+                // a rejection may name a block no trace holds.
+                if matches!(event.stage, Stage::LocalAttestation | Stage::Rejected) {
                     return;
                 }
                 let Some(slot) = event.slot else {

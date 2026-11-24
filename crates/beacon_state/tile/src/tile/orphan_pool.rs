@@ -2,7 +2,7 @@ use flux::spine::SpineProducers;
 use silver_beacon_state_data::{B256, SLOTS_PER_EPOCH, Slot};
 use silver_common::{
     BeaconStateEvent, BlockSource, BlockStage, P2pStreamId, PeerEvent, RpcOffence, RpcSeverity,
-    SyncNeed, TCacheRead, hex32,
+    StfStamp, SyncNeed, TCacheRead, hex32,
     metrics::timed,
     ssz_view::{ExecutionPayloadBidView, SignedBeaconBlockPqView, SignedBeaconBlockView},
 };
@@ -179,6 +179,7 @@ impl BeaconStateTile {
                 block_root,
                 BlockStage::AwaitParent,
                 block_source,
+                None,
                 producers,
             );
         }
@@ -190,6 +191,7 @@ impl BeaconStateTile {
         block_root: B256,
         stage: BlockStage,
         source: BlockSource,
+        stf: Option<StfStamp>,
         producers: &mut Producers,
     ) {
         let Ok(layout) = self.block_layout(data) else {
@@ -212,6 +214,7 @@ impl BeaconStateTile {
             source,
             parent_slot: parent.map(|parent| parent.slot),
             parent_empty,
+            stf,
         });
     }
 

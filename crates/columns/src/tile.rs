@@ -1375,6 +1375,7 @@ mod tests {
             source: BlockSource::Rpc,
             parent_slot: None,
             parent_empty: false,
+            stf: None,
         }
     }
 

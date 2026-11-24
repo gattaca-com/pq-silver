@@ -181,11 +181,14 @@ pub enum StageCode {
     StfDone = 7,
     Attestable = 8,
     LocalAttestation = 9,
+    Validated = 10,
+    Rejected = 11,
 }
 
 /// `detail` by stage: `Received`/`ElSent` block source (0 gossip, 1 rpc);
 /// `Column*` origin (0 gossip, 1 rpc, 2 el, 3 assembly); `ElVerdict` status
-/// (0 valid, 1 invalid, 2 syncing, 3 accepted); 0 otherwise.
+/// (0 valid, 1 invalid, 2 syncing, 3 accepted); `StfDone` gate (0 now, 1 data,
+/// 2 verify, 3 no attestations, 4 own block); 0 otherwise.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct StageRecord {
     pub block_root: [u8; 32],

@@ -51,6 +51,7 @@ impl Group {
                 Span::Stf(StfSpan::Validate),
                 Span::Stf(StfSpan::Apply),
                 Span::Stf(StfSpan::DaWait),
+                Span::Stf(StfSpan::PqVerify),
             ],
         }
     }
@@ -109,8 +110,9 @@ impl Span {
         match self {
             Self::Da(DaSpan::Cols(origin)) => !trace.da.has_origin(origin),
             Self::Da(DaSpan::Custody) => !trace.da.has_columns(),
-            Self::Stf(StfSpan::Validate | StfSpan::Apply) => trace.gloas,
-            Self::Stf(StfSpan::DaWait) => !trace.stf.parked(),
+            Self::Stf(wait @ (StfSpan::DaWait | StfSpan::PqVerify)) => {
+                trace.stf.wait_span() != Some(wait)
+            }
             Self::LocalVotes => trace.local_votes.count == 0,
             _ => false,
         }
@@ -134,6 +136,7 @@ impl StfSpan {
             Self::Validate => SpanSpec::new("validate", None),
             Self::Apply => SpanSpec::new("apply", None),
             Self::DaWait => SpanSpec::new("da wait", None),
+            Self::PqVerify => SpanSpec::new("pq att verify", None),
         }
     }
 }
@@ -219,11 +222,13 @@ impl Node {
         matches!(self, Self::Span(Span::Da(_)))
     }
 
-    /// A blobless block's data component is nothing but the gate opening, and
-    /// one local vote is one moment.
+    /// A blobless block's data component is nothing but the gate opening, a
+    /// PQ block with nothing for leanVM is verified at import, and one local
+    /// vote is one moment.
     pub fn is_instant(self, trace: &BlockTrace) -> bool {
         match self {
             Self::Span(Span::Da(DaSpan::Root)) => !trace.da.has_columns(),
+            Self::Span(Span::Stf(StfSpan::PqVerify)) => trace.stf.verify_skipped(),
             Self::Span(Span::LocalVotes) => trace.local_votes.count == 1,
             _ => false,
         }
@@ -340,12 +345,13 @@ impl Walk<'_> {
 
 #[cfg(test)]
 mod tests {
+    use silver_common::StfGate;
     use silver_stages::Stage;
 
     use super::*;
     use crate::sources::events::trace_tests::{
-        APPLY, DA, DA_WAIT, STF, VALIDATE, at, cols, el_sent, event, gloas_trace, received, trace,
-        valid,
+        APPLY, DA, DA_WAIT, PQ_VERIFY, STF, VALIDATE, at, cols, el_sent, event, gloas_trace,
+        received, stf_done, trace, valid,
     };
 
     fn rows_of(trace: BlockTrace) -> BlockTraces {
@@ -425,8 +431,7 @@ mod tests {
         );
     }
 
-    /// A Gloas block's stf has no dispatch to split at, and its data and
-    /// `el` belong to the payload.
+    /// A Gloas block's data and `el` belong to the payload.
     #[test]
     fn gloas_data_and_el_unfold_under_the_payload() {
         let block = gloas_trace(&[
@@ -446,21 +451,24 @@ mod tests {
         assert_eq!(nodes(&display), [
             Node::Span(Span::Strip),
             Node::Span(STF),
+            Node::Span(VALIDATE),
+            Node::Span(APPLY),
             Node::Span(Span::Payload),
             Node::Span(DA),
             Node::Span(Span::Da(DaSpan::Custody)),
             Node::Span(Span::El),
         ]);
-        assert_eq!(display[3].depth, 2);
+        assert_eq!(display[5].depth, 2);
         let traces = rows_of(gloas_trace(&[]));
         assert_eq!(Node::Span(Span::El).parent(&traces[0]), Some(Group::Payload));
         assert_eq!(Node::Span(DA).parent(&traces[0]), Some(Group::Payload));
         assert_eq!(Group::Payload.opener(), Node::Span(Span::Payload));
     }
 
-    /// The wait row exists only for a block that parked on its columns.
+    /// A wait row exists only for a held or PQ block, and names what it
+    /// waited on.
     #[test]
-    fn da_wait_unfolds_only_for_a_parked_block() {
+    fn wait_row_names_what_held_the_block() {
         let stf_rows = |block: BlockTrace| {
             let mut expanded = Expanded::default();
             expanded.toggle(block.block_root, Group::Block);
@@ -472,21 +480,31 @@ mod tests {
                 .collect::<Vec<_>>()
         };
 
-        let parked = trace(&[
-            (received(), 300),
-            (el_sent(), 301),
-            (Stage::StfDone, 308),
-            (Stage::Attestable, 337),
-        ]);
-        assert_eq!(stf_rows(parked), [STF, VALIDATE, APPLY, DA_WAIT].map(Node::Span));
+        let held = [STF, VALIDATE, APPLY, DA_WAIT].map(Node::Span);
+        assert_eq!(stf_rows(gated_import(StfGate::Data)), held);
+        let pq = [STF, VALIDATE, APPLY, PQ_VERIFY].map(Node::Span);
+        for gate in [StfGate::Verify, StfGate::NoAttestations, StfGate::OwnBlock] {
+            assert_eq!(stf_rows(gated_import(gate)), pq, "{gate:?}");
+        }
+        let unheld = [STF, VALIDATE, APPLY].map(Node::Span);
+        assert_eq!(stf_rows(gated_import(StfGate::Now)), unheld);
+    }
 
-        let unparked = trace(&[
+    #[test]
+    fn skipped_verify_is_an_instant() {
+        let skipped = rows_of(gated_import(StfGate::NoAttestations));
+        assert!(Node::Span(PQ_VERIFY).is_instant(&skipped[0]));
+        let verified = rows_of(gated_import(StfGate::Verify));
+        assert!(!Node::Span(PQ_VERIFY).is_instant(&verified[0]));
+    }
+
+    fn gated_import(gate: StfGate) -> BlockTrace {
+        gloas_trace(&[
             (received(), 300),
-            (el_sent(), 301),
-            (Stage::StfDone, 308),
-            (Stage::Attestable, 308),
-        ]);
-        assert_eq!(stf_rows(unparked), [STF, VALIDATE, APPLY].map(Node::Span));
+            (Stage::Validated, 301),
+            (stf_done(gate), 308),
+            (Stage::Attestable, 337),
+        ])
     }
 
     #[test]

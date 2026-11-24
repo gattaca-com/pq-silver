@@ -61,8 +61,9 @@ impl LocalVotes {
     }
 }
 
-/// The block's common points — arrival and `newPayload` dispatch, which both
-/// `stf` and `el` start from — plus the three components, joined at attestable.
+/// The block's common points — arrival, which `stf` starts from, and
+/// `newPayload` dispatch, which `el` does — plus the three components, joined
+/// at attestable.
 pub struct BlockTrace {
     pub slot: u64,
     pub block_root: [u8; 32],
@@ -106,8 +107,10 @@ impl BlockTrace {
                 }
             }
             Stage::ElSent { .. } => self.el_sent_at = Some(ts),
-            Stage::StfDone => self.stf.done(ts),
+            Stage::Validated => self.stf.validated(ts),
+            Stage::StfDone { gate } => self.stf.done(ts, gate),
             Stage::Attestable => self.stf.attestable(ts),
+            Stage::Rejected => self.stf.rejected(ts),
             Stage::ElVerdict { verdict } => self.el.verdict_received(verdict, ts),
             Stage::ColumnRecv { index, origin } => self.da.column_received(index, origin, ts),
             Stage::ColumnValidated { index, .. } => self.da.column_validated(index, ts),
@@ -143,28 +146,22 @@ impl BlockTrace {
     }
 
     /// The last event on the block's own path — column custody traffic
-    /// excluded, so a strip without a verdict ends at attestable, not at the
-    /// custody tail.
+    /// excluded, so a strip without a verdict ends at attestable or rejection,
+    /// not at the custody tail.
     fn last_event(&self) -> Option<Nanos> {
         let payload = if self.gloas { [None; 3] } else { self.payload_events() };
-        payload.into_iter().chain([self.stf.attestable_at()]).flatten().max()
+        payload.into_iter().chain([self.stf.end()]).flatten().max()
     }
 
     /// Where CL validation starts: the DA gate when it held the block (the
-    /// gate precedes dispatch), else arrival. No gate holds a Gloas block.
+    /// gate precedes validation), else arrival. No gate holds a Gloas block.
     fn validate_from(&self) -> Option<Nanos> {
         self.received_at.map(|at| match self.da.available() {
-            Some(gate) if !self.gloas && self.el_sent_at.is_some_and(|sent| gate < sent) => {
+            Some(gate) if !self.gloas && self.stf.validated_at().is_some_and(|v| gate < v) => {
                 at.max(gate)
             }
             _ => at,
         })
-    }
-
-    /// `newPayload` dispatch as the block's own stage; a Gloas dispatch is
-    /// its envelope's.
-    fn block_el_sent_at(&self) -> Option<Nanos> {
-        self.el_sent_at.filter(|_| !self.gloas)
     }
 
     /// `None` while the span has no events.
@@ -177,9 +174,7 @@ impl BlockTrace {
                 Some(Interval { start, end: end.max(start) })
             }
             Span::Da(span) => self.da.interval(span),
-            Span::Stf(span) => {
-                self.stf.interval(span, self.validate_from(), self.block_el_sent_at())
-            }
+            Span::Stf(span) => self.stf.interval(span, self.validate_from()),
             Span::El => self.el.interval(self.el_sent_at),
             Span::LocalVotes => self.local_votes.interval,
             Span::Payload => {
@@ -227,7 +222,7 @@ impl BlockTrace {
 
 #[cfg(test)]
 pub mod tests {
-    use silver_common::{ColumnOrigin, PayloadValidationStatus};
+    use silver_common::{ColumnOrigin, PayloadValidationStatus, StfGate};
 
     use super::*;
 
@@ -239,6 +234,11 @@ pub mod tests {
     pub const VALIDATE: Span = Span::Stf(StfSpan::Validate);
     pub const APPLY: Span = Span::Stf(StfSpan::Apply);
     pub const DA_WAIT: Span = Span::Stf(StfSpan::DaWait);
+    pub const PQ_VERIFY: Span = Span::Stf(StfSpan::PqVerify);
+
+    pub fn stf_done(gate: StfGate) -> Stage {
+        Stage::StfDone { gate }
+    }
 
     pub fn cols(origin: ColumnOrigin) -> Span {
         Span::Da(DaSpan::Cols(origin))
@@ -293,18 +293,20 @@ pub mod tests {
     fn block_spans() {
         let t = trace(&[
             (received(), 300),
-            (el_sent(), 300),
+            (Stage::Validated, 304),
+            (el_sent(), 304),
+            (stf_done(StfGate::Now), 460),
             (Stage::Attestable, 460),
             (valid(), 520),
             (Stage::DaAvailable, 350),
         ]);
 
         assert_eq!(t.interval(Span::Strip), iv(at(2, 300), at(2, 520)), "arrival → attestable");
-        // The gate fired after dispatch, so it never held the block.
-        assert_eq!(t.interval(VALIDATE), iv(at(2, 300), at(2, 300)));
-        assert_eq!(t.interval(APPLY), iv(at(2, 300), at(2, 460)));
+        // The gate fired after validation, so it never held the block.
+        assert_eq!(t.interval(VALIDATE), iv(at(2, 300), at(2, 304)));
+        assert_eq!(t.interval(APPLY), iv(at(2, 304), at(2, 460)));
         assert_eq!(t.interval(STF), iv(at(2, 300), at(2, 460)), "validate → import");
-        assert_eq!(t.interval(Span::El), iv(at(2, 300), at(2, 520)));
+        assert_eq!(t.interval(Span::El), iv(at(2, 304), at(2, 520)));
         assert_eq!(
             t.interval(DA),
             iv(at(2, 350), at(2, 350)),
@@ -315,19 +317,19 @@ pub mod tests {
         assert_eq!(t.el.status(), Some(PayloadValidationStatus::Valid));
     }
 
-    /// The DA gate precedes `newPayload` dispatch, so a gated block's
-    /// `validate` starts at the gate — the data wait must not be counted as
-    /// validation.
+    /// A DA gate ahead of validation starts a gated block's `validate` at
+    /// the gate — the data wait must not be counted as validation.
     #[test]
     fn gated_block_measures_validate_from_the_gate() {
         let t = trace(&[
             (received(), 300),
             (Stage::DaAvailable, 410),
-            (el_sent(), 413),
+            (Stage::Validated, 413),
+            (stf_done(StfGate::Now), 422),
             (Stage::Attestable, 422),
         ]);
 
-        assert_eq!(t.interval(VALIDATE), iv(at(2, 410), at(2, 413)), "gate → dispatch");
+        assert_eq!(t.interval(VALIDATE), iv(at(2, 410), at(2, 413)), "gate → validated");
         assert_eq!(t.interval(APPLY), iv(at(2, 413), at(2, 422)));
         assert_eq!(t.interval(STF), iv(at(2, 410), at(2, 422)));
     }
@@ -357,34 +359,75 @@ pub mod tests {
         assert_eq!(late_gate.attestable_at(), Some(at(2, 470)), "DA joins the max when known");
     }
 
-    /// A block parked on its columns commits its post-state, then waits; the
-    /// wait is its own span, and an unparked import has none.
+    /// A block held on its columns commits its post-state, then waits; the
+    /// wait is its own span, and an import without a hold has none.
     #[test]
-    fn parked_block_waits_between_apply_and_import() {
-        let parked = trace(&[
+    fn held_block_waits_between_apply_and_import() {
+        let held = trace(&[
             (received(), 300),
-            (el_sent(), 301),
-            (Stage::StfDone, 308),
+            (Stage::Validated, 301),
+            (stf_done(StfGate::Data), 308),
             (Stage::DaAvailable, 336),
             (Stage::Attestable, 337),
         ]);
-        assert_eq!(parked.interval(APPLY), iv(at(2, 301), at(2, 308)), "dispatch → staged");
-        assert_eq!(parked.interval(DA_WAIT), iv(at(2, 308), at(2, 337)), "staged → import");
-        assert_eq!(parked.interval(STF), iv(at(2, 300), at(2, 337)));
-        assert!(parked.stf.parked());
+        assert_eq!(held.interval(APPLY), iv(at(2, 301), at(2, 308)), "validated → staged");
+        assert_eq!(held.interval(DA_WAIT), iv(at(2, 308), at(2, 337)), "staged → import");
+        assert_eq!(held.stf.wait_span(), Some(StfSpan::DaWait), "data held it, not leanVM");
+        assert_eq!(held.interval(STF), iv(at(2, 300), at(2, 337)));
 
-        let waiting = trace(&[(received(), 300), (el_sent(), 301), (Stage::StfDone, 308)]);
-        assert!(waiting.stf.parked(), "still parked");
+        let waiting =
+            trace(&[(received(), 300), (Stage::Validated, 301), (stf_done(StfGate::Data), 308)]);
         assert_eq!(waiting.interval(DA_WAIT), None, "no import yet");
+        assert_eq!(waiting.interval(STF), iv(at(2, 300), at(2, 308)), "runs to the post-state");
 
-        let unparked = trace(&[
+        let unheld = trace(&[
             (received(), 300),
-            (el_sent(), 301),
-            (Stage::StfDone, 308),
+            (Stage::Validated, 301),
+            (stf_done(StfGate::Now), 308),
             (Stage::Attestable, 308),
         ]);
-        assert!(!unparked.stf.parked());
-        assert_eq!(unparked.interval(DA_WAIT), iv(at(2, 308), at(2, 308)));
+        assert_eq!(unheld.stf.wait_span(), None);
+    }
+
+    /// A PQ block's attestation proof goes to leanVM after apply; the verdict
+    /// imports or rejects it.
+    #[test]
+    fn pq_block_waits_on_leanvm() {
+        let pq = |end| {
+            gloas_trace(&[
+                (received(), 420),
+                (Stage::Validated, 434),
+                (stf_done(StfGate::Verify), 456),
+                end,
+            ])
+        };
+        let verified = pq((Stage::Attestable, 868));
+        assert_eq!(verified.interval(VALIDATE), iv(at(2, 420), at(2, 434)));
+        assert_eq!(verified.interval(APPLY), iv(at(2, 434), at(2, 456)));
+        assert_eq!(verified.interval(PQ_VERIFY), iv(at(2, 456), at(2, 868)));
+        assert_eq!(verified.stf.wait_span(), Some(StfSpan::PqVerify));
+        assert_eq!(verified.attestable_at(), Some(at(2, 868)));
+
+        let rejected = pq((Stage::Rejected, 861));
+        assert!(rejected.stf.is_rejected());
+        assert_eq!(rejected.interval(PQ_VERIFY), iv(at(2, 456), at(2, 861)));
+        assert_eq!(rejected.attestable_at(), None);
+        assert_eq!(rejected.interval(Span::Strip), iv(at(2, 420), at(2, 861)), "ends at rejection");
+    }
+
+    /// Nothing went to leanVM: the verify row is the import instant.
+    #[test]
+    fn pq_block_without_a_proof_is_verified_at_import() {
+        for gate in [StfGate::NoAttestations, StfGate::OwnBlock] {
+            let t = gloas_trace(&[
+                (received(), 405),
+                (Stage::Validated, 419),
+                (stf_done(gate), 426),
+                (Stage::Attestable, 426),
+            ]);
+            assert!(t.stf.verify_skipped());
+            assert_eq!(t.interval(PQ_VERIFY), iv(at(2, 426), at(2, 426)));
+        }
     }
 
     /// Duplicates re-announce an imported block; the first import is the apply.
@@ -392,7 +435,8 @@ pub mod tests {
     fn repeat_imports_keep_the_first() {
         let t = trace(&[
             (received(), 300),
-            (el_sent(), 320),
+            (Stage::Validated, 320),
+            (stf_done(StfGate::Now), 460),
             (Stage::Attestable, 460),
             (Stage::Attestable, 900),
         ]);
@@ -490,7 +534,8 @@ pub mod tests {
         let validated = Stage::ColumnValidated { index: 5, origin: ColumnOrigin::Gossip };
         gloas_trace(&[
             (received(), 306),
-            (Stage::StfDone, 310),
+            (Stage::Validated, 308),
+            (stf_done(StfGate::Now), 310),
             (Stage::Attestable, 310),
             (recv, 420),
             (validated, 470),
@@ -506,8 +551,8 @@ pub mod tests {
         assert_eq!(t.attestable_at(), Some(at(2, 310)));
         assert_eq!(t.interval(Span::Strip), iv(at(2, 306), at(2, 310)));
         assert_eq!(t.interval(STF), iv(at(2, 306), at(2, 310)), "no gate holds the block");
-        assert_eq!(t.interval(VALIDATE), None, "the dispatch is the envelope's");
-        assert_eq!(t.interval(APPLY), None);
+        assert_eq!(t.interval(VALIDATE), iv(at(2, 306), at(2, 308)), "split without a dispatch");
+        assert_eq!(t.interval(APPLY), iv(at(2, 308), at(2, 310)));
 
         let recv = Stage::ColumnRecv { index: 5, origin: ColumnOrigin::Gossip };
         let missed_arrival = gloas_trace(&[(recv, 420), (Stage::Attestable, 430)]);

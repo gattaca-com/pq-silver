@@ -1441,6 +1441,9 @@ pub enum BeaconStateEvent {
         // separately as `RequestBlock`
         parent_slot: Option<u64>,
         parent_empty: bool,
+        /// Set only by the announcement whose handling validated the block
+        /// and ran its transition.
+        stf: Option<StfStamp>,
     },
     BlockRejected {
         block_root: [u8; 32],
@@ -1499,6 +1502,26 @@ pub enum BlockStage {
     AwaitVerify,
     Applied,
     AlreadyKnown,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, TypeHash)]
+#[repr(C)]
+pub struct StfStamp {
+    /// Wall clock when CL validation passed and the transition began.
+    pub validated_at: Nanos,
+    pub gate: StfGate,
+}
+
+/// What a block waited on between its transition and fork choice; a PQ block
+/// imported at once says why leanVM had nothing to verify.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, TypeHash)]
+#[repr(u8)]
+pub enum StfGate {
+    Now,
+    Data,
+    Verify,
+    NoAttestations,
+    OwnBlock,
 }
 
 #[derive(Clone, Copy, Debug, TypeHash)]

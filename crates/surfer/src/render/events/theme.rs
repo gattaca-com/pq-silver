@@ -43,6 +43,7 @@ pub struct Components {
     pub validate: Color,
     pub apply: Color,
     pub da_wait: Color,
+    pub pq_verify: Color,
     pub payload: Color,
     pub local_votes: Color,
 }
@@ -57,6 +58,7 @@ impl Default for Components {
             validate: Color::LightBlue,
             apply: Color::Blue,
             da_wait: Color::DarkGray,
+            pq_verify: Color::LightRed,
             payload: Color::LightGreen,
             local_votes: Color::LightMagenta,
         }
@@ -75,6 +77,7 @@ impl Components {
             Span::Stf(StfSpan::Validate) => Some(self.validate),
             Span::Stf(StfSpan::Apply) => Some(self.apply),
             Span::Stf(StfSpan::DaWait) => Some(self.da_wait),
+            Span::Stf(StfSpan::PqVerify) => Some(self.pq_verify),
             Span::Payload => Some(self.payload),
             Span::LocalVotes => Some(self.local_votes),
             Span::El => None,
@@ -179,6 +182,9 @@ impl Theme {
                 let counted = node.counted_for_gate(trace);
                 let color = if counted { self.components.da } else { self.components.custody };
                 (fg(color), fg(color))
+            }
+            Node::Span(Span::Stf(StfSpan::PqVerify)) if trace.stf.is_rejected() => {
+                (fg(self.verdicts.invalid), fg(self.verdicts.invalid))
             }
             Node::Span(span) => {
                 let color =

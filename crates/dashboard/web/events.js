@@ -7,7 +7,7 @@
 
 import { LineCharts } from './chart.js';
 import { legendClick, slotCharts } from './slot_charts.js';
-import { BLOCK_SOURCE, CLUSTER_OUTCOME, EL_VERDICT } from './wire.js';
+import { BLOCK_SOURCE, CLUSTER_OUTCOME, EL_VERDICT, StfGate } from './wire.js';
 import { Origin, Verdict, colsOrigin, colsSpan } from './trace.js';
 import { escape } from './view.js';
 
@@ -20,7 +20,7 @@ const GROUP_CHILDREN = {
   block: ['lock', 'da', 'custody', 'stf', 'el'],
   lock: ['lockAppend', 'lockPersist', 'lockQuorum'],
   da: [Origin.Gossip, Origin.El, Origin.Rpc, Origin.Assembly].map(colsSpan),
-  stf: ['validate', 'apply', 'daWait'],
+  stf: ['validate', 'apply', 'daWait', 'pqVerify'],
   payload: ['da', 'custody', 'el'],
 };
 const GLOAS_BLOCK_CHILDREN = ['stf', 'payload'];
@@ -36,6 +36,7 @@ const SPAN_LABEL = {
   validate: 'validate',
   apply: 'apply',
   daWait: 'da wait',
+  pqVerify: 'pq att verify',
   el: 'el',
   payload: 'payload',
   lock: 'raft lock',
@@ -68,8 +69,7 @@ function spanParent(span, trace) {
 function hidden(span, trace) {
   if (isCols(span)) return !trace.hasOrigin(colsOrigin(span));
   if (span === 'custody') return !trace.columns.length;
-  if (span === 'validate' || span === 'apply') return trace.gloas;
-  if (span === 'daWait') return !trace.parked();
+  if (span === 'daWait' || span === 'pqVerify') return trace.waitSpan() !== span;
   if (span.startsWith('lock')) return trace.interval(span) === null;
   return false;
 }
@@ -215,6 +215,12 @@ function attributes(node, trace) {
     return `${batch.length} cols${trace.openedGate(batch) ? ' DA' : ''}`;
   }
   if (node.span === 'el' && trace.verdict) return EL_VERDICT[trace.verdict.status] ?? '';
+  if (node.span === 'pqVerify') {
+    if (trace.gate === StfGate.NoAttestations) return 'no attestations';
+    if (trace.gate === StfGate.OwnBlock) return 'own block';
+    return trace.rejected !== null ? 'invalid' : '';
+  }
+  if (node.span === 'strip' && trace.rejected !== null) return 'rejected';
   if (node.span === 'lock' && trace.lock) {
     return `${CLUSTER_OUTCOME[trace.lock.outcome] ?? ''}, ${trace.lock.leaderOrigin ? 'as leader' : 'via leader'}`;
   }
@@ -229,6 +235,7 @@ const SPAN_CLASS = {
   validate: 'c-validate',
   apply: 'c-apply',
   daWait: 'c-dawait',
+  pqVerify: 'c-pqverify',
   payload: 'c-payload',
   lock: 'c-lock',
   lockAppend: 'c-lock',
@@ -258,7 +265,8 @@ function barClasses(node, trace) {
     const cls = countedForGate(node, trace) ? 'c-da' : 'c-custody';
     return [cls, cls];
   }
-  const cls = SPAN_CLASS[node.span] ?? verdictClass(trace);
+  const rejected = node.span === 'pqVerify' && trace.rejected !== null;
+  const cls = rejected ? 'c-invalid' : (SPAN_CLASS[node.span] ?? verdictClass(trace));
   return [cls, cls];
 }
 
@@ -267,7 +275,8 @@ function cells(row, clock) {
   const interval = nodeInterval(node, trace);
   const offset = interval ? trace.offsetInSlot(clock, interval.start) : null;
   const len = interval ? interval.end - interval.start : 0;
-  const instant = node.span === 'da' && !trace.columns.length;
+  const instant =
+    (node.span === 'da' && !trace.columns.length) || (node.span === 'pqVerify' && trace.verifySkipped());
   const duration = [interval && !instant ? fmtNanos(len) : '', attributes(node, trace)].filter(Boolean).join(' ');
   const strip = node.span === 'strip';
   const splits = node.span === 'da' || node.span === 'custody' || (node.span && isCols(node.span));

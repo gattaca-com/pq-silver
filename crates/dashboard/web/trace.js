@@ -2,7 +2,7 @@
 // sources/events model. Times are ns on that node's wall clock, held as
 // Number offsets from the trace's BigInt `base` so they stay exact.
 
-import { Stage } from './wire.js';
+import { Stage, StfGate } from './wire.js';
 
 export const Origin = { Gossip: 0, Rpc: 1, El: 2, Assembly: 3 };
 export const Verdict = { Valid: 0, Invalid: 1, Syncing: 2, Accepted: 3 };
@@ -60,6 +60,9 @@ const colEnd = (c) => c.validatedAt ?? c.receivedAt;
 const minOf = (xs) => (xs.length ? Math.min(...xs) : null);
 const maxOf = (xs) => (xs.length ? Math.max(...xs) : null);
 
+/** null until both ends are known; never ends before it starts. */
+const between = (start, end) => (start === null || end === null ? null : iv(start, Math.max(end, start)));
+
 export class BlockTrace {
   /** From Gloas the payload travels in its own envelope: its data and `el`
    *  leave the block's path and join under `payload`. */
@@ -75,8 +78,11 @@ export class BlockTrace {
     this.columns = [];
     this.available = null;
     this.custodyDone = null;
+    this.validated = null;
     this.stfDone = null;
+    this.gate = null;
     this.attestable = null;
+    this.rejected = null;
     this.verdict = null;
     /** This node's Raft lock on its own block, in trace time. */
     this.lock = null;
@@ -114,11 +120,20 @@ export class BlockTrace {
       case Stage.ElSent:
         this.elSentAt = ts;
         break;
+      case Stage.Validated:
+        this.validated ??= ts;
+        break;
       case Stage.StfDone:
-        this.stfDone ??= ts;
+        if (this.stfDone === null) {
+          this.stfDone = ts;
+          this.gate = e.detail;
+        }
         break;
       case Stage.Attestable:
         this.attestable ??= ts;
+        break;
+      case Stage.Rejected:
+        this.rejected ??= ts;
         break;
       case Stage.ElVerdict:
         this.verdict = { status: e.detail, at: ts };
@@ -170,40 +185,39 @@ export class BlockTrace {
   /** The block's own path; custody traffic excluded. */
   lastEvent() {
     const payload = this.gloas ? [] : this.payloadEvents();
-    return maxOf([...payload, this.attestable].filter((t) => t !== null));
+    return maxOf([...payload, this.stfEnd()].filter((t) => t !== null));
   }
 
-  /** The DA gate when it held the block (it precedes dispatch), else arrival.
-   *  No gate holds a Gloas block. */
+  /** The DA gate when it held the block (it precedes validation), else
+   *  arrival. No gate holds a Gloas block. */
   validateFrom() {
     if (this.receivedAt === null) return null;
     const gate = this.available;
-    return !this.gloas && gate !== null && this.elSentAt !== null && gate < this.elSentAt
+    return !this.gloas && gate !== null && this.validated !== null && gate < this.validated
       ? Math.max(this.receivedAt, gate)
       : this.receivedAt;
   }
 
-  /** `newPayload` dispatch as the block's own stage; a Gloas dispatch is its
-   *  envelope's. */
-  blockElSentAt() {
-    return this.gloas ? null : this.elSentAt;
+  stfEnd() {
+    return this.attestable ?? this.rejected;
+  }
+
+  /** The wait row the gate opens, if any. */
+  waitSpan() {
+    if (this.gate === null || this.gate === StfGate.Now) return null;
+    return this.gate === StfGate.Data ? 'daWait' : 'pqVerify';
+  }
+
+  /** A PQ block leanVM never saw: its verify row is the import instant. */
+  verifySkipped() {
+    return this.gate === StfGate.NoAttestations || this.gate === StfGate.OwnBlock;
   }
 
   /** CL validation and apply, waits excluded; null until known. */
   stfWork() {
-    if (this.gloas) {
-      const from = this.validateFrom();
-      const end = this.stfDone ?? this.attestable;
-      return from === null || end === null ? null : end - from;
-    }
     const validate = this.interval('validate');
     const apply = this.interval('apply');
     return validate && apply ? validate.end - validate.start + apply.end - apply.start : null;
-  }
-
-  /** Imports without parking stamp post-state and import in one message. */
-  parked() {
-    return this.stfDone !== null && this.stfDone !== this.attestable;
   }
 
   ofOrigin(origin) {
@@ -237,22 +251,12 @@ export class BlockTrace {
         const start = this.firstColumnAt();
         return start === null || this.custodyDone === null ? null : iv(start, this.custodyDone);
       }
-      case 'stf': {
-        const sent = this.blockElSentAt();
-        const start = this.validateFrom() ?? sent;
-        const end = this.attestable ?? sent;
-        return start === null || end === null ? null : iv(start, Math.max(end, start));
-      }
-      case 'validate': {
-        const start = this.validateFrom();
-        const sent = this.blockElSentAt();
-        return start === null || sent === null ? null : iv(start, sent);
-      }
-      case 'apply': {
-        const sent = this.blockElSentAt();
-        const end = this.stfDone ?? this.attestable;
-        return sent === null || end === null ? null : iv(sent, end);
-      }
+      case 'stf':
+        return between(this.validateFrom() ?? this.validated, this.stfEnd() ?? this.stfDone);
+      case 'validate':
+        return between(this.validateFrom(), this.validated);
+      case 'apply':
+        return between(this.validated, this.stfDone);
       case 'payload': {
         const start = minOf([this.elSentAt, this.firstColumnAt(), this.available].filter((t) => t !== null));
         if (start === null) return null;
@@ -260,7 +264,8 @@ export class BlockTrace {
         return iv(start, Math.max(end, start));
       }
       case 'daWait':
-        return this.stfDone === null || this.attestable === null ? null : iv(this.stfDone, this.attestable);
+      case 'pqVerify':
+        return between(this.stfDone, this.stfEnd());
       case 'el':
         return this.verdict ? iv(this.elSentAt ?? this.verdict.at, this.verdict.at) : null;
       case 'lock':

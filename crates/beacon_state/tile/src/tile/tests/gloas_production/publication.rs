@@ -413,6 +413,29 @@ fn envelope_becomes_available_only_after_a_verdict_other_than_invalid() {
     assert_eq!(rig.available_envelopes(), [signed]);
 }
 
+/// A node booted from a checkpoint whose epoch start slot was empty holds the
+/// finalized block below that slot, its payload unverified. Ignoring the
+/// envelope there left every FULL child parked for good.
+#[test]
+fn finalized_block_below_its_epoch_start_accepts_its_envelope() {
+    let (mut rig, signed, _) = ProductionRig::self_build_for_publication(0);
+    let root = *ExecutionPayloadEnvelopeView::beacon_block_root(
+        SignedExecutionPayloadEnvelopeView::message(&signed),
+    );
+    let idx = rig.tile.fork_choice.find_node_idx(&root).unwrap();
+    let epoch = rig.tile.fork_choice.node(idx).slot / SLOTS_PER_EPOCH + 1;
+
+    rig.tile.fork_choice.set_finalized_checkpoint(Checkpoint { epoch, root: [0xF1; 32] });
+    assert_eq!(rig.gossip_envelope(&signed), Feedback::Ignore, "settled below finality");
+
+    rig.tile.fork_choice.set_finalized_checkpoint(Checkpoint { epoch, root });
+    assert_eq!(rig.gossip_envelope(&signed), Feedback::Accept);
+    assert!(matches!(engine_requests(&mut rig.sink)[..], [EngineReq::NewPayloadEnvelope(_)]));
+
+    rig.new_payload_verdict(root, PayloadValidationStatus::Valid);
+    assert!(rig.tile.fork_choice.is_payload_verified(&root), "FULL children can apply");
+}
+
 /// The sync engine re-asks for anything left uncovered past its settle
 /// window, so coverage cannot wait on the EL.
 #[test]

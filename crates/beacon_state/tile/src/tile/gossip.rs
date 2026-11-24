@@ -1757,7 +1757,9 @@ impl BeaconStateTile {
         if SignedBlockLayout::at_slot(&self.spec, node.slot) != layout {
             return EnvelopeCheck::Reject;
         }
-        if node.slot < self.fork_choice.finalized_checkpoint().epoch * SLOTS_PER_EPOCH {
+
+        let finalized = self.fork_choice.finalized_checkpoint();
+        if node.slot < finalized.epoch * SLOTS_PER_EPOCH && block_root != finalized.root {
             return EnvelopeCheck::Ignore;
         }
         let state_id = node.state_id;

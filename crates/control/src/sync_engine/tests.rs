@@ -1713,6 +1713,59 @@ fn empty_parent_owes_no_envelope() {
     assert_eq!(estart, 2, "slot 1's payload is not on the chain");
 }
 
+/// A withheld payload has no columns either: they belong to the payload, so
+/// a node that custodies columns must not wait for slot 1's.
+#[test]
+fn empty_parent_owes_no_columns() {
+    let now = Instant::now();
+    let mut e = gloas_engine(0b1, 0);
+    peer_status(&mut e, PEER, HEAD_ROOT, 200);
+    local_status(&mut e, 0, 200);
+    advance(&mut e);
+
+    block_at(&mut e, 1, Some(0));
+    e.on_beacon_state_event(&BeaconStateEvent::BlockReceived {
+        slot: 2,
+        block_root: [2; 32],
+        stage: BlockStage::Applied,
+        source: BlockSource::Rpc,
+        parent_slot: Some(1),
+        parent_empty: true,
+    });
+
+    let issued = drive_all(&mut e, now);
+    let (_, cstart, _, _) = issued.columns.expect("column range issued");
+    assert_eq!(cstart, 2, "slot 1's columns are not owed");
+    assert_eq!(tail(&e), 1);
+}
+
+/// A withheld payload's child can sit past the fetch window (the chain went
+/// quiet), so no `parent_empty` ever covers it. A peer holding the span that
+/// serves no envelope proves the payloads withheld, as silence proves blocks
+/// absent; column silence proves nothing, the peer may custody none of ours.
+#[test]
+fn silent_envelope_range_proves_payloads_withheld() {
+    let now = Instant::now();
+    let mut e = gloas_engine(0b1, 0);
+    peer_status(&mut e, PEER, HEAD_ROOT, 200);
+    local_status(&mut e, 0, 200);
+    advance(&mut e);
+
+    block_at(&mut e, 1, Some(0));
+    let issued = drive_all(&mut e, now);
+    let (crid, ..) = issued.columns.expect("column range issued");
+    let (erid, estart, _) = issued.envelope.expect("envelope range issued");
+    assert_eq!(estart, 1);
+
+    e.on_terminator(crid, PEER, true, now);
+    drive_all(&mut e, now);
+    assert_eq!(tail(&e), 0, "column silence leaves slot 1 owed");
+
+    e.on_terminator(erid, PEER, true, now);
+    drive_all(&mut e, now);
+    assert_eq!(tail(&e), 1, "no envelope, so no columns either");
+}
+
 #[test]
 fn no_envelopes_below_gloas_fork() {
     let now = Instant::now();

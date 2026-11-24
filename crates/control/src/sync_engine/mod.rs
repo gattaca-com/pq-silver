@@ -412,8 +412,9 @@ impl SyncEngine {
             } => {
                 self.on_block_received(slot, block_root, parent_slot, stage);
                 if parent_empty && let Some(parent_slot) = parent_slot {
-                    self.window.envelope_covered(parent_slot);
+                    self.window.payload_withheld(parent_slot);
                     self.phase.note_report(DataKind::Envelope, parent_slot);
+                    self.phase.note_report(DataKind::Columns, parent_slot);
                 }
             }
             BeaconStateEvent::Reorg { lca_slot } => self.on_reorg(lca_slot),

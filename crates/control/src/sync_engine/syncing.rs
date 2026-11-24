@@ -95,13 +95,17 @@ impl Syncing {
         // `parent_slot` ever spans it, and the tail would owe these slots
         // forever. Which *delivered* slots settle is beacon state's call, not
         // the wire's — a block it has not reported may still be in its hands.
-        if d.kind == DataKind::Block &&
-            d.served == 0 &&
-            ctx.peers.claims_span(peer, d.span.0..=d.span.1)
-        {
-            for slot in d.span.0..=d.span.1 {
-                window.mark_empty(slot);
-            }
+        // Likewise for envelopes: a withheld payload's child may sit past the
+        // window, so its `parent_empty` never arrives. Column silence proves
+        // nothing: the peer may custody none of ours.
+        if d.served != 0 || !ctx.peers.claims_span(peer, d.span.0..=d.span.1) {
+            return;
+        }
+        let span = d.span.0..=d.span.1;
+        match d.kind {
+            DataKind::Block => span.for_each(|slot| window.mark_empty(slot)),
+            DataKind::Envelope => span.for_each(|slot| window.payload_withheld(slot)),
+            DataKind::Columns => {}
         }
     }
 

@@ -1849,6 +1849,19 @@ mod tests {
         assert_eq!(out.available, 1);
         assert_eq!(out.custody_complete, 1, "the sync window learns the slot is covered");
         assert!(out.missing.is_empty(), "no chase for columns that do not exist");
+
+        // Sync re-fetches it after a reorg dropped the slot's coverage.
+        let persisted = tcache_write(&mut rig.gossip_p, &block_bytes);
+        let again = BeaconStateEvent::PersistBlock {
+            ssz: persisted,
+            source: BlockSource::Rpc,
+            slot: 42,
+            block_root: root,
+        };
+        rig.tile.handle_beacon_state_event(again, &mut rig.conn.producers);
+        let out = rig.drain();
+        assert_eq!(out.custody_complete, 1, "covered again, as no column will say so");
+        assert_eq!(out.available, 0, "availability fires once");
     }
 
     /// A known column answers an outstanding chase without trusting the

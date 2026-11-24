@@ -96,12 +96,23 @@ impl ColumnTracker {
         }
     }
 
+    /// No column will ever arrive to re-announce a columnless block, so a
+    /// re-persist (sync re-fetching it after a reorg dropped its coverage)
+    /// announces it again.
     pub(crate) fn record_columnless(
         &mut self,
         block_root: BlockRoot,
         slot: u64,
         producers: &mut SilverSpineProducers,
     ) {
+        if self.custody_complete(&block_root) {
+            producers.produce(SyncNeed::Arrived {
+                root: block_root,
+                slot,
+                kind: DataKind::Columns,
+            });
+            return;
+        }
         self.record_and_notify(block_root, slot, self.custody.0, IngestionTime::now(), producers);
     }
 

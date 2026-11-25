@@ -4,7 +4,10 @@
 
 use std::{
     ptr,
-    sync::atomic::{AtomicPtr, AtomicU64, Ordering},
+    sync::{
+        OnceLock,
+        atomic::{AtomicPtr, AtomicU64, Ordering},
+    },
 };
 
 use flux::utils::{ThreadNiceness, thread_boot};
@@ -34,10 +37,46 @@ static COUNTERS: AtomicPtr<AtomicU64> = AtomicPtr::new(ptr::null_mut());
 
 pub const LOG_CORE: usize = 7;
 
+static START_CPUS: OnceLock<Vec<usize>> = OnceLock::new();
+
+/// Reads the CPUs the process may use. Call before any thread is pinned: a
+/// pinned thread's own set is not the one the process was given.
+pub fn capture_start_cpus() {
+    START_CPUS.get_or_init(read_cpus_allowed);
+}
+
+/// Core `n` counted within the CPUs the process started with, wrapping, so
+/// that pinning stays inside a taskset or a container's CPU set. Where that
+/// set can't be read, core `n` itself.
+pub fn start_cpu(n: usize) -> usize {
+    let cpus = START_CPUS.get_or_init(read_cpus_allowed);
+    if cpus.is_empty() { n } else { cpus[n % cpus.len()] }
+}
+
+fn read_cpus_allowed() -> Vec<usize> {
+    let Ok(status) = std::fs::read_to_string("/proc/self/status") else { return Vec::new() };
+    let Some(list) = status.lines().find_map(|line| line.strip_prefix("Cpus_allowed_list:")) else {
+        return Vec::new();
+    };
+    parse_cpu_list(list)
+}
+
+fn parse_cpu_list(list: &str) -> Vec<usize> {
+    let mut cpus = Vec::new();
+    for range in list.trim().split(',') {
+        let (first, last) = range.split_once('-').unwrap_or((range, range));
+        let (Ok(first), Ok(last)) = (first.parse::<usize>(), last.parse::<usize>()) else {
+            return Vec::new();
+        };
+        cpus.extend(first..=last);
+    }
+    cpus
+}
+
 /// Background threads share the logging core, so they stay off the tiles'
 /// cores.
 pub fn boot_on_log_core() {
-    thread_boot(&[LOG_CORE], Some(ThreadNiceness::Medium));
+    thread_boot(&[start_cpu(LOG_CORE)], Some(ThreadNiceness::Medium));
 }
 
 /// Counter `i` counts `LOG_SITES[i]`. Events before this are not counted.
@@ -104,7 +143,10 @@ macro_rules! warn {
 mod tests {
     use std::sync::atomic::{AtomicU64, Ordering};
 
-    use super::{LOG_CORE, LOG_SITES, LogSite, attach, boot_on_log_core};
+    use super::{
+        LOG_CORE, LOG_SITES, LogSite, START_CPUS, attach, boot_on_log_core, parse_cpu_list, read_cpus_allowed,
+        start_cpu,
+    };
 
     macro_rules! forwarded {
         ($message:expr) => {
@@ -163,6 +205,26 @@ mod tests {
             let line = status.lines().find(|line| line.starts_with("Cpus_allowed_list:"));
             line.unwrap().split_whitespace().nth(1).unwrap().to_owned()
         });
-        assert_eq!(allowed.join().unwrap(), LOG_CORE.to_string());
+        assert_eq!(allowed.join().unwrap(), start_cpu(LOG_CORE).to_string());
+    }
+
+    #[test]
+    fn a_cpu_list_parses_into_its_cpus() {
+        let cpus = parse_cpu_list(" 40-43,88-91\n");
+        assert_eq!(cpus, [40, 41, 42, 43, 88, 89, 90, 91]);
+        let (tile_1, tile_6, log) = (cpus[1 % cpus.len()], cpus[6 % cpus.len()], cpus[LOG_CORE % cpus.len()]);
+        assert_eq!((tile_1, tile_6, log), (41, 90, 91));
+        assert_eq!(parse_cpu_list("0-3,5"), [0, 1, 2, 3, 5]);
+        assert!(parse_cpu_list("x").is_empty());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn cores_are_counted_within_the_start_set() {
+        let cpus = START_CPUS.get_or_init(read_cpus_allowed);
+        assert!(!cpus.is_empty());
+        for n in 0..2 * cpus.len() {
+            assert_eq!(start_cpu(n), cpus[n % cpus.len()]);
+        }
     }
 }

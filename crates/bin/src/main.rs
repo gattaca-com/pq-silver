@@ -87,6 +87,7 @@ fn publish_build_info() -> io::Result<()> {
 }
 
 fn main() -> Result<(), Box<dyn Error>> {
+    silver_log::capture_start_cpus();
     let mut args = Args::parse();
     if let Some(command) = args.command.take() {
         if let Err(error) = command.run() {
@@ -102,7 +103,7 @@ fn main() -> Result<(), Box<dyn Error>> {
         10,
         None,
         false,
-        Some(silver_log::LOG_CORE),
+        Some(silver_log::start_cpu(silver_log::LOG_CORE)),
         Some(&build_info_log),
     );
     if let Err(e) = silver_log::counts::enable(APP_NAME) {
@@ -451,7 +452,7 @@ fn attached<'a, T: Tile<SilverSpine> + 'a>(
     core: usize,
 ) -> (TileName, Box<dyn FnOnce() + Send + 'a>) {
     let name = tile.name();
-    let config = TileConfig::new(core, Some(ThreadNiceness::Highest));
+    let config = TileConfig::new(silver_log::start_cpu(core), Some(ThreadNiceness::Highest));
     (name, Box::new(tile_runner(tile, spine, config)))
 }
 

@@ -46,10 +46,9 @@ impl<'a> Response<'a> {
         Self { out, submissions, signatures: Some(signatures), outcome: Outcome::Response(None) }
     }
 
-    /// Encodes one body entry straight into the submissions tcache and awaits
-    /// its verdict on each of `topics`. An entry the cache has no room for
-    /// fails.
-    pub(crate) fn await_verdicts(
+    /// Encodes one body entry straight into the submissions tcache, to publish
+    /// on each of `topics`. An entry the cache has no room for fails.
+    pub(crate) fn accept_entry(
         &mut self,
         body_index: usize,
         topics: impl IntoIterator<Item = GossipTopic>,
@@ -75,13 +74,17 @@ impl<'a> Response<'a> {
     pub(crate) fn fail_forged(&mut self) {
         let signatures = self.signatures.as_deref_mut().expect("only a handler publishes entries");
         let Refused { repeated, forged } = signatures.verify();
-        if let Outcome::AwaitingVerdicts(submission) = &mut self.outcome {
+        if let Some(submission) = self.outcome.submission_mut() {
             submission.fail_accepted(
                 repeated,
                 "an earlier entry of the body has the same validator and epoch",
             );
             submission.fail_accepted(forged, "invalid signature");
         }
+    }
+
+    pub(crate) fn answer_on_dispatch(&mut self) {
+        self.defer(Outcome::Dispatched(Submission::default()));
     }
 
     pub(crate) fn await_payload_envelope(
@@ -115,7 +118,7 @@ impl<'a> Response<'a> {
         body: &[u8],
         validation: BroadcastValidation,
     ) {
-        self.await_verdicts(0, [topic], body.len(), |out| out.copy_from_slice(body));
+        self.accept_entry(0, [topic], body.len(), |out| out.copy_from_slice(body));
         self.submission().validation = validation;
     }
 
@@ -124,11 +127,10 @@ impl<'a> Response<'a> {
     }
 
     fn submission(&mut self) -> &mut Submission {
-        if !matches!(self.outcome, Outcome::AwaitingVerdicts(_)) {
+        if self.outcome.submission_mut().is_none() {
             self.defer(Outcome::AwaitingVerdicts(Submission::default()));
         }
-        let Outcome::AwaitingVerdicts(submission) = &mut self.outcome else { unreachable!() };
-        submission
+        self.outcome.submission_mut().expect("deferred above")
     }
 
     /// Queues the head and records the subscription; writing begins after
@@ -235,9 +237,19 @@ impl<'a> Response<'a> {
 
     pub(crate) fn outcome(mut self) -> Outcome {
         match mem::take(&mut self.outcome) {
-            Outcome::AwaitingVerdicts(submission) if submission.accepted.is_empty() => {
+            Outcome::AwaitingVerdicts(submission) | Outcome::Dispatched(submission)
+                if submission.accepted.is_empty() =>
+            {
                 self.indexed_failures(&submission.failures);
                 Outcome::Response(None)
+            }
+            Outcome::Dispatched(submission) => {
+                if submission.failures.is_empty() {
+                    self.status_only(200);
+                } else {
+                    self.indexed_failures(&submission.failures);
+                }
+                Outcome::Dispatched(submission)
             }
             outcome => outcome,
         }

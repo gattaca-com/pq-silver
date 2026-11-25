@@ -68,7 +68,7 @@ impl SubmittedEntry for SubmittedPayloadAttestationMessage {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use silver_common::{
         TCacheProducer,
         ssz_view::{PayloadAttestationDataView, PayloadAttestationMessagePqView},
@@ -84,7 +84,7 @@ mod tests {
 
     const PATH: &str = "/eth/v1/beacon/pool/payload_attestations";
 
-    fn message(validator_index: u64) -> String {
+    pub(crate) fn message(validator_index: u64) -> String {
         format!(
             "{{\"validator_index\":\"{validator_index}\",\"data\":{{\"beacon_block_root\":\"0x{}\",\
              \"slot\":\"40\",\"payload_present\":true,\"blob_data_available\":false}},\

@@ -28,6 +28,7 @@ const _: () = assert!(
 );
 
 pub(crate) fn post_aggregate_and_proofs(req: &Request<'_>, ctx: &ApiCtx, resp: &mut Response<'_>) {
+    resp.answer_on_dispatch();
     post_submission::<SubmittedAggregate>(req, ctx, resp);
 }
 
@@ -109,7 +110,7 @@ impl SubmittedEntry for SubmittedAggregate<'_> {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use silver_common::{TCacheProducer, ssz_view::SignedAggregateAndProofPqView};
 
     use super::*;
@@ -125,13 +126,13 @@ mod tests {
         hex::encode(signature)
     }
 
-    fn own_leaf() -> u32 {
+    pub(crate) fn own_leaf() -> u32 {
         SlotDuty::AggregateAndProof.leaf(SLOT).unwrap()
     }
 
     /// One entry of the array a validator client posts, spelled as the
     /// schemas do.
-    fn entry(aggregation_bits: &str, committee_bits: &str, leaf: u32) -> String {
+    pub(crate) fn entry(aggregation_bits: &str, committee_bits: &str, leaf: u32) -> String {
         format!(
             "{{\"message\":{{\"aggregator_index\":\"7\",\"aggregate\":{{\
              \"aggregation_bits\":\"0x{aggregation_bits}\",\
@@ -157,10 +158,9 @@ mod tests {
         let entries = format!("[{}]", entry("1a05", "0400", own_leaf()));
         let mut submissions = submissions();
         let posted = posting("/eth/v2/validator/aggregate_and_proofs", &entries);
-        let Outcome::AwaitingVerdicts(submission) =
-            dispatch_into(&ctx(), &posted, &mut submissions).0
+        let Outcome::Dispatched(submission) = dispatch_into(&ctx(), &posted, &mut submissions).0
         else {
-            panic!("the aggregate defers")
+            panic!("the aggregate is dispatched")
         };
         let [accepted] = submission.accepted.as_slice() else { panic!("one accepted") };
         assert_eq!(accepted.topic, GossipTopic::BeaconAggregateAndProof);
@@ -189,8 +189,8 @@ mod tests {
             entry("1a05", "0600", own_leaf()),
             entry("1a05", "0400", own_leaf() - 1),
         );
-        let Outcome::AwaitingVerdicts(submission) = submit(&ctx, &entries).0 else {
-            panic!("the well-formed entry defers")
+        let Outcome::Dispatched(submission) = submit(&ctx, &entries).0 else {
+            panic!("the well-formed entry is dispatched")
         };
         assert_eq!(submission.accepted.len(), 1);
         assert_eq!(submission.accepted[0].body_index, 0);

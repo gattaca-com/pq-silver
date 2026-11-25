@@ -3,8 +3,8 @@ use std::time::{Duration, Instant};
 use serde::Deserialize;
 use silver_beacon_state_data::{B256, Slot, SpecConfig};
 use silver_common::{
-    BroadcastValidation, GossipTopic, LocalGossipFailure, PayloadValidationStatus, TCacheRead,
-    json_fields::each_array_entry, ssz_hash::HashedBody,
+    BeaconApiRequest, BroadcastValidation, GossipTopic, LocalGossipFailure,
+    PayloadValidationStatus, TCacheRead, json_fields::each_array_entry, ssz_hash::HashedBody,
 };
 
 use crate::{
@@ -116,7 +116,7 @@ fn submit(ctx: &ApiCtx, resp: &mut Response<'_>, body_index: usize, entry: impl 
         Err(message) => return resp.fail_entry(body_index, message),
     };
     let encode = |out: &mut [u8]| entry.encode(out);
-    if resp.await_verdicts(body_index, topics, entry.ssz_len(), encode) &&
+    if resp.accept_entry(body_index, topics, entry.ssz_len(), encode) &&
         let Some(check) = check
     {
         resp.await_signature(body_index, check);
@@ -303,6 +303,35 @@ impl RecentImports {
 }
 
 impl Submission {
+    /// One request per accepted entry, numbered from `first_id` by body index.
+    /// Returns how many ids the body takes.
+    pub(crate) fn emit_requests(
+        &self,
+        first_id: u64,
+        emit: &mut impl FnMut(BeaconApiRequest),
+    ) -> u64 {
+        for &AcceptedEntry { body_index, topic, ssz } in &self.accepted {
+            let request_id = first_id + body_index as u64;
+            let validation = self.validation;
+            emit(match self.envelope {
+                Some(publication) => BeaconApiRequest::PublishPayloadEnvelope {
+                    request_id,
+                    ssz,
+                    blob_data_included: publication.blob_data_included,
+                    validation,
+                },
+                None => BeaconApiRequest::LocalGossip {
+                    request_id,
+                    topic,
+                    ssz,
+                    validation,
+                    hashed_body: self.hashed_body,
+                },
+            });
+        }
+        self.body_len() as u64
+    }
+
     /// `body_indices` ascend, as entries are accepted in body order.
     pub(crate) fn fail_accepted(&mut self, body_indices: &[usize], message: &'static str) {
         debug_assert!(body_indices.is_sorted());

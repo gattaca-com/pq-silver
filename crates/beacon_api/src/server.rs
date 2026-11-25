@@ -42,8 +42,8 @@ use crate::{
     node::peers::Peer,
     routes::{ROUTES, SERVED_WHILE_SYNCING},
     submission::{
-        AcceptedEntry, Integration, MAX_SUBMISSION_ENTRIES, RecentImports, Submission,
-        SubmissionFailure, failure_message,
+        Integration, MAX_SUBMISSION_ENTRIES, RecentImports, Submission, SubmissionFailure,
+        failure_message,
     },
     validator::{
         aggregate_attestation::AggregateRequest, execution_payload_envelope::EnvelopeRequest,
@@ -206,34 +206,15 @@ impl Pending {
                 (Self::Envelope { request_id: first_id, request }, 1)
             }
             Outcome::AwaitingVerdicts(submission) => {
-                for &AcceptedEntry { body_index, topic, ssz } in &submission.accepted {
-                    let request_id = first_id + body_index as u64;
-                    let validation = submission.validation;
-                    emit(match submission.envelope {
-                        Some(publication) => BeaconApiRequest::PublishPayloadEnvelope {
-                            request_id,
-                            ssz,
-                            blob_data_included: publication.blob_data_included,
-                            validation,
-                        },
-                        None => BeaconApiRequest::LocalGossip {
-                            request_id,
-                            topic,
-                            ssz,
-                            validation,
-                            hashed_body: submission.hashed_body,
-                        },
-                    });
-                }
-                let body_len = submission.body_len();
+                let ids_used = submission.emit_requests(first_id, emit);
                 let pending = PendingSubmission {
                     first_id,
-                    body_len,
+                    body_len: ids_used as usize,
                     unanswered: submission.accepted.len(),
                     failures: submission.failures,
                     integration: submission.integration,
                 };
-                (Self::Submission(pending), body_len as u64)
+                (Self::Submission(pending), ids_used)
             }
             Outcome::AwaitingSidecarResponse(call_path) => {
                 (Self::SidecarResponse { request_id: first_id, call_path }, 1)
@@ -245,7 +226,10 @@ impl Pending {
                 emit(BeaconApiRequest::LockBlindedBlock { request_id: first_id, ssz });
                 (Self::BlindedBlockLock { request_id: first_id, ssz }, 1)
             }
-            Outcome::Response(_) | Outcome::Stream(_) | Outcome::Download(_) => {
+            Outcome::Response(_) |
+            Outcome::Stream(_) |
+            Outcome::Download(_) |
+            Outcome::Dispatched(_) => {
                 unreachable!("answered without deferring")
             }
         }
@@ -1194,7 +1178,7 @@ impl BeaconApi {
     ) {
         let request_id = response.request_id();
         let Some(token) = self.token_awaiting(request_id) else {
-            silver_log::debug!(request_id, "answer for a connection already closed");
+            silver_log::debug!(request_id, "answer no connection awaits");
             return;
         };
 
@@ -1502,12 +1486,16 @@ impl BeaconApi {
                 _ => {}
             }
         });
-        if let Outcome::Response(Some(request)) = dispatched {
-            emit(request);
+        match &dispatched {
+            Outcome::Response(Some(request)) => emit(*request),
+            Outcome::Dispatched(submission) => {
+                *next_request_id += submission.emit_requests(*next_request_id, emit);
+            }
+            _ => {}
         }
         match outcome {
             Ok(false) => match dispatched {
-                Outcome::Response(_) => {}
+                Outcome::Response(_) | Outcome::Dispatched(_) => {}
                 Outcome::Download(registry) => {
                     let conn = self.connections.remove(&token).expect("looked up above");
                     self.connections.insert(token, conn.downloading(registry, now));
@@ -1742,10 +1730,14 @@ mod tests {
         beacon::{
             block_submission::tests::{blinded_block, gloas_block, pq_block},
             operations::tests::{entry, signature as attestation_signature},
+            payload_attestations::tests::message as payload_attestation,
             proposer_preferences::tests as preferences,
         },
-        submission::{Submission, tests as submission},
+        submission::{AcceptedEntry, Submission, tests as submission},
         testing::{answer, dispatch_into, json, posting, request, submissions},
+        validator::aggregate_submission::tests::{
+            entry as aggregate_entry, own_leaf as own_aggregate_leaf,
+        },
     };
 
     /// Longer than any test's 10 s spin deadline: the idle sweep never reaps.
@@ -3889,21 +3881,42 @@ mod tests {
         write!(
             stream,
             "POST {path} HTTP/1.1\r\nHost: x\r\nContent-Type: application/json\r\n\
-             Content-Length: {}\r\nConnection: close\r\n\r\n{body}",
+             Eth-Consensus-Version: pq\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
             body.len()
         )
         .unwrap();
     }
 
-    /// Every attestation of one submission is locked and validated on its own,
-    /// and the body is answered once the last of them has been.
-    fn submit_two(server: &mut Server, results: [LocalGossipResult; 2]) -> Vec<u8> {
-        server.api.ctx = submission::pq_ctx();
-        let client = connect(tcp_addr(server));
-        let body = format!("[{},{}]", entry(1, 0), entry(2, 0));
-        post(&client, "/eth/v2/beacon/pool/attestations", &body);
+    #[test]
+    fn attestations_are_answered_200_before_their_verdicts() {
+        for (path, body) in [
+            ("/eth/v2/beacon/pool/attestations", format!("[{},{}]", entry(1, 0), entry(2, 0))),
+            (
+                "/eth/v2/validator/aggregate_and_proofs",
+                format!("[{}]", aggregate_entry("1a05", "0400", own_aggregate_leaf())),
+            ),
+        ] {
+            let mut server = server_with(64, LONG_TIMEOUT);
+            server.api.ctx = submission::pq_ctx();
+            let client = connect(tcp_addr(&server));
+            post(&client, path, &body);
+            let reader = std::thread::spawn(move || read_to_eof(client));
+            let response = serve(&mut server, reader, "submission answer");
+            assert!(response.starts_with(b"HTTP/1.1 200 OK\r\n"), "{path}: {response:?}");
+            assert!(!server.requests.is_empty(), "{path}: the entries were still sent");
+        }
+    }
 
-        pump_until(server, "both attestations were submitted", |s| s.requests.len() == 2);
+    const PAYLOAD_ATTESTATIONS: &str = "/eth/v1/beacon/pool/payload_attestations";
+
+    /// Every entry of one submission is validated on its own, and the body is
+    /// answered once the last of them has been.
+    fn submit_two(server: &mut Server, results: [LocalGossipResult; 2]) -> Vec<u8> {
+        let client = connect(tcp_addr(server));
+        let body = format!("[{},{}]", payload_attestation(1), payload_attestation(2));
+        post(&client, PAYLOAD_ATTESTATIONS, &body);
+
+        pump_until(server, "both entries were submitted", |s| s.requests.len() == 2);
         let submitted: Vec<_> = server.requests.drain(..).collect();
         for (request, response) in submitted.iter().zip(results) {
             server.answer(BeaconApiResponse::LocalGossipResponse {
@@ -3918,7 +3931,7 @@ mod tests {
     }
 
     #[test]
-    fn submission_answers_200_once_every_attestation_is_published() {
+    fn submission_answers_200_once_every_entry_is_published() {
         let mut server = server_with(64, LONG_TIMEOUT);
         let response = submit_two(&mut server, [Ok(()), Ok(())]);
         assert!(response.starts_with(b"HTTP/1.1 200 OK\r\n"), "{response:?}");
@@ -3927,32 +3940,27 @@ mod tests {
     /// A body that publishes in part answers the 400 naming what did not, by
     /// its place in the submitted array.
     #[test]
-    fn submission_answers_400_naming_the_attestation_that_failed() {
+    fn submission_answers_400_naming_the_entry_that_failed() {
         let mut server = server_with(64, LONG_TIMEOUT);
-        let response =
-            submit_two(&mut server, [Ok(()), Err(LocalGossipFailure::ConflictingAttestation)]);
+        let response = submit_two(&mut server, [Ok(()), Err(LocalGossipFailure::Invalid)]);
         assert!(response.starts_with(b"HTTP/1.1 400 Bad Request\r\n"), "{response:?}");
         assert_eq!(
             std::str::from_utf8(body(&response)).unwrap(),
             "{\"code\":400,\"message\":\"some entries were not published\",\"failures\":\
-             [{\"index\":1,\"message\":\"this validator already attested to another block \
-             for the slot\"}]}"
+             [{\"index\":1,\"message\":\"rejected as invalid\"}]}"
         );
     }
 
-    const ATTESTATIONS: &str = "/eth/v2/beacon/pool/attestations";
-
-    /// A body holds one entry per validator and epoch.
-    static DISTINCT_ATTESTATIONS: LazyLock<Vec<String>> =
-        LazyLock::new(|| (0..submission::PQ_ACTIVE as u64).map(|i| entry(i, 0)).collect());
-
     const LARGEST_BODY: usize = MAX_SUBMISSION_ENTRIES;
 
-    fn post_attestations(server: &mut Server, count: usize) -> TcpStream {
+    static PAYLOAD_ATTESTATION_BODY: LazyLock<Vec<String>> =
+        LazyLock::new(|| (0..LARGEST_BODY as u64).map(payload_attestation).collect());
+
+    fn post_payload_attestations(server: &mut Server, count: usize) -> TcpStream {
         let client = connect(tcp_addr(server));
-        let body = format!("[{}]", DISTINCT_ATTESTATIONS[..count].join(","));
+        let body = format!("[{}]", PAYLOAD_ATTESTATION_BODY[..count].join(","));
         let writer = client.try_clone().unwrap();
-        std::thread::spawn(move || post(writer, ATTESTATIONS, &body));
+        std::thread::spawn(move || post(writer, PAYLOAD_ATTESTATIONS, &body));
         client
     }
 
@@ -3961,7 +3969,7 @@ mod tests {
     }
 
     fn refused(server: &mut Server, count: usize) -> Vec<u8> {
-        let client = post_attestations(server, count);
+        let client = post_payload_attestations(server, count);
         let response = serve(server, std::thread::spawn(move || read_to_eof(client)), "refusal");
         assert!(response.starts_with(b"HTTP/1.1 503 Service Unavailable\r\n"), "{response:?}");
         response
@@ -3975,11 +3983,11 @@ mod tests {
         server.api.ctx = submission::pq_ctx();
         server.submissions = TCache::producer(TCacheId::BoundaryProcessing, 1 << 26);
 
-        let first = post_attestations(&mut server, LARGEST_BODY);
+        let first = post_payload_attestations(&mut server, LARGEST_BODY);
         submitted_after(&mut server, LARGEST_BODY, "the first body");
         let mut others = Vec::new();
         for filled in (2 * LARGEST_BODY..=MAX_OUTSTANDING_SUBMISSIONS).step_by(LARGEST_BODY) {
-            others.push(post_attestations(&mut server, LARGEST_BODY));
+            others.push(post_payload_attestations(&mut server, LARGEST_BODY));
             submitted_after(&mut server, filled, "a body within the budget");
         }
 
@@ -3987,7 +3995,7 @@ mod tests {
         assert!(body(&response).starts_with(b"{\"code\":503,"));
         assert_eq!(server.requests.len(), MAX_OUTSTANDING_SUBMISSIONS, "none of it was sent");
 
-        let _lone = post_attestations(&mut server, 1);
+        let _lone = post_payload_attestations(&mut server, 1);
         submitted_after(&mut server, MAX_OUTSTANDING_SUBMISSIONS + 1, "a body of one entry");
 
         let first_ids: Vec<_> =
@@ -4002,7 +4010,7 @@ mod tests {
         let response = serve(&mut server, std::thread::spawn(move || read_to_eof(first)), "200");
         assert!(response.starts_with(b"HTTP/1.1 200 OK\r\n"), "{response:?}");
         let admitted = MAX_OUTSTANDING_SUBMISSIONS - LARGEST_BODY + 3;
-        let _admitted = post_attestations(&mut server, 2);
+        let _admitted = post_payload_attestations(&mut server, 2);
         submitted_after(&mut server, admitted, "a body within the budget");
 
         refused(&mut server, LARGEST_BODY);
@@ -4010,7 +4018,7 @@ mod tests {
         server.api.idle.timeout = Duration::ZERO;
         pump_until(&mut server, "idle connections reaped", |s| s.api.connections.is_empty());
         server.api.idle.timeout = LONG_TIMEOUT;
-        let _largest = post_attestations(&mut server, LARGEST_BODY);
+        let _largest = post_payload_attestations(&mut server, LARGEST_BODY);
         submitted_after(&mut server, admitted + LARGEST_BODY, "the largest body");
     }
 

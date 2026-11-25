@@ -51,9 +51,19 @@ pub(crate) enum Outcome {
     AwaitingProducedBlock(ProduceBlockRequest),
     AwaitingEnvelope(EnvelopeRequest),
     AwaitingVerdicts(Submission),
+    Dispatched(Submission),
     AwaitingSidecarResponse(SidecarCall),
     AwaitingBuilderPreferences { is_json: bool },
     AwaitingBlindedBlockLock { ssz: TCacheRead },
+}
+
+impl Outcome {
+    pub(crate) fn submission_mut(&mut self) -> Option<&mut Submission> {
+        match self {
+            Self::AwaitingVerdicts(submission) | Self::Dispatched(submission) => Some(submission),
+            _ => None,
+        }
+    }
 }
 
 impl Default for Outcome {

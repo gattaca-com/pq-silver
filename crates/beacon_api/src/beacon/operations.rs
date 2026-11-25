@@ -21,6 +21,7 @@ use crate::{
 
 pub(crate) fn post_attestations(req: &Request<'_>, ctx: &ApiCtx, resp: &mut Response<'_>) {
     silver_log::info!("attestation: received signed attestations");
+    resp.answer_on_dispatch();
     post_submission::<SubmittedAttestation>(req, ctx, resp);
 }
 
@@ -314,10 +315,9 @@ pub(crate) mod tests {
         let body = format!("[{}]", entry(2, 0));
         let mut submissions = submissions();
         let posted = posting("/eth/v2/beacon/pool/attestations", &body);
-        let Outcome::AwaitingVerdicts(submission) =
-            dispatch_into(&ctx, &posted, &mut submissions).0
+        let Outcome::Dispatched(submission) = dispatch_into(&ctx, &posted, &mut submissions).0
         else {
-            panic!("the attestation defers")
+            panic!("the attestation is dispatched")
         };
         let [attestation] = submission.accepted.as_slice() else { panic!("one accepted") };
 
@@ -350,7 +350,7 @@ pub(crate) mod tests {
     fn forged_signature_fails_its_entry_while_the_others_are_published() {
         let ctx = pq_ctx();
         let body = format!("[{},{},{}]", entry(1, 0), forged_entry(2, 0), entry(3, 0));
-        let Outcome::AwaitingVerdicts(submission) = submit(&ctx, &body).0 else {
+        let Outcome::Dispatched(submission) = submit(&ctx, &body).0 else {
             panic!("the genuine entries defer")
         };
         let accepted: Vec<_> = submission.accepted.iter().map(|entry| entry.body_index).collect();
@@ -381,7 +381,7 @@ pub(crate) mod tests {
     fn body_past_the_submission_entry_cap_is_a_400() {
         let ctx = pq_ctx();
         let at_cap = format!("[{}]", vec![entry(1, 0); MAX_SUBMISSION_ENTRIES].join(","));
-        assert!(matches!(submit(&ctx, &at_cap).0, Outcome::AwaitingVerdicts(_)));
+        assert!(matches!(submit(&ctx, &at_cap).0, Outcome::Dispatched(_)));
 
         let past_cap = format!("[{}]", vec![entry(1, 0); MAX_SUBMISSION_ENTRIES + 1].join(","));
         let (outcome, response) = submit(&ctx, &past_cap);
@@ -401,8 +401,8 @@ pub(crate) mod tests {
         let past_the_count = posted_committees(&ctx);
         let body =
             format!("[{},{},{}]", entry(1, past_the_count), entry(1, 0), entry(2, past_the_count),);
-        let Outcome::AwaitingVerdicts(submission) = submit(&ctx, &body).0 else {
-            panic!("the resolvable entry defers")
+        let Outcome::Dispatched(submission) = submit(&ctx, &body).0 else {
+            panic!("the resolvable entry is dispatched")
         };
         assert_eq!(submission.accepted.len(), 1);
         assert_eq!(submission.accepted[0].body_index, 1);

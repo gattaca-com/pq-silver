@@ -263,6 +263,7 @@ pub struct BeaconStateTile {
     /// Kept separate from the reorg marker: an early Status must not hide a
     /// reorg that the end-of-loop check has yet to report.
     emitted_head: Option<HeadObservation>,
+    sent_fcu: Option<[B256; 3]>,
 
     initial_status_emitted: bool,
     cached_fork_digest: Option<(Epoch, [u8; 4])>,
@@ -379,6 +380,7 @@ impl BeaconStateTile {
             precomputed_epochs: PrecomputedEpochs::default(),
             last_seen_head_root: [0u8; 32],
             emitted_head: None,
+            sent_fcu: None,
             initial_status_emitted: false,
             cached_fork_digest: None,
             pq_rpc_digests,
@@ -832,6 +834,12 @@ impl BeaconStateTile {
             self.post_shufflings(emit);
         }
         self.state.publish_state_id(self.last_applied);
+    }
+
+    fn announce_head_change(&mut self, producers: &mut Producers) {
+        self.try_detect_reorg(producers);
+        self.publish_status_on_head_change(producers);
+        self.send_fcu_on_change(producers);
     }
 
     /// Covers changes since the last Status, including execution verdicts.
@@ -1583,8 +1591,7 @@ impl Tile<SilverSpine> for BeaconStateTile {
         }
 
         if self.fork_choice.take_head_moved() {
-            self.try_detect_reorg(&mut adapter.producers);
-            self.publish_status_on_head_change(&mut adapter.producers);
+            self.announce_head_change(&mut adapter.producers);
         }
 
         // After every event, so a request goes out in the iteration that unlocked it.

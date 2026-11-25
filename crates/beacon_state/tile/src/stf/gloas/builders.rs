@@ -2,7 +2,7 @@ use flux_profiler::timed;
 use silver_beacon_state_data::{
     Builder, BuilderPendingPayment, BuilderPreregistration, BuilderRegistry, Epoch,
     FAR_FUTURE_EPOCH, PAYLOAD_BUILDER_VERSION, PREREGISTRATION_EXPIRY_SLOTS, SLOTS_PER_EPOCH,
-    StateWriterView, Withdrawals,
+    SpecConfig, StateWriterView, Withdrawals,
     pq::{KeyScheme, xmss_pubkey, xmss_pubkey_padded},
 };
 use silver_common::ssz_view::{
@@ -12,8 +12,6 @@ use silver_common::ssz_view::{
 
 use crate::stf::is_valid_builder_deposit_signature;
 
-/// Delay from exit initiation to a builder's balance becoming withdrawable.
-const MIN_BUILDER_WITHDRAWABILITY_DELAY: u64 = 1 << 6;
 /// `2**40` — tags a `ValidatorIndex` as referring to the builder registry.
 const BUILDER_INDEX_FLAG: u64 = 1 << 40;
 
@@ -73,7 +71,11 @@ pub fn process_builder_pending_payments(view: &mut StateWriterView, current_epoc
     payments[SPE..].fill(BuilderPendingPayment::default());
 }
 
-pub fn process_builder_deposit_request(view: &mut StateWriterView, request: &[u8]) {
+pub fn process_builder_deposit_request(
+    view: &mut StateWriterView,
+    cfg: &SpecConfig,
+    request: &[u8],
+) {
     let request: &[u8; BUILDER_DEPOSIT_REQUEST_SIZE] = request.try_into().unwrap();
     let pubkey = *BuilderDepositRequestView::pubkey(request);
     let credentials = Withdrawals(*BuilderDepositRequestView::withdrawal_credentials(request));
@@ -106,7 +108,7 @@ pub fn process_builder_deposit_request(view: &mut StateWriterView, request: &[u8
             let builder_index =
                 add_builder_to_registry(view, registry_pubkey, &credentials, amount, current_epoch);
             if scheme.is_legacy(&pubkey) {
-                initiate_builder_exit(view, builder_index);
+                initiate_builder_exit(view, cfg, builder_index);
             }
         }
         None => {
@@ -126,7 +128,7 @@ pub fn process_builder_deposit_request(view: &mut StateWriterView, request: &[u8
             if b.withdrawable_epoch != FAR_FUTURE_EPOCH && b.balance == 0 {
                 view.builders.set_withdrawable_epoch(
                     builder_index,
-                    current_epoch + MIN_BUILDER_WITHDRAWABILITY_DELAY,
+                    current_epoch + cfg.min_builder_withdrawability_delay,
                 );
             }
             view.builders.add_balance(builder_index, amount);
@@ -195,6 +197,7 @@ fn get_index_for_new_builder(view: &StateWriterView, current_epoch: u64) -> Opti
 
 pub fn process_builder_exit_request(
     view: &mut StateWriterView,
+    cfg: &SpecConfig,
     finalized_epoch: u64,
     request: &[u8],
 ) {
@@ -216,11 +219,13 @@ pub fn process_builder_exit_request(
     if BuilderRegistry::of_writer(view).pending_balance_to_withdraw(builder_index as u64) != 0 {
         return;
     }
-    initiate_builder_exit(view, builder_index);
+    initiate_builder_exit(view, cfg, builder_index);
 }
 
-fn initiate_builder_exit(view: &mut StateWriterView, builder_index: usize) {
+fn initiate_builder_exit(view: &mut StateWriterView, cfg: &SpecConfig, builder_index: usize) {
     let current_epoch = view.slot.state().slot / SLOTS_PER_EPOCH;
-    view.builders
-        .set_withdrawable_epoch(builder_index, current_epoch + MIN_BUILDER_WITHDRAWABILITY_DELAY);
+    view.builders.set_withdrawable_epoch(
+        builder_index,
+        current_epoch + cfg.min_builder_withdrawability_delay,
+    );
 }

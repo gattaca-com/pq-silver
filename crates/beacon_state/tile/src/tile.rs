@@ -600,7 +600,7 @@ impl BeaconStateTile {
             if view.post_gloas_fork() {
                 weak_subjectivity_period_gloas(&self.spec, &view, &mut self.stf_scratch.active)
             } else {
-                weak_subjectivity_period_fulu(&view, &mut self.stf_scratch.active)
+                weak_subjectivity_period_fulu(&self.spec, &view, &mut self.stf_scratch.active)
             }
         };
 

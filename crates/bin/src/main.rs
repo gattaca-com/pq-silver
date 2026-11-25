@@ -123,6 +123,7 @@ fn main() -> Result<(), Box<dyn Error>> {
     chain_config.require_committee_count_in_range()?;
     chain_config.require_subnet_count_in_range()?;
     set_attestation_subnets_pq(chain_config.spec.attestation_subnet_count_pq as usize);
+    chain_config.claim_data_dir_preset()?;
     if config.pbs().is_some() {
         return Err("PQ has no PBS: remove the [pbs] table and --pbs-endpoint".into());
     }

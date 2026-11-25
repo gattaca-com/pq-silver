@@ -1,4 +1,7 @@
-use silver_common::{merkle::bitlist_len, ssz_view::ATTESTATION_DATA_SIZE};
+use silver_common::{
+    merkle::bitlist_len,
+    ssz_view::{ATTESTATION_DATA_SIZE, bitvector_word},
+};
 
 use super::{super::strategy::Committee, *};
 
@@ -67,7 +70,7 @@ fn groups_of_one_data_become_one_attestation_in_committee_order() {
 
     let [first, second] = &attestations[..] else { panic!("one attestation per data") };
     assert_eq!(AttestationPqView::data(first).as_bytes()[8..], [1; ATTESTATION_DATA_SIZE - 8]);
-    assert_eq!(AttestationPqView::committee_bits(first), &[0b101, 0]);
+    assert_eq!(bitvector_word(AttestationPqView::committee_bits(first)), 0b101);
     assert_eq!(bitlist_len(AttestationPqView::aggregation_bits(first)), 2 * COMMITTEE_LEN);
     let committee_2 = COMMITTEE_LEN;
     assert_eq!(votes(first), [1, committee_2, committee_2 + 3, committee_2 + 8]);

@@ -4,14 +4,14 @@ mod ef_common;
 
 use ef_common::{
     LoadedState, compare_states, iter_test_cases, load_state, load_state_gloas, pq_config,
-    spec_tests_dir,
+    preset_tests_dir,
 };
 use silver_beacon_state::stf::{self, HISTORICAL_SUMMARY_PERIOD};
 use silver_beacon_state_data::{EPOCHS_PER_SYNC_COMMITTEE_PERIOD, SpecConfig};
 /// Gloas EF config: mainnet preset with Gloas active from genesis, so the
 /// `cfg.is_gloas_at(epoch)`-gated STF branches fire on the loaded Gloas states.
 fn gloas_cfg() -> SpecConfig {
-    let mut cfg = SpecConfig::mainnet();
+    let mut cfg = SpecConfig::reference();
     cfg.gloas_fork_epoch = 0;
     cfg
 }
@@ -21,12 +21,7 @@ fn epoch_handler(handler_name: &str, run: impl Fn(&mut LoadedState)) {
 }
 
 fn epoch_handler_fork(fork: &str, handler_name: &str, run: impl Fn(&mut LoadedState)) {
-    let base = spec_tests_dir()
-        .join("tests")
-        .join("mainnet")
-        .join(fork)
-        .join("epoch_processing")
-        .join(handler_name);
+    let base = preset_tests_dir().join(fork).join("epoch_processing").join(handler_name);
     let cases = iter_test_cases(&base);
     if cases.is_empty() {
         eprintln!("{handler_name}: no test cases at {}, skipping", base.display());
@@ -68,7 +63,7 @@ fn epoch_handler_fork(fork: &str, handler_name: &str, run: impl Fn(&mut LoadedSt
 type Runner = fn(&SpecConfig, &mut LoadedState);
 
 fn fulu_handler(handler_name: &str, run: Runner) {
-    let cfg = SpecConfig::mainnet();
+    let cfg = SpecConfig::reference();
     epoch_handler(handler_name, |s| run(&cfg, s));
 }
 

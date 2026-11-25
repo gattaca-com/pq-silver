@@ -4,7 +4,7 @@ use flux::type_hash_derive::TypeHash;
 
 use crate::{
     StateReadView,
-    types::{B256, Epoch, SLOTS_PER_EPOCH, Slot},
+    types::{B256, Epoch, SLOTS_PER_EPOCH, Slot, TARGET_COMMITTEE_SIZE},
 };
 
 /// Identifies an attester shuffling by its epoch and attester-duty decision
@@ -41,8 +41,6 @@ impl ShufflingId {
         (self.epoch.saturating_sub(1) * SLOTS_PER_EPOCH).saturating_sub(1)
     }
 }
-
-pub const TARGET_COMMITTEE_SIZE: usize = 128;
 
 /// Spec `compute_committee` over an epoch's shuffled active set: committee
 /// `committee_index` of `slot` is a proportional slice, so sizes differ by at

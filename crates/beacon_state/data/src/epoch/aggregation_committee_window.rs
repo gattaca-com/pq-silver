@@ -91,13 +91,28 @@ const EMPTY_SSZ: [u8; TABLE_LEN] = {
     ssz
 };
 
-/// The 96 empty slot roots pad to 128 leaves, which fold to a 64-leaf full
-/// subtree beside one of 32 full and 32 zero leaves.
-const EMPTY_ROOT: B256 = {
-    const _: () = assert!(AGGREGATION_COMMITTEE_WINDOW_LEN == 64 + 32);
-    let right = const_hash_concat(&ZERO_HASHES[6], &ZERO_HASHES[5]);
-    const_hash_concat(&ZERO_HASHES[7], &right)
-};
+const EMPTY_ROOT: B256 = empty_slots_root(
+    AGGREGATION_COMMITTEE_WINDOW_LEN,
+    AGGREGATION_COMMITTEE_WINDOW_LEN.next_power_of_two().trailing_zeros() as usize,
+);
+
+/// Root of a subtree of `height` whose first `len` leaves are
+/// `EMPTY_SLOT_ROOT` and the rest zero. A full subtree of either kind is a
+/// `ZERO_HASHES` entry, so only the boundary path is hashed.
+const fn empty_slots_root(len: usize, height: usize) -> B256 {
+    if len == 0 {
+        return ZERO_HASHES[height];
+    }
+    if len == 1 << height {
+        return ZERO_HASHES[height + 1];
+    }
+    let half = 1 << (height - 1);
+    if len <= half {
+        const_hash_concat(&empty_slots_root(len, height - 1), &ZERO_HASHES[height - 1])
+    } else {
+        const_hash_concat(&ZERO_HASHES[height], &empty_slots_root(len - half, height - 1))
+    }
+}
 
 impl AggregationCommitteeWindow {
     pub(crate) fn from_ssz(ssz: &[u8]) -> Result<Self, DecomposeError> {

@@ -148,7 +148,6 @@ pub enum OutboundKind {
     ProposedPayload,
     PoolChange,
     PayloadAttributes,
-    LocalAttestation,
     NewPayload,
     NewPayloadEnvelope,
     Fcu,
@@ -176,7 +175,6 @@ impl OutboundKind {
             "proposed_payload" => Self::ProposedPayload,
             "pool_change" => Self::PoolChange,
             "payload_attributes" => Self::PayloadAttributes,
-            "local_attestation" => Self::LocalAttestation,
             "new_payload" => Self::NewPayload,
             "new_payload_envelope" => Self::NewPayloadEnvelope,
             "fcu" => Self::Fcu,
@@ -200,7 +198,6 @@ impl OutboundKind {
             BeaconStateEvent::ProposedPayload(_) => Self::ProposedPayload,
             BeaconStateEvent::PoolChange(_) => Self::PoolChange,
             BeaconStateEvent::PayloadAttributes(_) => Self::PayloadAttributes,
-            BeaconStateEvent::LocalAttestation { .. } => Self::LocalAttestation,
         }
     }
 
@@ -245,7 +242,7 @@ impl OutboundKind {
 /// against the fork version the config says is active at the block's epoch,
 /// and these fixtures sit in the first epochs.
 fn fulu_from_genesis() -> SpecConfig {
-    SpecConfig { fulu_fork_epoch: 0, ..SpecConfig::mainnet() }
+    SpecConfig { fulu_fork_epoch: 0, ..SpecConfig::reference() }
 }
 
 fn gloas_from_genesis() -> SpecConfig {
@@ -562,7 +559,7 @@ pub fn run_scenario(case_dir: &Path) {
     let transcript_yaml = fs::read_to_string(case_dir.join("steps.yaml")).expect("read steps.yaml");
     let t: Setup = serde_yml::from_str(&transcript_yaml).expect("parse steps.yaml");
 
-    let spec_root = spec_tests_dir();
+    let spec_root = spec_tests_dir().join("tests").join(silver_preset::PRESET_BASE);
     let resolve = |p: &str| -> PathBuf {
         if p.starts_with('/') { PathBuf::from(p) } else { spec_root.join(p) }
     };

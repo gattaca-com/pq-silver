@@ -27,6 +27,7 @@ members = [
   "crates/observe_wire",
   "crates/pbs",
   "crates/peer",
+  "crates/preset",
   "crates/leanvm_api",
   "crates/proto_gen",
   "crates/ssz",
@@ -107,6 +108,7 @@ silver_observe = { path = "crates/observe" }
 silver_observe_wire = { path = "crates/observe_wire" }
 silver_pbs = { path = "crates/pbs" }
 silver_peer = {path = "crates/peer" }
+silver_preset = { path = "crates/preset" }
 silver_leanvm_api = { path = "crates/leanvm_api" }
 silver_storage = { path = "crates/storage" }
 silver_engine_api = { path = "crates/engine_api" }

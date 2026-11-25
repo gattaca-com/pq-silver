@@ -6065,6 +6065,7 @@ dependencies = [
  "silver_log",
  "silver_network",
  "silver_peer",
+ "silver_preset",
  "silver_storage",
  "tempfile",
  "ureq",
@@ -6108,6 +6109,7 @@ dependencies = [
  "silver_httpcore",
  "silver_log",
  "silver_pbs",
+ "silver_preset",
  "smallvec",
  "tempfile",
  "toml",
@@ -6133,6 +6135,7 @@ dependencies = [
  "silver_config",
  "silver_crypto_simd",
  "silver_log",
+ "silver_preset",
  "silver_slashing",
  "silver_ssz",
  "silver_storage",
@@ -6160,6 +6163,7 @@ dependencies = [
  "silver_chain_spec",
  "silver_crypto_simd",
  "silver_log",
+ "silver_preset",
  "silver_ssz",
  "silver_state_hashing",
  "silver_state_memory",
@@ -6173,6 +6177,7 @@ version = "0.1.0-alpha.17"
 dependencies = [
  "hex",
  "serde",
+ "silver_preset",
  "silver_ssz",
  "toml",
  "type-hash",
@@ -6194,6 +6199,7 @@ dependencies = [
  "silver_common",
  "silver_control",
  "silver_log",
+ "silver_preset",
  "slab",
  "snap 1.1.2",
 ]
@@ -6232,6 +6238,7 @@ dependencies = [
  "silver_crypto_simd",
  "silver_log",
  "silver_metrics",
+ "silver_preset",
  "silver_ssz",
  "simd-json",
  "snap 1.1.2",
@@ -6253,6 +6260,7 @@ dependencies = [
  "silver_chain_spec",
  "silver_common",
  "silver_log",
+ "silver_preset",
  "tempfile",
  "toml",
 ]
@@ -6542,6 +6550,10 @@ dependencies = [
 ]
 
 [[package]]
+name = "silver_preset"
+version = "0.1.0-alpha.17"
+
+[[package]]
 name = "silver_proto_gen"
 version = "0.1.0-alpha.17"
 dependencies = [
@@ -6568,6 +6580,7 @@ dependencies = [
  "flux-profiler",
  "sha2",
  "sha2-const-stable",
+ "silver_preset",
  "silver_state_hashing",
  "thiserror 1.0.69",
 ]

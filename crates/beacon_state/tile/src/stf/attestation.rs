@@ -8,7 +8,7 @@ use silver_beacon_state_data::{
     bls::{self, SigBatch},
 };
 use silver_common::ssz_view::{
-    ATTESTATION_FIXED, AttestationDataView, AttestationPqView, AttestationView,
+    ATTESTATION_FIXED, AttestationDataView, AttestationPqView, AttestationView, bitvector_word,
 };
 
 use crate::{
@@ -111,7 +111,7 @@ impl<'a> Attestation<'a> {
         debug_assert!(att.len() >= ATTESTATION_FIXED);
         Self {
             data: AttestationView::data(att),
-            committee_bits: u64::from_le_bytes(*AttestationView::committee_bits(att)),
+            committee_bits: bitvector_word(AttestationView::committee_bits(att)),
             aggregation_bits: AttestationView::aggregation_bits(att),
             may_name_no_committee: false,
         }
@@ -694,7 +694,7 @@ impl<'a> ParsedAttestationData<'a> {
         }
         let inclusion_delay = current_slot.saturating_sub(self.att_slot);
 
-        Ok((u8::from(inclusion_delay <= 5) * TIMELY_SOURCE_FLAG) |
+        Ok((u8::from(inclusion_delay <= SLOTS_PER_EPOCH.isqrt()) * TIMELY_SOURCE_FLAG) |
             (u8::from(is_matching_target) * TIMELY_TARGET_FLAG) |
             (u8::from(is_matching_head && inclusion_delay == min_inclusion_delay) *
                 TIMELY_HEAD_FLAG))

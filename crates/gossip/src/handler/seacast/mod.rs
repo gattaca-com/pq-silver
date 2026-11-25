@@ -2,8 +2,9 @@
 //! envelope and the signed aggregate: a body is cut into Reed-Solomon coded
 //! chunks, each a message on its chunk topic, and offers, holdings and asks
 //! travel as strings among the ids of IHAVE, IDONTWANT and IWANT. The
-//! payload's topic, the chunk's frame and the group's key are Prysm's
-//! (`seacast-devnet`); the aggregates' topic has the same frame.
+//! payload's topic is Prysm's (`seacast-devnet`); the chunk's frame and the
+//! group's key are `seacast-lite.md`'s `Chunk` and `group_key`. The
+//! aggregates' topic has the same frame.
 //!
 //! A kind of body has its own `seacast_core::SeacastNode`, run here on the
 //! control tile's thread with level 1 and level 2 inline. The mesh is the peer
@@ -18,21 +19,27 @@ mod wire;
 use std::time::{Duration, Instant};
 
 use fxhash::FxHashMap;
-use seacast_codec::{ChunkBytes, SnappyBlockCompressor, VecBufferPool, build_group, leaf_hash};
+use seacast_codec::{
+    ChunkBytes, SnappyBlockCompressor, VecBufferPool, build_group, group_id, leaf_hash,
+};
 use seacast_core::{
     BoundedDeferredStore, ChunkId, ChunkMsg, DispatchOutcome, NodeConfig, NodeId, PeerId,
     PenaltyReason, PreallocVec, Rpc, RuntimeEnv, SeacastNode, Shape, SourceOffers, SplitMix64,
     TimerEvent, TypeCodec, ValidationResult,
 };
 use seacast_gossipsub::{
-    Inbound, MAX_CHUNK_BYTES, MESSAGE_ID_BYTES, PAYLOAD, PayloadCatalog, PayloadCodec, build_chunk,
-    chunk_id_of, is_seacast, payload_group, payload_join, read_holding, read_offer, read_want,
-    split_chunk, write_entry,
+    CONTEXT_BYTES, Inbound, MAX_CHUNK_BYTES, MESSAGE_ID_BYTES, PAYLOAD, PayloadCatalog,
+    PayloadCodec, build_chunk, chunk_id_of, group_key, is_seacast, payload_group, payload_join,
+    read_holding, read_offer, read_want, split_chunk, write_entry,
 };
 use silver_common::{
     BroadcastValidation, ForkName, GossipDomain, GossipTopic, GossipTraffic,
     LOCAL_GOSSIP_STREAM_ID, MessageId, Nanos, NewGossipMsg, PeerEvent, SszCache, TCacheId,
     TCacheProducer, msg_id_valid_snappy,
+    ssz_view::{
+        EXECUTION_PAYLOAD_FIXED_GLOAS, ExecutionPayloadEnvelopeView, ExecutionPayloadView,
+        SignedAggregateAndProofPqView, SignedExecutionPayloadEnvelopePqView,
+    },
 };
 
 use self::{
@@ -52,6 +59,43 @@ struct Kind {
     store_bytes: usize,
     /// Groups admitted in a slot. The store has room for one more, ours.
     groups_per_slot: usize,
+    /// The slot and block a local body is of, which its chunks name.
+    context: fn(&[u8]) -> Option<Context>,
+}
+
+/// `slot | beacon_block_root`, the head of a chunk's frame.
+type Context = [u8; CONTEXT_BYTES];
+
+fn context(slot: u64, block_root: &[u8; 32]) -> Context {
+    let mut context = [0; CONTEXT_BYTES];
+    context[..8].copy_from_slice(&slot.to_le_bytes());
+    context[8..].copy_from_slice(block_root);
+    context
+}
+
+/// An envelope's slot is its payload's `slot_number`, which the state
+/// transition holds to the block's slot.
+fn envelope_context(ssz: &[u8]) -> Option<Context> {
+    if !SignedExecutionPayloadEnvelopePqView::check_size(ssz) {
+        return None;
+    }
+    let message = SignedExecutionPayloadEnvelopePqView::message(ssz);
+    if !ExecutionPayloadEnvelopeView::check_size(message) {
+        return None;
+    }
+    let payload = ExecutionPayloadEnvelopeView::payload(message);
+    (payload.len() >= EXECUTION_PAYLOAD_FIXED_GLOAS).then(|| {
+        let block_root = ExecutionPayloadEnvelopeView::beacon_block_root(message);
+        context(ExecutionPayloadView::slot_number(payload), block_root)
+    })
+}
+
+/// The slot and block the aggregate's attestation votes for.
+fn aggregate_context(ssz: &[u8]) -> Option<Context> {
+    SignedAggregateAndProofPqView::check_size(ssz).then(|| {
+        let data = SignedAggregateAndProofPqView::agg_data(ssz);
+        context(data.slot(), data.beacon_block_root())
+    })
 }
 
 const PAYLOADS: usize = 0;
@@ -62,6 +106,7 @@ const KINDS: [Kind; 2] = [
         cache: TCacheId::ControlSeacast,
         store_bytes: 128 << 20,
         groups_per_slot: 2,
+        context: envelope_context,
     },
     // An aggregate of every aggregator of every subnet.
     Kind {
@@ -70,6 +115,7 @@ const KINDS: [Kind; 2] = [
         cache: TCacheId::ControlSeacastAggregates,
         store_bytes: 512 << 20,
         groups_per_slot: 16 * 4,
+        context: aggregate_context,
     },
 ];
 const _: () = assert!(
@@ -226,12 +272,15 @@ impl Core {
             return bad(&mut self.env);
         };
         let f = split_chunk(frame)?;
+        let context: &Context = frame[..CONTEXT_BYTES].try_into().ok()?;
         // A group's slot is the wall slot at its first chunk.
-        let (key, slot) = (f.descriptor.root, self.catalog.host.wall_slot);
+        let (key, slot) = (f.group, self.catalog.host.wall_slot);
         let store = &mut codec.store;
-        let at = store.find(&key).or_else(|| store.open(&key, slot, &f.descriptor))?;
-        // The key does not bind the descriptor: the first one taken stands.
-        if store.descriptor(at) != Some(&f.descriptor) {
+        let at = store.find(&key).or_else(|| store.open(&key, slot, context, &f.descriptor))?;
+        // The key binds the descriptor and the chunk's slot, which level 1 checked.
+        debug_assert_eq!(store.descriptor(at), Some(&f.descriptor));
+        // It does not bind the block root: the first chunk's stands.
+        if store.context(at) != Some(context) {
             return None;
         }
         let (index, head) = (f.index as usize, &frame[..len - f.data.len()]);
@@ -413,22 +462,26 @@ impl Core {
         {
             return false;
         }
+        let Some(context) = (self.kind.context)(ssz) else {
+            return false;
+        };
         let slot = self.catalog.host.wall_slot;
         let (d, shards) =
             build_group::<Vec<u8>, _, _>(ssz, &mut VecBufferPool, &SnappyBlockCompressor);
-        let key = d.root;
+        let chunk_slot = u64::from_le_bytes(context[..8].try_into().unwrap());
+        let key = group_key(&group_id(&d), chunk_slot);
         let group = payload_group(key);
         let codec = &mut self.catalog.codec;
         if codec.store.find(&key).is_some() {
             return true;
         }
-        let Some(at) = codec.store.open(&key, slot, &d) else {
+        let Some(at) = codec.store.open(&key, slot, &context, &d) else {
             silver_log::warn!(slot, topic = %self.kind.whole, "seacast: no room to publish");
             return false;
         };
         self.rebuilt.clear();
         for shard in &shards {
-            let head = build_chunk(&d, shard.index, &shard.proof, &[]);
+            let head = build_chunk(&context, &key, &d, shard.index, &shard.proof, &[]);
             let id = codec.inner.chunk_id(&group, shard.index, &head, &shard.data);
             let leaf = leaf_hash(&shard.data);
             let index = shard.index as usize;
@@ -598,16 +651,18 @@ impl GossipHandler {
             match self.seacast_deliver(kind, domain, &body, emit) {
                 Ok(new) => {
                     let store = self.seacast.cores[kind].as_ref().map(|c| &c.catalog.codec.store);
-                    let Some((slot, root, d, received, peers)) =
+                    let Some((slot, block, d, received, peers)) =
                         store.and_then(|store| store.origin(&body))
                     else {
                         continue;
                     };
-                    let (root, k, n) = (hex::encode(root), d.k(), d.n());
+                    let (root, block) = (hex::encode(d.root), hex::encode(block));
+                    let (k, n) = (d.k(), d.n());
                     match kind {
                         PAYLOADS => silver_log::info!(
                             slot,
                             root,
+                            block,
                             k,
                             n,
                             received,
@@ -618,6 +673,7 @@ impl GossipHandler {
                         _ => silver_log::debug!(
                             slot,
                             root,
+                            block,
                             k,
                             n,
                             received,

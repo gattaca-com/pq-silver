@@ -50,8 +50,8 @@ pub const MAX_GOSSIP_FRAME_SIZE: usize = MAX_GOSSIP_COMPRESSED_PAYLOAD_SIZE + 10
 pub const DEFAULT_GOSSIP_MAX_BYTES_PER_SECOND: u64 = 50_000_000;
 /// SSZ bounds of a message on a segment topic: the fixed part of a
 /// segment, and that with the longest proof and data this node takes.
-pub const PAYLOAD_SEGMENT_MIN: usize = 72;
-pub const PAYLOAD_SEGMENT_MAX: usize = 33_288;
+pub const PAYLOAD_SEGMENT_MIN: usize = 135;
+pub const PAYLOAD_SEGMENT_MAX: usize = 33_351;
 
 /// One fork-qualified gossip domain: the digest names the wire topics,
 /// the format fixes every schema decision for messages carrying it. A
@@ -106,8 +106,8 @@ pub enum GossipTopic {
     ExecutionPayload,
     PayloadAttestationMessage,
     ProposerPreferences,
-    /// A SEACAST chunk of the execution payload envelope, as Prysm's
-    /// `ExecutionPayloadSegment`. Not in a specification yet.
+    /// A SEACAST chunk of the execution payload envelope: the `Chunk` of
+    /// `seacast-lite.md` §2. The topic is Prysm's `seacast-devnet` name.
     ExecutionPayloadSegment,
     /// The same for a signed aggregate and proof.
     BeaconAggregateAndProofSegment,

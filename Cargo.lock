@@ -5716,7 +5716,6 @@ checksum = "94143f37725109f92c262ed2cf5e59bce7498c01bcc1502d7b9afe439a4e9f49"
 [[package]]
 name = "seacast-codec"
 version = "0.1.0"
-source = "git+https://github.com/gattaca-com/seacast-rs?rev=54c600cc7da1dd0ab0fa4f9cd0aba8b1c6439535#54c600cc7da1dd0ab0fa4f9cd0aba8b1c6439535"
 dependencies = [
  "seacast-core",
 ]
@@ -5724,7 +5723,6 @@ dependencies = [
 [[package]]
 name = "seacast-core"
 version = "0.1.0"
-source = "git+https://github.com/gattaca-com/seacast-rs?rev=54c600cc7da1dd0ab0fa4f9cd0aba8b1c6439535#54c600cc7da1dd0ab0fa4f9cd0aba8b1c6439535"
 dependencies = [
  "fxhash",
 ]
@@ -5732,7 +5730,6 @@ dependencies = [
 [[package]]
 name = "seacast-gossipsub"
 version = "0.1.0"
-source = "git+https://github.com/gattaca-com/seacast-rs?rev=54c600cc7da1dd0ab0fa4f9cd0aba8b1c6439535#54c600cc7da1dd0ab0fa4f9cd0aba8b1c6439535"
 dependencies = [
  "seacast-codec",
  "seacast-core",

@@ -13,9 +13,9 @@ use super::store::Buf;
 
 const ACCEPTED: usize = 256;
 
-/// The domain, as a stand-in: the bid commits no descriptor yet and a chunk
-/// names no block, so the first groups seen in a slot are taken as authentic,
-/// as Prysm's interim authority takes them.
+/// The domain, as a stand-in: the bid commits no descriptor yet, so the first
+/// groups seen in a slot are taken as authentic, as Prysm's interim authority
+/// takes them. The slot and block a chunk names are not looked up.
 /// A group's slot is the wall slot at its first chunk. Whether the body is a
 /// block's payload is Beacon State's to say, of the envelope decoded.
 pub(super) struct Host {
@@ -65,7 +65,12 @@ impl Host {
 }
 
 impl PayloadHost for Host {
-    fn authenticate(&mut self, group: &GroupId, _header_id: &Bytes32) -> ValidationResult {
+    fn authenticate(
+        &mut self,
+        group: &GroupId,
+        _header_id: &Bytes32,
+        _context: &[u8],
+    ) -> ValidationResult {
         if self.slot_of(group).is_some() {
             return ValidationResult::Accept;
         }
@@ -83,7 +88,7 @@ impl PayloadHost for Host {
     }
 
     /// The end of the group's slot, when its assembly is freed.
-    fn deadline(&self, group: &GroupId) -> Option<Timestamp> {
+    fn deadline(&self, group: &GroupId, _context: &[u8]) -> Option<Timestamp> {
         let slot = self.slot_of(group).unwrap_or(self.wall_slot);
         let slots = (slot + 1) as f64 - self.wall_slot as f64;
         Some(self.slot_start + slots * self.slot_secs)

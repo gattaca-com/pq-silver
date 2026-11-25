@@ -6,7 +6,10 @@ use buffa::{MessageView, encoding::decode_varint};
 use silver_common::{
     ForkName, GossipDomain, GossipTopic, PeerControl, TCache, TCacheId, TCacheProducer,
     TCacheTable, TProducer,
-    ssz_view::{SIGNED_PQ_FIXED, SignedExecutionPayloadEnvelopePqView},
+    ssz_view::{
+        ATTESTATION_PQ_FIXED, EXECUTION_PAYLOAD_ENVELOPE_MIN, SIGNED_PQ_FIXED,
+        SignedAggregateAndProofPqView, SignedExecutionPayloadEnvelopePqView,
+    },
 };
 
 use super::*;
@@ -14,6 +17,7 @@ use super::*;
 const DOMAIN: GossipDomain = GossipDomain::new([7; 4], ForkName::Pq);
 const PEER: usize = 1;
 const SLOT: u64 = 9;
+const BLOCK_ROOT: [u8; 32] = [0xb1; 32];
 
 struct Node {
     handler: GossipHandler,
@@ -101,12 +105,46 @@ impl Node {
     }
 }
 
-/// A PQ envelope of `len` bytes.
+/// Bytes that do not compress.
+fn noise(len: usize) -> Vec<u8> {
+    (0..len as u32).map(|i| (i.wrapping_mul(2_654_435_761) >> 13) as u8).collect()
+}
+
+/// A PQ envelope of `len` bytes for the block at `SLOT`: the rest of its
+/// message is the payload, and the execution requests are empty.
 fn envelope(len: usize) -> Vec<u8> {
-    let mut ssz: Vec<u8> =
-        (0..len as u32).map(|i| (i.wrapping_mul(2_654_435_761) >> 13) as u8).collect();
+    let mut ssz = noise(len);
     ssz[..4].copy_from_slice(&(SIGNED_PQ_FIXED as u32).to_le_bytes());
+    let message = &mut ssz[SIGNED_PQ_FIXED..];
+    let requests_at = message.len() as u32;
+    message[..4].copy_from_slice(&(EXECUTION_PAYLOAD_ENVELOPE_MIN as u32).to_le_bytes());
+    message[4..8].copy_from_slice(&requests_at.to_le_bytes());
+    message[16..48].copy_from_slice(&BLOCK_ROOT);
+    let slot_at = EXECUTION_PAYLOAD_ENVELOPE_MIN + EXECUTION_PAYLOAD_FIXED_GLOAS - 8;
+    message[slot_at..slot_at + 8].copy_from_slice(&SLOT.to_le_bytes());
     assert!(SignedExecutionPayloadEnvelopePqView::check_size(&ssz));
+    assert_eq!(envelope_context(&ssz), Some(context(SLOT, &BLOCK_ROOT)));
+    ssz
+}
+
+/// A PQ signed aggregate of `len` bytes for the block at `SLOT`: its
+/// attestation sets no bit, and its proof is the rest.
+fn aggregate(len: usize) -> Vec<u8> {
+    let mut attestation = vec![0; ATTESTATION_PQ_FIXED + 1];
+    attestation[..4].copy_from_slice(&(ATTESTATION_PQ_FIXED as u32).to_le_bytes());
+    attestation[4..12].copy_from_slice(&SLOT.to_le_bytes());
+    attestation[20..52].copy_from_slice(&BLOCK_ROOT);
+    // An empty bitlist is its delimiter bit.
+    attestation[ATTESTATION_PQ_FIXED] = 1;
+    let (fixed, proof_at) = (8 + 4 + 4, 8 + 4 + 4 + attestation.len());
+    let mut ssz = noise(len);
+    ssz[..4].copy_from_slice(&(SIGNED_PQ_FIXED as u32).to_le_bytes());
+    let message = &mut ssz[SIGNED_PQ_FIXED..];
+    message[8..12].copy_from_slice(&(fixed as u32).to_le_bytes());
+    message[12..16].copy_from_slice(&(proof_at as u32).to_le_bytes());
+    message[fixed..proof_at].copy_from_slice(&attestation);
+    assert!(SignedAggregateAndProofPqView::check_size(&ssz));
+    assert_eq!(aggregate_context(&ssz), Some(context(SLOT, &BLOCK_ROOT)));
     ssz
 }
 
@@ -135,6 +173,19 @@ fn is_chunk(frame: &[u8]) -> bool {
     RPCView::decode_view(frame).is_ok_and(|rpc| (&rpc.publish).into_iter().next().is_some())
 }
 
+/// The chunks a frame carries, decompressed.
+fn chunks(frame: &[u8]) -> Vec<Vec<u8>> {
+    let Ok(rpc) = RPCView::decode_view(frame) else {
+        return Vec::new();
+    };
+    let mut decoder = snap::raw::Decoder::new();
+    (&rpc.publish)
+        .into_iter()
+        .filter_map(|message| message.data)
+        .map(|data| decoder.decompress_vec(data).unwrap())
+        .collect()
+}
+
 /// An envelope of `len` bytes from one node to the other, as chunks alone.
 fn crosses(len: usize, keep: impl FnMut(&[u8]) -> bool) {
     body_crosses(GossipTopic::ExecutionPayload, envelope(len), false, keep);
@@ -153,7 +204,19 @@ fn body_crosses(
     let now = run(&mut a, &mut b, start, |_| true);
 
     assert_eq!(a.handler.seacast_publish(topic, &ssz), !whole);
-    run(&mut a, &mut b, now, &mut keep);
+    // Every chunk names the body's slot and block, and the group key at that
+    // slot (`seacast-lite.md` §1, §2).
+    let mut named = 0;
+    run(&mut a, &mut b, now, |frame| {
+        for chunk in chunks(frame) {
+            let f = split_chunk(&chunk).unwrap();
+            assert_eq!((f.slot, f.beacon_block_root), (SLOT, &BLOCK_ROOT[..]));
+            assert_eq!(f.group, group_key(&group_id(&f.descriptor), SLOT));
+            named += 1;
+        }
+        keep(frame)
+    });
+    assert!(named > 0);
 
     let delivered = b.delivered(topic);
     assert_eq!(delivered.len(), 1);
@@ -177,9 +240,20 @@ fn an_uncoded_envelope_crosses_a_link() {
 /// An aggregate travels as chunks on its own topic, and whole beside them.
 #[test]
 fn an_aggregate_crosses_a_link() {
-    let ssz: Vec<u8> =
-        (0..200_000u32).map(|i| (i.wrapping_mul(2_654_435_761) >> 13) as u8).collect();
-    body_crosses(GossipTopic::BeaconAggregateAndProof, ssz, true, |_| true);
+    body_crosses(GossipTopic::BeaconAggregateAndProof, aggregate(200_000), true, |_| true);
+}
+
+/// A body whose slot and block cannot be read goes whole, as chunks never.
+#[test]
+fn an_envelope_without_its_block_goes_whole() {
+    let mut ssz = envelope(300_000);
+    let payload_at = SIGNED_PQ_FIXED..SIGNED_PQ_FIXED + 4;
+    ssz[payload_at].copy_from_slice(&(EXECUTION_PAYLOAD_ENVELOPE_MIN as u32 + 1).to_le_bytes());
+    let start = Instant::now();
+    let mut node = Node::new(start);
+    assert!(!node.handler.seacast_publish(GossipTopic::ExecutionPayload, &ssz));
+    node.tick(start + Duration::from_millis(50));
+    assert!(!node.frames().iter().any(|frame| is_chunk(frame)));
 }
 
 /// Every third chunk message is lost: the receiver decodes from what

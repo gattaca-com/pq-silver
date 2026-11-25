@@ -20,7 +20,7 @@ use seacast_core::{
     Bytes32, ChunkBuffer, ChunkId, ChunkMsg, GroupId, PreallocVec, Shape, TypeCodec,
     ValidationResult,
 };
-use seacast_gossipsub::{CHUNK_FIXED, PayloadCodec, build_chunk, payload_group};
+use seacast_gossipsub::{CHUNK_FIXED, CONTEXT_BYTES, PayloadCodec, build_chunk, payload_group};
 use silver_common::{AcquiredRead, TCache, TCacheId, TCacheProducer, TProducer, TReservation};
 
 /// A coded group has at most 256 chunks, an uncoded one this many.
@@ -99,6 +99,10 @@ struct Assembly {
     base: NonNull<u8>,
     key: Bytes32,
     slot: u64,
+    /// `slot | beacon_block_root` of the first chunk. The key binds the slot,
+    /// not the block root: every chunk kept names this block, and so do the
+    /// chunks rebuilt.
+    context: [u8; CONTEXT_BYTES],
     d: SegmentDescriptor,
     head_len: usize,
     have: [u64; MAX_N / 64],
@@ -204,12 +208,14 @@ impl Store {
         self.slots.iter().position(|s| s.assembly.as_ref().is_some_and(|a| a.key == *key))
     }
 
-    /// An assembly for the group `key` of `slot`. `None`: no slot is free,
-    /// the slot has its share, or the tcache has no room.
+    /// An assembly for the group `key` of `slot`, whose chunks carry
+    /// `context`. `None`: no slot is free, the slot has its share, or the
+    /// tcache has no room.
     pub(super) fn open(
         &mut self,
         key: &Bytes32,
         slot: u64,
+        context: &[u8; CONTEXT_BYTES],
         d: &SegmentDescriptor,
     ) -> Option<usize> {
         let of_slot = |s: &&Slot| s.assembly.as_ref().is_some_and(|a| a.slot == slot);
@@ -227,6 +233,7 @@ impl Store {
             base,
             key: *key,
             slot,
+            context: *context,
             d: *d,
             head_len,
             have: [0; MAX_N / 64],
@@ -263,6 +270,10 @@ impl Store {
     /// The descriptor the assembly was opened with, which its chunks carry.
     pub(super) fn descriptor(&self, at: usize) -> Option<&SegmentDescriptor> {
         self.assembly(at).map(|a| &a.d)
+    }
+
+    pub(super) fn context(&self, at: usize) -> Option<&[u8; CONTEXT_BYTES]> {
+        self.assembly(at).map(|a| &a.context)
     }
 
     pub(super) fn id(&self, at: usize, index: usize) -> &ChunkId {
@@ -317,14 +328,15 @@ impl Store {
         }
     }
 
-    /// Of the group `buf` is of: its slot, key and descriptor, the chunks
-    /// taken from peers and the first peers they came from.
+    /// Of the group `buf` is of: its slot, the block its chunks name, its
+    /// descriptor, the chunks taken from peers and the first peers they came
+    /// from.
     pub(super) fn origin(
         &self,
         buf: &Buf,
-    ) -> Option<(u64, &Bytes32, &SegmentDescriptor, u16, &[u16])> {
+    ) -> Option<(u64, &[u8], &SegmentDescriptor, u16, &[u16])> {
         let a = self.assembly(buf.assembly as usize)?;
-        Some((a.slot, &a.key, &a.d, a.received, &a.from[..a.senders as usize]))
+        Some((a.slot, &a.context[8..], &a.d, a.received, &a.from[..a.senders as usize]))
     }
 
     /// Whether `buf` is of an assembly that is still held.
@@ -460,14 +472,14 @@ impl TypeCodec<Buf> for StoreCodec {
         out_rebuilt: &mut PreallocVec<ChunkMsg<Buf>>,
     ) -> Option<Buf> {
         let at = self.store.find(&group.key)?;
-        let (d, had) = {
+        let (d, had, key, context) = {
             let a = self.store.assembly(at)?;
-            (a.d, a.have)
+            (a.d, a.have, a.key, a.context)
         };
         let tree = self.store.complete(at)?;
         for index in 0..d.n() as usize {
             if had[index / 64] >> (index % 64) & 1 == 0 {
-                let head = build_chunk(&d, index as u32, &tree.proof(index), &[]);
+                let head = build_chunk(&context, &key, &d, index as u32, &tree.proof(index), &[]);
                 let (data, len) = {
                     let a = self.store.assembly(at)?;
                     (a.at(index * a.size()), a.data_len(index))

@@ -4,16 +4,20 @@ use ratatui::{
     Frame,
     layout::{Constraint, Direction, Layout, Rect},
     style::{Color, Modifier, Style},
-    widgets::{Block, Borders, Cell, Paragraph, Row, Sparkline, Table},
+    symbols,
+    text::Line,
+    widgets::{Axis, Block, Borders, Cell, Chart, Dataset, GraphType, Paragraph, Row, Table},
 };
 
 use crate::{
     app::App,
-    sources::attestations::{Arrivals, BIN_MS},
+    sources::attestations::{Arrivals, AttestationArrivals, BIN_MS},
 };
 
 const BINS_PER_SEC: usize = (1_000 / BIN_MS) as usize;
 const ARRIVAL_COLOR: Color = Color::Cyan;
+const RELAYED_COLOR: Color = Color::Yellow;
+const LOCAL_COLOR: Color = Color::Green;
 const BARS: [char; 9] = [' ', '▁', '▂', '▃', '▄', '▅', '▆', '▇', '█'];
 /// Slot, total, late, first and peak, with their spacing.
 const FIXED_COLUMNS: u16 = 10 + 9 + 7 + 8 + 15 + 5;
@@ -74,14 +78,10 @@ impl Scale {
             })
             .collect()
     }
-
-    fn bin_of(&self, column: usize) -> usize {
-        column / self.repeat * self.merge
-    }
 }
 
-fn selected(app: &App, row: Option<u64>) -> &Arrivals {
-    row.and_then(|slot| app.attestations.slot(slot)).unwrap_or(&app.attestations.all)
+fn selected(source: &AttestationArrivals, row: Option<u64>) -> Option<&Arrivals> {
+    row.map_or(Some(&source.all), |slot| source.slot(slot))
 }
 
 fn row_label(row: Option<u64>) -> String {
@@ -120,7 +120,7 @@ fn draw_table(f: &mut Frame, area: Rect, app: &mut App) {
         app.attestations_display_order
             .iter()
             .map(|&row| {
-                let arrivals = selected(app, row);
+                let arrivals = selected(&app.attestations, row).unwrap_or(&app.attestations.all);
                 let first = arrivals.bins.iter().position(|&count| count > 0);
                 let peak = (arrivals.bins.iter().enumerate())
                     .max_by_key(|&(bin, &count)| (count, usize::MAX - bin))
@@ -168,51 +168,57 @@ fn draw_table(f: &mut Frame, area: Rect, app: &mut App) {
     f.render_stateful_widget(table, area, &mut app.attestations_table_state);
 }
 
-/// One label per second, where it fits, under the column its second starts in.
-fn seconds_axis(scale: &Scale, columns: usize) -> String {
-    let mut axis = vec![' '; columns];
-    let mut free_from = 0;
-    let mut labelled = None;
-    for column in 0..columns {
-        let second = scale.bin_of(column) / BINS_PER_SEC;
-        if labelled == Some(second) {
-            continue;
-        }
-        labelled = Some(second);
-        let label = format!("{second}s");
-        if column >= free_from && column + label.len() <= columns {
-            label.chars().enumerate().for_each(|(i, c)| axis[column + i] = c);
-            free_from = column + label.len() + 1;
-        }
-    }
-    axis.into_iter().collect()
+/// Count per bin against the bin's midpoint, in seconds into the slot.
+fn series(arrivals: Option<&Arrivals>) -> Vec<(f64, f64)> {
+    let bins = arrivals.map_or(&[][..], |arrivals| &arrivals.bins);
+    bins.iter()
+        .enumerate()
+        .map(|(bin, &count)| (bin_start_secs(bin) + BIN_MS as f64 / 2_000.0, f64::from(count)))
+        .collect()
 }
 
 fn draw_plot(f: &mut Frame, area: Rect, app: &App) {
-    let arrivals = selected(app, app.attestations_selected);
-    let title = format!(
-        " slot {} — arrivals per {BIN_MS} ms — total {}, late {} ",
-        row_label(app.attestations_selected),
-        arrivals.total(),
-        arrivals.late
-    );
-    let block = Block::default().borders(Borders::ALL).title(title);
-    let inner = block.inner(area);
-    f.render_widget(block, area);
+    let row = app.attestations_selected;
+    let sources = [
+        ("arrival", ARRIVAL_COLOR, &app.attestations),
+        ("relayed", RELAYED_COLOR, &app.attestations_relayed),
+        ("local", LOCAL_COLOR, &app.attestations_local),
+    ];
+    let lines = sources.map(|(name, color, source)| {
+        let arrivals = selected(source, row);
+        let total = arrivals.map_or(0, Arrivals::total);
+        (format!("{name} {total}"), color, series(arrivals))
+    });
 
-    let [bars_area, axis_area] =
-        Layout::vertical([Constraint::Min(0), Constraint::Length(1)]).areas(inner);
-    let scale = Scale::new(arrivals.bins.len(), inner.width as usize);
-    let columns = scale.columns(&arrivals.bins);
-    f.render_widget(
-        Paragraph::new(seconds_axis(&scale, columns.len()))
-            .style(Style::default().fg(Color::DarkGray)),
-        axis_area,
-    );
-    f.render_widget(
-        Sparkline::default().data(&columns).style(Style::default().fg(ARRIVAL_COLOR)),
-        bars_area,
-    );
+    let title = format!(" slot {} — votes per {BIN_MS} ms by time into the slot ", row_label(row));
+    let slot_secs = (app.attestations.all.bins.len() / BINS_PER_SEC) as f64;
+    let peak = lines.iter().flat_map(|(.., data)| data).map(|&(_, y)| y).fold(1.0, f64::max);
+    let datasets = lines
+        .iter()
+        .map(|(name, color, data)| {
+            Dataset::default()
+                .name(name.as_str())
+                .marker(symbols::Marker::Braille)
+                .style(Style::default().fg(*color))
+                .graph_type(GraphType::Line)
+                .data(data)
+        })
+        .collect();
+
+    let axis = Style::default().fg(Color::DarkGray);
+    let chart = Chart::new(datasets)
+        .block(Block::default().borders(Borders::ALL).title(title))
+        .x_axis(Axis::default().bounds([0.0, slot_secs]).style(axis).labels(vec![
+            Line::from("0s"),
+            Line::from(format!("{}s", slot_secs / 2.0)),
+            Line::from(format!("{slot_secs}s")),
+        ]))
+        .y_axis(Axis::default().bounds([0.0, peak]).style(axis).labels(vec![
+            Line::from("0"),
+            Line::from(format!("{}", (peak / 2.0).round())),
+            Line::from(format!("{peak}")),
+        ]));
+    f.render_widget(chart, area);
 }
 
 #[cfg(test)]
@@ -224,17 +230,17 @@ mod tests {
         let bins = [1, 2, 3, 4];
         let wide = Scale::new(bins.len(), 9);
         assert_eq!(wide.columns(&bins), [1, 1, 2, 2, 3, 3, 4, 4]);
-        assert_eq!(wide.bin_of(5), 2);
 
         let narrow = Scale::new(bins.len(), 3);
         assert_eq!(narrow.columns(&bins), [3, 7]);
-        assert_eq!(narrow.bin_of(1), 2);
     }
 
     #[test]
-    fn axis_labels_each_second_that_fits() {
-        let scale = Scale::new(3 * BINS_PER_SEC, 3 * BINS_PER_SEC);
-        let axis = seconds_axis(&scale, 3 * BINS_PER_SEC);
-        assert_eq!(axis, "0s        1s        2s        ");
+    fn a_series_point_sits_at_its_bin_midpoint() {
+        let mut bins = vec![0; 8];
+        bins[7] = 3;
+        let arrivals = Arrivals { bins, late: 0 };
+        assert_eq!(series(Some(&arrivals))[7], (0.75, 3.0));
+        assert!(series(None).is_empty());
     }
 }

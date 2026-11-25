@@ -13,7 +13,9 @@ use flux::{
 use silver_observe::TimingFile;
 use silver_stages::SlotClock;
 
-const TIMER: &str = "pq_attestation_arrival";
+pub const ARRIVAL_TIMER: &str = "pq_attestation_arrival";
+pub const RELAYED_PUBLISH_TIMER: &str = "attestation_publish_relayed";
+pub const LOCAL_PUBLISH_TIMER: &str = "attestation_publish_local";
 pub const BIN_MS: u64 = 100;
 const SLOT_HISTORY_LEN: usize = 64;
 
@@ -49,10 +51,11 @@ pub struct SlotArrivals {
     pub arrivals: Arrivals,
 }
 
-/// PQ votes by the slot they vote in, from the `pq_attestation_arrival`
-/// latency queue. A sample carries only its time into the slot, so the slot
-/// is the one that started that long before the sample was read.
+/// Votes by slot, from one time-into-slot latency queue. A sample carries only
+/// its time into the slot, so the slot is the one that started that long
+/// before the sample was read.
 pub struct AttestationArrivals {
+    timer: &'static str,
     clock: SlotClock,
     consumer: Option<Consumer<TimingMessage>>,
     /// Ascending by slot.
@@ -62,9 +65,9 @@ pub struct AttestationArrivals {
 }
 
 impl AttestationArrivals {
-    pub fn new(clock: SlotClock) -> Self {
+    pub fn new(clock: SlotClock, timer: &'static str) -> Self {
         let bins = (clock.slot_duration().0 / Nanos::from_millis(BIN_MS).0) as usize;
-        Self { clock, consumer: None, slots: VecDeque::new(), all: Arrivals::new(bins) }
+        Self { timer, clock, consumer: None, slots: VecDeque::new(), all: Arrivals::new(bins) }
     }
 
     /// Opens the queue once the node has created it.
@@ -72,7 +75,7 @@ impl AttestationArrivals {
         if self.consumer.is_some() {
             return;
         }
-        let Some(file) = timings.iter().find(|file| file.name == TIMER) else { return };
+        let Some(file) = timings.iter().find(|file| file.name == self.timer) else { return };
         if let Ok(queue) = Queue::<TimingMessage>::try_open_shared(&file.path) {
             self.consumer = Some(Consumer::new(queue, "surfer-attestation-arrivals").without_log());
         }
@@ -84,7 +87,7 @@ impl AttestationArrivals {
     }
 
     fn drain_at(&mut self, now: Nanos) {
-        let Self { clock, consumer, slots, all } = self;
+        let Self { clock, consumer, slots, all, .. } = self;
         let Some(consumer) = consumer else { return };
         // Reading lags arrival by far less than half a slot.
         let half_slot = Nanos(clock.slot_duration().0 / 2);
@@ -137,7 +140,7 @@ mod tests {
         let clock = SlotClock::new(GENESIS_SECS, SLOT_MS);
         let queue: Queue<TimingMessage> = Queue::new(8, QueueType::SPMC);
         let mut producer = Producer::from(queue);
-        let mut arrivals = AttestationArrivals::new(clock);
+        let mut arrivals = AttestationArrivals::new(clock, ARRIVAL_TIMER);
         arrivals.consumer = Some(Consumer::new(queue, "arrivals-test").without_log());
         let read_at = |slot, ms| clock.slot_start(slot) + Nanos::from_millis(ms);
         arrivals.drain_at(read_at(5, 0));

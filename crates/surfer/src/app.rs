@@ -2,15 +2,20 @@ use std::collections::HashSet;
 
 use ratatui::widgets::TableState;
 use silver_common::{GossipTopic, PeerId};
-use silver_observe::{DiscoveredSources, sort_key};
+use silver_observe::{DiscoveredSources, TimingFile, sort_key};
 
 use crate::{
     flamegraph::Flamegraph,
     render::events::EventsPane,
     search::Search,
     sources::{
-        attestations::AttestationArrivals, counters::CounterSet, peers::Peers,
-        tilemetrics::TileMetricsSet, timings::TimingSet,
+        attestations::{
+            ARRIVAL_TIMER, AttestationArrivals, LOCAL_PUBLISH_TIMER, RELAYED_PUBLISH_TIMER,
+        },
+        counters::CounterSet,
+        peers::Peers,
+        tilemetrics::TileMetricsSet,
+        timings::TimingSet,
     },
 };
 
@@ -112,6 +117,8 @@ pub struct App {
     pub gossip_selected: Option<GossipTopic>,
     pub gossip_display_order: Vec<GossipTopic>,
     pub attestations: AttestationArrivals,
+    pub attestations_relayed: AttestationArrivals,
+    pub attestations_local: AttestationArrivals,
     /// By slot, so the highlight stays on it as new slots arrive. `None` is
     /// the row of every slot together.
     pub attestations_selected: Option<u64>,
@@ -174,7 +181,9 @@ impl App {
             peers_sort_desc: true,
             gossip_selected: None,
             gossip_display_order: Vec::new(),
-            attestations: AttestationArrivals::new(events.clock()),
+            attestations: AttestationArrivals::new(events.clock(), ARRIVAL_TIMER),
+            attestations_relayed: AttestationArrivals::new(events.clock(), RELAYED_PUBLISH_TIMER),
+            attestations_local: AttestationArrivals::new(events.clock(), LOCAL_PUBLISH_TIMER),
             attestations_selected: None,
             attestations_display_order: Vec::new(),
             events,
@@ -217,12 +226,18 @@ impl App {
         self.split_pct = new as u16;
     }
 
+    pub fn attach_attestation_timers(&mut self, timings: &[TimingFile]) {
+        self.attestations.attach(timings);
+        self.attestations_relayed.attach(timings);
+        self.attestations_local.attach(timings);
+    }
+
     /// Absorb any sources that appeared since the last discovery.
     /// Insertion-only — existing handles keep their mmaps and history
     /// rings. Selections are restored by name across the sort so a
     /// newly-inserted source doesn't shift the user's highlight.
     pub fn merge_new_sources(&mut self, sources: DiscoveredSources) {
-        self.attestations.attach(&sources.timings);
+        self.attach_attestation_timers(&sources.timings);
         if sources.build_info.is_some() {
             self.build_info = sources.build_info;
         }
@@ -340,6 +355,8 @@ impl App {
             t.drain();
         }
         self.attestations.drain();
+        self.attestations_relayed.drain();
+        self.attestations_local.drain();
         self.peers.sample();
         self.events.sample();
     }

@@ -34,6 +34,7 @@ use silver_peer::{PeerManager, SweepOutput};
 use self::{
     gossip_schedule::GossipSchedule,
     local_gossip::{LocalGossipHandler, LocalMessage, produce_response},
+    publication_timers::PublicationTimers,
     slashing_protection::{PendingAttestation, SlashingProtectionHandler, SubmittedBlock},
     subnet_duties::{SubnetDuties, Subnets},
 };
@@ -46,6 +47,7 @@ use crate::{
 
 mod gossip_schedule;
 mod local_gossip;
+mod publication_timers;
 mod slashing_protection;
 mod subnet_duties;
 
@@ -100,6 +102,7 @@ pub struct Controller {
     spec: Arc<SpecConfig>,
     gossip_schedule: Option<GossipSchedule>,
     scheduled_gossip_topics: Vec<GossipTopic>,
+    publication_timers: PublicationTimers,
 
     // Last: acquired reads above point into it.
     reader: TCacheReader,
@@ -151,6 +154,7 @@ impl Controller {
             spec,
             gossip_schedule: None,
             scheduled_gossip_topics: Vec::new(),
+            publication_timers: PublicationTimers::new(),
             reader: TCacheReader::new(tcaches),
         })
     }
@@ -816,6 +820,17 @@ impl Tile<SilverSpine> for Controller {
 
             if let PeerEvent::SendGossip { topic, domain, msg_hash, protobuf, .. } = &event {
                 self.gossip_handler.mcache_insert(*msg_hash, *topic, *domain, *protobuf);
+            }
+            if let (
+                PeerEvent::SendGossip {
+                    originator_stream_id,
+                    topic: GossipTopic::BeaconAttestation(_),
+                    ..
+                },
+                Some(schedule),
+            ) = (&event, &self.gossip_schedule)
+            {
+                self.publication_timers.attestation(*originator_stream_id, &schedule.ticker);
             }
 
             if let Some(exchange) = &mut self.partial_exchange {

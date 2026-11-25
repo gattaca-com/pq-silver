@@ -357,6 +357,18 @@ fn dispatch(tile: &mut BeaconStateTile, topic: &str, msg: &Message, ssz: &[u8]) 
     }
 }
 
+/// Silver diverges from the spec here on purpose. A node booted from a
+/// checkpoint holds the finalized block without its payload, and its FULL
+/// children cannot apply until gossip delivers it.
+fn accepts_finalized_payload(tile: &BeaconStateTile, msg: &Message, ssz: &[u8], got: &str) -> bool {
+    let envelope = msg.message.starts_with("execution_payload_envelope_0x");
+    envelope &&
+        (msg.expected.as_str(), got) == ("ignore", "valid") &&
+        *ExecutionPayloadEnvelopeView::beacon_block_root(
+            SignedExecutionPayloadEnvelopeView::message(ssz),
+        ) == tile.ef_fork_choice().finalized_checkpoint().root
+}
+
 /// Every mismatching message of one case, as `message: got, want (reason)`;
 /// `Err` names a precondition the tile cannot be put into.
 fn run_case(dir: &Path, is_gloas: bool) -> Result<Vec<String>, &'static str> {
@@ -403,7 +415,7 @@ fn run_case(dir: &Path, is_gloas: bool) -> Result<Vec<String>, &'static str> {
                 outcome(&dispatch(&mut tile, message_topic(&meta.topic, &msg.message), msg, &bytes))
             }
         };
-        if got != msg.expected {
+        if got != msg.expected && !accepts_finalized_payload(&tile, msg, &bytes, got) {
             let reason = msg.reason.as_deref().unwrap_or("");
             mismatches
                 .push(format!("{}: got {got}, want {} ({reason})", msg.message, msg.expected));

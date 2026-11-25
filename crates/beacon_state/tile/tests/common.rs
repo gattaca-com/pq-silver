@@ -148,7 +148,6 @@ pub enum OutboundKind {
     ProposedPayload,
     PoolChange,
     PayloadAttributes,
-    LocalAttestation,
     NewPayload,
     NewPayloadEnvelope,
     Fcu,
@@ -176,7 +175,6 @@ impl OutboundKind {
             "proposed_payload" => Self::ProposedPayload,
             "pool_change" => Self::PoolChange,
             "payload_attributes" => Self::PayloadAttributes,
-            "local_attestation" => Self::LocalAttestation,
             "new_payload" => Self::NewPayload,
             "new_payload_envelope" => Self::NewPayloadEnvelope,
             "fcu" => Self::Fcu,
@@ -200,7 +198,6 @@ impl OutboundKind {
             BeaconStateEvent::ProposedPayload(_) => Self::ProposedPayload,
             BeaconStateEvent::PoolChange(_) => Self::PoolChange,
             BeaconStateEvent::PayloadAttributes(_) => Self::PayloadAttributes,
-            BeaconStateEvent::LocalAttestation { .. } => Self::LocalAttestation,
         }
     }
 

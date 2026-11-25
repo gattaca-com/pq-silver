@@ -101,10 +101,9 @@ silver_stages = { path = "crates/stages" }
 silver_control = { path = "crates/control" }
 silver_discovery = {path = "crates/discovery" }
 silver_gossip = {path = "crates/gossip" }
-# Local seacast-rs on its spec-chunk branch: the spec's chunk frame.
-seacast-core = { path = "../seacast-rs/crates/seacast-core" }
-seacast-codec = { path = "../seacast-rs/crates/seacast-codec" }
-seacast-gossipsub = { path = "../seacast-rs/crates/seacast-gossipsub" }
+seacast-core = { git = "https://github.com/gattaca-com/seacast-rs", rev = "314cd6979982a99daabf32e859bee00158dfdd9e" }
+seacast-codec = { git = "https://github.com/gattaca-com/seacast-rs", rev = "314cd6979982a99daabf32e859bee00158dfdd9e" }
+seacast-gossipsub = { git = "https://github.com/gattaca-com/seacast-rs", rev = "314cd6979982a99daabf32e859bee00158dfdd9e" }
 silver_httpcore = { path = "crates/httpcore" }
 silver_network = {path = "crates/network" }
 silver_observe = { path = "crates/observe" }

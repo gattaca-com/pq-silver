@@ -1,60 +1,51 @@
-use std::{cmp::Reverse, mem};
+use std::{mem, ops::RangeInclusive};
 
 use flux::{Timer, spine::SpineProducers};
-use rustc_hash::FxHashMap;
 use silver_beacon_state_data::{B256, Slot, pq::MIN_ATTESTATION_INCLUSION_DELAY_PQ};
 use silver_common::{
-    LeanVmReq, LeanVmResp, Nanos, TCacheProducer, TCacheRead, TCacheReader, TProducer,
-    ssz_view::{MAX_VALIDATORS_PER_COMMITTEE, SingleAttestationPqView},
+    LeanVmResp, Nanos, TCacheProducer, TCacheReader, TProducer,
+    leanvm::{ProofBody, ProofLen},
+    ssz_view::{ATTESTATION_PQ_FIXED, AttestationPqView, MAX_VALIDATORS_PER_COMMITTEE},
     ticker::SlotTicker,
 };
 
 use super::{
-    Aggregate, VerifiedVote,
-    claims::Vote,
-    leaf::{LeafAggregation, LeafKey, ProvedAggregate},
-    merge::MergeAggregation,
-    rolling::{POOL_SLOTS, Rolling, RollingJob, claims_of},
-    strategy::Batch,
+    Claim, VerifiedVote,
+    claims::ClaimCheck,
+    cost_model::MergeShape,
+    merge_planner::{Merge, MergePlanner, Scratch, Sent},
+    proof_sources::ProofSources,
+    proof_store::ProofStore,
+    proof_targets::{LeafKey, ProofTargets},
+    proved::POOL_SLOTS,
+    running_proof::ProvedAggregate,
+    slot_aggregates::AggregateRefused,
+    stats::Stats,
 };
 use crate::{counters::BeaconStateCounters, tile::Producers};
 
-/// A merge waits this fraction of the next slot for that slot's block to
-/// import: 3 s of 12 s, the attestation deadline.
-const MERGE_WAIT_DIVISOR: u64 = 4;
-
-#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
-enum AggregationKey {
-    Leaf(LeafKey),
-    Merge(Slot),
-}
-
-impl AggregationKey {
-    fn slot(&self) -> Slot {
-        match self {
-            Self::Leaf(leaf) => leaf.slot,
-            Self::Merge(slot) => *slot,
-        }
-    }
-}
-
-/// What one request to the prover is for.
-enum Job {
-    Batch(AggregationKey, Batch),
-    Rolling(RollingJob),
+struct InFlight {
+    merge: Sent,
+    predicted: Nanos,
+    /// Since genesis, read once the request is written. A slow planner pass is
+    /// not prover time.
+    sent: Nanos,
+    /// On the wall clock the round trip `Timer` uses.
+    timer_start: Nanos,
 }
 
 /// The prover as the aggregator sees it: one request at a time, and none
-/// before it is ready.
+/// before it is ready. There is one per aggregator, so its size does not
+/// matter.
 #[derive(Default)]
+#[allow(clippy::large_enum_variant)]
 enum LeanVm {
     #[default]
-    Down,
+    NotReady,
     Idle,
     Busy {
         request_id: u64,
-        job: Job,
-        sent: Nanos,
+        in_flight: InFlight,
     },
 }
 
@@ -63,19 +54,18 @@ impl LeanVm {
         matches!(self, Self::Idle)
     }
 
-    fn up(&mut self) {
-        if let Self::Down = self {
+    fn ready(&mut self) {
+        if let Self::NotReady = self {
             *self = Self::Idle;
         }
     }
 
-    /// Becomes idle if `request_id` is in flight, handing back its job and
-    /// when it went out.
-    fn take_answered(&mut self, request_id: u64) -> Option<(Job, Nanos)> {
+    /// Becomes idle if `request_id` is in flight, handing it back.
+    fn take_answered(&mut self, request_id: u64) -> Option<InFlight> {
         match mem::take(self) {
-            Self::Busy { request_id: id, job, sent } if id == request_id => {
+            Self::Busy { request_id: id, in_flight } if id == request_id => {
                 *self = Self::Idle;
-                Some((job, sent))
+                Some(in_flight)
             }
             other => {
                 *self = other;
@@ -85,189 +75,240 @@ impl LeanVm {
     }
 }
 
-/// Every aggregation this node runs. One `LeanVmReq` is in flight at a time,
-/// across all aggregations. Events only change state; `send_next` sends.
+/// Why the planner runs at the end of this loop. The strongest wins.
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+enum Trigger {
+    /// A stored vote or aggregate, a state change, or the armed time.
+    Event,
+    /// A response freed the prover. A request sent now is not an idle start.
+    Answer,
+}
+
+/// Events change state. Only `send_next` sends requests to leanVM.
 pub struct PqAggregator {
-    leaves: FxHashMap<LeafKey, LeafAggregation>,
-    /// An event changed state since `send_next` last found nothing to send.
-    changed: bool,
-    /// By attestation slot.
-    merges: FxHashMap<Slot, MergeAggregation>,
-    /// When the next merge opens unless a block opens it first. No event
-    /// marks that moment, so `send_next` watches the clock until then.
-    merge_opens: Option<Nanos>,
     /// The newest slot whose block imported.
     block_imported: Slot,
-    /// `None`: a block gets only the merge of the newest slot it may
-    /// include.
-    rolling: Option<Rolling>,
+    sources: ProofSources,
+    proofs: ProofStore,
+    targets: ProofTargets,
+    /// The strongest trigger since the planner last ran.
+    pending: Option<Trigger>,
+    /// When the planner runs again if no event runs it first.
+    timer: Option<Nanos>,
     leanvm: LeanVm,
+    stats: Stats,
+    scratch: Box<Scratch>,
+    merge: Merge,
+    claim_check: ClaimCheck,
     next_request_id: u64,
-    leaf_round_trip: Timer,
-    merge_round_trip: Timer,
-    roll_round_trip: Timer,
-    reduce_round_trip: Timer,
+    round_trip: Timer,
 }
 
 impl Default for PqAggregator {
     fn default() -> Self {
         Self {
-            leaves: FxHashMap::default(),
-            merges: FxHashMap::default(),
-            merge_opens: None,
             block_imported: 0,
-            rolling: None,
-            changed: false,
+            sources: ProofSources::default(),
+            proofs: ProofStore::default(),
+            targets: ProofTargets::default(),
+            pending: None,
+            timer: None,
             leanvm: LeanVm::default(),
+            stats: Stats::default(),
+            scratch: Box::default(),
+            merge: Merge::default(),
+            claim_check: ClaimCheck::default(),
             next_request_id: 0,
-            leaf_round_trip: Timer::new("silver", "leanvm_prove"),
-            merge_round_trip: Timer::new("silver", "leanvm_merge"),
-            roll_round_trip: Timer::new("silver", "leanvm_roll"),
-            reduce_round_trip: Timer::new("silver", "leanvm_reduce"),
+            round_trip: Timer::new("silver", "leanvm_merge"),
         }
     }
 }
 
 impl PqAggregator {
-    /// Keeps one proof of the pooled votes not yet on chain, across slots.
-    pub fn enable_rolling(&mut self) {
-        self.rolling = Some(Rolling::default());
-    }
-
-    pub fn is_rolling(&self) -> bool {
-        self.rolling.is_some()
-    }
-
-    /// `last_position` is the last place a local aggregator of the vote's
-    /// committee holds in its aggregation committee. Votes are taken until
-    /// its cutoff and proved until its aggregate is due.
-    pub fn add_vote(&mut self, vote: VerifiedVote, last_position: u64, ticker: &SlotTicker) {
-        let leaf = LeafKey::new(&vote);
+    /// `last_position` is the last place a local aggregator holds in the
+    /// vote's aggregation committee. It determines the aggregate proof
+    /// deadline. Votes without a duty can still serve a local block proof.
+    /// The first eligible vote opens its aggregate-proof target.
+    pub fn add_vote(
+        &mut self,
+        vote: &VerifiedVote,
+        last_position: Option<u64>,
+        ticker: &SlotTicker,
+    ) {
+        let key = LeafKey::new(vote);
         if vote.committee_position >= vote.committee_len.min(MAX_VALIDATORS_PER_COMMITTEE) {
             let (committee_position, committee_len) = (vote.committee_position, vote.committee_len);
             silver_log::error!(
-                slot = leaf.slot,
+                slot = key.slot,
                 committee_position,
                 committee_len,
                 "vote outside committee"
             );
             return;
         }
-        if ticker.since_genesis() >= ticker.aggregation_cutoff(leaf.slot, last_position) {
-            silver_log::debug!(slot = leaf.slot, "vote after the aggregation cutoff");
+        if key.slot > ticker.current_slot().saturating_add(1) {
+            silver_log::debug!(slot = key.slot, "vote ahead of the PQ source window");
             return;
         }
-        // TODO: the aggregate due time stands in for the VC's pull. A VC that
-        // pulls later gets a proof frozen at the due time. Consider ending on
-        // the last local aggregator's pull instead.
-        let deadline = ticker.pq_aggregate_due(leaf.slot, last_position);
-        let aggregation = self.leaves.entry(leaf).or_insert_with(|| {
-            let data = SingleAttestationPqView::data(vote.single);
-            LeafAggregation::new(*data.as_bytes(), vote.committee_len, deadline)
-        });
-        let (position, signature) =
-            (vote.committee_position, SingleAttestationPqView::signature(vote.single));
-        let added = aggregation.add(Vote::new(position, vote.pubkey, vote.message, signature));
-        debug_assert!(added, "the position was checked against the largest committee");
-        self.changed = true;
+        let now = ticker.since_genesis();
+        let due =
+            last_position.map(|position| (position, ticker.pq_aggregate_due(key.slot, position)));
+        let aggregate_proof_due =
+            due.filter(|&(position, due)| now < self.stats.aggregate_proof_deadline(due, position));
+        if due.is_some() && aggregate_proof_due.is_none() {
+            silver_log::debug!(slot = key.slot, "vote after its aggregate proof's deadline");
+        }
+        if aggregate_proof_due.is_none() && !self.targets.block_wants_votes(key.slot) {
+            return;
+        }
+        if let Err(refused) = self.sources.add_vote(vote, &mut self.proofs) {
+            silver_log::debug!(slot = key.slot, ?refused, "vote not stored");
+            return;
+        }
+        if let Some((last_position, due)) = aggregate_proof_due {
+            self.targets.open_aggregate_proof(key, vote.committee(), due, last_position);
+        }
+        self.notify(Trigger::Event);
     }
 
-    /// `aggregate` is verified. It joins the merge of its attestation slot,
-    /// until the first block to include it is due or the rolling proof has
-    /// taken the merge in. A merge refuses it once it holds too many
-    /// committees.
-    ///
-    /// The merge is proved in the next slot, once that slot's block imports.
-    /// It stops waiting for a late block at the attestation deadline.
-    pub fn add_aggregate(&mut self, aggregate: Aggregate, ticker: &SlotTicker) {
-        BeaconStateCounters::PqMergeClaimsOffered.add(aggregate.claims.len() as u64);
-        let slot = aggregate.group.slot;
-        let deadline = ticker.slot_start(slot + MIN_ATTESTATION_INCLUSION_DELAY_PQ);
-        let awaited = self.rolling.as_ref().is_none_or(|rolling| rolling.awaits(slot));
-        if ticker.since_genesis() >= deadline || !awaited {
-            silver_log::debug!(slot, "aggregate after its slot's merge ended");
+    /// Only a newly stored aggregate triggers a pass.
+    pub fn add_aggregate(
+        &mut self,
+        attestation: &[u8],
+        attesters: &[u32],
+        claims: &[Claim],
+        proof: &[u8],
+        ticker: &SlotTicker,
+    ) {
+        let ceiling = ticker.current_slot().saturating_add(1);
+        let slot = (attestation.len() >= ATTESTATION_PQ_FIXED)
+            .then(|| AttestationPqView::data(attestation).slot());
+        if let Some(slot) = slot &&
+            slot > ceiling
+        {
+            BeaconStateCounters::PqMergeClaimsOffered.add(claims.len() as u64);
+            silver_log::debug!(slot, "aggregate ahead of the PQ source window");
             return;
         }
-        let opens = if self.block_imported > slot {
-            ticker.since_genesis()
-        } else {
-            ticker.slot_start(slot + 1) + Nanos(ticker.slot_start(1).0 / MERGE_WAIT_DIVISOR)
+        match self.sources.add_aggregate(attestation, attesters, claims, proof, &mut self.proofs) {
+            Ok(()) => self.notify(Trigger::Event),
+            Err(AggregateRefused::Malformed) => {
+                silver_log::error!(?slot, "verified aggregate does not fit a merge");
+            }
+            Err(refused) => {
+                let slot = slot.unwrap();
+                silver_log::debug!(slot, ?refused, "aggregate not stored");
+            }
+        }
+    }
+
+    /// A response to a request that is not in flight is logged and dropped.
+    /// A body that cannot be read counts as no answer.
+    pub fn on_response(&mut self, resp: LeanVmResp, now: Nanos, reader: &mut TCacheReader) {
+        let request_id = resp.request_id();
+        let Some(in_flight) = self.leanvm.take_answered(request_id) else {
+            silver_log::error!(request_id, "leanvm response to no request in flight");
+            return;
         };
-        self.merge_opens = Some(self.merge_opens.map_or(opens, |held| held.min(opens)));
-        let merge =
-            (self.merges.entry(slot)).or_insert_with(|| MergeAggregation::new(opens, deadline));
-        if !merge.add(aggregate) {
-            silver_log::warn!(slot, "aggregate dropped: the merge holds too many committees");
-            return;
+        if !matches!(resp, LeanVmResp::NoAnswer { .. }) {
+            self.round_trip.emit_latency_from_nanos(in_flight.timer_start, Nanos::now());
         }
-        self.changed = true;
-    }
-
-    /// A response to a request that is not in flight is ignored. A body that
-    /// cannot be read counts as no answer.
-    pub fn on_response(&mut self, resp: LeanVmResp, reader: &mut TCacheReader) {
-        let acquired = resp.body.map(|read| reader.acquire(read));
-        let body = acquired.as_ref().and_then(|acquired| acquired.buffer().ok());
-        if body.is_none() && acquired.is_some() {
-            silver_log::error!(request_id = resp.request_id, "leanvm response unreadable");
-        }
-        let Some((job, sent)) = self.leanvm.take_answered(resp.request_id) else { return };
-        if body.is_some() {
-            let round_trip = match job {
-                Job::Batch(AggregationKey::Leaf(_), _) => &mut self.leaf_round_trip,
-                Job::Batch(AggregationKey::Merge(_), _) => &mut self.merge_round_trip,
-                Job::Rolling(RollingJob::Roll { .. }) => &mut self.roll_round_trip,
-                Job::Rolling(RollingJob::Reduce { .. }) => &mut self.reduce_round_trip,
-            };
-            round_trip.emit_latency_from_nanos(sent, Nanos::now());
-        }
-        self.finish(job, body.map(|(body, _)| body));
-        self.changed = true;
+        let acquired;
+        let response = match resp {
+            LeanVmResp::Proven { claims, proof, body, .. } => {
+                // Hold the pin through settle so the checked bytes can replace the old proof.
+                acquired = reader.is_open(body.id()).then(|| reader.acquire_strict(body)).flatten();
+                let checked = acquired.as_ref().and_then(|read| {
+                    let (body, _) = read.buffer().ok()?;
+                    let proof = ProofLen { claims, proof }.split(body);
+                    read.revalidate().ok()?;
+                    Some(proof)
+                });
+                match checked {
+                    Some(Ok(proof)) => Ok(proof),
+                    Some(Err(reason)) => {
+                        silver_log::warn!(request_id, ?reason, "leanvm response refused");
+                        Err("malformed response")
+                    }
+                    None => {
+                        silver_log::error!(request_id, "leanvm response unreadable");
+                        Err("no answer")
+                    }
+                }
+            }
+            LeanVmResp::Refused { reason, .. } => {
+                silver_log::warn!(request_id, ?reason, "leanvm prover rejected the batch");
+                Err("rejected by the leanvm prover")
+            }
+            LeanVmResp::NoAnswer { .. } => Err("no answer"),
+        };
+        self.settle(in_flight, response, now);
+        self.notify(Trigger::Answer);
     }
 
     pub fn on_prover_ready(&mut self) {
-        self.leanvm.up();
-        self.changed = true;
+        self.leanvm.ready();
+        self.notify(Trigger::Event);
     }
 
-    /// Drops the aggregations of slots before `floor`. The request in flight
-    /// for one still occupies the prover until its response arrives.
-    ///
-    /// Called as slot `floor + 1` starts. The block of that slot may include
-    /// the `POOL_SLOTS` slots up to `floor - 1`.
+    /// Called as slot `floor + 1` starts. Its block may still take the votes
+    /// and aggregates of `POOL_SLOTS` slots before `floor`.
+    /// The in-flight request keeps the prover busy if its target is pruned.
     pub fn prune_before(&mut self, floor: Slot) {
-        self.leaves.retain(|leaf, _| leaf.slot >= floor);
-        self.merges.retain(|&slot, _| slot + MIN_ATTESTATION_INCLUSION_DELAY_PQ >= floor);
-        if let Some(rolling) = &mut self.rolling {
-            rolling.expire_before(floor.saturating_sub(POOL_SLOTS));
-        }
-        self.changed = true;
+        self.targets.prune_before(floor, &mut self.proofs);
+        self.sources.prune_before(floor.saturating_sub(POOL_SLOTS), &mut self.proofs);
+        self.notify(Trigger::Event);
     }
 
-    /// The merges of slots before `slot` open.
-    pub fn on_block_imported(&mut self, slot: Slot, ticker: &SlotTicker) {
+    /// An import can open older votes and aggregates for the next block proof.
+    pub fn on_block_imported(&mut self, slot: Slot) {
         self.block_imported = self.block_imported.max(slot);
-        let now = ticker.since_genesis();
-        (self.merges.iter_mut())
-            .filter(|(merged, _)| **merged < slot)
-            .for_each(|(_, merge)| merge.open_by(now));
-        self.changed = true;
+        self.notify(Trigger::Event);
     }
 
-    /// A block included the votes of `validators` for attestation slot
-    /// `slot`: the rolling proof no longer needs them.
+    /// Marks the votes of `validators` for attestation slot `slot` as included.
     pub fn on_chain(&mut self, slot: Slot, validators: &[u32]) {
-        if let Some(rolling) = &mut self.rolling {
-            rolling.include_on_chain(slot, validators);
-            self.changed = true;
+        if slot >= self.block_imported {
+            let imported = self.block_imported;
+            silver_log::error!(slot, imported, "on-chain PQ attestation did not precede its block");
+            return;
+        }
+        self.sources.include_on_chain(slot, validators, &mut self.proofs);
+        self.notify(Trigger::Event);
+    }
+
+    /// `slots` are the block slots of `proposal_window` a local validator
+    /// proposes.
+    pub fn set_local_proposals(&mut self, slots: &[Slot], is_gloas: bool, ticker: &SlotTicker) {
+        self.targets.set_local_proposals(slots, is_gloas, ticker);
+        self.notify(Trigger::Event);
+    }
+
+    /// Whether a local block may include the votes of attestation slot `slot`.
+    pub fn block_wants_votes(&self, slot: Slot) -> bool {
+        self.targets.block_wants_votes(slot)
+    }
+
+    /// The block slots at `wall_slot` whose proofs may take aggregates now.
+    /// The last is the last block whose pool holds `wall_slot`.
+    pub fn proposal_window(wall_slot: Slot) -> RangeInclusive<Slot> {
+        wall_slot + 1..=wall_slot + MIN_ATTESTATION_INCLUSION_DELAY_PQ - 1 + POOL_SLOTS
+    }
+
+    /// Keeps the stronger of `trigger` and the pending one.
+    fn notify(&mut self, trigger: Trigger) {
+        self.pending = Some(self.pending.map_or(trigger, |pending| pending.max(trigger)));
+    }
+
+    /// Brings the timer forward to `at`. `None` leaves it.
+    fn arm(&mut self, at: Option<Nanos>) {
+        if let Some(at) = at {
+            self.timer = Some(self.timer.map_or(at, |held| held.min(at)));
         }
     }
 
-    /// Sends a batch of the highest priority aggregation, if the prover is
-    /// idle. The tile calls it once per loop, after the events.
-    ///
-    /// It returns at once until an event changes state. A full tcache leaves
-    /// `changed` set, so the next loop retries. It is not a failure.
+    /// The tile calls this after processing the loop's events. A full tcache
+    /// preserves the planner's trigger for the next loop.
     pub fn send_next(
         &mut self,
         ticker: &SlotTicker,
@@ -275,146 +316,166 @@ impl PqAggregator {
         producers: &mut Producers,
     ) {
         let now = ticker.since_genesis();
-        if self.merge_opens.is_some_and(|opens| now >= opens) {
-            self.merge_opens = None;
-            self.changed = true;
+        if let LeanVm::Busy { in_flight, .. } = &self.leanvm {
+            self.stats.overdue(in_flight.predicted, now.saturating_sub(in_flight.sent));
         }
-        if !self.changed || !self.leanvm.is_idle() {
-            return;
-        }
-        let rolling_request = self.next_rolling_request(ticker, tcache);
-        if let Some(rolling) = &self.rolling {
-            BeaconStateCounters::PqMergedClaims.set(rolling.claims_len() as u64);
-        }
-        let (job, body) = if let Some((job, body)) = rolling_request {
-            // `None`: the tcache is full. The next loop retries.
-            let Some(body) = body else { return };
-            (Job::Rolling(job), body)
-        } else {
-            let Some(key) = self.highest_priority(now) else {
-                self.changed = false;
-                return;
-            };
-            // `None`: the tcache is full, or a strategy bug counted a failure.
-            // The next loop retries.
-            let Some((batch, body)) = self.write_request(key, now, tcache) else { return };
-            (Job::Batch(key, batch), body)
-        };
-        let request_id = self.next_request_id;
-        self.next_request_id += 1;
-        self.leanvm = LeanVm::Busy { request_id, job, sent: Nanos::now() };
-        producers.produce(LeanVmReq { request_id, body });
+        self.run_planner(now, ticker, tcache, producers);
     }
 
-    /// The next change to the rolling proof that needs the prover, with its
-    /// request written to `tcache`, or `None` for a full tcache.
-    /// Changes that need no proof are made here. It goes ahead of every
-    /// batch: there are at most two a slot, and a proposal waits on them.
-    ///
-    /// A slot's merge is taken in once it has nothing left to prove. The
-    /// merge itself stays, for a block whose rolling proof lacks that slot.
-    fn next_rolling_request(
+    fn planner(&self, now: Nanos) -> MergePlanner<'_> {
+        MergePlanner {
+            sources: &self.sources,
+            proofs: &self.proofs,
+            targets: &self.targets,
+            stats: &self.stats,
+            imported: self.block_imported,
+            now,
+        }
+    }
+
+    /// Returns the next gate of a target that still has no proof.
+    fn take_best_aggregates(&mut self, now: Nanos) -> Option<Nanos> {
+        let mut after = None;
+        while let Some(slot) = self.targets.next_bare_block_proof(after) {
+            after = Some(slot);
+            let planner = self.planner(now);
+            let Some(best) = planner.best_aggregate(slot) else { continue };
+            let id = best.proof;
+            let group = best.group;
+            self.targets.take_best_aggregate(slot, id, group, &mut self.proofs);
+        }
+        self.planner(now).best_aggregate_gate()
+    }
+
+    /// Runs the planner if a trigger is pending or the timer is due.
+    /// Block targets take their best aggregates even while the prover is busy.
+    /// With a busy prover the trigger is dropped until the answer arrives.
+    fn run_planner(
         &mut self,
+        now: Nanos,
         ticker: &SlotTicker,
         tcache: &mut TProducer,
-    ) -> Option<(RollingJob, Option<TCacheRead>)> {
-        let now = ticker.since_genesis();
-        let rolling = self.rolling.as_mut()?;
-        loop {
-            if let Some(groups) = rolling.next_reduction() {
-                let kept = claims_of(&groups);
-                let request = rolling.reduce_request(&kept)?;
-                let body = tcache.write_with(request.len(), |out| request.write(out));
-                return Some((RollingJob::Reduce { groups }, body));
-            }
-            let (&slot, merge) = (self.merges.iter())
-                .filter(|(slot, merge)| rolling.awaits(**slot) && merge.is_proved())
-                .min_by_key(|(slot, _)| **slot)?;
-            if merge.priority(now).is_some() {
-                return None;
-            }
-            let taken = merge.proved()?;
-            let Some(request) = rolling.roll_request(&taken) else {
-                rolling.start_with(slot, taken);
-                continue;
-            };
-            let body = tcache.write_with(request.len(), |out| request.write(out));
-            return Some((RollingJob::Roll { slot, taken }, body));
+        producers: &mut Producers,
+    ) {
+        if self.timer.is_some_and(|at| now >= at) {
+            self.timer = None;
+            self.notify(Trigger::Event);
         }
+        let Some(trigger) = self.pending.take() else { return };
+        let gate = self.take_best_aggregates(now);
+        if !self.leanvm.is_idle() {
+            self.arm(gate);
+            return;
+        }
+        let planner = MergePlanner {
+            sources: &self.sources,
+            proofs: &self.proofs,
+            targets: &self.targets,
+            stats: &self.stats,
+            imported: self.block_imported,
+            now,
+        };
+        let pass =
+            planner.plan_next_merge(trigger != Trigger::Answer, &mut self.scratch, &mut self.merge);
+        self.timer = pass.wake;
+        let Some(merge) = pass.sent else { return };
+        let Some(body) = tcache.write_with(self.merge.shape().request_bytes, |out| {
+            self.merge.write(out, planner.proofs, planner.sources)
+        }) else {
+            self.pending = Some(trigger);
+            return;
+        };
+        for id in self.merge.proof_ids() {
+            self.proofs.share(id);
+        }
+        let request_id = self.next_request_id;
+        self.next_request_id += 1;
+        let shape = self.merge.shape();
+        let predicted = self.stats.cost().predict(shape);
+        let sent = ticker.since_genesis();
+        let timer_start = Nanos::now();
+        let in_flight = InFlight { merge, predicted, sent, timer_start };
+        self.leanvm = LeanVm::Busy { request_id, in_flight };
+        producers.produce(self.merge.request(request_id, body, &self.proofs));
     }
 
+    /// A read without a target does not train the deadline estimate.
     pub fn aggregate(
-        &self,
+        &mut self,
         slot: Slot,
         committee_index: u64,
         data_root: B256,
+        ticker: &SlotTicker,
     ) -> Option<ProvedAggregate<'_>> {
-        self.leaves.get(&LeafKey { slot, committee_index, data_root })?.proved(committee_index)
+        let key = LeafKey { slot, committee_index, data_root };
+        self.notify(Trigger::Event);
+        let target = self.targets.aggregate_proofs().get(&key)?;
+        self.stats.aggregate_proof_read(key.slot, target.due, target.last_position, ticker);
+        target.proof.aggregate(&self.proofs)
+    }
+
+    pub fn on_block_proof_read(&mut self, block_slot: Slot, ticker: &SlotTicker) {
+        self.stats.block_proof_read(block_slot, ticker);
+        self.notify(Trigger::Event);
     }
 
     /// The attestations and proof for the body of the block at `slot`.
     pub fn block_proof(&self, slot: Slot) -> Option<(Vec<Vec<u8>>, &[u8])> {
-        let newest = slot.checked_sub(MIN_ATTESTATION_INCLUSION_DELAY_PQ)?;
-        let merged = self.merges.get(&newest).and_then(|merge| merge.block_proof());
-        let Some(rolling) = &self.rolling else { return merged };
-        // The rolling proof lacks the newest slot until its roll is proved,
-        // and for good if that roll failed.
-        rolling.block_proof_through(newest).or(merged).or_else(|| rolling.block_proof(slot))
+        self.targets.block_proof(slot, &self.proofs)
     }
 
-    /// A pruned aggregation drops its batch.
-    fn finish(&mut self, job: Job, body: Option<&[u8]>) {
-        let (key, batch) = match job {
-            Job::Batch(key, batch) => (key, batch),
-            Job::Rolling(job) => {
-                let finished = self.rolling.as_mut().map(|rolling| rolling.finish(job, body));
-                if let Some(Err(reason)) = finished {
-                    silver_log::warn!(reason, "rolling proof request failed");
-                }
-                return;
-            }
-        };
-        let rolls = self.rolling.is_some();
-        let settled = match key {
-            AggregationKey::Leaf(leaf) => (self.leaves.get_mut(&leaf))
-                .map(|leaf| (leaf.finish(batch, body), leaf.core.is_stopped())),
-            AggregationKey::Merge(slot) => self.merges.get_mut(&slot).map(|merge| {
-                let finished = merge.finish(batch, body);
-                if let (false, Some((claims, _))) = (rolls, merge.core.best_proof()) {
-                    BeaconStateCounters::PqMergedClaims.set(claims.len() as u64);
-                }
-                (finished, merge.core.is_stopped())
-            }),
-        };
-        let Some((Err(reason), stopped)) = settled else { return };
-        let slot = key.slot();
-        silver_log::warn!(slot, reason, "aggregation batch failed");
-        if stopped {
-            silver_log::warn!(slot, "aggregation stopped after repeated failures");
-        }
-    }
-
-    /// The next batch of `key`, with its request written to `tcache`.
-    fn write_request(
+    /// The log line allows reconstructing each request's cost.
+    /// Only requests that produce a proof train the model, since refusals may
+    /// skip proving.
+    fn settle(
         &mut self,
-        key: AggregationKey,
+        in_flight: InFlight,
+        response: Result<ProofBody<'_>, &'static str>,
         now: Nanos,
-        tcache: &mut TProducer,
-    ) -> Option<(Batch, TCacheRead)> {
-        match key {
-            AggregationKey::Leaf(leaf) => self.leaves.get_mut(&leaf)?.next_request(now, tcache),
-            AggregationKey::Merge(slot) => self.merges.get_mut(&slot)?.next_request(now, tcache),
+    ) {
+        let InFlight { merge, predicted, sent, .. } = in_flight;
+        let shape = *self.merge.shape();
+        let slot = Some(merge.key.slot());
+        let finished = self.targets.settle(
+            &merge.key,
+            response,
+            self.merge.running_id(),
+            &mut self.proofs,
+            &mut self.claim_check,
+            |proofs, visit| self.merge.visit_members(proofs, &self.sources, visit),
+        );
+        for id in self.merge.proof_ids() {
+            self.proofs.release(id);
         }
-    }
-
-    /// Ties go to the lower key, so the order is total and deterministic.
-    fn highest_priority(&self, now: Nanos) -> Option<AggregationKey> {
-        let leaves = self.leaves.iter().filter_map(|(&leaf, aggregation)| {
-            Some((aggregation.priority(now)?, Reverse(AggregationKey::Leaf(leaf))))
-        });
-        let merges = self.merges.iter().filter_map(|(&slot, aggregation)| {
-            Some((aggregation.priority(now)?, Reverse(AggregationKey::Merge(slot))))
-        });
-        leaves.chain(merges).max().map(|(_, Reverse(key))| key)
+        let late = finished.is_ok() && now > merge.deadline;
+        let round_trip = now.saturating_sub(sent);
+        let q = self.stats.cost().margin();
+        let ratio = self.stats.record_answer(&shape, predicted, round_trip, finished.is_ok());
+        let MergeShape { idle, proofs, signatures, claims_in, request_bytes } = shape;
+        let claims_out = *finished.as_ref().unwrap_or(&0);
+        let (round_trip_ms, predicted_ms) = (round_trip.as_millis(), predicted.as_millis());
+        let outcome = if late { "late" } else { finished.err().unwrap_or("ok") };
+        let target = merge.key.name();
+        let (groups, new_votes) = (merge.groups, merge.new_votes);
+        let slack_ms = merge.horizon.as_millis() - now.as_millis();
+        silver_log::debug!(
+            target,
+            slot,
+            groups,
+            new_votes,
+            slack_ms,
+            idle,
+            proofs,
+            signatures,
+            claims_in,
+            claims_out,
+            request_bytes,
+            round_trip_ms,
+            predicted_ms,
+            q,
+            ratio,
+            outcome,
+            "leanvm merge"
+        );
     }
 }

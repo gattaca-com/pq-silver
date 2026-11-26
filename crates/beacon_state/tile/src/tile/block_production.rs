@@ -1041,6 +1041,7 @@ impl BeaconStateTile {
             packed.clear();
             self.slashing_pool.select(&pre_state, &mut packed.slashings);
             if let Some(rewards) = &rewards {
+                self.pq_aggregator.on_block_proof_read(proposal.slot, &self.ticker);
                 packed.pack_merge(&self.pq_aggregator, rewards, proposal.slot);
             }
             return;

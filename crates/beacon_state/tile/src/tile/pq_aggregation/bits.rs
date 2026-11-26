@@ -14,10 +14,37 @@ impl Bits {
         fresh
     }
 
+    pub fn contains(&self, position: usize) -> bool {
+        self.0[position / 64] >> (position % 64) & 1 == 1
+    }
+
+    pub fn iter(&self) -> impl Iterator<Item = usize> {
+        self.0.iter().enumerate().flat_map(|(index, &word)| {
+            let mut word = word;
+            std::iter::from_fn(move || {
+                if word == 0 {
+                    return None;
+                }
+                let bit = word.trailing_zeros() as usize;
+                word &= word - 1;
+                Some(index * 64 + bit)
+            })
+        })
+    }
+
     /// How many of these `have` lacks.
     pub fn count_outside(&self, have: &Bits) -> usize {
         let outside = self.0.iter().zip(&have.0).map(|(word, have)| word & !have);
         outside.map(|word| word.count_ones() as usize).sum()
+    }
+
+    pub fn count(&self) -> usize {
+        self.0.iter().map(|word| word.count_ones() as usize).sum()
+    }
+
+    pub(super) fn outside(mut self, held: &Self) -> Self {
+        self.0.iter_mut().zip(&held.0).for_each(|(word, held)| *word &= !held);
+        self
     }
 
     pub fn union_with(&mut self, other: &Bits) {

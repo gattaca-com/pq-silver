@@ -1,5 +1,6 @@
 use silver_beacon_state_data::{
-    BUILDER_INDEX_SELF_BUILD, EpochState, FinalizedValidators, Fork, HashFormat, ValidatorsGroup,
+    AGGREGATORS_PER_COMMITTEE, BUILDER_INDEX_SELF_BUILD, EpochState, FinalizedValidators, Fork,
+    HashFormat, ValidatorsGroup,
     pq::PQ_FORK_VERSION,
     xmss::{
         LeafOffset, SignatureCheck, compute_xmss_attestation_leaf_index, compute_xmss_leaf_index,
@@ -313,11 +314,13 @@ fn proposer_slashing_needs_both_signatures() {
 /// A vote for a block not yet seen waits for it unrelayed, then counts in
 /// fork choice and reaches the aggregator of its subnet.
 #[test]
-fn unknown_root_vote_counts_and_is_aggregated_once_its_block_imports() {
+fn unknown_root_vote_is_merged_once_its_block_imports() {
     let key = SecretKey::new(&[7; 32]);
     let pubkey = key.public_key();
     let wall_slot = 31;
     let (mut tile, mut gossip, _spine, mut adapter) = pq_tile(&pubkey, 0, wall_slot);
+    let now = tile.ticker.slot_start(wall_slot).as_millis_u64() + 1_000;
+    tile.ticker.set_since_genesis_ms(now);
     tile.unknown_root_pq_votes.on_slot(wall_slot);
     adapter.consume(|_: PeerEvent, _| {});
     adapter.consume(|_: SyncNeed, _| {});
@@ -353,9 +356,6 @@ fn unknown_root_vote_counts_and_is_aggregated_once_its_block_imports() {
     adapter.consume(|_: LeanVmReq, _| requests += 1);
     assert_eq!(requests, 0);
 
-    // XMSS signing is slow; keep the clock before the aggregation cutoff.
-    let before_cutoff = tile.ticker.aggregation_cutoff(wall_slot, 0).as_millis_u64() - 1;
-    tile.ticker.set_since_genesis_ms(before_cutoff);
     tile.fork_choice
         .on_block(BlockImport { slot: wall_slot, ..anchor_child(late, tile.last_applied) });
     tile.promote_unknown_root_votes(&mut adapter.producers);
@@ -365,7 +365,7 @@ fn unknown_root_vote_counts_and_is_aggregated_once_its_block_imports() {
     assert_eq!(voted_weight(&mut tile, late), MAX_EFFECTIVE_BALANCE);
     assert!(buffered(&tile).is_none(), "promoted once");
     adapter.consume(|_: LeanVmReq, _| requests += 1);
-    assert_eq!(requests, 1, "the leaf goes to the prover");
+    assert_eq!(requests, 1, "the vote goes to the prover");
 }
 
 const AGGREGATE_SLOT: Slot = 2 * SLOTS_PER_EPOCH;
@@ -456,37 +456,44 @@ impl PqAggregate {
     }
 }
 
-/// A proven aggregate goes to the prover again, as a merge, only when a
-/// validator registered here proposes the first block to include it.
+/// A local proposal can take a proven aggregate as its block proof.
+/// This includes aggregates published by this node.
 #[test]
-fn proven_aggregate_is_merged_for_a_local_proposal_that_packs_it() {
+fn a_proven_aggregate_serves_a_local_proposal() {
     let key = SecretKey::new(&[7; 32]);
-    for (local, justified_source) in [(false, true), (true, true), (true, false)] {
+    let block = AGGREGATE_SLOT + 2;
+    let cases =
+        [(true, false, true), (false, false, true), (true, true, true), (true, false, false)];
+    for (local, published_here, justified_source) in cases {
         let (mut tile, mut gossip, _spine, mut adapter) =
             pq_tile(&key.public_key(), 0, AGGREGATE_SLOT + 1);
-        // A frozen clock past the merge's 3 s wait, so the test does not race it.
-        let merge_open_ms = tile.ticker.slot_start(AGGREGATE_SLOT + 1).as_millis_u64() + 4_000;
-        tile.ticker.set_since_genesis_ms(merge_open_ms);
         adapter.consume(|_: LeanVmReq, _| {});
-        // Every validator shares one key, so two votes would be one claim.
         let mut aggregate = PqAggregate::of_committee_zero_votes(&mut tile, 1);
         if !justified_source {
             aggregate.signed[SOURCE_ROOT_AT] ^= 1;
         }
         aggregate.sign(&key, LeafOffset::AggregateAndProof);
-        // The proposer lookahead of the anchor state ends before the block.
         tile.last_applied = tile.epoch_start_state(tile.last_applied, AGGREGATE_SLOT);
-        let proposer = tile.proposer_on_head(AGGREGATE_SLOT + 2).expect("within the lookahead");
+        let proposer = tile.proposer_on_head(block).expect("within the lookahead");
         if local {
             let mut preparation = [0; ProposerPreparation::SIZE];
             ProposerPreparation { validator_index: proposer, fee_recipient: [1; 20] }
                 .encode(&mut preparation);
             tile.proposer_preparations.record(&preparation, 2);
+            tile.set_pq_local_proposals();
+        } else {
+            // The target exists, so only the claims not kept leave it empty.
+            tile.pq_aggregator.set_local_proposals(&[block], false, &tile.ticker);
         }
-        assert_eq!(tile.proposes_locally(AGGREGATE_SLOT + 2), local);
+
+        assert_eq!(tile.proposes_locally(block), local);
 
         let signed = &aggregate.signed;
-        let msg = pq_gossip_msg(&tile, &mut gossip, signed, GossipTopic::BeaconAggregateAndProof);
+        let topic = GossipTopic::BeaconAggregateAndProof;
+        let mut msg = pq_gossip_msg(&tile, &mut gossip, signed, topic);
+        if published_here {
+            msg.stream_id = LOCAL_GOSSIP_STREAM_ID;
+        }
         tile.leanvm_verifier = LeanVmVerifier::Fixed(true);
         tile.handle_gossip(msg.ssz, msg, true, false, &mut adapter.producers);
         adapter.consume(|_: LeanVmReq, _| {});
@@ -494,9 +501,18 @@ fn proven_aggregate_is_merged_for_a_local_proposal_that_packs_it() {
         tile.pq_aggregator.on_prover_ready();
         let tcache = &mut tile.events_producer;
         tile.pq_aggregator.send_next(&tile.ticker, tcache, &mut adapter.producers);
-        let mut merges = 0;
-        adapter.consume(|_: LeanVmReq, _| merges += 1);
-        assert_eq!(merges, usize::from(local && justified_source));
+        let mut requests = 0;
+        adapter.consume(|_: LeanVmReq, _| requests += 1);
+        assert_eq!(requests, 0, "one aggregate needs no request");
+        let proof = tile.pq_aggregator.block_proof(block);
+        assert_eq!(
+            proof.is_some(),
+            local && justified_source,
+            "local {local}, published here {published_here}, justified source {justified_source}"
+        );
+        if let Some((attestations, proof)) = proof {
+            assert_eq!((attestations.len(), proof), (1, &b"proof"[..]));
+        }
     }
 }
 
@@ -582,5 +598,96 @@ fn envelope_for_an_unseen_block_parks_only_with_its_signature() {
         );
         assert_eq!(matches!(feedback, Feedback::Reject { .. }), !parked);
         assert_eq!(tile.pending_envelopes.holds(&block_root), parked);
+    }
+}
+
+/// A verified vote with no aggregator duty and an optional local block target.
+/// A validator registered here proposes either way.
+struct GapVote {
+    tile: BeaconStateTile,
+    adapter: SpineAdapter<SilverSpine>,
+    _gossip: TProducer,
+    _spine: TestSpine,
+}
+
+impl GapVote {
+    const SLOT: Slot = 31;
+    /// A block that may include the votes of `SLOT`.
+    const WANTS_SLOT: Slot = Self::SLOT + 2;
+    const UNKNOWN_ROOT: B256 = [0x42; 32];
+
+    fn new(block: Option<Slot>, unknown_root: bool) -> Self {
+        let key = SecretKey::new(&[7; 32]);
+        let (mut tile, mut gossip, spine, mut adapter) = pq_tile(&key.public_key(), 0, Self::SLOT);
+        tile.unknown_root_pq_votes.on_slot(Self::SLOT);
+        adapter.consume(|_: PeerEvent, _| {});
+        adapter.consume(|_: SyncNeed, _| {});
+        adapter.consume(|_: LeanVmReq, _| {});
+        let mut preparation = [0; ProposerPreparation::SIZE];
+        ProposerPreparation { validator_index: 0, fee_recipient: [1; 20] }.encode(&mut preparation);
+        tile.proposer_preparations.record(&preparation, 2);
+        if let Some(block) = block {
+            tile.pq_aggregator.set_local_proposals(&[block], false, &tile.ticker);
+        }
+
+        let validator = (0..VALIDATORS as u32)
+            .find(|&validator| find_committee_for(&tile, validator).0 == Self::SLOT)
+            .expect("a validator attests at the wall slot");
+        let root = if unknown_root { Self::UNKNOWN_ROOT } else { tile.head_block_root() };
+        let (bytes, subnet) = signed_attestation(&tile, &key, validator, 0, root);
+        let msg = pq_gossip_msg(&tile, &mut gossip, &bytes, GossipTopic::BeaconAttestation(subnet));
+        tile.on_gossip(msg, &mut adapter.producers);
+        tile.flush_votes(&mut adapter.producers);
+        Self { tile, adapter, _gossip: gossip, _spine: spine }
+    }
+
+    fn import_the_unknown_block(&mut self) {
+        let tile = &mut self.tile;
+        let block =
+            BlockImport { slot: Self::SLOT, ..anchor_child(Self::UNKNOWN_ROOT, tile.last_applied) };
+        tile.fork_choice.on_block(block);
+        tile.promote_unknown_root_votes(&mut self.adapter.producers);
+    }
+
+    fn assert_buffered_attester_only(&mut self) {
+        let buffer = &mut self.tile.unknown_root_pq_votes;
+        let votes =
+            buffer.take(buffer.next_with_known_block(0, |_| true).expect("a buffered vote"));
+        assert_eq!(votes.attesters.len(), 1);
+        assert!(votes.aggregated.is_empty());
+    }
+
+    fn requests_at_the_vote_gate(&mut self) -> usize {
+        let tile = &mut self.tile;
+        let gate = tile.ticker.pq_aggregate_due(Self::SLOT, AGGREGATORS_PER_COMMITTEE as u64 - 1);
+        tile.ticker.set_since_genesis_ms(gate.as_millis_u64());
+        tile.pq_aggregator.on_prover_ready();
+        let tcache = &mut tile.events_producer;
+        tile.pq_aggregator.send_next(&tile.ticker, tcache, &mut self.adapter.producers);
+        let mut requests = 0;
+        self.adapter.consume(|_: LeanVmReq, _| requests += 1);
+        requests
+    }
+}
+
+#[test]
+fn a_vote_with_no_duty_is_stored_for_a_local_block_that_wants_its_slot() {
+    let wants = Some(GapVote::WANTS_SLOT);
+    assert_eq!(GapVote::new(wants, false).requests_at_the_vote_gate(), 1);
+    let no_block = GapVote::new(None, false).requests_at_the_vote_gate();
+    assert_eq!(no_block, 0, "no local block wants the slot");
+}
+
+#[test]
+fn a_buffered_vote_with_no_duty_is_stored_once_its_block_imports() {
+    let mut gap_vote = GapVote::new(Some(GapVote::WANTS_SLOT), true);
+    gap_vote.import_the_unknown_block();
+    assert_eq!(gap_vote.requests_at_the_vote_gate(), 1);
+}
+
+#[test]
+fn the_buffer_keeps_no_vote_with_no_duty_without_a_block_that_can_include_it() {
+    for proposal in [None, Some(GapVote::SLOT + 1)] {
+        GapVote::new(proposal, true).assert_buffered_attester_only();
     }
 }

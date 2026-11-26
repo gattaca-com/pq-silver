@@ -7,7 +7,7 @@ use silver_beacon_state_data::{
     SYNC_SUBCOMMITTEE_SIZE, ShufflingId, Slot, SpecConfig, StateId, StateReadView,
     SyncSubcommittee,
     bls::{self, CheckedSignature, PublicKey, Signature, VerifiedSingleAttestation},
-    pq::{MIN_ATTESTATION_INCLUSION_DELAY_PQ, xmss_pubkey},
+    pq::xmss_pubkey,
     xmss::SignatureCheck,
 };
 use silver_common::{
@@ -43,7 +43,7 @@ use super::{
     fork_data_roots::ForkDataRoots,
     held_blocks::BlockSourceMsg,
     pending_envelopes::{BLOCK_WAIT_SLOTS, ParkedEnvelope, ParkedKind, UnverifiedEnvelope},
-    pq_aggregation::{Aggregate, Claim, VerifiedVote, claim},
+    pq_aggregation::{VerifiedVote, claim},
     seen_aggregates::Coverage,
     seen_proposer_preferences::ProposerPreferences,
     shuffling_cache::ShufflingRequest,
@@ -174,6 +174,7 @@ impl PreparedPqAttestation {
             data_root: self.data_root,
             message: self.signing_root,
             pubkey: self.pubkey,
+            validator: self.checked.attester,
             committee_position: self.checked.committee_position,
             committee_len: self.checked.committee_len,
         }
@@ -321,7 +322,6 @@ pub(super) struct BatchedVote {
 
 struct PqAggregateVotes {
     target: stf::VoteTarget,
-    attesters: Vec<u32>,
     committee_index: u64,
     data_root: B256,
     aggregator_index: usize,
@@ -801,16 +801,18 @@ impl BeaconStateTile {
     }
 
     /// A vote waiting for its block or payload is buffered until it arrives.
-    /// A local aggregator on the vote's subnet also proves it.
+    /// A local aggregator on the vote's subnet also proves it, and so may a
+    /// local block that wants its slot. No subnet is joined for the block.
     fn commit_pq_attestation(&mut self, p: PreparedPqAttestation) -> Feedback {
         let checked = p.checked;
         let target = checked.target;
         self.arrival_timers.attestation(target.attestation_slot, &self.ticker);
         self.seen_attesters.mark(target.target_epoch, checked.attester as usize);
-        let aggregates = self.aggregator_subnets.aggregates(target.attestation_slot, p.subnet);
+        let proves = self.aggregator_subnets.aggregates(target.attestation_slot, p.subnet) ||
+            self.pq_aggregator.block_wants_votes(target.attestation_slot);
         if checked.attested.is_ready() {
             self.record_votes(target, std::slice::from_ref(&checked.attester));
-            if aggregates {
+            if proves {
                 self.aggregate_pq_vote(&p);
             }
             return Feedback::Accept;
@@ -823,7 +825,7 @@ impl BeaconStateTile {
             data_root,
             checked.shuffling,
             checked.attester,
-            aggregates.then_some(p),
+            proves.then_some(p),
         );
         self.buffered_vote_feedback(
             new_data,
@@ -835,8 +837,10 @@ impl BeaconStateTile {
 
     fn aggregate_pq_vote(&mut self, p: &PreparedPqAttestation) {
         let slot = p.checked.target.attestation_slot;
-        let Some(position) = self.aggregator_subnets.last_position(slot, p.subnet) else { return };
-        self.pq_aggregator.add_vote(p.verified_vote(), position, &self.ticker);
+        let position = self.aggregator_subnets.last_position(slot, p.subnet);
+        if position.is_some() || self.pq_aggregator.block_wants_votes(slot) {
+            self.pq_aggregator.add_vote(&p.verified_vote(), position, &self.ticker);
+        }
     }
 
     fn record_votes(&mut self, target: stf::VoteTarget, attesters: &[u32]) {
@@ -2494,14 +2498,7 @@ impl BeaconStateTile {
         }
         self.arrival_timers.aggregate(votes.target.attestation_slot, &self.ticker);
 
-        // The rolling proof serves any later local proposal. Without it only
-        // the first block to include the aggregate uses it.
-        let merges = if self.pq_aggregator.is_rolling() {
-            self.has_local_proposers()
-        } else {
-            let block_slot = votes.target.attestation_slot + MIN_ATTESTATION_INCLUSION_DELAY_PQ;
-            self.proposes_locally(block_slot)
-        };
+        let merges = self.has_local_proposers();
 
         let data = SignedAggregateAndProofPqView::agg_data(signed);
         // One proof covers a block's attestations, so a vote the block may
@@ -2510,14 +2507,17 @@ impl BeaconStateTile {
         let view = self.state.read_view(state_id);
         let domain = Self::attester_domain(&self.spec, &mut self.fork_data_roots, &view, data);
         let (_, message) = self.attestation_root_memo.roots(data.as_bytes(), &domain);
-        let claims = votes.attesters.iter().map(|&attester| {
+        let attesters = &self.stf_scratch.active;
+        let claims = attesters.iter().map(|&attester| {
             claim(xmss_pubkey(view.validators.pubkey(attester as usize)), &message)
         });
-        let merge_claims = merges.then(|| claims.clone().collect());
+        if merges && let Some(out) = self.pq_claims.get_mut(..attesters.len()) {
+            out.iter_mut().zip(claims.clone()).for_each(|(out, claim)| *out = claim);
+        }
         if !self.leanvm_verifier.verify(claims, SignedAggregateAndProofPqView::proof(signed)) {
             return Feedback::reject("STARK proof invalid");
         }
-        self.commit_pq_aggregate(signed, votes, coverage, merge_claims)
+        self.commit_pq_aggregate(signed, votes, coverage, merges)
     }
 
     fn check_pq_aggregate(
@@ -2574,10 +2574,10 @@ impl BeaconStateTile {
         if merkle::bitlist_len(bits) != shuffling.committee(slot, committee_index).len() {
             return Err(Feedback::reject("aggregate bits do not match committee size"));
         }
-        let mut attesters = Vec::new();
+        let attesters = &mut self.stf_scratch.active;
         let aggregate = SignedAggregateAndProofPqView::aggregate(signed);
         if stf::AttestedCommittees::new(aggregate, true, &shuffling)
-            .and_then(|committees| committees.attesters_into(count, &mut attesters))
+            .and_then(|committees| committees.attesters_into(count, attesters))
             .is_err() ||
             attesters.is_empty()
         {
@@ -2591,7 +2591,6 @@ impl BeaconStateTile {
                 attestation_slot: slot,
                 payload_present,
             },
-            attesters,
             committee_index: committee_index as u64,
             data_root,
             aggregator_index,
@@ -2660,7 +2659,7 @@ impl BeaconStateTile {
         signed: &[u8],
         aggregate: PqAggregateVotes,
         coverage: Coverage,
-        merge_claims: Option<Vec<Claim>>,
+        merges: bool,
     ) -> Feedback {
         let target = aggregate.target;
         let (slot, committee_index) = (target.attestation_slot, aggregate.committee_index);
@@ -2671,18 +2670,20 @@ impl BeaconStateTile {
         if coverage != Coverage::ByUnion {
             self.fork_choice.record_or_defer_votes(
                 target,
-                &aggregate.attesters,
+                &self.stf_scratch.active,
                 self.head_validator_count(),
                 self.ticker.current_slot(),
             );
         }
-        if let Some(claims) = merge_claims {
-            let proof = SignedAggregateAndProofPqView::proof(signed).to_vec();
-            let attestation = SignedAggregateAndProofPqView::aggregate(signed);
-            match Aggregate::new(attestation, &aggregate.attesters, claims, proof) {
-                Some(merged) => self.pq_aggregator.add_aggregate(merged, &self.ticker),
-                None => silver_log::error!(slot, "verified aggregate does not fit a merge"),
-            }
+        if merges {
+            let attesters = &self.stf_scratch.active;
+            self.pq_aggregator.add_aggregate(
+                SignedAggregateAndProofPqView::aggregate(signed),
+                attesters,
+                self.pq_claims.get(..attesters.len()).unwrap_or_default(),
+                SignedAggregateAndProofPqView::proof(signed),
+                &self.ticker,
+            );
         }
         Feedback::Accept
     }

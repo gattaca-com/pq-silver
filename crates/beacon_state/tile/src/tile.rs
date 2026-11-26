@@ -14,13 +14,14 @@ use silver_beacon_state_data::{
 };
 use silver_common::{
     BeaconApiRequest, BeaconApiResponse, BeaconStateEvent, BlockSource, BuilderBidsResponse,
-    DataColumnsEvent, DataKind, EngineResp, GossipTopic, HeadChange, HeadRoots, LeanVmHealthEvent,
+    DataColumnsEvent, DataKind, EngineResp, GossipTopic, HeadChange, HeadRoots, LeanVmReady,
     LeanVmResp, NewGossipMsg, Origin, PayloadResolution, PayloadValidationStatus,
     ProduceBlockFailure, PtcObservation, ReplayBlock, RequestId, RpcInbound, RpcResponse,
     RpcResponseInbound, SidecarBidResponse, SilverSpine, SyncNeed, SyncUpdate, TCacheError,
     TCacheId, TCacheProducer, TCacheRead, TCacheReader, TCacheTable, TProducer, TReadMode, TileId,
     hex32,
-    ssz_view::{STATUS_V2_SIZE, SYNC_COMMITTEE_CONTRIBUTION_SIZE},
+    leanvm::MAX_REQUEST_LEN,
+    ssz_view::{MAX_VALIDATORS_PER_COMMITTEE, STATUS_V2_SIZE, SYNC_COMMITTEE_CONTRIBUTION_SIZE},
     ticker::{MAXIMUM_GOSSIP_CLOCK_DISPARITY, SlotTicker, TickEvent},
     wake_within,
 };
@@ -48,7 +49,7 @@ use crate::{
         payload_attributes::PayloadAttributes,
         payload_execution_requests::PayloadExecutionRequests,
         pending_envelopes::{BLOCK_WAIT_SLOTS, PendingEnvelopes},
-        pq_aggregation::{PqAggregator, wire::MAX_REQUEST_LEN},
+        pq_aggregation::{Claim, PqAggregator},
         precomputed_epochs::PrecomputedEpochs,
         proposer_preparations::ProposerPreparations,
         seen_aggregates::SeenAggregates,
@@ -284,6 +285,7 @@ pub struct BeaconStateTile {
     payload_execution_requests: PayloadExecutionRequests,
     payload_attestation_pool: PayloadAttestationPool,
     pq_aggregator: PqAggregator,
+    pq_claims: Box<[Claim]>,
     arrival_timers: ArrivalTimers,
     aggregator_subnets: AggregatorSubnets,
     leanvm_verifier: LeanVmVerifier,
@@ -388,6 +390,8 @@ impl BeaconStateTile {
             payload_execution_requests: PayloadExecutionRequests::default(),
             payload_attestation_pool: PayloadAttestationPool::default(),
             pq_aggregator: PqAggregator::default(),
+            pq_claims: vec![[0; size_of::<Claim>()]; MAX_VALIDATORS_PER_COMMITTEE]
+                .into_boxed_slice(),
             arrival_timers: ArrivalTimers::new(),
             aggregator_subnets: AggregatorSubnets::default(),
             leanvm_verifier: LeanVmVerifier::default(),
@@ -400,12 +404,6 @@ impl BeaconStateTile {
         tile.seed_anchor(anchor, anchor_header, val_cap);
         silver_log::info!("created BeaconStateTile: head_state_slot is {}", tile.head_state_slot());
         tile
-    }
-
-    /// Keeps a rolling proof of pooled PQ votes for local proposals. Off, a
-    /// proposal includes only the newest slot it may.
-    pub fn enable_pq_rolling_aggregate(&mut self) {
-        self.pq_aggregator.enable_rolling();
     }
 
     pub fn open_tcaches(&mut self) -> Result<(), TCacheError> {
@@ -730,7 +728,8 @@ impl BeaconStateTile {
     ) {
         let events = &mut self.events_producer;
         let written = if self.spec.is_pq_at_slot(slot) {
-            let aggregate = self.pq_aggregator.aggregate(slot, committee_index, data_root);
+            let aggregate =
+                self.pq_aggregator.aggregate(slot, committee_index, data_root, &self.ticker);
             aggregate.map(|aggregate| {
                 events.write_with(aggregate.ssz_len(), |buffer| aggregate.write_ssz(buffer))
             })
@@ -923,6 +922,19 @@ impl BeaconStateTile {
         self.shuffling_cache.precompute(&view, epoch + 1);
     }
 
+    /// Proposers are read off the head, so a new head may change them. A
+    /// syncing head may not reach the coming slots.
+    fn set_pq_local_proposals(&mut self) {
+        if self.sync_target.is_syncing() || !self.has_local_proposers() {
+            return;
+        }
+        let wall_slot = self.ticker.current_slot();
+        let window = PqAggregator::proposal_window(wall_slot);
+        let slots: Vec<_> = window.filter(|&slot| self.proposes_locally(slot)).collect();
+        let is_gloas = self.spec.is_gloas_at_slot(wall_slot);
+        self.pq_aggregator.set_local_proposals(&slots, is_gloas, &self.ticker);
+    }
+
     fn on_fc_lookahead(&mut self, _slot: Slot) {
         // Pre-emptive get_head for next slot.
         // TODO: self.get_head() and cache result
@@ -955,6 +967,7 @@ impl BeaconStateTile {
         self.seen_aggregates.prune_before(floor);
         self.attestation_root_memo.prune_before(floor);
         self.pq_aggregator.prune_before(floor);
+        self.set_pq_local_proposals();
         self.payload_bids_pool.on_slot(slot);
         self.seen_proposer_preferences.on_slot(slot);
         self.envelope_arrivals.on_slot(slot);
@@ -1188,9 +1201,10 @@ impl BeaconStateTile {
             self.handle_engine_response(eng_resp, producers);
         });
 
-        adapter.consume(|_: LeanVmHealthEvent, _| self.pq_aggregator.on_prover_ready());
-        adapter
-            .consume(|resp: LeanVmResp, _| self.pq_aggregator.on_response(resp, &mut self.reader));
+        adapter.consume(|_: LeanVmReady, _| self.pq_aggregator.on_prover_ready());
+        adapter.consume(|resp: LeanVmResp, _| {
+            self.pq_aggregator.on_response(resp, self.ticker.since_genesis(), &mut self.reader);
+        });
 
         adapter.consume(|answer: SidecarBidResponse, producers| {
             self.on_sidecar_bid(answer, producers);
@@ -1543,9 +1557,9 @@ impl Tile<SilverSpine> for BeaconStateTile {
         adapter.subscribe_broadcast::<ReplayBlock>();
         // Read only once Following; requests made while syncing must wait.
         adapter.subscribe_broadcast::<BeaconApiRequest>();
-        // Readiness is published once per change, possibly before this
-        // tile's first loop. A missed `ready` would keep the aggregator down.
-        adapter.subscribe_broadcast::<LeanVmHealthEvent>();
+        // Published once, possibly before this tile's first loop. A missed
+        // event would leave the aggregator waiting for the prover.
+        adapter.subscribe_broadcast::<LeanVmReady>();
     }
 
     fn try_init(&mut self, adapter: &mut SpineAdapter<SilverSpine>) -> bool {
@@ -1573,6 +1587,7 @@ impl Tile<SilverSpine> for BeaconStateTile {
         }
         if self.fork_choice.take_head_moved() {
             self.announce_head_change(&mut adapter.producers);
+            self.set_pq_local_proposals();
         }
 
         // After every event, so a request goes out in the iteration that unlocked it.

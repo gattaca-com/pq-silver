@@ -27,6 +27,7 @@ use silver_common::{
     SilverSpine, TCache, TCacheId, TCacheProducer, TCacheReader, TCacheTable,
     cell_store::{CellStoreConfig, GOSSIP_DELIVERY_RETENTION},
     column_util::data_column_sidecar_len,
+    leanvm::MAX_RESPONSE_LEN,
     profiler::enable_profiler,
     set_attestation_subnets_pq,
     ssz_view::NUMBER_OF_COLUMNS,
@@ -67,9 +68,8 @@ const CONTROL_RPC_TCACHE_SIZE: usize = 1 << 20;
 /// two-million-validator set, so the two the validator API serves never wait
 /// on the one being written.
 const BEACON_STATE_TCACHE_SIZE: usize = 1 << 25;
-/// leanVM responses: a proof is at most 1 MiB, and `beacon_state` copies
-/// each out as it arrives.
 const LEANVM_TCACHE_SIZE: usize = 1 << 24;
+const _: () = assert!(MAX_RESPONSE_LEN < LEANVM_TCACHE_SIZE);
 /// Every column of a full block is about 6 MiB.
 const PROPOSED_COLUMNS_TCACHE_SIZE: usize = 1 << 24;
 const _: () = assert!(
@@ -364,7 +364,7 @@ fn main() -> Result<(), Box<dyn Error>> {
     let checkpoint = boot_checkpoint.decompose(&chain_config.spec);
     control_tile
         .set_gossip_clock(ticker.clone(), &checkpoint.state().immutable.genesis_validators_root);
-    let mut beacon_state_tile = BeaconStateTile::new(
+    let beacon_state_tile = BeaconStateTile::new(
         ticker,
         spec.clone(),
         &config.syncing_config(),
@@ -375,9 +375,6 @@ fn main() -> Result<(), Box<dyn Error>> {
         config.suggested_fee_recipient(),
         config.engine_config().get_payload_timeout(),
     );
-    if config.pq_rolling_aggregate() {
-        beacon_state_tile.enable_pq_rolling_aggregate();
-    }
     let state_reader = beacon_state_tile.reader();
 
     let storage_tile = StorageTile::new(

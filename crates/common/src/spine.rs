@@ -9,6 +9,7 @@ use flux::{
     spine_derive::from_spine,
     tile::TileInfo,
 };
+pub use leanvm::{LeanVmReq, LeanVmResp, RefusalCode};
 pub use messages::*;
 pub use stream_id::{LOCAL_GOSSIP_STREAM_ID, P2pStreamId};
 pub use stream_protocol::{
@@ -19,6 +20,7 @@ pub use tcache::*;
 use crate::cell_store::{CellStoreEvent, RetentionEvent};
 
 mod cluster_admin;
+pub mod leanvm;
 mod messages;
 mod stream_id;
 mod stream_protocol;
@@ -88,7 +90,7 @@ pub struct SilverSpine {
     #[queue(size(2usize.pow(8)))]
     pub leanvm_resps: SpineQueue<LeanVmResp>,
     #[queue(size(2usize.pow(8)))]
-    pub leanvm_health: SpineQueue<LeanVmHealthEvent>,
+    pub leanvm_ready: SpineQueue<LeanVmReady>,
 
     #[queue(size(2usize.pow(6)))]
     pub sidecar_bid_requests: SpineQueue<SidecarBidRequest>,

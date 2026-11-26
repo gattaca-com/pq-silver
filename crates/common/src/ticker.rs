@@ -219,11 +219,6 @@ impl SlotTicker {
         Nanos::from_millis(slot * self.slot_ms)
     }
 
-    /// Spec `get_aggregation_cutoff_ms` for `slot`, since genesis.
-    pub fn aggregation_cutoff(&self, slot: Slot, position: u64) -> Nanos {
-        self.staggered(slot, AGGREGATION_CUTOFF_BPS, position)
-    }
-
     /// Spec PQ `get_aggregate_due_ms` for `slot`, since genesis.
     pub fn pq_aggregate_due(&self, slot: Slot, position: u64) -> Nanos {
         self.staggered(slot, AGGREGATE_DUE_BPS_PQ, position)
@@ -353,10 +348,7 @@ mod tests {
             SlotTicker::new(genesis_secs_ago(20), &spec(12_000, 2), Duration::from_secs(4));
         let slot = 7;
         let into_slot = |at: Nanos| at.as_millis_u64() - slot * 12_000;
-        for (position, cutoff_ms, due_ms) in
-            [(0, 4_800, 7_200), (1, 5_400, 7_800), (2, 6_000, 8_400), (3, 6_600, 9_000)]
-        {
-            assert_eq!(into_slot(ticker.aggregation_cutoff(slot, position)), cutoff_ms);
+        for (position, due_ms) in [(0, 7_200), (1, 7_800), (2, 8_400), (3, 9_000)] {
             assert_eq!(into_slot(ticker.pq_aggregate_due(slot, position)), due_ms);
         }
         assert!(ticker.slot_start(slot + 1) > ticker.pq_aggregate_due(slot, 3));

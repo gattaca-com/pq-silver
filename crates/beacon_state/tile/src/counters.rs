@@ -40,8 +40,8 @@ silver_common::declare_counters! {
         UnknownRootVotesDropped,
         // PQ block proof. Offered: claims of every verified aggregate handed
         // to a merge, late and refused ones included; aggregates of one
-        // committee repeat claims. Merged: distinct claims in the proof last
-        // updated, the rolling proof when that is on.
+        // committee repeat claims. Merged: distinct claims in the block proof
+        // last updated.
         PqMergeClaimsOffered,
         PqMergedClaims: gauge,
     }

@@ -7695,19 +7695,38 @@ mod leanvm_verifier {
 }
 
 mod pq_aggregator {
-    use silver_common::{LeanVmReq, LeanVmResp, TReservation};
+    use std::{
+        io,
+        sync::{
+            Arc,
+            atomic::{AtomicBool, Ordering},
+        },
+    };
+
+    use silver_beacon_state_data::AGGREGATORS_PER_COMMITTEE;
+    use silver_common::{
+        LeanVmReq, LeanVmResp, RefusalCode, TReservation,
+        leanvm::{MAX_STARK_PROOF_SIZE, ProofLen},
+        ticker::MAXIMUM_GOSSIP_CLOCK_DISPARITY,
+    };
     use silver_ssz::ssz_view::{AttestationPqView, ProvedAttestationView, SINGLE_ATT_PQ_SIZE};
+    use tracing_subscriber::{filter::LevelFilter, util::SubscriberInitExt};
 
     use super::*;
     use crate::tile::pq_aggregation::{
-        Aggregate, Claim, VerifiedVote, test_util::attestation_in, wire::AggregateResponse,
+        Claim, VerifiedVote,
+        test_util::{FakeProof, attestation_in},
     };
 
     const SLOT: Slot = 40;
     const DATA_ROOT: B256 = [0xDD; 32];
     const COMMITTEE_LEN: usize = 8;
-    const ROOT_A: B256 = [0xAA; 32];
-    const ROOT_B: B256 = [0xBB; 32];
+
+    enum FakeAnswer<'a> {
+        Proven(&'a FakeProof),
+        Refused,
+        NoAnswer,
+    }
 
     struct Rig {
         tile: BeaconStateTile,
@@ -7728,15 +7747,38 @@ mod pq_aggregator {
             sink.consume(|_: LeanVmReq, _| {});
             sink.consume(|_: BeaconApiResponse, _| {});
             tile.consume_shared(&mut adapter);
-            // The block of `SLOT` came 1 s in, so merges of earlier slots run.
-            tile.pq_aggregator.on_block_imported(SLOT, &tile.ticker);
+            // The block of `SLOT` imported 1 s into the slot.
+            tile.pq_aggregator.on_block_imported(SLOT);
             Self { tile, gossip, adapter, sink, _spine: spine }
+        }
+
+        fn advance_ms(&mut self, millis: u64) {
+            let now = self.tile.ticker.since_genesis().as_millis_u64();
+            self.tile.ticker.set_since_genesis_ms(now + millis);
+        }
+
+        fn at(&mut self, time: Nanos) {
+            self.tile.ticker.set_since_genesis_ms(time.as_millis_u64());
+        }
+
+        fn at_slot_ms(&mut self, slot: Slot, millis: u64) {
+            self.at(self.tile.ticker.slot_start(slot) + Nanos::from_millis(millis));
+        }
+
+        fn propose(&mut self, slots: &[Slot]) {
+            self.tile.pq_aggregator.set_local_proposals(slots, false, &self.tile.ticker);
+        }
+
+        fn open_vote_gate(&mut self) {
+            let last_position = AGGREGATORS_PER_COMMITTEE as u64 - 1;
+            self.at(self.tile.ticker.pq_aggregate_due(SLOT, last_position));
+            self.send_next();
         }
 
         /// The prover's answer without a proof, taken in through the tile's
         /// own consume path.
         fn unanswered(&mut self, request_id: u64) {
-            self.sink.produce(LeanVmResp { request_id, body: None });
+            self.sink.produce(LeanVmResp::NoAnswer { request_id });
             self.tile.consume_shared(&mut self.adapter);
             self.send_next();
         }
@@ -7754,55 +7796,68 @@ mod pq_aggregator {
         }
 
         fn vote(&mut self, tag: u8) {
-            self.vote_on(DATA_ROOT, tag);
-        }
-
-        fn vote_on(&mut self, data_root: B256, tag: u8) {
-            self.vote_in(SLOT, data_root, tag);
+            self.vote_in(SLOT, DATA_ROOT, tag);
         }
 
         fn vote_in(&mut self, slot: Slot, data_root: B256, tag: u8) {
+            self.store_vote(slot, data_root, tag, Some(0));
+            self.send_next();
+        }
+
+        fn store_vote(&mut self, slot: Slot, data_root: B256, tag: u8, last_position: Option<u64>) {
+            self.store_vote_for(slot, data_root, tag, last_position, 0);
+        }
+
+        fn store_vote_for(
+            &mut self,
+            slot: Slot,
+            data_root: B256,
+            tag: u8,
+            last_position: Option<u64>,
+            committee: u64,
+        ) {
+            self.store_vote_as(slot, data_root, tag, last_position, committee, tag.into());
+        }
+
+        fn store_vote_as(
+            &mut self,
+            slot: Slot,
+            data_root: B256,
+            tag: u8,
+            last_position: Option<u64>,
+            committee: u64,
+            validator: u32,
+        ) {
             let mut single = [0u8; SINGLE_ATT_PQ_SIZE];
+            single[..8].copy_from_slice(&committee.to_le_bytes());
             single[16..24].copy_from_slice(&slot.to_le_bytes());
             let vote = VerifiedVote {
                 single: &single,
                 data_root,
                 message: [tag; 32],
                 pubkey: [tag; 32],
+                validator,
                 committee_position: tag as usize,
                 committee_len: COMMITTEE_LEN,
             };
-            self.tile.pq_aggregator.add_vote(vote, 0, &self.tile.ticker);
-            self.send_next();
+            self.tile.pq_aggregator.add_vote(&vote, last_position, &self.tile.ticker);
         }
 
         /// An aggregate of attestation slot `slot`.
         fn aggregate(&mut self, slot: Slot, claims: &[Claim]) {
+            self.aggregate_with_proof(slot, claims, b"child");
+        }
+
+        fn aggregate_with_proof(&mut self, slot: Slot, claims: &[Claim], proof: &[u8]) {
             let attestation = attestation_in(slot, 0, 0..claims.len());
             let attesters: Vec<u32> = (0..claims.len() as u32).collect();
-            let aggregate =
-                Aggregate::new(&attestation, &attesters, claims.to_vec(), b"child".to_vec());
-            self.tile.pq_aggregator.add_aggregate(aggregate.unwrap(), &self.tile.ticker);
-            self.send_next();
-        }
-
-        /// Merges of `SLOT` and `SLOT + 1`, each proved as its slot ended. The
-        /// roll of the second is the next request.
-        fn two_merged_slots(&mut self) {
-            self.aggregate(SLOT, &[[1; 64], [2; 64]]);
-            self.start_slot(SLOT + 1);
-            let request = self.request();
-            self.respond(request.request_id, &[[1; 64], [2; 64]]);
-            self.aggregate(SLOT + 1, &[[3; 64]]);
-            self.start_slot(SLOT + 2);
-            let request = self.request();
-            self.respond(request.request_id, &[[3; 64]]);
-        }
-
-        /// The slot starts and its block imports at once.
-        fn start_slot(&mut self, slot: Slot) {
-            self.start_slot_without_a_block(slot);
-            self.tile.pq_aggregator.on_block_imported(slot, &self.tile.ticker);
+            self.tile.pq_aggregator.add_aggregate(
+                &attestation,
+                &attesters,
+                claims,
+                proof,
+                &self.tile.ticker,
+            );
             self.send_next();
         }
 
@@ -7829,12 +7884,19 @@ mod pq_aggregator {
 
         fn carries(&mut self, request: &LeanVmReq, tag: u8) -> bool {
             let body = self.tile.events_producer.read_buffer(request.body).unwrap();
-            body.windows(64).any(|window| window == [tag; 64])
+            let request = request.split(body).unwrap();
+            let claim = [tag; size_of::<Claim>()];
+            request.signatures.iter().any(|signed| signed.first_chunk() == Some(&claim)) ||
+                request.children().iter().any(|child| child.claims().contains(&claim))
         }
 
         fn requests(&mut self) -> Vec<LeanVmReq> {
             let mut requests = Vec::new();
             self.sink.consume(|request: LeanVmReq, _| requests.push(request));
+            for request in &requests {
+                let written = self.tile.events_producer.read_buffer(request.body).unwrap();
+                assert_eq!(request.body_len(), Ok(written.len()));
+            }
             requests
         }
 
@@ -7845,11 +7907,45 @@ mod pq_aggregator {
         }
 
         fn respond(&mut self, request_id: u64, claims: &[Claim]) {
-            let body = AggregateResponse::encode(claims, b"proof");
-            let body = self.gossip.write_with(body.len(), |out| out.copy_from_slice(&body));
-            let resp = LeanVmResp { request_id, body };
-            self.tile.pq_aggregator.on_response(resp, &mut self.tile.reader);
+            self.respond_with(request_id, FakeAnswer::Proven(&FakeProof::new(claims, b"proof")));
+        }
+
+        fn respond_with(&mut self, request_id: u64, answer: FakeAnswer<'_>) {
+            self.receive_response(request_id, answer);
             self.send_next();
+        }
+
+        fn receive_response(&mut self, request_id: u64, answer: FakeAnswer<'_>) {
+            let resp = match answer {
+                FakeAnswer::Proven(proof) => {
+                    let body = self
+                        .gossip
+                        .write_with(proof.bytes.len(), |out| out.copy_from_slice(&proof.bytes))
+                        .expect("response fits the test tcache");
+                    LeanVmResp::Proven {
+                        request_id,
+                        claims: proof.len.claims,
+                        proof: proof.len.proof,
+                        body,
+                    }
+                }
+                FakeAnswer::Refused => {
+                    LeanVmResp::Refused { request_id, reason: RefusalCode::ProvingFailed }
+                }
+                FakeAnswer::NoAnswer => LeanVmResp::NoAnswer { request_id },
+            };
+            let now = self.tile.ticker.since_genesis();
+            self.tile.pq_aggregator.on_response(resp, now, &mut self.tile.reader);
+        }
+
+        fn answer_before_next_slot(&mut self, answer: FakeAnswer<'_>) {
+            self.at_slot_ms(SLOT - 1, 1_000);
+            self.ready();
+            self.vote_in(SLOT - 1, DATA_ROOT, 1);
+            let request = self.request();
+            self.advance_ms(300);
+            self.receive_response(request.request_id, answer);
+            self.at_slot_ms(SLOT, 1_000);
         }
 
         fn served(&mut self) -> Option<Vec<u8>> {
@@ -7865,33 +7961,567 @@ mod pq_aggregator {
     }
 
     #[test]
-    fn a_vote_sends_a_request_once_the_prover_is_ready() {
+    fn an_unanswered_merge_fails_once() {
         let mut rig = Rig::new();
-        rig.vote_on(ROOT_A, 1);
-        rig.vote_on(ROOT_B, 3);
+        rig.ready();
+        rig.vote(1);
+        let first = rig.request();
+        rig.unanswered(first.request_id);
+        let second = rig.request();
+        assert_eq!(rig.tags(&second), [1], "the vote waits again");
+        rig.respond_with(second.request_id, FakeAnswer::Refused);
+        let third = rig.request();
+        rig.respond_with(third.request_id, FakeAnswer::Refused);
+        assert!(rig.requests().is_empty(), "the third failure stops the aggregate proof");
+    }
+
+    #[test]
+    fn a_read_serves_the_aggregate_proof() {
+        let mut rig = Rig::new();
+        rig.ready();
+        let bits = |ssz: &[u8]| {
+            AttestationPqView::aggregation_bits(ProvedAttestationView::attestation(ssz)).to_vec()
+        };
+        rig.vote(1);
+        let first = rig.request();
+        rig.respond(first.request_id, &[[1; 64]]);
+        rig.vote(2);
+        let second = rig.request();
+        assert_eq!(rig.tags(&second), [1, 2], "the running proof and the new vote");
+
+        let ssz = rig.served().expect("the aggregate proof");
+        let attestation = ProvedAttestationView::attestation(&ssz);
+        assert!(AttestationPqView::check_canonical(attestation));
+        assert_eq!(bitvector_word(AttestationPqView::committee_bits(attestation)), 1);
+        assert_eq!(bits(&ssz), [0b10, 1], "only position 1 is set");
+        assert!(!ProvedAttestationView::proof(&ssz).is_empty());
+        rig.respond(second.request_id, &[[1; 64], [2; 64]]);
+        assert_eq!(bits(&rig.served().unwrap()), [0b110, 1], "positions 1 and 2");
+    }
+
+    #[test]
+    fn an_early_read_ends_the_aggregate_proof_at_once() {
+        let mut rig = Rig::new();
+        rig.ready();
+        rig.vote(1);
+        let first = rig.request();
+        assert!(rig.served().is_none(), "no proof yet, and still a read");
+        rig.respond(first.request_id, &[[1; 64]]);
+        assert!(rig.served().is_some());
+        rig.vote(2);
+        assert!(rig.requests().is_empty(), "a reader this early is due now");
+    }
+
+    #[test]
+    fn a_read_of_a_key_with_no_aggregate_proof_teaches_nothing() {
+        let mut rig = Rig::new();
+        rig.ready();
+        assert!(rig.served().is_none());
+        rig.at_slot_ms(SLOT, 6_000);
+        rig.vote(1);
+        let request = rig.request();
+        assert_eq!(rig.tags(&request), [1]);
+    }
+
+    #[test]
+    fn a_vote_after_the_deadline_is_refused() {
+        let mut rig = Rig::new();
+        rig.ready();
+        let due = rig.tile.ticker.pq_aggregate_due(SLOT, 0);
+        let disparity: Nanos =
+            u64::try_from(MAXIMUM_GOSSIP_CLOCK_DISPARITY.as_nanos()).unwrap().into();
+        rig.at(due - disparity);
+        rig.vote(1);
+        assert!(rig.requests().is_empty());
+        rig.at(due - disparity - Nanos::from_millis(1));
+        rig.vote(2);
+        let request = rig.request();
+        assert_eq!(rig.tags(&request), [2], "only the vote before the deadline was stored");
+    }
+
+    #[test]
+    fn after_an_early_pull_votes_close_at_the_earlier_deadline() {
+        for (until_read_ms, position, sends) in
+            [(2_001, 0, true), (2_000, 0, false), (2_000, 2, true)]
+        {
+            let mut rig = Rig::new();
+            rig.ready();
+            rig.vote(1);
+            let first = rig.request();
+            rig.respond(first.request_id, &[[1; 64]]);
+            let due = rig.tile.ticker.pq_aggregate_due(SLOT, 0);
+            rig.at(due - Nanos::from_secs(2));
+            assert!(rig.served().is_some());
+
+            rig.at(due - Nanos::from_millis(until_read_ms));
+            rig.store_vote_for(SLOT, DATA_ROOT, 2, Some(position), 1);
+            rig.send_next();
+            if sends {
+                let request = rig.request();
+                assert_eq!(rig.tags(&request), [2]);
+            } else {
+                assert!(rig.requests().is_empty());
+            }
+        }
+    }
+
+    #[test]
+    fn a_vote_without_a_duty_is_only_sent_for_a_block_that_wants_its_slot() {
+        let mut rig = Rig::new();
+        let block = SLOT + 2;
+        rig.ready();
+        rig.store_vote(SLOT, DATA_ROOT, 1, None);
+        rig.propose(&[block + 4]);
+        rig.store_vote(SLOT, DATA_ROOT, 2, None);
+        rig.propose(&[block]);
+        rig.store_vote(SLOT, DATA_ROOT, 3, None);
+        rig.send_next();
+        assert!(rig.requests().is_empty());
+        assert!(rig.served().is_none());
+
+        rig.open_vote_gate();
+        let request = rig.request();
+        assert_eq!(rig.tags(&request), [3]);
+        rig.respond(request.request_id, &[[3; 64]]);
+        assert!(rig.served().is_none());
+        assert_eq!(rig.tile.pq_aggregator.block_proof(block).unwrap().1, b"proof");
+    }
+
+    #[test]
+    fn a_gap_vote_lives_until_its_block_proof_is_pruned() {
+        let mut rig = Rig::new();
+        let block = SLOT + 2;
+        rig.propose(&[block]);
+        rig.store_vote(SLOT - 3, DATA_ROOT, 1, None);
+        rig.tile.pq_aggregator.prune_before(block - 1);
+        rig.store_vote(SLOT - 4, DATA_ROOT, 2, None);
+        rig.store_vote(SLOT, DATA_ROOT, 3, None);
+        rig.tile.pq_aggregator.on_block_imported(block - 1);
+        rig.open_vote_gate();
+        rig.ready();
+        let first = rig.request();
+        assert_eq!(rig.tags(&first), [1]);
+        rig.respond(first.request_id, &[[1; 64]]);
+        let second = rig.request();
+        assert_eq!(rig.tags(&second), [1, 3], "both live votes are proved");
+    }
+
+    #[test]
+    fn a_block_proof_read_rearms_a_held_merge_in_the_same_loop() {
+        let mut rig = Rig::new();
+        rig.ready();
+        let start = rig.tile.ticker.slot_start(SLOT).as_millis_u64();
+        rig.vote(1);
+        let first = rig.request();
+        // The round trip makes the later block merge hold across the read.
+        rig.tile.ticker.set_since_genesis_ms(start + 3_310);
+        rig.respond(first.request_id, &[[1; 64]]);
+
+        let earlier = SLOT + 1;
+        rig.tile.ticker.set_since_genesis_ms(start + 7_000);
+        rig.tile.pq_aggregator.set_local_proposals(
+            &[earlier, earlier + 1],
+            false,
+            &rig.tile.ticker,
+        );
+        rig.aggregate(SLOT, &[[2; 64]]);
+        rig.aggregate(SLOT, &[[2; 64], [3; 64]]);
+        assert!(rig.requests().is_empty(), "the block merge is held");
+
+        rig.tile.pq_aggregator.on_block_proof_read(earlier, &rig.tile.ticker);
+        rig.send_next();
+        assert!(rig.requests().is_empty(), "the shorter hold is still ahead");
+
+        rig.tile.ticker.set_since_genesis_ms(start + 7_146);
+        rig.send_next();
+        let merge = rig.request();
+        assert_eq!(rig.tags(&merge), [2, 3]);
+    }
+
+    #[test]
+    fn an_answer_wins_over_a_vote_in_the_same_loop() {
+        for same_loop in [true, false] {
+            let mut rig = Rig::new();
+            rig.ready();
+            rig.at_slot_ms(SLOT, 5_400);
+            rig.vote(1);
+            let first = rig.request();
+            assert_eq!(rig.tags(&first), [1]);
+            rig.advance_ms(700);
+            let proof = FakeProof::new(&[[1; 64]], b"proof");
+            rig.receive_response(first.request_id, FakeAnswer::Proven(&proof));
+            if !same_loop {
+                rig.send_next();
+                assert!(rig.requests().is_empty());
+            }
+            rig.vote(2);
+            if same_loop {
+                let second = rig.request();
+                assert_eq!(rig.tags(&second), [1, 2]);
+            } else {
+                assert!(rig.requests().is_empty(), "a cold merge would miss the deadline");
+            }
+        }
+    }
+
+    #[test]
+    fn a_retry_after_a_full_tcache_keeps_the_answer_trigger() {
+        let mut rig = Rig::new();
+        rig.ready();
+        rig.at_slot_ms(SLOT, 5_400);
+        rig.vote(1);
+        let first = rig.request();
+        rig.vote(2);
+
+        let pin = rig.fill_tcache();
+        rig.advance_ms(700);
+        rig.respond(first.request_id, &[[1; 64]]);
+        assert!(rig.requests().is_empty());
+        drop(pin);
+
+        rig.advance_ms(1);
+        rig.send_next();
+        let second = rig.request();
+        assert_eq!(rig.tags(&second), [1, 2]);
+    }
+
+    #[test]
+    fn a_vote_waits_for_the_prover_to_come_up() {
+        let mut rig = Rig::new();
+        rig.vote(1);
         assert!(rig.requests().is_empty());
         rig.ready();
         let request = rig.request();
+        assert_eq!(rig.tags(&request), [1]);
         let body = rig.tile.events_producer.read_buffer(request.body).unwrap();
         assert_eq!(body[0], 1, "aggregate op");
     }
 
     #[test]
-    fn a_response_is_served_as_a_canonical_attestation_with_its_proof() {
+    fn marks_of_a_replay_reach_the_first_request_after_it() {
+        let wall = SLOT + 10;
+        for mark in [false, true] {
+            let mut rig = Rig::new();
+            rig.ready();
+            rig.vote(7);
+            let warmup = rig.request();
+            rig.advance_ms(800);
+            rig.respond(warmup.request_id, &[[7; 64]]);
+
+            let pq = &mut rig.tile.pq_aggregator;
+            pq.on_block_imported(wall - 8);
+            pq.on_chain(wall - 10, &[1]);
+            pq.on_block_imported(wall);
+            if mark {
+                pq.on_chain(wall - 2, &[2]);
+            }
+            rig.start_slot_without_a_block(wall);
+            rig.propose(&[wall + 1]);
+            rig.store_vote(wall - 2, DATA_ROOT, 2, None);
+            rig.store_vote(wall - 2, DATA_ROOT, 3, None);
+            rig.store_vote(wall - 1, DATA_ROOT, 4, None);
+            rig.send_next();
+            let request = rig.request();
+            assert_eq!(rig.tags(&request), if mark { &[3, 4][..] } else { &[2, 3, 4][..] });
+        }
+    }
+
+    #[test]
+    fn a_block_import_after_a_pause_preserves_live_requests_and_proofs() {
+        let block = SLOT + 5;
+        let run = |mark_on_import| {
+            let mut rig = Rig::new();
+            rig.propose(&[block]);
+            rig.ready();
+            rig.tile.pq_aggregator.on_chain(SLOT - 7, &[6]);
+            rig.aggregate(SLOT, &[[1; 64]]);
+            assert!(rig.tile.pq_aggregator.block_proof(block).is_none());
+
+            rig.at_slot_ms(block - 1, 1);
+            rig.tile.pq_aggregator.on_block_imported(block - 1);
+            if mark_on_import {
+                rig.tile.pq_aggregator.on_chain(block - 3, &[6]);
+            }
+            rig.store_vote(block - 2, DATA_ROOT, 3, None);
+            rig.send_next();
+            let request = rig.request();
+            assert_eq!(rig.tags(&request), [1, 3]);
+            let body = rig.tile.events_producer.read_buffer(request.body).unwrap().to_vec();
+            assert_eq!(body, include_bytes!("pq_aggregation/mixed-request.bin"));
+            assert_eq!((request.request_id, request.signatures, request.proofs), (0, 1, 1));
+            assert_eq!(request.children[0], ProofLen { claims: 1, proof: 5 });
+            assert!(request.children[1..].iter().all(|len| *len == ProofLen::default()));
+            let (attestations, proof) = rig.tile.pq_aggregator.block_proof(block).unwrap();
+            assert_eq!(proof, b"child");
+            (body, attestations, proof.to_vec())
+        };
+        assert_eq!(run(true), run(false));
+    }
+
+    #[test]
+    fn future_inputs_do_not_evict_the_available_votes() {
+        let block = SLOT + 2;
+        for future_vote in [false, true] {
+            let mut rig = Rig::new();
+            rig.propose(&[block]);
+            rig.store_vote(SLOT, DATA_ROOT, 2, None);
+            if future_vote {
+                rig.store_vote(SLOT + 8, DATA_ROOT, 4, Some(0));
+            } else {
+                rig.aggregate(SLOT + 8, &[[5; 64]]);
+            }
+            rig.tile.pq_aggregator.on_chain(SLOT, &[2]);
+            rig.ready();
+            rig.open_vote_gate();
+            let request = rig.request();
+            assert_eq!(rig.tags(&request), [2]);
+        }
+
         let mut rig = Rig::new();
+        rig.propose(&[block]);
+        rig.store_vote(SLOT, DATA_ROOT, 2, None);
+        rig.store_vote(SLOT + 2, DATA_ROOT, 4, Some(0));
+        rig.ready();
+        rig.open_vote_gate();
+        let request = rig.request();
+        assert_eq!(rig.tags(&request), [2]);
+        rig.advance_ms(700);
+        rig.respond(request.request_id, &[[2; 64]]);
+        assert!(rig.requests().is_empty());
+    }
+
+    #[test]
+    fn an_out_of_range_validator_does_not_block_other_on_chain_marks() {
+        let block = SLOT + 2;
+        let cap = 1 << 22;
+        let mut rig = Rig::new();
+        rig.propose(&[block]);
+        rig.store_vote_as(SLOT, DATA_ROOT, 1, None, 0, cap - 1);
+        rig.store_vote_as(SLOT, DATA_ROOT, 2, None, 0, cap);
+        rig.tile.pq_aggregator.on_block_imported(SLOT + 1);
+        rig.tile.pq_aggregator.on_chain(SLOT, &[cap, cap - 1]);
+        rig.ready();
+        rig.open_vote_gate();
+        let request = rig.request();
+        assert_eq!(rig.tags(&request), [2]);
+    }
+
+    #[test]
+    fn a_block_keeps_its_proof_after_the_source_ring_recycles_the_slot() {
+        let block = SLOT + 2;
+        let mut rig = Rig::new();
+        rig.propose(&[block]);
+        rig.aggregate_with_proof(SLOT, &[[1; 64]], b"held");
+        let before = rig.tile.pq_aggregator.block_proof(block).unwrap().0;
+
+        let wall = SLOT + 10;
+        rig.at_slot_ms(wall, 0);
+        rig.tile.pq_aggregator.on_block_imported(wall);
+        rig.tile.pq_aggregator.on_chain(wall - 2, &[7]);
+        rig.aggregate_with_proof(wall - 2, &[[2; 64]], b"replacement");
+        let (attestations, proof) = rig.tile.pq_aggregator.block_proof(block).unwrap();
+        assert_eq!(attestations, before);
+        assert_eq!(proof, b"held");
+    }
+
+    #[test]
+    fn reusing_a_source_slot_leaves_only_the_newer_inputs_available() {
+        let block = SLOT + 5;
+        for prune in [false, true] {
+            let mut rig = Rig::new();
+            rig.propose(&[block]);
+            rig.store_vote(SLOT, DATA_ROOT, 1, None);
+            rig.aggregate(SLOT, &[[7; 64]]);
+            rig.at_slot_ms(SLOT + 1, 0);
+            rig.store_vote(SLOT + 1, DATA_ROOT, 2, None);
+            rig.at_slot_ms(SLOT + 3, 0);
+            rig.store_vote(SLOT + 3, DATA_ROOT, 3, None);
+            rig.at_slot_ms(SLOT + 7, 11_999);
+            if prune {
+                rig.tile.pq_aggregator.prune_before(block);
+            }
+            rig.store_vote(SLOT + 8, DATA_ROOT, 6, Some(0));
+
+            // Reopen the old deadline on the frozen clock to inspect the remaining inputs.
+            rig.at_slot_ms(block - 1, 4_000);
+            rig.propose(&[block]);
+            rig.store_vote(SLOT, DATA_ROOT, 4, None);
+            rig.aggregate(SLOT, &[[5; 64]]);
+            rig.ready();
+            let request = rig.request();
+            assert_eq!(rig.tags(&request), [2]);
+            assert!(rig.tile.pq_aggregator.block_proof(block).is_none());
+        }
+    }
+
+    #[test]
+    fn a_block_proof_takes_the_best_aggregate_when_the_older_gate_opens_during_a_request() {
+        let mut rig = Rig::new();
+        let block = SLOT + 2;
+        rig.tile.pq_aggregator.set_local_proposals(&[block], false, &rig.tile.ticker);
         rig.ready();
         rig.vote(1);
-        let request_id = rig.request().request_id;
-        assert!(rig.served().is_none(), "no proof yet");
+        let in_flight = rig.request();
 
-        rig.respond(request_id, &[[1; 64]]);
-        let ssz = rig.served().expect("a best proof");
-        let attestation = ProvedAttestationView::attestation(&ssz);
-        assert!(AttestationPqView::check_canonical(attestation));
-        assert_eq!(bitvector_word(AttestationPqView::committee_bits(attestation)), 1);
-        let bits = AttestationPqView::aggregation_bits(attestation);
-        assert_eq!(bits, [0b10, 1], "only position 1 is set");
-        assert!(!ProvedAttestationView::proof(&ssz).is_empty());
+        rig.store_vote(SLOT, DATA_ROOT, 2, None);
+        rig.aggregate(SLOT - 1, &[[3; 64]]);
+        assert!(rig.tile.pq_aggregator.block_proof(block).is_none());
+
+        let older_gate = rig.tile.ticker.slot_start(block - 1).as_millis_u64() + 3_999;
+        rig.tile.ticker.set_since_genesis_ms(older_gate - 1);
+        rig.send_next();
+        assert!(rig.tile.pq_aggregator.block_proof(block).is_none());
+
+        rig.tile.ticker.set_since_genesis_ms(older_gate);
+        rig.send_next();
+        let (attestations, proof) = rig.tile.pq_aggregator.block_proof(block).unwrap();
+        assert_eq!(attestations.len(), 1);
+        assert_eq!(proof, b"child");
+        assert!(rig.requests().is_empty());
+        rig.respond(in_flight.request_id, &[[1; 64]]);
+        assert_eq!(ProvedAttestationView::proof(&rig.served().unwrap()), b"proof");
+    }
+
+    #[test]
+    fn overlapping_aggregates_settle_to_the_union_of_their_members() {
+        let mut rig = Rig::new();
+        let block = SLOT + 2;
+        rig.propose(&[block]);
+        rig.aggregate(SLOT, &[[1; 64], [2; 64]]);
+        let claims: Vec<Claim> = (2..=40).map(|tag| [tag; 64]).collect();
+        let attesters: Vec<u32> = (1..40).collect();
+        let attestation = attestation_in(SLOT, 0, 1..40);
+        rig.tile.pq_aggregator.add_aggregate(
+            &attestation,
+            &attesters,
+            &claims,
+            b"overlapping",
+            &rig.tile.ticker,
+        );
+        rig.ready();
+        let request = rig.request();
+        let union: Vec<Claim> = (1..=40).map(|tag| [tag; 64]).collect();
+        rig.respond(request.request_id, &union);
+        let (attestations, proof) = rig.tile.pq_aggregator.block_proof(block).unwrap();
+        assert_eq!(proof, b"proof");
+        assert_eq!(attestations, [attestation_in(SLOT, 0, 0..40)]);
+    }
+
+    #[test]
+    fn a_merge_with_another_claim_at_a_held_position_fails() {
+        let mut rig = Rig::new();
+        let block = SLOT + 2;
+        rig.propose(&[block]);
+        rig.aggregate(SLOT, &[[1; 64]]);
+        let claims: Vec<Claim> = (2..=32).map(|tag| [tag; 64]).collect();
+        rig.aggregate(SLOT, &claims);
+        rig.ready();
+        let request = rig.request();
+        let union: Vec<Claim> = (1..=32).map(|tag| [tag; 64]).collect();
+        rig.respond(request.request_id, &union);
+        let (attestations, proof) = rig.tile.pq_aggregator.block_proof(block).unwrap();
+        assert_eq!(proof, b"child");
+        assert_eq!(attestations, [attestation_in(SLOT, 0, [0])]);
+    }
+
+    #[test]
+    fn a_block_keeps_the_proof_of_a_replaced_aggregate() {
+        let mut rig = Rig::new();
+        let block = SLOT + 2;
+        rig.propose(&[block]);
+        rig.aggregate(SLOT, &[[1; 64]]);
+        let first = rig.tile.pq_aggregator.block_proof(block).unwrap().0;
+
+        let claims = [[2; 64], [3; 64], [4; 64], [5; 64], [6; 64]];
+        for count in 2..=5 {
+            rig.aggregate(SLOT, &claims[..count]);
+        }
+        let (attestations, proof) = rig.tile.pq_aggregator.block_proof(block).unwrap();
+        assert_eq!(attestations, first);
+        assert_eq!(proof, b"child");
+
+        rig.ready();
+        let request = rig.request();
+        assert_eq!(rig.tags(&request), [1, 2, 3, 4, 5, 6]);
+    }
+
+    #[test]
+    fn a_merge_keeps_a_picked_proof_after_its_source_slot_is_recycled() {
+        let mut rig = Rig::new();
+        let block = SLOT + 2;
+        rig.propose(&[block]);
+        rig.aggregate(SLOT, &[[1; 64]]);
+        rig.aggregate(SLOT - 1, &[[2; 64]]);
+        rig.ready();
+        assert!(rig.requests().is_empty());
+
+        rig.at_slot_ms(block - 1, 0);
+        rig.tile.pq_aggregator.on_block_imported(block - 1);
+        rig.send_next();
+        let request = rig.request();
+        assert_eq!(rig.tags(&request), [1, 2]);
+
+        let wall = SLOT + 9;
+        rig.at_slot_ms(wall, 0);
+        rig.tile.pq_aggregator.on_block_imported(wall);
+        rig.tile.pq_aggregator.on_chain(wall - 2, &[7]);
+        rig.respond(request.request_id, &[[1; 64], [2; 64]]);
+        assert_eq!(rig.tile.pq_aggregator.block_proof(block).unwrap().1, b"proof");
+    }
+
+    #[test]
+    fn only_an_answer_with_a_new_proof_lets_the_next_target_batch_votes() {
+        let wrong = FakeProof::new(&[[9; 64]], b"proof");
+        let proof = FakeProof::new(&[[1; 64]], b"proof");
+        let unsorted = FakeProof::new(&[[2; 64], [1; 64]], b"proof");
+        let mut truncated = FakeProof::new(&[[1; 64]], b"proof");
+        truncated.bytes.pop();
+        let mut oversized = FakeProof::new(&[[1; 64]], b"proof");
+        oversized.len.proof = MAX_STARK_PROOF_SIZE as u32 + 1;
+        let answers = [
+            (FakeAnswer::Refused, &[2][..], "a refusal"),
+            (FakeAnswer::Proven(&wrong), &[2][..], "other claims"),
+            (FakeAnswer::Proven(&unsorted), &[2][..], "unsorted claims"),
+            (FakeAnswer::Proven(&truncated), &[2][..], "a truncated proof"),
+            (FakeAnswer::Proven(&oversized), &[2][..], "an oversized proof"),
+            (FakeAnswer::NoAnswer, &[2][..], "no answer"),
+            (FakeAnswer::Proven(&proof), &[2, 3, 4][..], "the expected claims"),
+        ];
+        for (body, tags, answer) in answers {
+            let mut rig = Rig::new();
+            rig.answer_before_next_slot(body);
+            for tag in 2..=4 {
+                rig.store_vote(SLOT, DATA_ROOT, tag, Some(0));
+            }
+            rig.send_next();
+            let request = rig.request();
+            assert_eq!(rig.tags(&request), tags, "{answer}");
+        }
+    }
+
+    #[test]
+    fn an_unanswered_request_shrinks_the_next_merge_if_it_was_seen_overdue() {
+        let proof = FakeProof::new(&[[1; 64]], b"proof");
+        for check_overdue in [true, false] {
+            let mut rig = Rig::new();
+            rig.answer_before_next_slot(FakeAnswer::Proven(&proof));
+            rig.vote(1);
+            let lost = rig.request();
+            for tag in 2..=4 {
+                rig.store_vote(SLOT, DATA_ROOT, tag, Some(0));
+            }
+            for _ in 0..2 {
+                rig.advance_ms(500);
+                if check_overdue {
+                    rig.send_next();
+                    assert!(rig.requests().is_empty(), "the prover is busy");
+                }
+            }
+            rig.unanswered(lost.request_id);
+            let next = rig.request();
+            let expected: &[u8] = if check_overdue { &[1] } else { &[1, 2, 3, 4] };
+            assert_eq!(rig.tags(&next), expected);
+        }
     }
 
     #[test]
@@ -7903,198 +8533,11 @@ mod pq_aggregator {
     }
 
     #[test]
-    fn a_vote_after_the_cutoff_is_dropped() {
-        let mut rig = Rig::new();
-        rig.ready();
-        let cutoff_ms = rig.tile.ticker.aggregation_cutoff(SLOT, 0).as_millis_u64();
-        rig.tile.ticker.set_since_genesis_ms(cutoff_ms);
-        rig.vote(1);
-        assert!(rig.requests().is_empty());
-    }
-
-    #[test]
-    fn an_aggregate_is_merged_into_the_block_proof() {
-        let mut rig = Rig::new();
-        rig.ready();
-        rig.aggregate(SLOT - 1, &[[1; 64], [2; 64]]);
-        let request = rig.request();
-        assert!(rig.tile.pq_aggregator.block_proof(SLOT + 1).is_none(), "no proof yet");
-
-        rig.respond(request.request_id, &[[1; 64], [2; 64]]);
-        assert!(rig.tile.pq_aggregator.block_proof(SLOT + 2).is_none(), "only the newest slot");
-        let (attestations, proof) = rig.tile.pq_aggregator.block_proof(SLOT + 1).unwrap();
-        assert_eq!(attestations, [attestation_in(SLOT - 1, 0, 0..2)]);
-        assert_eq!(proof, b"proof");
-    }
-
-    #[test]
-    fn a_merge_waits_for_the_next_slots_block_until_the_attestation_deadline() {
-        let mut rig = Rig::new();
-        rig.ready();
-        rig.aggregate(SLOT, &[[1; 64]]);
-        rig.start_slot_without_a_block(SLOT + 1);
-        assert!(rig.requests().is_empty(), "the block may not have imported yet");
-
-        let deadline_ms = rig.tile.ticker.slot_start(SLOT + 1).as_millis_u64() + 12_000 / 4;
-        rig.tile.ticker.set_since_genesis_ms(deadline_ms - 1);
-        rig.send_next();
-        assert!(rig.requests().is_empty());
-        rig.tile.ticker.set_since_genesis_ms(deadline_ms);
-        rig.send_next();
-        let request = rig.request();
-        assert!(rig.carries(&request, 1));
-    }
-
-    #[test]
-    fn a_merge_starts_as_soon_as_the_next_slots_block_imports() {
-        let mut rig = Rig::new();
-        rig.ready();
-        rig.aggregate(SLOT, &[[1; 64]]);
-        rig.start_slot_without_a_block(SLOT + 1);
-        assert!(rig.requests().is_empty());
-
-        rig.tile.pq_aggregator.on_block_imported(SLOT + 1, &rig.tile.ticker);
-        rig.send_next();
-        let request = rig.request();
-        assert!(rig.carries(&request, 1));
-
-        rig.respond(request.request_id, &[[1; 64]]);
-        rig.aggregate(SLOT, &[[1; 64], [2; 64]]);
-        let late = rig.request();
-        assert!(rig.carries(&late, 2), "an aggregate after the block is merged at once");
-    }
-
-    #[test]
-    fn a_rolling_proof_starts_with_the_first_ended_slot() {
-        let mut rig = Rig::new();
-        rig.tile.enable_pq_rolling_aggregate();
-        rig.ready();
-        rig.aggregate(SLOT, &[[1; 64], [2; 64]]);
-        assert!(rig.requests().is_empty(), "the merge waits for its slot to end");
-
-        rig.start_slot(SLOT + 1);
-        let request = rig.request();
-        rig.respond(request.request_id, &[[1; 64], [2; 64]]);
-        assert!(rig.requests().is_empty(), "the first proof needs no roll");
-        assert!(rig.tile.pq_aggregator.block_proof(SLOT + 1).is_none(), "too new to include");
-        let (attestations, proof) = rig.tile.pq_aggregator.block_proof(SLOT + 2).unwrap();
-        assert_eq!(attestations, [attestation_in(SLOT, 0, 0..2)]);
-        assert_eq!(proof, b"proof");
-    }
-
-    #[test]
-    fn each_slot_rolls_into_one_proof_and_on_chain_votes_are_proved_out() {
-        let mut rig = Rig::new();
-        rig.tile.enable_pq_rolling_aggregate();
-        rig.ready();
-        rig.two_merged_slots();
-        let roll = rig.request();
-        assert!([1, 2, 3].into_iter().all(|tag| rig.carries(&roll, tag)));
-        let (attestations, _) = rig.tile.pq_aggregator.block_proof(SLOT + 3).unwrap();
-        assert_eq!(attestations, [attestation_in(SLOT + 1, 0, [0])], "the roll is not proved yet");
-        rig.respond(roll.request_id, &[[1; 64], [2; 64], [3; 64]]);
-        let (attestations, _) = rig.tile.pq_aggregator.block_proof(SLOT + 3).unwrap();
-        assert_eq!(attestations.len(), 2, "one per slot");
-
-        rig.tile.pq_aggregator.on_chain(SLOT, &[0]);
-        rig.send_next();
-        let reduce = rig.request();
-        rig.respond(reduce.request_id, &[[2; 64], [3; 64]]);
-        let (attestations, _) = rig.tile.pq_aggregator.block_proof(SLOT + 3).unwrap();
-        assert_eq!(attestations[0], attestation_in(SLOT, 0, [1]), "validator 0 is on chain");
-
-        rig.start_slot(SLOT + 6);
-        let expire = rig.request();
-        rig.respond(expire.request_id, &[[3; 64]]);
-        let (attestations, _) = rig.tile.pq_aggregator.block_proof(SLOT + 6).unwrap();
-        assert_eq!(attestations, [attestation_in(SLOT + 1, 0, [0])], "slot SLOT grew too old");
-    }
-
-    #[test]
-    fn a_failed_roll_leaves_the_block_the_merge_of_its_newest_slot() {
-        let mut rig = Rig::new();
-        rig.tile.enable_pq_rolling_aggregate();
-        rig.ready();
-        rig.two_merged_slots();
-        let roll = rig.request();
-        rig.unanswered(roll.request_id);
-
-        let (attestations, _) = rig.tile.pq_aggregator.block_proof(SLOT + 3).unwrap();
-        assert_eq!(attestations, [attestation_in(SLOT + 1, 0, [0])]);
-        let (attestations, _) = rig.tile.pq_aggregator.block_proof(SLOT + 4).unwrap();
-        assert_eq!(attestations, [attestation_in(SLOT, 0, 0..2)], "no newer merge: the old roll");
-    }
-
-    #[test]
-    fn leaves_go_by_earliest_deadline_then_most_new_votes() {
-        let mut rig = Rig::new();
-        rig.ready();
-        rig.vote_on(ROOT_A, 1);
-        let a1 = rig.request();
-        rig.vote_in(SLOT + 1, ROOT_B, 2);
-        rig.vote_in(SLOT + 1, ROOT_B, 3);
-        rig.vote_on(ROOT_B, 4);
-        rig.vote_on(ROOT_A, 5);
-        rig.vote_on(ROOT_A, 6);
-        rig.vote_on(ROOT_A, 1);
-
-        rig.respond(a1.request_id, &[[1; 64]]);
-        let a2 = rig.request();
-        assert_eq!(rig.tags(&a2), [1, 5, 6], "two new votes beat one; vote 1 again adds none");
-
-        rig.respond(a2.request_id, &[[1; 64], [5; 64], [6; 64]]);
-        let b = rig.request();
-        assert_eq!(rig.tags(&b), [4], "the earlier deadline beats more votes");
-
-        rig.respond(b.request_id, &[[4; 64]]);
-        let later = rig.request();
-        assert_eq!(rig.tags(&later), [2, 3]);
-    }
-
-    #[test]
-    fn earlier_deadlines_go_first_whatever_the_kind_and_ties_go_to_the_lower_key() {
-        let mut rig = Rig::new();
-        rig.ready();
-        rig.vote_on(ROOT_A, 1);
-        let mut request = rig.request();
-        rig.vote_in(SLOT + 1, ROOT_A, 4);
-        rig.aggregate(SLOT - 1, &[[9; 64]]);
-        rig.vote_on(ROOT_B, 3);
-        rig.vote_on(ROOT_A, 2);
-        assert!(rig.requests().is_empty(), "the others wait");
-
-        let mut order = Vec::new();
-        let answers: [&[Claim]; 4] = [&[[1; 64]], &[[1; 64], [2; 64]], &[[3; 64]], &[[9; 64]]];
-        for (request_id, claims) in (1..).zip(answers) {
-            rig.respond(request.request_id, claims);
-            request = rig.request();
-            assert_eq!(request.request_id, request_id);
-            let merge = rig.carries(&request, 9);
-            order.push(if merge { vec![9] } else { rig.tags(&request) });
-        }
-        let by_deadline = [vec![1, 2], vec![3], vec![9], vec![4]];
-        assert_eq!(order, by_deadline, "earliest deadline, then the lower root");
-    }
-
-    #[test]
-    fn an_aggregate_at_its_block_slot_start_is_dropped() {
-        let mut rig = Rig::new();
-        rig.ready();
-        let start_ms = rig.tile.ticker.slot_start(SLOT + 1).as_millis_u64();
-        rig.tile.ticker.set_since_genesis_ms(start_ms);
-        rig.aggregate(SLOT - 1, &[[9; 64]]);
-        rig.tile.ticker.set_since_genesis_ms(start_ms - 1);
-        rig.aggregate(SLOT - 1, &[[10; 64]]);
-        let request = rig.request();
-        assert!(rig.carries(&request, 10), "an earlier arrival would go first");
-    }
-
-    #[test]
     fn a_full_tcache_retries_without_a_failure() {
         let mut rig = Rig::new();
         rig.ready();
         let pin = rig.fill_tcache();
-        rig.aggregate(SLOT - 1, &[[9; 64]]);
+        rig.vote(1);
         for _ in 0..5 {
             rig.send_next();
         }
@@ -8103,7 +8546,7 @@ mod pq_aggregator {
         drop(pin);
         rig.send_next();
         let request = rig.request();
-        assert!(rig.carries(&request, 9), "six misses did not stop the merge");
+        assert!(rig.carries(&request, 1), "six misses did not stop the merge");
     }
 
     #[test]
@@ -8112,13 +8555,56 @@ mod pq_aggregator {
         rig.ready();
         rig.vote(1);
         let stale = rig.request();
-        rig.tile.pq_aggregator.prune_before(SLOT + 1);
-        rig.aggregate(SLOT - 1, &[[9; 64]]);
-        assert!(rig.requests().is_empty(), "the prover is still proving the old batch");
+        rig.start_slot_without_a_block(SLOT + 2);
+        rig.vote_in(SLOT + 2, DATA_ROOT, 2);
+        assert!(rig.requests().is_empty(), "the prover is still proving the old request");
 
         rig.respond(stale.request_id, &[[1; 64]]);
-        assert!(rig.served().is_none(), "the pruned leaf is gone");
+        assert!(rig.served().is_none(), "the pruned target is gone");
         let merge = rig.request();
-        assert!(rig.carries(&merge, 9), "the merge goes out");
+        assert!(rig.carries(&merge, 2), "the merge goes out");
+    }
+
+    #[test]
+    fn a_response_from_an_unopened_cache_does_not_install_a_proof() {
+        let mut rig = Rig::new();
+        rig.ready();
+        rig.vote(1);
+        let request = rig.request();
+        rig.tile.reader.close(rig.gossip.cache_ref().id());
+        rig.respond(request.request_id, &[[1; 64]]);
+        assert!(rig.served().is_none());
+    }
+
+    #[test]
+    fn a_response_for_an_unknown_request_is_logged_and_dropped() {
+        let mut rig = Rig::new();
+        rig.ready();
+        rig.vote(1);
+        let request = rig.request();
+        rig.vote(2);
+
+        let logged = Arc::new(AtomicBool::new(false));
+        let capture = Arc::clone(&logged);
+        let log_guard = tracing_subscriber::fmt()
+            .with_max_level(LevelFilter::ERROR)
+            .with_writer(move || {
+                capture.store(true, Ordering::Relaxed);
+                io::sink()
+            })
+            .finish()
+            .set_default();
+        let wrong = FakeProof::new(&[[1; 64]], b"wrong request");
+        rig.receive_response(request.request_id + 1, FakeAnswer::Proven(&wrong));
+        drop(log_guard);
+
+        assert!(logged.load(Ordering::Relaxed), "the response logs an error");
+        rig.send_next();
+        assert!(rig.requests().is_empty(), "the prover stays busy");
+        assert!(rig.served().is_none(), "the wrong request installs no proof");
+
+        rig.respond(request.request_id, &[[1; 64]]);
+        let ssz = rig.served().expect("the original request still completes");
+        assert_eq!(ProvedAttestationView::proof(&ssz), b"proof");
     }
 }

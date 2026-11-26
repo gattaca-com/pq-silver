@@ -8,14 +8,21 @@ use std::{
 };
 
 use flux::{spine::SpineAdapter, tile::Tile};
-use lean_vm::{AggregateClaims, AggregateProof, lean_xmss};
+use lean_vm::{
+    AggregateClaims, AggregateProof,
+    lean_xmss::{self, LeanXmssPublicKey, LeanXmssSignature},
+};
 use silver_common::{
-    LeanVmHealthEvent, LeanVmReq, LeanVmResp, SilverSpine, TCache, TCacheId, TCacheProducer,
-    TCacheReader, TCacheTable, TProducer, TReadMode, test_util::ShmemDir,
+    LeanVmReady, LeanVmReq, LeanVmResp, RefusalCode, SilverSpine, TCache, TCacheId, TCacheProducer,
+    TCacheRead, TCacheReader, TCacheTable, TProducer, TReadMode,
+    leanvm::{
+        MAX_PROOFS, MAX_SIGNATURES, ProofBody, ProofLen, RequestBody, SIGNED_CLAIM_SIZE,
+        SignedClaim,
+    },
+    test_util::ShmemDir,
 };
 
-use super::LeanVmTile;
-use crate::wire::{Request, tests::encode_request};
+use super::{LeanVmTile, MAX_QUEUED_AGGREGATES, Prover, decode_claim, read_request};
 
 struct Injector;
 impl Tile<SilverSpine> for Injector {
@@ -30,8 +37,15 @@ struct Rig {
     injector: SpineAdapter<SilverSpine>,
     handoff: TProducer,
     responses: TCacheReader,
-    answers: Vec<(u64, Option<Vec<u8>>)>,
-    health: Vec<bool>,
+    answers: Vec<(u64, Answer)>,
+    ready_events: usize,
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum Answer {
+    Proven(ProofLen, Vec<u8>),
+    Refused(RefusalCode),
+    NoAnswer,
 }
 
 impl Rig {
@@ -47,7 +61,7 @@ impl Rig {
         tile.on_attach(&mut adapter);
         let mut injector = SpineAdapter::connect_tile(&Injector, &mut *spine);
         injector.consume(|_: LeanVmResp, _| {});
-        injector.consume(|_: LeanVmHealthEvent, _| {});
+        injector.consume(|_: LeanVmReady, _| {});
         assert!(tile.try_init(&mut adapter));
         let responses = TCacheReader::single(out_ref, "test", TReadMode::Sliding).unwrap();
         Self {
@@ -59,34 +73,85 @@ impl Rig {
             handoff,
             responses,
             answers: Vec::new(),
-            health: Vec::new(),
+            ready_events: 0,
         }
+    }
+
+    fn warm_without_proving() -> Self {
+        let mut rig = Self::new(Vec::new());
+        rig.tile.prover = Prover::Warm;
+        rig
     }
 
     fn crank(&mut self) {
         self.tile.loop_body(&mut self.adapter);
-        let Self { injector, responses, answers, health, .. } = self;
+        self.read_answers();
+    }
+
+    fn read_answers(&mut self) {
+        let Self { injector, responses, answers, ready_events, .. } = self;
         injector.consume(|resp: LeanVmResp, _| {
-            let body = resp.body.map(|read| {
-                let acquired = responses.acquire(read);
-                acquired.buffer().unwrap().0.to_vec()
-            });
-            answers.push((resp.request_id, body));
+            let answer = match resp {
+                LeanVmResp::Proven { claims, proof, body, .. } => {
+                    let acquired = responses.acquire(body);
+                    Answer::Proven(
+                        ProofLen { claims, proof },
+                        acquired.buffer().unwrap().0.to_vec(),
+                    )
+                }
+                LeanVmResp::Refused { reason, .. } => Answer::Refused(reason),
+                LeanVmResp::NoAnswer { .. } => Answer::NoAnswer,
+            };
+            answers.push((resp.request_id(), answer));
         });
-        injector.consume(|event: LeanVmHealthEvent, _| health.push(event.ready));
+        injector.consume(|_: LeanVmReady, _| *ready_events += 1);
     }
 
-    fn request(&mut self, request_id: u64, body: &[u8]) {
-        let body = self.handoff.write_with(body.len(), |out| out.copy_from_slice(body)).unwrap();
+    fn prepare(
+        &mut self,
+        request_id: u64,
+        signatures: &[SignedClaim],
+        proofs: &[(ProofLen, &[u8])],
+    ) -> LeanVmReq {
+        let mut children = [ProofLen::default(); MAX_PROOFS];
+        for (next, &(len, _)) in children.iter_mut().zip(proofs) {
+            *next = len;
+        }
+        let bytes =
+            size_of_val(signatures) + proofs.iter().map(|(len, _)| len.bytes()).sum::<usize>();
+        let body = self
+            .handoff
+            .write_with(bytes, |out| {
+                RequestBody::write(out, signatures, proofs.iter().map(|&(_, bytes)| bytes));
+            })
+            .unwrap();
         self.handoff.loop_start();
-        self.injector.produce(LeanVmReq { request_id, body });
+        LeanVmReq {
+            request_id,
+            signatures: signatures.len() as u16,
+            proofs: proofs.len() as u8,
+            children,
+            body,
+        }
     }
 
-    fn answer(&mut self, request_id: u64) -> Option<Vec<u8>> {
+    fn lap(&mut self, read: TCacheRead) {
+        for _ in 0..5 {
+            self.handoff.write_with(1 << 22, |out| out.fill(0)).unwrap();
+            self.handoff.loop_start();
+            // The reader takes the producer's floor snapshot, then applies it on the next
+            // pass.
+            self.crank();
+            self.crank();
+        }
+        assert!(self.handoff.read_buffer(read).is_err());
+    }
+
+    fn answer(&mut self, request_id: u64) -> Answer {
         let deadline = Instant::now() + Duration::from_secs(300);
         loop {
-            if let Some((_, body)) = self.answers.iter().find(|(id, _)| *id == request_id) {
-                return body.clone();
+            if let Some(index) = self.answers.iter().position(|(id, _)| *id == request_id) {
+                return self.answers.swap_remove(index).1;
             }
             assert!(Instant::now() < deadline, "no answer to {request_id}");
             self.crank();
@@ -97,11 +162,165 @@ impl Rig {
 #[test]
 fn without_a_prover_every_request_is_answered_none() {
     let mut rig = Rig::new(Vec::new());
-    rig.request(1, &[2]);
-    rig.request(2, &[1]);
-    assert_eq!(rig.answer(1), None);
-    assert_eq!(rig.answer(2), None);
-    assert!(rig.health.is_empty());
+    for request_id in [1, 2] {
+        let request = rig.prepare(request_id, &[[0; SIGNED_CLAIM_SIZE]], &[]);
+        rig.injector.produce(request);
+    }
+    assert_eq!(rig.answer(1), Answer::NoAnswer);
+    assert_eq!(rig.answer(2), Answer::NoAnswer);
+    assert_eq!(rig.ready_events, 0);
+}
+
+#[test]
+fn signatures_of_a_request_reach_lean_vm_unchanged() {
+    let (secret, key) = lean_xmss::key_gen(&[7; lean_xmss::SECRET_KEY_LEN]);
+    let message = [8; lean_xmss::MESSAGE_LEN];
+    secret.prepare(7);
+    let signature = lean_xmss::sign(&secret, &message, 7);
+    let mut rig = Rig::new(Vec::new());
+    let request = rig.prepare(1, &[signed_claim(key, message, &signature)], &[]);
+    let decoded = read_request(&mut rig.tile.reader, request).unwrap();
+
+    assert!(decoded.children.is_empty());
+    let [(decoded_key, decoded_message, decoded_signature)] = decoded.signatures.as_slice() else {
+        panic!("expected one signature");
+    };
+    assert_eq!((*decoded_key, *decoded_message), (key, message));
+    assert_eq!(decoded_signature.to_bytes(), signature.to_bytes());
+}
+
+#[test]
+fn a_child_that_is_no_proof_is_refused() {
+    let len = ProofLen { claims: 1, proof: 1 };
+    let mut child = vec![0; len.bytes()];
+    ProofBody::write(&mut child, [[7; 64]].into_iter(), b"p");
+    let mut rig = Rig::warm_without_proving();
+    let request = rig.prepare(1, &[], &[(len, &child)]);
+    rig.injector.produce(request);
+    assert_eq!(rig.answer(1), Answer::Refused(RefusalCode::InvalidChild));
+}
+
+#[test]
+fn a_forged_count_is_refused_without_reading_the_body() {
+    let mut rig = Rig::warm_without_proving();
+    let mut request = rig.prepare(1, &[[0; SIGNED_CLAIM_SIZE]], &[]);
+    rig.lap(request.body);
+    request.proofs = MAX_PROOFS as u8 + 1;
+    rig.injector.produce(request);
+    assert_eq!(rig.answer(1), Answer::Refused(RefusalCode::Malformed));
+
+    let request = LeanVmReq { request_id: 2, signatures: 0, proofs: 0, ..request };
+    rig.injector.produce(request);
+    assert_eq!(rig.answer(2), Answer::Refused(RefusalCode::InvalidInput));
+}
+
+#[test]
+fn a_truncated_request_is_refused() {
+    let len = ProofLen { claims: 1, proof: 1 };
+    let mut child = vec![0; len.bytes()];
+    ProofBody::write(&mut child, [[7; 64]].into_iter(), b"p");
+    let mut rig = Rig::warm_without_proving();
+    let mut request = rig.prepare(1, &[], &[(len, &child)]);
+    request.children[0].proof += 1;
+    rig.injector.produce(request);
+    assert_eq!(rig.answer(1), Answer::Refused(RefusalCode::Malformed));
+}
+
+#[test]
+fn unsorted_child_claims_are_refused() {
+    let len = ProofLen { claims: 2, proof: 1 };
+    let mut child = vec![0; len.bytes()];
+    ProofBody::write(&mut child, [[2; 64], [1; 64]].into_iter(), b"p");
+    let mut rig = Rig::warm_without_proving();
+    let request = rig.prepare(1, &[], &[(len, &child)]);
+    rig.injector.produce(request);
+    assert_eq!(rig.answer(1), Answer::Refused(RefusalCode::Malformed));
+}
+
+#[test]
+fn lapped_and_unopened_requests_get_no_answer() {
+    let mut rig = Rig::warm_without_proving();
+    let request = rig.prepare(1, &[[0; SIGNED_CLAIM_SIZE]], &[]);
+    rig.lap(request.body);
+    rig.injector.produce(request);
+    assert_eq!(rig.answer(1), Answer::NoAnswer);
+
+    let body = rig.tile.producer.write_with(SIGNED_CLAIM_SIZE, |out| out.fill(0)).unwrap();
+    rig.injector.produce(LeanVmReq { request_id: 2, body, ..request });
+    assert_eq!(rig.answer(2), Answer::NoAnswer);
+}
+
+#[test]
+fn a_request_past_the_queue_cap_gets_no_answer() {
+    let mut rig = Rig::warm_without_proving();
+    let extra = MAX_QUEUED_AGGREGATES as u64 + 1;
+    for request_id in 1..=extra {
+        let request = rig.prepare(request_id, &[[0; SIGNED_CLAIM_SIZE]], &[]);
+        rig.injector.produce(request);
+    }
+    rig.tile.intake(&mut rig.adapter);
+    rig.tile.publish(&mut rig.adapter);
+    rig.read_answers();
+    assert_eq!(rig.answers, [(extra, Answer::NoAnswer)]);
+}
+
+#[test]
+fn a_refusal_needs_no_response_tcache() {
+    let mut rig = Rig::warm_without_proving();
+    let capacity = rig.tile.producer.cache_ref().max_payload_len();
+    let _held = rig.tile.producer.reserve(capacity, false).unwrap();
+    assert!(rig.tile.producer.reserve(1, false).is_none());
+
+    let mut request = rig.prepare(1, &[[0; SIGNED_CLAIM_SIZE]], &[]);
+    request.signatures = MAX_SIGNATURES as u16 + 1;
+    rig.injector.produce(request);
+    assert_eq!(rig.answer(1), Answer::Refused(RefusalCode::Malformed));
+}
+
+#[test]
+fn the_response_body_carries_only_claims_and_proof() {
+    let mut rig = Rig::new(Vec::new());
+    let key = lean_xmss::LeanXmssPublicKey::from_bytes(&[1; lean_xmss::PUB_KEY_SIZE]);
+    let claims = AggregateClaims {
+        lean_xmss: vec![(key, [2; lean_xmss::MESSAGE_LEN])],
+        ..AggregateClaims::default()
+    };
+    let LeanVmResp::Proven { request_id: 7, claims, proof, body } =
+        rig.tile.write_proven(7, &claims, b"proof")
+    else {
+        panic!("expected a proven response");
+    };
+    let acquired = rig.responses.acquire(body);
+    let (bytes, _) = acquired.buffer().unwrap();
+    let split = ProofLen { claims, proof }.split(bytes).unwrap();
+    assert_eq!(split.claims().as_flattened(), [&[1; 32][..], &[2; 32]].concat());
+    assert_eq!(split.proof(), b"proof");
+}
+
+#[test]
+fn output_outside_the_response_format_is_refused() {
+    use lean_vm::lean_sphincs::LeanSphincsPublicKey;
+    use silver_common::leanvm::{MAX_PROOF_CLAIMS, MAX_STARK_PROOF_SIZE};
+
+    let mut rig = Rig::new(Vec::new());
+    let mut claims = AggregateClaims { da_commitment: Some([1; 32]), ..AggregateClaims::default() };
+    let refused = |response| {
+        assert!(matches!(response, LeanVmResp::Refused {
+            request_id: 7,
+            reason: RefusalCode::ProvingFailed
+        }));
+    };
+    refused(rig.tile.write_proven(7, &claims, b"proof"));
+    claims.da_commitment = None;
+    claims.lean_sphincs.push((LeanSphincsPublicKey::from_bytes(&[1; 32]), [2; 32]));
+    refused(rig.tile.write_proven(7, &claims, b"proof"));
+    claims.lean_sphincs.clear();
+
+    let key = lean_xmss::LeanXmssPublicKey::from_bytes(&[1; lean_xmss::PUB_KEY_SIZE]);
+    claims.lean_xmss = vec![(key, [2; 32]); MAX_PROOF_CLAIMS + 1];
+    refused(rig.tile.write_proven(7, &claims, b"proof"));
+    claims.lean_xmss.truncate(1);
+    refused(rig.tile.write_proven(7, &claims, &vec![0; MAX_STARK_PROOF_SIZE + 1]));
 }
 
 /// Whatever the machine, one CPU per physical core, none below `first`.
@@ -123,16 +342,24 @@ fn test_cores() -> Vec<usize> {
 }
 
 /// An `aggregate` response's claims and proof.
-fn proven(response: &[u8]) -> (AggregateClaims, Vec<u8>) {
-    assert_eq!(response[0], 0, "refused: {response:?}");
-    let field = |at: usize| {
-        let len = u64::from_le_bytes(response[at..at + 8].try_into().unwrap()) as usize;
-        (&response[at + 8..at + 8 + len], at + 8 + len)
-    };
-    let (claims, next) = field(1);
-    let (proof, end) = field(next);
-    assert_eq!(end, response.len());
-    (AggregateClaims::from_bytes(claims).unwrap(), proof.to_vec())
+fn proof_parts(len: ProofLen, bytes: &[u8]) -> (AggregateClaims, &[u8]) {
+    let body = len.split(bytes).unwrap();
+    let lean_xmss = body.claims().iter().map(decode_claim).collect();
+    (AggregateClaims { lean_xmss, ..AggregateClaims::default() }, body.proof())
+}
+
+fn signed_claim(
+    key: LeanXmssPublicKey,
+    message: lean_xmss::Message,
+    signature: &LeanXmssSignature,
+) -> SignedClaim {
+    let mut record = [0; SIGNED_CLAIM_SIZE];
+    let (key_bytes, rest) = record.split_at_mut(lean_xmss::PUB_KEY_SIZE);
+    let (message_bytes, signature_bytes) = rest.split_at_mut(lean_xmss::MESSAGE_LEN);
+    key_bytes.copy_from_slice(&key.to_bytes());
+    message_bytes.copy_from_slice(&message);
+    signature_bytes.copy_from_slice(&signature.to_bytes());
+    record
 }
 
 /// Four keys sign one message; the tile proves two of them, then merges that
@@ -140,47 +367,45 @@ fn proven(response: &[u8]) -> (AggregateClaims, Vec<u8>) {
 /// against one claim short.
 #[test]
 #[ignore = "proves with the real prover: set LEANVM_TEST_CORES"]
-fn the_tile_proves_as_the_sidecar_did() {
+fn the_tile_proves_and_merges() {
     let message = [7; lean_xmss::MESSAGE_LEN];
-    let raw_lean_xmss: Vec<_> = (0..4u8)
+    let signatures: Vec<_> = (0..4u8)
         .map(|k| {
             let (secret_key, public_key) = lean_xmss::key_gen(&[k; lean_xmss::SECRET_KEY_LEN]);
             secret_key.prepare(7);
-            (public_key, message, lean_xmss::sign(&secret_key, &message, 7))
+            signed_claim(public_key, message, &lean_xmss::sign(&secret_key, &message, 7))
         })
         .collect();
-    let request = |raw_lean_xmss: Vec<_>, children| Request {
-        children,
-        raw_lean_xmss,
-        raw_lean_sphincs: vec![],
-        blobs: vec![],
-        output: None,
-        log_inv_rate: 2,
-    };
-
     let mut rig = Rig::new(test_cores());
     rig.crank();
-    assert_eq!(rig.health, [true]);
+    assert_eq!(rig.ready_events, 1);
 
-    rig.request(1, &encode_request(&request(raw_lean_xmss[..2].to_vec(), vec![])));
-    let (claims, proof) = proven(&rig.answer(1).expect("a response"));
+    let request = rig.prepare(1, &signatures[..2], &[]);
+    rig.injector.produce(request);
+    let Answer::Proven(first_len, first) = rig.answer(1) else { panic!("expected a proof") };
+    let (claims, proof) = proof_parts(first_len, &first);
     assert_eq!(claims.lean_xmss.len(), 2);
 
-    rig.request(
-        2,
-        &encode_request(&request(raw_lean_xmss[2..].to_vec(), vec![(claims.clone(), &proof)])),
-    );
-    let (union, merged) = proven(&rig.answer(2).expect("a response"));
+    let request = rig.prepare(2, &signatures[2..], &[(first_len, &first)]);
+    let decoded = read_request(&mut rig.tile.reader, request).unwrap();
+    let [(child_claims, child_proof)] = decoded.children.as_slice() else {
+        panic!("expected one child");
+    };
+    assert_eq!(child_claims, &claims);
+    assert_eq!(child_proof.to_bytes(), proof);
+    rig.injector.produce(request);
+    let Answer::Proven(merged_len, merged) = rig.answer(2) else {
+        panic!("expected a merge proof")
+    };
+    let (union, merged_proof) = proof_parts(merged_len, &merged);
     assert_eq!(union.lean_xmss.len(), 4);
 
-    for (claims, proof) in [(claims, proof), (union, merged)] {
-        let proof = AggregateProof::from_bytes(&proof).expect("a proof");
+    eprintln!("leaf proof {} bytes, merge proof {} bytes", proof.len(), merged_proof.len());
+    for (claims, proof) in [(claims, proof), (union, merged_proof)] {
+        let proof = AggregateProof::from_bytes(proof).expect("a proof");
         assert!(proof.verify(&claims));
         let mut fewer = claims;
         fewer.lean_xmss.pop();
         assert!(!proof.verify(&fewer), "a claim short");
     }
-
-    rig.request(5, &[9]);
-    assert_eq!(rig.answer(5).expect("a response")[0], 5, "malformed");
 }

@@ -683,7 +683,7 @@ impl BeaconStateTile {
             votes,
         } = applied;
 
-        self.pq_aggregator.on_block_imported(parsed.header.slot, &self.ticker);
+        self.pq_aggregator.on_block_imported(parsed.header.slot);
         let is_gloas = parsed.fork.post_gloas_fork();
         let (parent_payload_status, bid_block_hash, payload_verified) = if is_gloas {
             (parsed.parent_payload_status, bid_block_hash, false)

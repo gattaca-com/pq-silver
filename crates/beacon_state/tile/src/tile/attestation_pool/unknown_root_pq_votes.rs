@@ -26,7 +26,7 @@ pub(crate) struct CandidateVotes {
     /// The head shuffling the committee positions were read from.
     shuffling: ShufflingId,
     pub(crate) attesters: Vec<u32>,
-    /// The votes a local aggregator proves.
+    /// The votes a local aggregator or a local block proof proves.
     pub(crate) aggregated: Vec<PreparedPqAttestation>,
 }
 

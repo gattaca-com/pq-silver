@@ -34,10 +34,6 @@ const fn default_usize<const N: usize>() -> usize {
     N
 }
 
-const fn default_bool<const V: bool>() -> bool {
-    V
-}
-
 const fn default_u8<const V: u8>() -> u8 {
     V
 }
@@ -287,11 +283,6 @@ pub struct Config {
     /// `tile_cores`. Unset: all of them. 0: no prover.
     #[serde(default)]
     leanvm_cores: Option<usize>,
-    /// Keeps one STARK proof of the pooled PQ votes not yet on chain, so a
-    /// local proposal also includes votes older than the newest slot. Costs
-    /// about two more leanVM proofs each slot.
-    #[serde(default = "default_bool::<true>")]
-    pq_rolling_aggregate: bool,
 }
 
 impl Config {
@@ -414,10 +405,6 @@ impl Config {
     /// `None` when unset, for all of them.
     pub fn leanvm_cores(&self) -> Option<usize> {
         self.leanvm_cores
-    }
-
-    pub fn pq_rolling_aggregate(&self) -> bool {
-        self.pq_rolling_aggregate
     }
 
     pub fn enr(&self, keypair: &Keypair, enr_fork_id: [u8; 16]) -> Result<Enr, Error> {
@@ -670,13 +657,6 @@ mod tests {
         let cfg = Config::from_toml("", flag).unwrap();
         assert_eq!(cfg.pbs().unwrap().get_header_timeout(), Duration::from_millis(1200));
         assert_eq!(cfg.pbs().unwrap().submit_blinded_block_timeout(), Duration::from_millis(5000));
-    }
-
-    #[test]
-    fn pq_rolling_aggregate_is_on_unless_the_file_turns_it_off() {
-        assert!(Config::from_toml("", Overrides::default()).unwrap().pq_rolling_aggregate());
-        let off = Config::from_toml("pq_rolling_aggregate = false", Overrides::default());
-        assert!(!off.unwrap().pq_rolling_aggregate());
     }
 
     #[test]

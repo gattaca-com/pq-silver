@@ -1,25 +1,28 @@
-//! Post-quantum aggregation: votes and aggregates proved into one growing
-//! proof by the leanVM tile.
+//! Post-quantum aggregation for local aggregator duties and block proposals.
 //!
-//! A leaf proves the votes of one committee for one attestation data. A
-//! merge proves the aggregates of one slot for the block body. Each extends
-//! its best proof batch by batch.
-//!
-//! [`PqAggregator`] routes verified claims and responses, and keeps one
-//! request in flight. A leaf or a merge owns its strategy, which picks the
-//! next batch and never sees claim bytes. Its core owns the verified claims,
-//! the best proof and every check on a response.
+//! `ProofSources` stores verified votes and aggregates.
+//! `ProofTargets` holds the proofs each duty or proposal needs.
+//! The target with the earliest deadline goes first.
+//! The planner sizes each merge using the learnt request cost.
+//! [`PqAggregator`] keeps one leanVM request in flight.
 
-mod aggregation;
 mod aggregator;
+mod bits;
 mod claims;
-mod leaf;
-mod merge;
-mod rolling;
-mod strategy;
+mod cost_model;
+mod deadline_tracker;
+mod merge_planner;
+mod proof_sources;
+mod proof_store;
+mod proof_targets;
+mod proved;
+mod running_proof;
+mod segments;
+mod slot_aggregates;
+mod slot_votes;
+mod stats;
 #[cfg(test)]
 pub(super) mod test_util;
-pub(super) mod wire;
 
 pub use aggregator::PqAggregator;
-pub use claims::{Aggregate, Claim, VerifiedVote, claim};
+pub use claims::{Claim, VerifiedVote, claim};

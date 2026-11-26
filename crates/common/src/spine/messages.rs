@@ -1819,27 +1819,9 @@ pub struct EngineHealthEvent {
     pub sync_status: ELSyncStatus,
 }
 
-/// A leanVM tile request body, op byte onwards and unframed.
 #[derive(Clone, Copy, Debug, TypeHash)]
 #[repr(C)]
-pub struct LeanVmReq {
-    pub request_id: u64,
-    pub body: TCacheRead,
-}
-
-/// A leanVM tile response body, status byte included. `None` is no answer.
-#[derive(Clone, Copy, Debug, TypeHash)]
-#[repr(C)]
-pub struct LeanVmResp {
-    pub request_id: u64,
-    pub body: Option<TCacheRead>,
-}
-
-#[derive(Clone, Copy, Debug, TypeHash)]
-#[repr(C)]
-pub struct LeanVmHealthEvent {
-    pub ready: bool,
-}
+pub struct LeanVmReady;
 
 impl BeaconStateEvent {
     pub fn view(&self) -> SszView {

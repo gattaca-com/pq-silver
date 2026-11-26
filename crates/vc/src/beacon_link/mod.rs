@@ -8,14 +8,10 @@ mod requests;
 #[cfg(test)]
 mod stub_server;
 
-#[cfg(feature = "thread_park")]
-use std::io;
-use std::time::Duration;
+use std::{io, time::Duration};
 
 use flux_network::{NetworkEvent, NetworkWithExternalPoll};
-#[cfg(feature = "thread_park")]
-use mio::Waker;
-use mio::{Events, Poll, Token};
+use mio::{Events, Poll, Token, Waker};
 use silver_common::Error;
 
 use self::{beacon_node::BeaconNode, chain::ExpectedGenesis};
@@ -29,7 +25,11 @@ pub use self::{
 };
 use crate::config::Config;
 
+/// flux's waker, and the signer's: one eventfd each.
+#[cfg(feature = "thread_park")]
 const WAKER_TOKEN: Token = Token(0);
+const SIGNER_WAKER_TOKEN: Token = Token(1);
+const FIRST_SOCKET_TOKEN: usize = 2;
 const EVENTS_CAPACITY: usize = 256;
 /// Under `thread_park` the loop sleeps in `epoll` rather than spinning. Socket
 /// readiness ends the wait at once; this bounds how late a slot phase or retry
@@ -54,7 +54,7 @@ impl BeaconLink {
         Ok(Self {
             poll,
             events: Events::with_capacity(EVENTS_CAPACITY),
-            net: NetworkWithExternalPoll::new(registry, WAKER_TOKEN.0 + 1..usize::MAX),
+            net: NetworkWithExternalPoll::new(registry, FIRST_SOCKET_TOKEN..usize::MAX),
             beacon_node: BeaconNode::new(
                 &config.beacon_node,
                 expected,
@@ -66,6 +66,10 @@ impl BeaconLink {
     #[cfg(feature = "thread_park")]
     pub fn waker(&self) -> io::Result<Waker> {
         Waker::new(self.poll.registry(), WAKER_TOKEN)
+    }
+
+    pub fn signer_waker(&self) -> io::Result<Waker> {
+        Waker::new(self.poll.registry(), SIGNER_WAKER_TOKEN)
     }
 
     pub fn genesis_time(&self) -> Option<u64> {
@@ -89,7 +93,7 @@ impl BeaconLink {
         if let Err(error) = poll.poll(events, Some(POLL_TIMEOUT.min(net.max_poll_interval()))) {
             silver_log::error!(%error, "poll");
         }
-        for event in events.iter().filter(|event| event.token() != WAKER_TOKEN) {
+        for event in events.iter().filter(|event| event.token().0 >= FIRST_SOCKET_TOKEN) {
             net.handle_event(event, &mut route);
         }
         net.post_poll(&mut route);

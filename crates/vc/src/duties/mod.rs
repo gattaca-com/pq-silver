@@ -171,6 +171,10 @@ impl Duties {
         }
     }
 
+    pub fn current_slot(&self) -> Option<u64> {
+        self.clock.as_ref().map(DutyClock::current_slot)
+    }
+
     pub fn on_tick(
         &mut self,
         genesis_time: u64,

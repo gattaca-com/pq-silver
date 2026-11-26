@@ -19,7 +19,7 @@ Add the crate to your `Cargo.toml`:
 silver_crypto_simd = "0.1"
 ```
 
-The minimum Rust version is 1.91, and blst is the only runtime dependency. The default `simd` feature enables runtime selection of the IFMA implementation; no CPU-specific build flags are needed. Set `default-features = false` to disable IFMA.
+The minimum Rust version is 1.96.1, and blst is the only runtime dependency. The default `simd` feature enables runtime selection of the IFMA implementation; no CPU-specific build flags are needed. Set `default-features = false` to disable IFMA.
 
 The 0.1 API may change in subsequent releases before 1.0.
 

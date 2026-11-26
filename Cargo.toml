@@ -121,6 +121,7 @@ flux-sse = { git = "https://github.com/gattaca-com/flux", rev = "539bf86d97f5d56
 flux-network = { git = "https://github.com/gattaca-com/flux", rev = "539bf86d97f5d56ff5b7f58cfea6c1bbafbe6714"}
 flux-utils = { git = "https://github.com/gattaca-com/flux", rev = "539bf86d97f5d56ff5b7f58cfea6c1bbafbe6714", features = ["bytes"]}
 flux-profiler = { git = "https://github.com/gattaca-com/flux", rev = "539bf86d97f5d56ff5b7f58cfea6c1bbafbe6714"}
+lean_xmss = { git = "https://github.com/leanEthereum/leanVM", rev = "3d84ffc3c866d66f4c632848f8fc6f30a3350f76" }
 type-hash = { git = "https://github.com/gattaca-com/flux", rev = "539bf86d97f5d56ff5b7f58cfea6c1bbafbe6714"}
 type-hash-derive = { git = "https://github.com/gattaca-com/flux", rev = "539bf86d97f5d56ff5b7f58cfea6c1bbafbe6714"}
 

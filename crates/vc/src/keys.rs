@@ -1,4 +1,8 @@
-use std::{fs, os::unix::fs::PermissionsExt, path::Path};
+use std::{
+    fs,
+    os::unix::fs::PermissionsExt,
+    path::{Path, PathBuf},
+};
 
 use serde::Deserialize;
 use silver_common::{Error, json_fields::bytes, ssz_view::XMSSPubkey};
@@ -10,11 +14,13 @@ pub struct ValidatorKey {
     #[serde(deserialize_with = "bytes")]
     pub pubkey: XMSSPubkey,
     #[serde(deserialize_with = "bytes")]
-    #[expect(dead_code, reason = "read by the leanVM signer")]
-    privkey: [u8; 32],
+    pub privkey: [u8; 32],
     #[serde(deserialize_with = "bytes")]
     #[expect(dead_code, reason = "read by the VRF prover")]
     vrf_seed: [u8; 32],
+    /// The file it was read from; its leaf record lives beside it.
+    #[serde(skip)]
+    pub path: PathBuf,
 }
 
 /// Every `*.json` file in `dir`, sorted by pubkey. A file others can read is
@@ -34,8 +40,9 @@ pub fn load_keys(dir: &Path) -> Result<Vec<ValidatorKey>, Error> {
             return Err(unreadable(&path, format!("mode {:o} lets others read it", mode & 0o777)));
         }
         let text = fs::read(&path)?;
-        let key = serde_json::from_slice::<ValidatorKey>(&text)
+        let mut key = serde_json::from_slice::<ValidatorKey>(&text)
             .map_err(|e| unreadable(&path, e.to_string()))?;
+        key.path = path;
         keys.push(key);
     }
     keys.sort_unstable_by_key(|key| key.pubkey);

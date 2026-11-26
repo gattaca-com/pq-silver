@@ -7,7 +7,7 @@ use crate::{
     duties::Duties,
     keys::load_keys,
     signer::Signer,
-    signing::SignRequests,
+    signing::{SignAnswer, SignRequests},
 };
 
 pub struct ValidatorTile {
@@ -22,11 +22,13 @@ impl ValidatorTile {
     pub fn new(config: &Config) -> Result<Self, Error> {
         let keys = load_keys(&config.keys_dir)?;
         silver_log::info!(keys = keys.len(), dir = %config.keys_dir.display(), "validator keys");
+        let beacon_link = BeaconLink::new(config)?;
+        let signer = Signer::new(&keys, config.signer_threads, beacon_link.signer_waker()?)?;
         let pubkeys = keys.iter().map(|key| key.pubkey).collect();
         Ok(Self {
-            beacon_link: BeaconLink::new(config)?,
+            beacon_link,
             duties: Duties::new(config, pubkeys),
-            signer: Signer::new(keys),
+            signer,
             requests: BeaconRequests::default(),
             signs: SignRequests::default(),
         })
@@ -50,6 +52,17 @@ impl Tile<VcSpine> for ValidatorTile {
         if let Some(genesis_time) = beacon_link.genesis_time() {
             duties.on_tick(genesis_time, requests, signs);
         }
-        signs.drain(|request| duties.on_signed(&request, signer.answer(&request), requests));
+        if let Some(slot) = duties.current_slot() {
+            signer.prepare_for(slot);
+        }
+        signs.drain(|request| {
+            if !signer.submit(&request) {
+                duties.on_signed(&request, SignAnswer::Refused, requests);
+            }
+        });
+        signer.drain(|request, signature| {
+            let answer = signature.map_or(SignAnswer::Refused, SignAnswer::Signature);
+            duties.on_signed(request, answer, requests);
+        });
     }
 }

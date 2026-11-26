@@ -40,7 +40,6 @@ pub struct SignRequest {
 }
 
 pub enum SignAnswer<'a> {
-    #[cfg_attr(not(test), expect(dead_code, reason = "answered by the leanVM signer"))]
     Signature(&'a XMSSSignature),
     #[cfg_attr(not(test), expect(dead_code, reason = "answered by the VRF prover"))]
     VrfProof(&'a VRFProof),

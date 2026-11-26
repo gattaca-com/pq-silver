@@ -60,10 +60,10 @@ dependencies = [
  "claims",
  "fiat_shamir_prover",
  "isa",
- "keccak256",
+ "keccak256 0.1.0 (git+https://github.com/leanEthereum/leanVM?tag=bindings-v0.19.0)",
  "lean_da",
  "lean_sphincs",
- "lean_xmss",
+ "lean_xmss 0.1.0 (git+https://github.com/leanEthereum/leanVM?tag=bindings-v0.19.0)",
  "stable_lean_vm_core",
  "stable_pcs",
  "stable_primitives",
@@ -1306,7 +1306,7 @@ version = "0.1.0"
 source = "git+https://github.com/leanEthereum/leanVM?tag=bindings-v0.19.0#351f7ae421529ce164ed747eee1f78bdeaec3e80"
 dependencies = [
  "lean_sphincs",
- "lean_xmss",
+ "lean_xmss 0.1.0 (git+https://github.com/leanEthereum/leanVM?tag=bindings-v0.19.0)",
 ]
 
 [[package]]
@@ -2559,7 +2559,7 @@ source = "git+https://github.com/leanEthereum/leanVM?tag=bindings-v0.19.0#351f7a
 dependencies = [
  "experimental_parallel",
  "fiat_shamir_prover",
- "keccak256",
+ "keccak256 0.1.0 (git+https://github.com/leanEthereum/leanVM?tag=bindings-v0.19.0)",
 ]
 
 [[package]]
@@ -2693,7 +2693,7 @@ name = "fiat_shamir_prover"
 version = "0.1.0"
 source = "git+https://github.com/leanEthereum/leanVM?tag=bindings-v0.19.0#351f7ae421529ce164ed747eee1f78bdeaec3e80"
 dependencies = [
- "keccak256",
+ "keccak256 0.1.0 (git+https://github.com/leanEthereum/leanVM?tag=bindings-v0.19.0)",
  "verifier",
 ]
 
@@ -4191,6 +4191,11 @@ version = "0.1.0"
 source = "git+https://github.com/leanEthereum/leanVM?tag=bindings-v0.19.0#351f7ae421529ce164ed747eee1f78bdeaec3e80"
 
 [[package]]
+name = "keccak256"
+version = "0.1.0"
+source = "git+https://github.com/leanEthereum/leanVM?rev=3d84ffc3c866d66f4c632848f8fc6f30a3350f76#3d84ffc3c866d66f4c632848f8fc6f30a3350f76"
+
+[[package]]
 name = "keccak256_armaes"
 version = "0.1.0"
 source = "git+https://github.com/leanEthereum/leanVM?tag=bindings-v0.19.0#351f7ae421529ce164ed747eee1f78bdeaec3e80"
@@ -4266,7 +4271,7 @@ name = "lean_da"
 version = "0.1.0"
 source = "git+https://github.com/leanEthereum/leanVM?tag=bindings-v0.19.0#351f7ae421529ce164ed747eee1f78bdeaec3e80"
 dependencies = [
- "keccak256",
+ "keccak256 0.1.0 (git+https://github.com/leanEthereum/leanVM?tag=bindings-v0.19.0)",
  "stable_pcs",
  "stable_primitives",
  "tracing",
@@ -4278,7 +4283,7 @@ name = "lean_sphincs"
 version = "0.1.0"
 source = "git+https://github.com/leanEthereum/leanVM?tag=bindings-v0.19.0#351f7ae421529ce164ed747eee1f78bdeaec3e80"
 dependencies = [
- "keccak256",
+ "keccak256 0.1.0 (git+https://github.com/leanEthereum/leanVM?tag=bindings-v0.19.0)",
 ]
 
 [[package]]
@@ -4293,7 +4298,7 @@ dependencies = [
  "lean_da",
  "lean_sphincs",
  "lean_vrf",
- "lean_xmss",
+ "lean_xmss 0.1.0 (git+https://github.com/leanEthereum/leanVM?tag=bindings-v0.19.0)",
  "stable_lean_vm_core",
  "verifier",
 ]
@@ -4303,7 +4308,7 @@ name = "lean_vrf"
 version = "0.1.0"
 source = "git+https://github.com/leanEthereum/leanVM?tag=bindings-v0.19.0#351f7ae421529ce164ed747eee1f78bdeaec3e80"
 dependencies = [
- "keccak256",
+ "keccak256 0.1.0 (git+https://github.com/leanEthereum/leanVM?tag=bindings-v0.19.0)",
 ]
 
 [[package]]
@@ -4311,7 +4316,15 @@ name = "lean_xmss"
 version = "0.1.0"
 source = "git+https://github.com/leanEthereum/leanVM?tag=bindings-v0.19.0#351f7ae421529ce164ed747eee1f78bdeaec3e80"
 dependencies = [
- "keccak256",
+ "keccak256 0.1.0 (git+https://github.com/leanEthereum/leanVM?tag=bindings-v0.19.0)",
+]
+
+[[package]]
+name = "lean_xmss"
+version = "0.1.0"
+source = "git+https://github.com/leanEthereum/leanVM?rev=3d84ffc3c866d66f4c632848f8fc6f30a3350f76#3d84ffc3c866d66f4c632848f8fc6f30a3350f76"
+dependencies = [
+ "keccak256 0.1.0 (git+https://github.com/leanEthereum/leanVM?rev=3d84ffc3c866d66f4c632848f8fc6f30a3350f76)",
 ]
 
 [[package]]
@@ -7348,6 +7361,7 @@ dependencies = [
  "flux-network",
  "flux-sse",
  "hex",
+ "lean_xmss 0.1.0 (git+https://github.com/leanEthereum/leanVM?rev=3d84ffc3c866d66f4c632848f8fc6f30a3350f76)",
  "mio",
  "serde",
  "serde_json",
@@ -7355,6 +7369,7 @@ dependencies = [
  "silver_chain_spec",
  "silver_common",
  "silver_config",
+ "silver_crypto_simd",
  "silver_log",
  "tempfile",
 ]
@@ -7658,7 +7673,7 @@ source = "git+https://github.com/leanEthereum/leanVM?tag=bindings-v0.19.0#351f7a
 dependencies = [
  "fiat_shamir_prover",
  "isa",
- "keccak256",
+ "keccak256 0.1.0 (git+https://github.com/leanEthereum/leanVM?tag=bindings-v0.19.0)",
  "stable_parallel",
 ]
 
@@ -9177,7 +9192,7 @@ version = "0.1.0"
 source = "git+https://github.com/leanEthereum/leanVM?tag=bindings-v0.19.0#351f7ae421529ce164ed747eee1f78bdeaec3e80"
 dependencies = [
  "isa",
- "keccak256",
+ "keccak256 0.1.0 (git+https://github.com/leanEthereum/leanVM?tag=bindings-v0.19.0)",
  "verifier",
 ]
 

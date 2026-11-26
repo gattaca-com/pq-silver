@@ -16,6 +16,7 @@ flux-dns.workspace = true
 flux-network = { workspace = true, features = ["tls"] }
 flux-sse = { workspace = true, features = ["tls"] }
 hex.workspace = true
+lean_xmss.workspace = true
 mio.workspace = true
 serde.workspace = true
 serde_json = { workspace = true, features = ["raw_value"] }
@@ -27,6 +28,7 @@ silver_log.workspace = true
 
 [dev-dependencies]
 silver_common = { workspace = true, features = ["test-util"] }
+silver_crypto_simd.workspace = true
 tempfile = "3"
 
 [features]

@@ -97,8 +97,6 @@ pub struct AttesterDuty {
     #[serde(deserialize_with = "uint64")]
     pub committee_index: u64,
     #[serde(deserialize_with = "uint64")]
-    pub committee_length: u64,
-    #[serde(deserialize_with = "uint64")]
     pub committees_at_slot: u64,
     #[serde(deserialize_with = "uint64")]
     pub slot: u64,
@@ -146,11 +144,6 @@ impl SlotDuties<'_> {
 }
 
 #[derive(Deserialize)]
-struct PayloadAttestationDataBody {
-    data: PayloadAttestationDataJson,
-}
-
-#[derive(Deserialize)]
 struct PayloadAttestationDataJson {
     #[serde(deserialize_with = "bytes")]
     beacon_block_root: [u8; 32],
@@ -160,16 +153,19 @@ struct PayloadAttestationDataJson {
     blob_data_available: bool,
 }
 
-impl PayloadAttestationData<'_> {
-    pub fn to_ssz(&self) -> Result<[u8; PAYLOAD_ATTESTATION_DATA_SIZE], &'static str> {
-        let PayloadAttestationDataBody { data } = serde_json::from_slice(self.0)
-            .map_err(|_| "payload attestation data answer is malformed")?;
+impl<'a> PayloadAttestationData<'a> {
+    /// The data as SSZ, and its served JSON.
+    pub fn parse(&self) -> Result<([u8; PAYLOAD_ATTESTATION_DATA_SIZE], &'a str), &'static str> {
+        let malformed = "payload attestation data answer is malformed";
+        let DataBody { data: json } = serde_json::from_slice(self.0).map_err(|_| malformed)?;
+        let data = serde_json::from_str::<PayloadAttestationDataJson>(json.get())
+            .map_err(|_| malformed)?;
         let mut ssz = [0; PAYLOAD_ATTESTATION_DATA_SIZE];
         ssz[0..32].copy_from_slice(&data.beacon_block_root);
         ssz[32..40].copy_from_slice(&data.slot.to_le_bytes());
         ssz[40] = data.payload_present as u8;
         ssz[41] = data.blob_data_available as u8;
-        Ok(ssz)
+        Ok((ssz, json.get()))
     }
 }
 
@@ -183,11 +179,6 @@ fn for_each_duty<'a, T: Deserialize<'a>>(
     each_array_entry(body.data.get().as_bytes(), max, |_, duty| each(duty))
         .map_err(|_| "duties answer has a malformed or surplus entry")?;
     Ok(body.dependent_root)
-}
-
-#[derive(Deserialize)]
-struct AttestationDataBody {
-    data: AttestationDataJson,
 }
 
 #[derive(Deserialize)]
@@ -222,22 +213,17 @@ impl AttestationDataJson {
     }
 }
 
-impl AttestationData<'_> {
-    pub fn to_ssz(&self) -> Result<[u8; ATTESTATION_DATA_SIZE], &'static str> {
-        let AttestationDataBody { data } =
-            serde_json::from_slice(self.0).map_err(|_| "attestation data answer is malformed")?;
+impl<'a> AttestationData<'a> {
+    /// The data as SSZ, and its served JSON.
+    pub fn parse(&self) -> Result<([u8; ATTESTATION_DATA_SIZE], &'a str), &'static str> {
+        let malformed = "attestation data answer is malformed";
+        let DataBody { data: json } = serde_json::from_slice(self.0).map_err(|_| malformed)?;
+        let data =
+            serde_json::from_str::<AttestationDataJson>(json.get()).map_err(|_| malformed)?;
         let mut ssz = [0; ATTESTATION_DATA_SIZE];
         data.write_ssz(&mut ssz);
-        Ok(ssz)
+        Ok((ssz, json.get()))
     }
-}
-
-/// A served aggregate with its STARK proof: the JSON to publish, and the SSZ
-/// its signing root is hashed over.
-pub struct ProvedAggregate<'a> {
-    pub json: &'a str,
-    pub attestation: Vec<u8>,
-    pub proof: Vec<u8>,
 }
 
 #[derive(Deserialize)]
@@ -256,14 +242,21 @@ struct AggregateJson {
 }
 
 impl<'a> Aggregate<'a> {
-    pub fn parse(&self) -> Result<ProvedAggregate<'a>, &'static str> {
+    /// Writes the aggregate's PQ `Attestation` SSZ and its proof's bytes, and
+    /// returns the served `{"aggregate", "proof"}` JSON.
+    pub fn parse(
+        &self,
+        attestation: &mut Vec<u8>,
+        proof_bytes: &mut Vec<u8>,
+    ) -> Result<&'a str, &'static str> {
         let DataBody { data } =
             serde_json::from_slice(self.0).map_err(|_| "aggregate answer lacks data")?;
         let ProvedJson { aggregate, proof } =
             serde_json::from_str(data.get()).map_err(|_| "aggregate answer is malformed")?;
 
         let bits = aggregate.aggregation_bits.as_bytes();
-        let mut attestation = vec![0; ATTESTATION_PQ_FIXED + bits.len()];
+        attestation.clear();
+        attestation.resize(ATTESTATION_PQ_FIXED + bits.len(), 0);
         attestation[..4].copy_from_slice(&(ATTESTATION_PQ_FIXED as u32).to_le_bytes());
         let data_ssz = (&mut attestation[4..4 + ATTESTATION_DATA_SIZE]).try_into().expect("sized");
         aggregate.data.write_ssz(data_ssz);
@@ -271,9 +264,10 @@ impl<'a> Aggregate<'a> {
             .copy_from_slice(&aggregate.committee_bits);
         attestation[ATTESTATION_PQ_FIXED..].copy_from_slice(bits);
 
-        let mut proof_bytes = vec![0; proof.byte_len()];
-        proof.decode_into(&mut proof_bytes);
-        Ok(ProvedAggregate { json: data.get(), attestation, proof: proof_bytes })
+        proof_bytes.clear();
+        proof_bytes.resize(proof.byte_len(), 0);
+        proof.decode_into(proof_bytes);
+        Ok(data.get())
     }
 }
 
@@ -354,7 +348,6 @@ pub mod tests {
             pubkey,
             validator_index,
             committee_index,
-            committee_length: 128,
             committees_at_slot: 64,
             slot,
             aggregator_position: None,
@@ -368,8 +361,13 @@ pub mod tests {
     #[test]
     fn attestation_data_answer_becomes_ssz() {
         let json = json!({"data": attestation_data_json()}).to_string();
-        assert_eq!(AttestationData(json.as_bytes()).to_ssz().unwrap(), attestation_data_ssz());
-        assert!(AttestationData(br#"{"data":{"slot":"1"}}"#).to_ssz().is_err());
+        let (ssz, served) = AttestationData(json.as_bytes()).parse().unwrap();
+        assert_eq!(ssz, attestation_data_ssz());
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(served).unwrap(),
+            attestation_data_json()
+        );
+        assert!(AttestationData(br#"{"data":{"slot":"1"}}"#).parse().is_err());
     }
 
     #[test]
@@ -383,8 +381,9 @@ pub mod tests {
             "proof": "0xc0ffee",
         });
         let body = json!({"version": "pq", "data": proved}).to_string();
-        let parsed = Aggregate(body.as_bytes()).parse().unwrap();
-        assert_eq!(serde_json::from_str::<serde_json::Value>(parsed.json).unwrap(), proved);
+        let (mut attestation, mut proof) = (vec![0xff; 1000], Vec::new());
+        let json = Aggregate(body.as_bytes()).parse(&mut attestation, &mut proof).unwrap();
+        assert_eq!(serde_json::from_str::<serde_json::Value>(json).unwrap(), proved);
         let expected = [
             &(ATTESTATION_PQ_FIXED as u32).to_le_bytes()[..],
             &attestation_data_ssz(),
@@ -392,8 +391,8 @@ pub mod tests {
             &[0x0b],
         ]
         .concat();
-        assert_eq!(parsed.attestation, expected);
-        assert_eq!(parsed.proof, [0xc0, 0xff, 0xee]);
-        assert!(Aggregate(b"{}").parse().is_err());
+        assert_eq!(attestation, expected);
+        assert_eq!(proof, [0xc0, 0xff, 0xee]);
+        assert!(Aggregate(b"{}").parse(&mut attestation, &mut proof).is_err());
     }
 }

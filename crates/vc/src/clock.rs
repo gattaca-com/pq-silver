@@ -1,12 +1,7 @@
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use silver_chain_spec::SpecConfig;
-use silver_common::{
-    SLOTS_PER_EPOCH,
-    ticker::{
-        AGGREGATE_DUE_BPS, AGGREGATE_DUE_BPS_GLOAS, BASIS_POINTS, PAYLOAD_ATTESTATION_DUE_BPS,
-        attestation_due_bps,
-    },
+use silver_common::ticker::{
+    AGGREGATE_DUE_BPS_GLOAS, ATTESTATION_DUE_BPS_GLOAS, BASIS_POINTS, PAYLOAD_ATTESTATION_DUE_BPS,
 };
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -21,12 +16,11 @@ impl DutyPhase {
     const ORDER: [Self; 4] =
         [Self::SlotStart, Self::AttestationDue, Self::AggregateDue, Self::PayloadAttestationDue];
 
-    fn offset_bps(self, gloas: bool) -> u64 {
+    fn offset_bps(self) -> u64 {
         match self {
             Self::SlotStart => 0,
-            Self::AttestationDue => attestation_due_bps(gloas),
-            Self::AggregateDue if gloas => AGGREGATE_DUE_BPS_GLOAS,
-            Self::AggregateDue => AGGREGATE_DUE_BPS,
+            Self::AttestationDue => ATTESTATION_DUE_BPS_GLOAS,
+            Self::AggregateDue => AGGREGATE_DUE_BPS_GLOAS,
             Self::PayloadAttestationDue => PAYLOAD_ATTESTATION_DUE_BPS,
         }
     }
@@ -42,20 +36,14 @@ pub struct Tick {
 pub struct DutyClock {
     genesis_ms: u64,
     slot_ms: u64,
-    gloas_fork_slot: u64,
     /// The last emitted slot and its index into `DutyPhase::ORDER`.
     last: Option<(u64, usize)>,
 }
 
 impl DutyClock {
     /// None before genesis.
-    pub fn start(genesis_time: u64, spec: &SpecConfig) -> Option<Self> {
-        let clock = Self {
-            genesis_ms: genesis_time * 1000,
-            slot_ms: spec.slot_duration_ms(),
-            gloas_fork_slot: spec.gloas_fork_epoch.saturating_mul(SLOTS_PER_EPOCH),
-            last: None,
-        };
+    pub fn start(genesis_time: u64, slot_ms: u64) -> Option<Self> {
+        let clock = Self { genesis_ms: genesis_time * 1000, slot_ms, last: None };
         clock.millis_since_genesis().map(|_| clock)
     }
 
@@ -68,7 +56,7 @@ impl DutyClock {
     pub fn tick(&mut self) -> Option<Tick> {
         let ms = self.millis_since_genesis()?;
         let (slot, into) = (ms / self.slot_ms, ms % self.slot_ms);
-        let passed = |phase: &DutyPhase| self.offset_ms(*phase, slot) <= into;
+        let passed = |phase: &DutyPhase| self.slot_ms * phase.offset_bps() / BASIS_POINTS <= into;
 
         match self.last {
             Some((last, _)) if last > slot => None,
@@ -85,10 +73,6 @@ impl DutyClock {
         }
     }
 
-    fn offset_ms(&self, phase: DutyPhase, slot: u64) -> u64 {
-        self.slot_ms * phase.offset_bps(slot >= self.gloas_fork_slot) / BASIS_POINTS
-    }
-
     fn millis_since_genesis(&self) -> Option<u64> {
         let now = SystemTime::now().duration_since(UNIX_EPOCH).expect("clock after unix epoch");
         (now.as_millis() as u64).checked_sub(self.genesis_ms)
@@ -102,7 +86,7 @@ mod tests {
     fn clock_at(ms_into_chain: u64) -> DutyClock {
         let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_millis() as u64;
         let genesis_secs = (now - ms_into_chain).div_ceil(1000);
-        DutyClock::start(genesis_secs, &SpecConfig::mainnet()).unwrap()
+        DutyClock::start(genesis_secs, 12_000).unwrap()
     }
 
     #[test]
@@ -116,6 +100,6 @@ mod tests {
     #[test]
     fn not_started_before_genesis() {
         let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs();
-        assert!(DutyClock::start(now + 60, &SpecConfig::mainnet()).is_none());
+        assert!(DutyClock::start(now + 60, 12_000).is_none());
     }
 }

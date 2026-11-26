@@ -2,12 +2,6 @@ use serde::Deserialize;
 use silver_chain_spec::SpecConfig;
 use silver_common::json_fields::{bytes, uint64};
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct ChainInfo {
-    pub genesis_time: u64,
-    pub genesis_validators_root: [u8; 32],
-}
-
 /// The genesis `--network` requires the beacon node to serve.
 pub struct ExpectedGenesis {
     genesis_validators_root: [u8; 32],
@@ -22,8 +16,8 @@ impl ExpectedGenesis {
         }
     }
 
-    /// `GET /eth/v1/beacon/genesis`.
-    pub fn check(&self, body: &[u8]) -> Result<ChainInfo, String> {
+    /// The genesis time from a `GET /eth/v1/beacon/genesis` answer.
+    pub fn check(&self, body: &[u8]) -> Result<u64, String> {
         let Data { data: genesis } = serde_json::from_slice::<Data<Genesis>>(body)
             .map_err(|e| format!("unreadable genesis: {e}"))?;
         if genesis.genesis_fork_version != self.genesis_fork_version {
@@ -40,10 +34,7 @@ impl ExpectedGenesis {
                 hex::encode(self.genesis_validators_root)
             ));
         }
-        Ok(ChainInfo {
-            genesis_time: genesis.genesis_time,
-            genesis_validators_root: genesis.genesis_validators_root,
-        })
+        Ok(genesis.genesis_time)
     }
 }
 
@@ -79,9 +70,7 @@ pub mod tests {
 
     #[test]
     fn mainnet_genesis_passes() {
-        let chain = mainnet().check(GENESIS.as_bytes()).unwrap();
-        assert_eq!(chain.genesis_time, 1606824023);
-        assert_eq!(chain.genesis_validators_root, GENESIS_VALIDATORS_ROOT);
+        assert_eq!(mainnet().check(GENESIS.as_bytes()), Ok(1606824023));
     }
 
     #[test]

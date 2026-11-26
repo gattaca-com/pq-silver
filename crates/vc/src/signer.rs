@@ -14,12 +14,16 @@ impl Signer {
         Self { keys }
     }
 
-    pub fn answer(&self, request: &SignRequest) -> SignAnswer {
-        let pubkey = hex::encode(request.pubkey);
+    pub fn answer(&self, request: &SignRequest) -> SignAnswer<'static> {
         if self.keys.binary_search_by_key(&request.pubkey, |key| key.pubkey).is_err() {
+            let pubkey = hex::encode(request.pubkey);
             silver_log::error!(pubkey, purpose = ?request.purpose, "no key to sign with");
         } else {
-            silver_log::warn!(pubkey, purpose = ?request.purpose, "not signed: no leanVM signer yet");
+            silver_log::warn!(
+                slot = request.slot,
+                purpose = ?request.purpose,
+                "not signed: no leanVM signer yet"
+            );
         }
         SignAnswer::Refused
     }

@@ -9,8 +9,7 @@ use flux_network::http::HttpResponse;
 use silver_common::{
     ForkName,
     ssz_view::{
-        AttestationDataView, PAYLOAD_ATTESTATION_DATA_SIZE, PROPOSER_PREFERENCES_SIZE,
-        PayloadAttestationDataView, ProposerPreferencesView, VRFProof, XMSS_SIGNATURE_SIZE,
+        PROPOSER_PREFERENCES_SIZE, ProposerPreferencesView, VRFProof, XMSS_SIGNATURE_SIZE,
         XMSSPubkey, XMSSSignature,
     },
 };
@@ -24,30 +23,53 @@ use crate::{
         },
     },
     block_contents::GloasBlockContents,
-    signing::{KeyWork, SignPurpose, SignRequest},
 };
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct RequestId(u64);
 
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum BeaconRequest {
     ValidatorIndices,
     AttesterDuties,
     AttestationData,
-    PublishAttestations(ForkName),
     CommitteeSubscriptions,
     AggregateAttestation,
-    PublishAggregates(ForkName),
     ProposerDuties,
     PrepareProposers,
-    ProduceBlock(ForkName),
-    PublishBlock(ForkName),
+    ProduceBlock,
+    PublishBlock,
     PtcDuties,
     PayloadAttestationData,
-    PublishPayloadAttestations,
-    PublishProposerPreferences,
     PublishEnvelope,
+    Publish(Batch),
+}
+
+/// Signed objects of one kind and slot, published in one request.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Batch {
+    pub kind: Published,
+    pub slot: u64,
+    pub count: u32,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Published {
+    Attestations,
+    Aggregates,
+    PayloadAttestations,
+    ProposerPreferences,
+}
+
+impl Published {
+    fn path(self) -> &'static str {
+        match self {
+            Self::Attestations => "/eth/v2/beacon/pool/attestations",
+            Self::Aggregates => "/eth/v2/validator/aggregate_and_proofs",
+            Self::PayloadAttestations => "/eth/v1/beacon/pool/payload_attestations",
+            Self::ProposerPreferences => "/eth/v1/validator/proposer_preferences",
+        }
+    }
 }
 
 impl BeaconRequest {
@@ -59,28 +81,21 @@ impl BeaconRequest {
             Self::PayloadAttestationData => "GET",
             Self::ValidatorIndices |
             Self::AttesterDuties |
-            Self::PublishAttestations(_) |
             Self::CommitteeSubscriptions |
-            Self::PublishAggregates(_) |
             Self::PrepareProposers |
-            Self::PublishBlock(_) |
-            Self::ProduceBlock(_) |
+            Self::ProduceBlock |
+            Self::PublishBlock |
             Self::PtcDuties |
-            Self::PublishPayloadAttestations |
-            Self::PublishProposerPreferences |
-            Self::PublishEnvelope => "POST",
+            Self::PublishEnvelope |
+            Self::Publish(_) => "POST",
         }
     }
 
     pub fn consensus_version(self) -> Option<&'static str> {
         match self {
-            Self::PublishAttestations(fork) |
-            Self::PublishAggregates(fork) |
-            Self::ProduceBlock(fork) |
-            Self::PublishBlock(fork) => Some(fork.name()),
-            Self::PublishPayloadAttestations |
-            Self::PublishProposerPreferences |
-            Self::PublishEnvelope => Some(ForkName::Pq.name()),
+            Self::ProduceBlock | Self::PublishBlock | Self::PublishEnvelope | Self::Publish(_) => {
+                Some(ForkName::Pq.name())
+            }
             Self::ValidatorIndices |
             Self::AttesterDuties |
             Self::AttestationData |
@@ -95,7 +110,7 @@ impl BeaconRequest {
 
     pub fn media_type(self) -> &'static str {
         match self {
-            Self::ProduceBlock(_) | Self::PublishBlock(_) | Self::PublishEnvelope => SSZ,
+            Self::ProduceBlock | Self::PublishBlock | Self::PublishEnvelope => SSZ,
             _ => JSON,
         }
     }
@@ -124,29 +139,20 @@ impl BeaconRequest {
             Self::PayloadAttestationData => {
                 BeaconEvent::PayloadAttestationData { id, data: PayloadAttestationData(body) }
             }
-            Self::ProduceBlock(_) => {
+            Self::ProduceBlock => {
                 let payload_included = response
                     .header("Eth-Execution-Payload-Included")
                     .is_some_and(|got| got.eq_ignore_ascii_case(b"true"));
                 let block = ProducedBlock { payload_included, ssz: body };
                 BeaconEvent::ProducedBlock { id, block }
             }
-            Self::PublishAttestations(_) |
             Self::CommitteeSubscriptions |
-            Self::PublishAggregates(_) |
             Self::PrepareProposers |
-            Self::PublishBlock(_) |
-            Self::PublishPayloadAttestations |
-            Self::PublishProposerPreferences |
-            Self::PublishEnvelope => BeaconEvent::Accepted { id, request: self },
+            Self::PublishBlock |
+            Self::PublishEnvelope |
+            Self::Publish(_) => BeaconEvent::Accepted { id, request: self },
         }
     }
-}
-
-pub struct SignedAttestation<'a> {
-    pub committee_index: u64,
-    pub attester_index: u64,
-    pub signature: &'a XMSSSignature,
 }
 
 pub struct CommitteeSubscription {
@@ -155,23 +161,6 @@ pub struct CommitteeSubscription {
     pub committees_at_slot: u64,
     pub slot: u64,
     pub is_aggregator: bool,
-}
-
-pub struct IndexedSignature<'a> {
-    pub validator_index: u64,
-    pub signature: &'a XMSSSignature,
-}
-
-pub struct SignedPreferences<'a> {
-    pub message: [u8; PROPOSER_PREFERENCES_SIZE],
-    pub signature: &'a XMSSSignature,
-}
-
-pub struct SignedAggregate<'a> {
-    pub aggregator_index: u64,
-    /// The served `{"aggregate": …, "proof": …}` object, passed on untouched.
-    pub proved: &'a str,
-    pub signature: &'a XMSSSignature,
 }
 
 struct QueuedRequest {
@@ -186,7 +175,6 @@ struct QueuedRequest {
 pub struct BeaconRequests {
     next_id: u64,
     queued: Vec<QueuedRequest>,
-    signing: Vec<SignRequest>,
     paths: String,
     bodies: Vec<u8>,
 }
@@ -221,35 +209,23 @@ impl BeaconRequests {
         self.push(BeaconRequest::AttestationData, path, start)
     }
 
-    pub fn publish_attestations<'a>(
+    pub fn publish_attestation(
         &mut self,
-        fork: ForkName,
-        data: AttestationDataView<'_>,
-        attestations: impl IntoIterator<Item = SignedAttestation<'a>>,
-    ) -> RequestId {
-        let path = self.path(format_args!("/eth/v2/beacon/pool/attestations"));
-        let start = self.bodies.len();
-        let mut data_json = None;
-        self.push_array(attestations, |this, attestation| {
+        slot: u64,
+        committee_index: u64,
+        attester_index: u64,
+        data_json: &str,
+        signature: &XMSSSignature,
+    ) {
+        self.append(Published::Attestations, slot, |this| {
             write!(
                 this.bodies,
-                "{{\"committee_index\":\"{}\",\"attester_index\":\"{}\",\"data\":",
-                attestation.committee_index, attestation.attester_index
+                "{{\"committee_index\":\"{committee_index}\",\"attester_index\":\"{attester_index}\",\"data\":{data_json},\"signature\":"
             )
             .expect("writes to a Vec");
-            match data_json.clone() {
-                Some(written) => this.bodies.extend_from_within(written),
-                None => {
-                    let at = this.bodies.len();
-                    this.push_attestation_data(data);
-                    data_json = Some(at..this.bodies.len());
-                }
-            }
-            this.bodies.extend_from_slice(b",\"signature\":");
-            this.push_hex(attestation.signature);
+            this.push_hex(signature);
             this.bodies.push(b'}');
         });
-        self.push(BeaconRequest::PublishAttestations(fork), path, start)
     }
 
     pub fn committee_subscriptions(
@@ -283,25 +259,25 @@ impl BeaconRequests {
         self.push(BeaconRequest::AggregateAttestation, path, start)
     }
 
-    pub fn publish_aggregates<'a>(
+    /// `proved` is the served `{"aggregate": …, "proof": …}` object, passed on
+    /// untouched.
+    pub fn publish_aggregate(
         &mut self,
-        fork: ForkName,
-        aggregates: impl IntoIterator<Item = SignedAggregate<'a>>,
-    ) -> RequestId {
-        let path = self.path(format_args!("/eth/v2/validator/aggregate_and_proofs"));
-        let start = self.bodies.len();
-        self.push_array(aggregates, |this, signed| {
-            let fields = signed.proved.strip_prefix('{').expect("served as a JSON object");
+        slot: u64,
+        aggregator_index: u64,
+        proved: &str,
+        signature: &XMSSSignature,
+    ) {
+        let fields = proved.strip_prefix('{').expect("served as a JSON object");
+        self.append(Published::Aggregates, slot, |this| {
             write!(
                 this.bodies,
-                "{{\"message\":{{\"aggregator_index\":\"{}\",{fields},\"signature\":",
-                signed.aggregator_index
+                "{{\"message\":{{\"aggregator_index\":\"{aggregator_index}\",{fields},\"signature\":"
             )
             .expect("writes to a Vec");
-            this.push_hex(signed.signature);
+            this.push_hex(signature);
             this.bodies.push(b'}');
         });
-        self.push(BeaconRequest::PublishAggregates(fork), path, start)
     }
 
     pub fn proposer_duties(&mut self, epoch: u64) -> RequestId {
@@ -328,7 +304,6 @@ impl BeaconRequests {
 
     pub fn produce_block(
         &mut self,
-        fork: ForkName,
         slot: u64,
         randao_reveal: &VRFProof,
         graffiti: &[u8; 32],
@@ -343,34 +318,27 @@ impl BeaconRequests {
         let path = self.path(format_args!(
             "/eth/v4/validator/blocks/{slot}?randao_reveal=0x{randao}&graffiti=0x{graffiti}&include_payload=true"
         ));
-        self.push(BeaconRequest::ProduceBlock(fork), path, start)
+        self.push(BeaconRequest::ProduceBlock, path, start)
     }
 
-    pub fn publish_block(
-        &mut self,
-        fork: ForkName,
-        payload_included: bool,
-        produced: &[u8],
-        signature: &XMSSSignature,
-    ) -> RequestId {
+    pub fn publish_block(&mut self, block: &[u8], signature: &XMSSSignature) -> RequestId {
         const SIGNED_BLOCK_FIXED: usize = 4 + XMSS_SIGNATURE_SIZE;
         let path = self.path(format_args!("/eth/v2/beacon/blocks"));
         let start = self.bodies.len();
-        let block = match payload_included {
-            true => GloasBlockContents::parse(produced).expect("checked when served").block,
-            false => produced,
-        };
         self.bodies.extend_from_slice(&(SIGNED_BLOCK_FIXED as u32).to_le_bytes());
         self.bodies.extend_from_slice(signature);
         self.bodies.extend_from_slice(block);
-        self.push(BeaconRequest::PublishBlock(fork), path, start)
+        self.push(BeaconRequest::PublishBlock, path, start)
     }
 
-    pub fn publish_envelope(&mut self, produced: &[u8], signature: &XMSSSignature) -> RequestId {
+    pub fn publish_envelope(
+        &mut self,
+        contents: &GloasBlockContents<'_>,
+        signature: &XMSSSignature,
+    ) -> RequestId {
         const SIGNED_ENVELOPE_FIXED: usize = 4 + XMSS_SIGNATURE_SIZE;
         let path = self.path(format_args!("/eth/v1/beacon/execution_payload_envelopes"));
         let start = self.bodies.len();
-        let contents = GloasBlockContents::parse(produced).expect("checked when served");
         let proofs_at = 3 * 4 + SIGNED_ENVELOPE_FIXED + contents.envelope.len();
         let blobs_at = proofs_at + contents.kzg_proofs.len();
         for offset in [3 * 4, proofs_at, blobs_at] {
@@ -400,61 +368,37 @@ impl BeaconRequests {
         self.push(BeaconRequest::PayloadAttestationData, path, start)
     }
 
-    pub fn publish_payload_attestations<'a>(
+    pub fn publish_payload_attestation(
         &mut self,
-        data: &[u8; PAYLOAD_ATTESTATION_DATA_SIZE],
-        attestations: impl IntoIterator<Item = IndexedSignature<'a>>,
-    ) -> RequestId {
-        let path = self.path(format_args!("/eth/v1/beacon/pool/payload_attestations"));
-        let start = self.bodies.len();
-        self.push_array(attestations, |this, attestation| {
+        slot: u64,
+        validator_index: u64,
+        data_json: &str,
+        signature: &XMSSSignature,
+    ) {
+        self.append(Published::PayloadAttestations, slot, |this| {
             write!(
                 this.bodies,
-                "{{\"validator_index\":\"{}\",\"data\":",
-                attestation.validator_index
+                "{{\"validator_index\":\"{validator_index}\",\"data\":{data_json},\"signature\":"
             )
             .expect("writes to a Vec");
-            this.push_payload_attestation_data(data);
-            this.bodies.extend_from_slice(b",\"signature\":");
-            this.push_hex(attestation.signature);
+            this.push_hex(signature);
             this.bodies.push(b'}');
         });
-        self.push(BeaconRequest::PublishPayloadAttestations, path, start)
     }
 
-    pub fn publish_proposer_preferences<'a>(
+    pub fn publish_proposer_preferences(
         &mut self,
-        preferences: impl IntoIterator<Item = SignedPreferences<'a>>,
-    ) -> RequestId {
-        let path = self.path(format_args!("/eth/v1/validator/proposer_preferences"));
-        let start = self.bodies.len();
-        self.push_array(preferences, |this, signed| {
+        message: &[u8; PROPOSER_PREFERENCES_SIZE],
+        signature: &XMSSSignature,
+    ) {
+        let slot = ProposerPreferencesView::proposal_slot(message);
+        self.append(Published::ProposerPreferences, slot, |this| {
             this.bodies.extend_from_slice(b"{\"message\":");
-            this.push_preferences(&signed.message);
+            this.push_preferences(message);
             this.bodies.extend_from_slice(b",\"signature\":");
-            this.push_hex(signed.signature);
+            this.push_hex(signature);
             this.bodies.push(b'}');
         });
-        self.push(BeaconRequest::PublishProposerPreferences, path, start)
-    }
-
-    pub fn sign(
-        &mut self,
-        pubkey: &XMSSPubkey,
-        purpose: SignPurpose,
-        leaf_index: u32,
-        signing_root: &[u8; 32],
-    ) -> RequestId {
-        let work = KeyWork::Sign { leaf_index, signing_root: *signing_root };
-        self.push_signing(pubkey, purpose, work)
-    }
-
-    pub fn vrf_proof(&mut self, pubkey: &XMSSPubkey, slot: u64) -> RequestId {
-        self.push_signing(pubkey, SignPurpose::Randao, KeyWork::VrfProof { slot })
-    }
-
-    pub fn drain_signing(&mut self, send: impl FnMut(SignRequest)) {
-        self.signing.drain(..).for_each(send);
     }
 
     pub fn drain(&mut self, mut send: impl FnMut(RequestId, BeaconRequest, &str, &[u8])) {
@@ -474,29 +418,41 @@ impl BeaconRequests {
     }
 
     fn push(&mut self, request: BeaconRequest, path: Range<usize>, body_start: usize) -> RequestId {
-        let id = self.next_id();
+        let id = RequestId(self.next_id);
+        self.next_id += 1;
         let body = body_start..self.bodies.len();
         self.queued.push(QueuedRequest { id, request, path, body });
         id
     }
 
-    fn push_signing(
-        &mut self,
-        pubkey: &XMSSPubkey,
-        purpose: SignPurpose,
-        work: KeyWork,
-    ) -> RequestId {
-        let id = self.next_id();
-        self.signing.push(SignRequest { id, purpose, pubkey: *pubkey, work });
-        id
-    }
+    /// Joins the last queued request when it publishes the same kind and
+    /// slot, so signatures answered together go out in one request.
+    fn append(&mut self, kind: Published, slot: u64, push_entry: impl FnOnce(&mut Self)) {
+        let joins = matches!(
+            self.queued.last(),
+            Some(QueuedRequest { request: BeaconRequest::Publish(batch), .. })
+                if batch.kind == kind && batch.slot == slot
+        );
+        let start = self.bodies.len();
+        if joins {
+            debug_assert_eq!(self.bodies.last(), Some(&b']'));
+            *self.bodies.last_mut().expect("an array") = b',';
+        } else {
+            self.bodies.push(b'[');
+        }
+        push_entry(self);
+        self.bodies.push(b']');
 
-    /// Shared by beacon and signing requests, so a duty's ids ascend across
-    /// both.
-    fn next_id(&mut self) -> RequestId {
-        let id = RequestId(self.next_id);
-        self.next_id += 1;
-        id
+        if !joins {
+            let path = self.path(format_args!("{}", kind.path()));
+            self.push(BeaconRequest::Publish(Batch { kind, slot, count: 1 }), path, start);
+            return;
+        }
+        let last = self.queued.last_mut().expect("joined");
+        last.body.end = self.bodies.len();
+        if let BeaconRequest::Publish(batch) = &mut last.request {
+            batch.count += 1;
+        }
     }
 
     fn push_hex(&mut self, bytes: &[u8]) {
@@ -514,7 +470,9 @@ impl BeaconRequests {
         validator_indices: impl IntoIterator<Item = u64>,
     ) -> RequestId {
         let start = self.bodies.len();
-        self.push_quoted(validator_indices);
+        self.push_array(validator_indices, |this, value| {
+            write!(this.bodies, "\"{value}\"").expect("writes to a Vec")
+        });
         self.push(request, path, start)
     }
 
@@ -531,19 +489,6 @@ impl BeaconRequests {
             push(self, item);
         }
         self.bodies.push(b']');
-    }
-
-    fn push_payload_attestation_data(&mut self, data: &[u8; PAYLOAD_ATTESTATION_DATA_SIZE]) {
-        self.bodies.extend_from_slice(b"{\"beacon_block_root\":");
-        self.push_hex(PayloadAttestationDataView::beacon_block_root(data));
-        write!(
-            self.bodies,
-            ",\"slot\":\"{}\",\"payload_present\":{},\"blob_data_available\":{}}}",
-            PayloadAttestationDataView::slot(data),
-            PayloadAttestationDataView::payload_present(data),
-            PayloadAttestationDataView::blob_data_available(data),
-        )
-        .expect("writes to a Vec");
     }
 
     fn push_preferences(&mut self, preferences: &[u8; PROPOSER_PREFERENCES_SIZE]) {
@@ -563,30 +508,6 @@ impl BeaconRequests {
             ProposerPreferencesView::target_gas_limit(preferences)
         )
         .expect("writes to a Vec");
-    }
-
-    fn push_quoted(&mut self, values: impl IntoIterator<Item = u64>) {
-        self.push_array(values, |this, value| {
-            write!(this.bodies, "\"{value}\"").expect("writes to a Vec")
-        });
-    }
-
-    fn push_attestation_data(&mut self, data: AttestationDataView<'_>) {
-        write!(
-            self.bodies,
-            "{{\"slot\":\"{}\",\"index\":\"{}\",\"beacon_block_root\":",
-            data.slot(),
-            data.index()
-        )
-        .expect("writes to a Vec");
-        self.push_hex(data.beacon_block_root());
-        write!(self.bodies, ",\"source\":{{\"epoch\":\"{}\",\"root\":", data.source_epoch())
-            .expect("writes to a Vec");
-        self.push_hex(data.source_root());
-        write!(self.bodies, "}},\"target\":{{\"epoch\":\"{}\",\"root\":", data.target_epoch())
-            .expect("writes to a Vec");
-        self.push_hex(data.target_root());
-        self.bodies.extend_from_slice(b"}}");
     }
 }
 
@@ -677,26 +598,24 @@ pub mod tests {
         ]);
     }
 
-    #[test]
-    fn published_attestations_share_one_data_object() {
-        let ssz = attestation_data_ssz();
-        let mut requests = BeaconRequests::default();
-        let signatures = [[0xc1; XMSS_SIGNATURE_SIZE], [0xc2; XMSS_SIGNATURE_SIZE]];
-        let signed = |committee_index, attester_index, signature| SignedAttestation {
-            committee_index,
-            attester_index,
-            signature,
-        };
-        requests.publish_attestations(ForkName::Pq, AttestationDataView::new(&ssz), [
-            signed(4, 100, &signatures[0]),
-            signed(9, 200, &signatures[1]),
-        ]);
-
+    fn published(requests: &mut BeaconRequests) -> Vec<(BeaconRequest, String, Value)> {
         let mut sent = Vec::new();
         requests.drain(|_, request, path, body| {
             assert_eq!(request.consensus_version(), Some("pq"));
-            sent.push((path.to_owned(), serde_json::from_slice::<Value>(body).unwrap()));
+            sent.push((request, path.to_owned(), serde_json::from_slice::<Value>(body).unwrap()));
         });
+        sent
+    }
+
+    #[test]
+    fn attestations_of_a_slot_join_one_request() {
+        let data = attestation_data_json().to_string();
+        let mut requests = BeaconRequests::default();
+        let signatures = [[0xc1; XMSS_SIGNATURE_SIZE], [0xc2; XMSS_SIGNATURE_SIZE]];
+        requests.publish_attestation(65, 4, 100, &data, &signatures[0]);
+        requests.publish_attestation(65, 9, 200, &data, &signatures[1]);
+        requests.publish_attestation(66, 9, 200, &data, &signatures[1]);
+
         let entry = |committee: &str, attester: &str, byte: &str| {
             json!({
                 "committee_index": committee,
@@ -705,10 +624,28 @@ pub mod tests {
                 "signature": format!("0x{}", byte.repeat(XMSS_SIGNATURE_SIZE)),
             })
         };
-        assert_eq!(sent, [(
-            "/eth/v2/beacon/pool/attestations".to_owned(),
-            json!([entry("4", "100", "c1"), entry("9", "200", "c2")])
-        )]);
+        let batch = |slot, count| {
+            BeaconRequest::Publish(Batch { kind: Published::Attestations, slot, count })
+        };
+        let path = "/eth/v2/beacon/pool/attestations".to_owned();
+        assert_eq!(published(&mut requests), [
+            (batch(65, 2), path.clone(), json!([entry("4", "100", "c1"), entry("9", "200", "c2")])),
+            (batch(66, 1), path, json!([entry("9", "200", "c2")])),
+        ]);
+    }
+
+    #[test]
+    fn a_request_between_publishes_starts_a_new_batch() {
+        let data = attestation_data_json().to_string();
+        let signature = [0xc1; XMSS_SIGNATURE_SIZE];
+        let mut requests = BeaconRequests::default();
+        requests.publish_attestation(65, 4, 100, &data, &signature);
+        requests.attestation_data(66);
+        requests.publish_attestation(65, 4, 101, &data, &signature);
+        let bodies = drained(&mut requests).into_iter().map(|(.., body)| body);
+        let lengths =
+            bodies.map(|body| Some(serde_json::from_str::<Value>(&body).ok()?.as_array()?.len()));
+        assert!(lengths.eq([Some(1), None, Some(1)]));
     }
 
     fn bodies(requests: &mut BeaconRequests) -> Vec<(String, Value)> {
@@ -752,18 +689,11 @@ pub mod tests {
         let mut requests = BeaconRequests::default();
         let proved = r#"{"aggregate":{"aggregation_bits":"0x03"},"proof":"0xc0ffee"}"#;
         let signature = [0xc2; XMSS_SIGNATURE_SIZE];
-        requests.publish_aggregates(ForkName::Pq, [SignedAggregate {
-            aggregator_index: 7,
-            proved,
-            signature: &signature,
-        }]);
-        let mut sent = Vec::new();
-        requests.drain(|_, request, path, body| {
-            assert_eq!(request.consensus_version(), Some("pq"));
-            sent.push((path.to_owned(), serde_json::from_slice::<Value>(body).unwrap()));
-        });
-        assert_eq!(sent, [(
-            "/eth/v2/validator/aggregate_and_proofs".to_owned(),
+        requests.publish_aggregate(65, 7, proved, &signature);
+        let sent = published(&mut requests);
+        assert_eq!(sent[0].1, "/eth/v2/validator/aggregate_and_proofs");
+        assert_eq!(
+            sent[0].2,
             json!([{
                 "message": {
                     "aggregator_index": "7",
@@ -772,35 +702,7 @@ pub mod tests {
                 },
                 "signature": format!("0x{}", "c2".repeat(XMSS_SIGNATURE_SIZE)),
             }])
-        )]);
-    }
-
-    #[test]
-    fn signing_requests_queue_apart_and_share_ids() {
-        let mut requests = BeaconRequests::default();
-        let fetch = requests.attestation_data(65);
-        let signed = requests.sign(&[0xaa; 32], SignPurpose::Attestation, 7, &[0x5a; 32]);
-        let reveal = requests.vrf_proof(&[0xbb; 32], 66);
-        assert!(fetch < signed && signed < reveal);
-        assert_eq!(drained(&mut requests).len(), 1);
-
-        let mut queued = Vec::new();
-        requests.drain_signing(|request| queued.push(request));
-        assert_eq!(queued, [
-            SignRequest {
-                id: signed,
-                purpose: SignPurpose::Attestation,
-                pubkey: [0xaa; 32],
-                work: KeyWork::Sign { leaf_index: 7, signing_root: [0x5a; 32] },
-            },
-            SignRequest {
-                id: reveal,
-                purpose: SignPurpose::Randao,
-                pubkey: [0xbb; 32],
-                work: KeyWork::VrfProof { slot: 66 },
-            },
-        ]);
-        requests.drain_signing(|_| unreachable!("drained"));
+        );
     }
 
     #[test]
@@ -820,7 +722,7 @@ pub mod tests {
             ),
         ]);
 
-        requests.produce_block(ForkName::Pq, 65, &[0x7a; VRF_PROOF_SIZE], &[0x67; 32]);
+        requests.produce_block(65, &[0x7a; VRF_PROOF_SIZE], &[0x67; 32]);
         let mut sent = Vec::new();
         requests.drain(|_, request, path, body| {
             assert_eq!(request.method(), "POST");
@@ -845,9 +747,10 @@ pub mod tests {
         let end = 16 + block.len() + envelope.len();
         let produced =
             [&at(16)[..], &at(16 + block.len()), &at(end), &at(end), &block, &envelope].concat();
+        let contents = GloasBlockContents::parse(&produced).unwrap();
         let signatures = [[0xc1; XMSS_SIGNATURE_SIZE], [0xc2; XMSS_SIGNATURE_SIZE]];
-        requests.publish_block(ForkName::Pq, true, &produced, &signatures[0]);
-        requests.publish_envelope(&produced, &signatures[1]);
+        requests.publish_block(contents.block, &signatures[0]);
+        requests.publish_envelope(&contents, &signatures[1]);
         let mut sent = Vec::new();
         requests.drain(|_, request, path, body| {
             sent.push((path.to_owned(), request.extra_header(), body.to_vec()))

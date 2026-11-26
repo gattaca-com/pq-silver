@@ -2,10 +2,8 @@ use silver_beacon_state_data::{
     BUILDER_INDEX_SELF_BUILD, DOMAIN_BEACON_BUILDER,
     bls::{DOMAIN_BEACON_PROPOSER, DOMAIN_PROPOSER_PREFERENCES},
 };
-use silver_chain_spec::SpecConfig;
 use silver_common::{
-    ForkName, SLOTS_PER_EPOCH,
-    ssz_hash::{compute_domain, compute_signing_root, hash_beacon_block_header_bytes},
+    ssz_hash::hash_beacon_block_header_bytes,
     ssz_hash_gloas::ExecutionRequestsView,
     ssz_view::{
         BEACON_BLOCK_HEADER_SIZE, BeaconBlockBodyGloasView, BeaconBlockHeaderView,
@@ -16,89 +14,116 @@ use silver_common::{
 };
 
 use crate::{
-    beacon_link::{BeaconRequests, ChainInfo, ProducedBlock, RequestId},
+    beacon_link::{BeaconRequests, ProducedBlock, RequestId},
     block_contents::GloasBlockContents,
     config::ProposalConfig,
     duties::{
-        round::{Data, DataRound, Stage},
-        schedule::{DutySchedule, Fetch, ProposerDuty, Signing},
+        schedule::{DutySchedule, Fetch, Reveal},
         validators::Validators,
     },
-    signing::SignPurpose,
+    signing::{SignPurpose, SignRequests, SigningDomains},
 };
 
 const BEACON_BLOCK_FIXED: usize = 8 + 8 + 32 + 32 + 4;
 const HEADER_BEFORE_BODY_ROOT: usize = BEACON_BLOCK_HEADER_SIZE - 32;
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct Produced {
-    header: [u8; BEACON_BLOCK_HEADER_SIZE],
+/// The last block produced, with its envelope when the payload is included.
+#[derive(Default)]
+struct Produced {
+    ssz: Vec<u8>,
     payload_included: bool,
 }
 
 impl Produced {
-    fn of(block: &ProducedBlock<'_>) -> Result<Self, &'static str> {
-        let beacon_block = match block.payload_included {
-            false => block.ssz,
-            true => {
-                let contents = GloasBlockContents::parse(block.ssz).ok_or("contents misframed")?;
-                let envelope = contents.envelope;
-                let envelope_ok = ExecutionPayloadEnvelopeView::check_size(envelope) &&
-                    ExecutionPayloadView::check_canonical_gloas(
-                        ExecutionPayloadEnvelopeView::payload(envelope),
-                    ) &&
-                    ExecutionRequestsView::check_canonical(
-                        ExecutionPayloadEnvelopeView::execution_requests(envelope),
-                    );
-                if !envelope_ok {
-                    return Err("envelope malformed");
-                }
-                contents.block
+    fn replace(&mut self, block: &ProducedBlock<'_>) {
+        self.ssz.clear();
+        self.ssz.extend_from_slice(block.ssz);
+        self.payload_included = block.payload_included;
+    }
+
+    fn contents(&self) -> Option<Result<GloasBlockContents<'_>, &'static str>> {
+        self.payload_included
+            .then(|| GloasBlockContents::parse(&self.ssz).ok_or("contents misframed"))
+    }
+
+    fn block(&self) -> &[u8] {
+        match self.contents() {
+            Some(contents) => contents.expect("checked when produced").block,
+            None => &self.ssz,
+        }
+    }
+
+    /// The block's header, once the block and any envelope are well-formed.
+    fn header(&self) -> Result<[u8; BEACON_BLOCK_HEADER_SIZE], &'static str> {
+        if let Some(contents) = self.contents() {
+            let envelope = contents?.envelope;
+            let envelope_ok = ExecutionPayloadEnvelopeView::check_size(envelope) &&
+                ExecutionPayloadView::check_canonical_gloas(
+                    ExecutionPayloadEnvelopeView::payload(envelope),
+                ) &&
+                ExecutionRequestsView::check_canonical(
+                    ExecutionPayloadEnvelopeView::execution_requests(envelope),
+                );
+            if !envelope_ok {
+                return Err("envelope malformed");
             }
-        };
-        let fixed = beacon_block.get(..BEACON_BLOCK_FIXED).ok_or("block too short")?;
+        }
+        let block = self.block();
+        let fixed = block.get(..BEACON_BLOCK_FIXED).ok_or("block too short")?;
         let body_at = fixed[HEADER_BEFORE_BODY_ROOT..].try_into().map(u32::from_le_bytes);
         if body_at.expect("4 bytes") as usize != BEACON_BLOCK_FIXED {
             return Err("block body offset is not canonical");
         }
-        let body = &beacon_block[BEACON_BLOCK_FIXED..];
+        let body = &block[BEACON_BLOCK_FIXED..];
         if !BeaconBlockBodyGloasView::check_canonical(body) {
             return Err("block body malformed");
         }
-        let body_root = BeaconBlockBodyGloasView::hash_tree_root(body);
         let mut header = [0; BEACON_BLOCK_HEADER_SIZE];
         header[..HEADER_BEFORE_BODY_ROOT].copy_from_slice(&fixed[..HEADER_BEFORE_BODY_ROOT]);
-        header[HEADER_BEFORE_BODY_ROOT..].copy_from_slice(&body_root);
-        Ok(Self { header, payload_included: block.payload_included })
+        header[HEADER_BEFORE_BODY_ROOT..]
+            .copy_from_slice(&BeaconBlockBodyGloasView::hash_tree_root(body));
+        Ok(header)
     }
 }
 
-#[derive(Debug, PartialEq, Eq)]
-enum Envelope {
-    None,
-    Signing(RequestId),
-    Signed(Box<XMSSSignature>),
-    Publishing(RequestId),
+/// The slot's proposal. The envelope is signed once its block is accepted.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Proposal {
+    Idle,
+    /// Produced once the slot's duty and its RANDAO reveal are known.
+    Due,
+    Producing(RequestId),
+    SigningBlock {
+        key: usize,
+    },
+    PublishingBlock {
+        id: RequestId,
+        key: usize,
+    },
+    SigningEnvelope,
+    PublishingEnvelope(RequestId),
 }
 
 pub struct Proposer {
     config: ProposalConfig,
-    pub block_round: DataRound<Produced, ProposerDuty>,
-    block: Vec<u8>,
-    block_accepted: bool,
-    envelope: Envelope,
+    slot: u64,
+    proposal: Proposal,
+    produced: Produced,
     preparation: Fetch,
+    /// Preferences are signed once per proposal slot, in slot order: the slot
+    /// fixes their XMSS leaf.
+    preferences_through: u64,
 }
 
 impl Proposer {
     pub fn new(config: ProposalConfig) -> Self {
         Self {
             config,
-            block_round: DataRound::new("block"),
-            block: Vec::new(),
-            block_accepted: false,
-            envelope: Envelope::None,
+            slot: 0,
+            proposal: Proposal::Idle,
+            produced: Produced::default(),
             preparation: Fetch::Due { from_slot: 0 },
+            preferences_through: 0,
         }
     }
 
@@ -106,56 +131,9 @@ impl Proposer {
         self.preparation = Fetch::Due { from_slot: 0 };
     }
 
-    pub fn epoch_started(&mut self) {
-        self.prepare_again();
-    }
-
     pub fn slot_started(&mut self, slot: u64) {
-        self.block_round.due(slot);
-        self.block_accepted = false;
-        self.envelope = Envelope::None;
-    }
-
-    pub fn on_block(&mut self, id: RequestId, block: &ProducedBlock<'_>) {
-        if self.block_round.data != Data::Awaiting(id) {
-            return;
-        }
-        let produced = Produced::of(block);
-        if produced.is_ok() {
-            self.block.clear();
-            self.block.extend_from_slice(block.ssz);
-        }
-        self.block_round.on_data(id, produced);
-    }
-
-    pub fn on_block_accepted(&mut self, id: RequestId) {
-        self.block_round.round.on_accepted(id);
-        self.block_accepted = self.block_round.round.stage() == Stage::Done;
-    }
-
-    pub fn on_envelope_signed(&mut self, id: RequestId, signature: Option<Box<XMSSSignature>>) {
-        if self.envelope != Envelope::Signing(id) {
-            return;
-        }
-        self.envelope = match signature {
-            Some(signature) => Envelope::Signed(signature),
-            None => {
-                silver_log::warn!(slot = self.block_round.round.slot(), "envelope not signed");
-                Envelope::None
-            }
-        };
-    }
-
-    pub fn on_envelope_answered(&mut self, id: RequestId, accepted: bool) {
-        if self.envelope != Envelope::Publishing(id) {
-            return;
-        }
-        let slot = self.block_round.round.slot();
-        match accepted {
-            true => silver_log::info!(slot, "envelope published"),
-            false => silver_log::warn!(slot, "envelope not published"),
-        }
-        self.envelope = Envelope::None;
+        self.slot = slot;
+        self.proposal = Proposal::Due;
     }
 
     pub fn on_prepared(&mut self, id: RequestId) {
@@ -182,147 +160,220 @@ impl Proposer {
     }
 
     pub fn send_preferences(
-        &self,
+        &mut self,
         slot: u64,
-        spec: &SpecConfig,
-        schedule: &mut DutySchedule,
+        schedule: &DutySchedule,
         validators: &Validators,
-        chain: &ChainInfo,
-        requests: &mut BeaconRequests,
+        domains: &SigningDomains,
+        signs: &mut SignRequests,
     ) {
-        let gvr = chain.genesis_validators_root;
-        schedule.ask_preferences(|duty, dependent_root| {
-            if duty.slot <= slot || !spec.is_gloas_at_slot(duty.slot) {
-                return None;
-            }
+        let after = self.preferences_through.max(slot);
+        for (duty, dependent_root) in schedule.proposals().filter(|(duty, _)| duty.slot > after) {
+            self.preferences_through = self.preferences_through.max(duty.slot);
             let Some(leaf) = SlotDuty::ProposerPreferences.leaf(duty.slot) else {
                 silver_log::error!(slot = duty.slot, "no XMSS leaf for proposer preferences");
-                return None;
+                continue;
             };
-            let message = self.preferences(duty, dependent_root);
-            let version = spec.fork_version_at(duty.slot / SLOTS_PER_EPOCH);
-            let domain = compute_domain(DOMAIN_PROPOSER_PREFERENCES, version, &gvr);
-            let root =
-                compute_signing_root(&ProposerPreferencesView::hash_tree_root(&message), &domain);
-            let pubkey = validators.pubkey(duty.key);
-            Some(requests.sign(pubkey, SignPurpose::ProposerPreferences, leaf, &root))
-        });
-        schedule.publish_preferences(|duty, root| self.preferences(duty, root), requests);
+            let message = self.preferences(duty.slot, duty.validator_index, dependent_root);
+            let root = ProposerPreferencesView::hash_tree_root(&message);
+            let signing_root = domains.signing_root(DOMAIN_PROPOSER_PREFERENCES, duty.slot, &root);
+            let purpose = SignPurpose::ProposerPreferences {
+                validator_index: duty.validator_index,
+                dependent_root: *dependent_root,
+            };
+            signs.sign(duty.slot, purpose, validators.pubkey(duty.key), leaf, signing_root);
+        }
+    }
+
+    pub fn publish_preferences(
+        &self,
+        slot: u64,
+        validator_index: u64,
+        dependent_root: &[u8; 32],
+        signature: &XMSSSignature,
+        requests: &mut BeaconRequests,
+    ) {
+        let message = self.preferences(slot, validator_index, dependent_root);
+        requests.publish_proposer_preferences(&message, signature);
     }
 
     fn preferences(
         &self,
-        duty: &ProposerDuty,
+        slot: u64,
+        validator_index: u64,
         dependent_root: &[u8; 32],
     ) -> [u8; PROPOSER_PREFERENCES_SIZE] {
         let mut message = [0; PROPOSER_PREFERENCES_SIZE];
         message[0..32].copy_from_slice(dependent_root);
-        message[32..40].copy_from_slice(&duty.slot.to_le_bytes());
-        message[40..48].copy_from_slice(&duty.validator_index.to_le_bytes());
+        message[32..40].copy_from_slice(&slot.to_le_bytes());
+        message[40..48].copy_from_slice(&validator_index.to_le_bytes());
         message[48..68].copy_from_slice(&self.config.fee_recipient);
         message[68..76].copy_from_slice(&self.config.gas_limit.to_le_bytes());
         message
     }
 
-    pub fn propose(
-        &mut self,
-        slot: u64,
-        spec: &SpecConfig,
-        schedule: &DutySchedule,
-        validators: &Validators,
-        chain: &ChainInfo,
-        requests: &mut BeaconRequests,
-    ) {
-        let round = &mut self.block_round;
-        if round.round.slot() != slot {
+    pub fn propose(&mut self, slot: u64, schedule: &DutySchedule, requests: &mut BeaconRequests) {
+        if self.slot != slot || self.proposal != Proposal::Due {
             return;
         }
-        let fork = spec.fork_at_slot(slot);
-        match (round.round.stage(), round.data) {
-            (Stage::Due, Data::Unasked) => {
-                let Some(duty) = schedule.proposer_at(slot) else { return };
-                if fork < ForkName::Gloas {
-                    silver_log::warn!(slot, "proposal missed: only Gloas blocks are produced");
-                    return round.round.abandon();
-                }
-                match &duty.randao {
-                    Signing::Signed(randao) => {
-                        let graffiti = &self.config.graffiti;
-                        let id = requests.produce_block(fork, slot, randao, graffiti);
-                        round.data = Data::Awaiting(id);
-                        round.round.working();
-                    }
-                    Signing::Done => {
-                        silver_log::warn!(slot, "proposal missed: RANDAO reveal refused");
-                        round.round.abandon();
-                    }
-                    Signing::Unasked | Signing::Asked(_) => {}
-                }
+        let Some(duty) = schedule.proposer_at(slot) else { return };
+        match &duty.randao {
+            Reveal::Proved(randao) => {
+                let id = requests.produce_block(slot, randao, &self.config.graffiti);
+                self.proposal = Proposal::Producing(id);
             }
-            (Stage::Working, Data::Ready(produced)) => {
-                let Some(duty) = schedule.proposer_at(slot) else {
-                    silver_log::warn!(slot, "proposal missed: duty gone before signing");
-                    return round.round.abandon();
-                };
-                let header = &produced.header;
-                if BeaconBlockHeaderView::slot(header) != slot ||
-                    BeaconBlockHeaderView::proposer_index(header) != duty.validator_index
-                {
-                    silver_log::warn!(slot, "proposal missed: block for another slot or proposer");
-                    return round.round.abandon();
-                }
-                let block_root = hash_beacon_block_header_bytes(header);
-                let envelope = produced.payload_included.then(|| {
-                    GloasBlockContents::parse(&self.block).expect("checked when served").envelope
-                });
-                if let Some(envelope) = envelope &&
-                    (ExecutionPayloadEnvelopeView::beacon_block_root(envelope) != &block_root ||
-                        ExecutionPayloadEnvelopeView::builder_index(envelope) !=
-                            BUILDER_INDEX_SELF_BUILD)
-                {
-                    silver_log::warn!(slot, "proposal missed: envelope for another block");
-                    return round.round.abandon();
-                }
-
-                let (Some(block_leaf), Some(envelope_leaf)) = (
-                    SlotDuty::BeaconProposer.leaf(slot),
-                    SlotDuty::ExecutionPayloadEnvelope.leaf(slot),
-                ) else {
-                    silver_log::error!(slot, "proposal missed: no XMSS leaf for the slot");
-                    return round.round.abandon();
-                };
-
-                let gvr = chain.genesis_validators_root;
-                let version = spec.fork_version_at(slot / SLOTS_PER_EPOCH);
-                let pubkey = validators.pubkey(duty.key);
-                let domain = compute_domain(DOMAIN_BEACON_PROPOSER, version, &gvr);
-                let signing_root = compute_signing_root(&block_root, &domain);
-                let id = requests.sign(pubkey, SignPurpose::Block, block_leaf, &signing_root);
-                round.round.sign(id, duty.clone());
-                round.data = Data::Signing(produced);
-
-                if let Some(envelope) = envelope {
-                    let domain = compute_domain(DOMAIN_BEACON_BUILDER, version, &gvr);
-                    let root = ExecutionPayloadEnvelopeView::hash_tree_root(envelope);
-                    let signing_root = compute_signing_root(&root, &domain);
-                    let id =
-                        requests.sign(pubkey, SignPurpose::Envelope, envelope_leaf, &signing_root);
-                    self.envelope = Envelope::Signing(id);
-                }
-            }
-            (Stage::Working, Data::Signing(produced)) if round.round.all_signatures_answered() => {
-                let block = &self.block;
-                round.round.publish(|round| {
-                    let (_, signature) = round.signed().next().expect("published only if signed");
-                    requests.publish_block(fork, produced.payload_included, block, signature)
-                });
-            }
-            _ => {}
+            Reveal::Refused => self.missed("RANDAO reveal refused"),
+            Reveal::Unasked | Reveal::Asked => {}
         }
-        if self.block_accepted &&
-            let Envelope::Signed(signature) = &self.envelope
+    }
+
+    pub fn on_block(
+        &mut self,
+        id: RequestId,
+        block: &ProducedBlock<'_>,
+        schedule: &DutySchedule,
+        validators: &Validators,
+        domains: &SigningDomains,
+        signs: &mut SignRequests,
+    ) {
+        if self.proposal != Proposal::Producing(id) {
+            return;
+        }
+        self.produced.replace(block);
+        match self.sign_block(schedule, validators, domains, signs) {
+            Ok(key) => self.proposal = Proposal::SigningBlock { key },
+            Err(reason) => self.missed(reason),
+        }
+    }
+
+    /// Returns the proposer's key.
+    fn sign_block(
+        &self,
+        schedule: &DutySchedule,
+        validators: &Validators,
+        domains: &SigningDomains,
+        signs: &mut SignRequests,
+    ) -> Result<usize, &'static str> {
+        let slot = self.slot;
+        let duty = schedule.proposer_at(slot).ok_or("duty gone before signing")?;
+        let header = self.produced.header()?;
+        if BeaconBlockHeaderView::slot(&header) != slot ||
+            BeaconBlockHeaderView::proposer_index(&header) != duty.validator_index
         {
-            self.envelope = Envelope::Publishing(requests.publish_envelope(&self.block, signature));
+            return Err("block for another slot or proposer");
         }
+        let block_root = hash_beacon_block_header_bytes(&header);
+        if let Some(contents) = self.produced.contents() {
+            let envelope = contents?.envelope;
+            if ExecutionPayloadEnvelopeView::beacon_block_root(envelope) != &block_root ||
+                ExecutionPayloadEnvelopeView::builder_index(envelope) != BUILDER_INDEX_SELF_BUILD
+            {
+                return Err("envelope for another block");
+            }
+        }
+        let leaf = SlotDuty::BeaconProposer.leaf(slot).ok_or("no XMSS leaf for the slot")?;
+        let signing_root = domains.signing_root(DOMAIN_BEACON_PROPOSER, slot, &block_root);
+        signs.sign(slot, SignPurpose::Block, validators.pubkey(duty.key), leaf, signing_root);
+        Ok(duty.key)
+    }
+
+    pub fn on_produce_failed(&mut self, id: RequestId) {
+        if self.proposal == Proposal::Producing(id) {
+            self.missed("no block produced");
+        }
+    }
+
+    pub fn on_block_signed(
+        &mut self,
+        slot: u64,
+        signature: Option<&XMSSSignature>,
+        requests: &mut BeaconRequests,
+    ) {
+        let Proposal::SigningBlock { key } = self.proposal else { return };
+        if self.slot != slot {
+            return;
+        }
+        match signature {
+            Some(signature) => {
+                let id = requests.publish_block(self.produced.block(), signature);
+                self.proposal = Proposal::PublishingBlock { id, key };
+            }
+            None => self.missed("block not signed"),
+        }
+    }
+
+    pub fn on_block_answered(
+        &mut self,
+        id: RequestId,
+        accepted: bool,
+        validators: &Validators,
+        domains: &SigningDomains,
+        signs: &mut SignRequests,
+    ) {
+        let Proposal::PublishingBlock { id: sent, key } = self.proposal else { return };
+        if sent != id {
+            return;
+        }
+        if !accepted {
+            return self.missed("block not published");
+        }
+        silver_log::info!(slot = self.slot, "block published");
+        let signing = self.sign_envelope(key, validators, domains, signs);
+        self.proposal = if signing { Proposal::SigningEnvelope } else { Proposal::Idle };
+    }
+
+    /// False when the block came without its envelope, or it cannot be signed.
+    fn sign_envelope(
+        &self,
+        key: usize,
+        validators: &Validators,
+        domains: &SigningDomains,
+        signs: &mut SignRequests,
+    ) -> bool {
+        let Some(contents) = self.produced.contents() else { return false };
+        let envelope = contents.expect("checked when produced").envelope;
+        let Some(leaf) = SlotDuty::ExecutionPayloadEnvelope.leaf(self.slot) else {
+            silver_log::error!(slot = self.slot, "no XMSS leaf for the envelope");
+            return false;
+        };
+        let root = ExecutionPayloadEnvelopeView::hash_tree_root(envelope);
+        let signing_root = domains.signing_root(DOMAIN_BEACON_BUILDER, self.slot, &root);
+        signs.sign(self.slot, SignPurpose::Envelope, validators.pubkey(key), leaf, signing_root);
+        true
+    }
+
+    pub fn on_envelope_signed(
+        &mut self,
+        slot: u64,
+        signature: Option<&XMSSSignature>,
+        requests: &mut BeaconRequests,
+    ) {
+        if self.slot != slot || self.proposal != Proposal::SigningEnvelope {
+            return;
+        }
+        let Some(signature) = signature else {
+            silver_log::warn!(slot, "envelope not signed");
+            self.proposal = Proposal::Idle;
+            return;
+        };
+        let contents = self.produced.contents().expect("signed with its envelope");
+        let id = requests.publish_envelope(&contents.expect("checked when produced"), signature);
+        self.proposal = Proposal::PublishingEnvelope(id);
+    }
+
+    pub fn on_envelope_answered(&mut self, id: RequestId, accepted: bool) {
+        if self.proposal != Proposal::PublishingEnvelope(id) {
+            return;
+        }
+        match accepted {
+            true => silver_log::info!(slot = self.slot, "envelope published"),
+            false => silver_log::warn!(slot = self.slot, "envelope not published"),
+        }
+        self.proposal = Proposal::Idle;
+    }
+
+    fn missed(&mut self, reason: &'static str) {
+        silver_log::warn!(slot = self.slot, reason, "proposal missed");
+        self.proposal = Proposal::Idle;
     }
 }

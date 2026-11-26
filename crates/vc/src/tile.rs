@@ -7,6 +7,7 @@ use crate::{
     duties::Duties,
     keys::load_keys,
     signer::Signer,
+    signing::SignRequests,
 };
 
 pub struct ValidatorTile {
@@ -14,6 +15,7 @@ pub struct ValidatorTile {
     duties: Duties,
     signer: Signer,
     requests: BeaconRequests,
+    signs: SignRequests,
 }
 
 impl ValidatorTile {
@@ -26,6 +28,7 @@ impl ValidatorTile {
             duties: Duties::new(config, pubkeys),
             signer: Signer::new(keys),
             requests: BeaconRequests::default(),
+            signs: SignRequests::default(),
         })
     }
 }
@@ -42,13 +45,11 @@ impl Tile<VcSpine> for ValidatorTile {
     }
 
     fn loop_body(&mut self, _adapter: &mut SpineAdapter<VcSpine>) {
-        let Self { beacon_link, duties, signer, requests } = self;
-        beacon_link.spin(requests, |event| duties.on_beacon_event(event));
-        if let Some(chain) = beacon_link.chain_info() {
-            duties.on_tick(chain, requests);
+        let Self { beacon_link, duties, signer, requests, signs } = self;
+        beacon_link.spin(requests, |event| duties.on_beacon_event(event, signs));
+        if let Some(genesis_time) = beacon_link.genesis_time() {
+            duties.on_tick(genesis_time, requests, signs);
         }
-        requests.drain_signing(|request| {
-            duties.on_signed(request.id, request.purpose, signer.answer(&request))
-        });
+        signs.drain(|request| duties.on_signed(&request, signer.answer(&request), requests));
     }
 }

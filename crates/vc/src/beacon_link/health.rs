@@ -60,17 +60,18 @@ impl HealthCheck {
         self.in_flight == Some(id)
     }
 
-    pub fn on_answer(&mut self, answer: Result<(u16, &[u8]), String>, url: &str) {
+    /// `None` when the check got no answer.
+    pub fn on_answer(&mut self, answer: Option<(u16, &[u8])>, url: &str) {
         self.in_flight = None;
         let verdict = match answer {
-            Ok((200, body)) => match serde_json::from_slice::<SyncingBody>(body) {
+            Some((200, body)) => match serde_json::from_slice::<SyncingBody>(body) {
                 Ok(SyncingBody { data: Syncing { is_syncing: true, .. } }) => Err("syncing"),
                 Ok(SyncingBody { data: Syncing { is_optimistic: true, .. } }) => Err("optimistic"),
                 Ok(_) => Ok(()),
                 Err(_) => Err("malformed syncing answer"),
             },
-            Ok(_) => Err("syncing check refused"),
-            Err(_) => Err("syncing check failed"),
+            Some(_) => Err("syncing check refused"),
+            None => Err("syncing check failed"),
         };
         self.judge(verdict, url);
     }
@@ -118,7 +119,7 @@ pub mod tests {
         move || http.send(&mut net, pool, "GET", SYNCING_PATH, &[], &[], 0).unwrap()
     }
 
-    fn answered(check: &mut HealthCheck, answer: Result<(u16, &[u8]), String>) -> bool {
+    fn answered(check: &mut HealthCheck, answer: Option<(u16, &[u8])>) -> bool {
         check.on_answer(answer, URL);
         check.is_healthy()
     }
@@ -129,18 +130,18 @@ pub mod tests {
         assert!(!check.is_healthy());
 
         let synced = syncing_json(false, false);
-        assert!(answered(&mut check, Ok((200, synced.as_bytes()))));
+        assert!(answered(&mut check, Some((200, synced.as_bytes()))));
         let syncing = syncing_json(true, false);
-        assert!(!answered(&mut check, Ok((200, syncing.as_bytes()))));
-        assert!(answered(&mut check, Ok((200, synced.as_bytes()))));
+        assert!(!answered(&mut check, Some((200, syncing.as_bytes()))));
+        assert!(answered(&mut check, Some((200, synced.as_bytes()))));
         let optimistic = syncing_json(false, true);
-        assert!(!answered(&mut check, Ok((200, optimistic.as_bytes()))));
-        assert!(answered(&mut check, Ok((200, br#"{"data":{"is_syncing":false}}"#))));
-        assert!(!answered(&mut check, Ok((503, synced.as_bytes()))));
-        assert!(answered(&mut check, Ok((200, synced.as_bytes()))));
-        assert!(!answered(&mut check, Ok((200, b"{}"))));
-        assert!(answered(&mut check, Ok((200, synced.as_bytes()))));
-        assert!(!answered(&mut check, Err("timed out".into())));
+        assert!(!answered(&mut check, Some((200, optimistic.as_bytes()))));
+        assert!(answered(&mut check, Some((200, br#"{"data":{"is_syncing":false}}"#))));
+        assert!(!answered(&mut check, Some((503, synced.as_bytes()))));
+        assert!(answered(&mut check, Some((200, synced.as_bytes()))));
+        assert!(!answered(&mut check, Some((200, b"{}"))));
+        assert!(answered(&mut check, Some((200, synced.as_bytes()))));
+        assert!(!answered(&mut check, None));
     }
 
     #[test]
@@ -152,7 +153,7 @@ pub mod tests {
         let id = next_id();
         check.sent(Some(id), URL);
         assert!(check.owns(id) && !check.owns(next_id()));
-        check.on_answer(Ok((200, syncing_json(false, false).as_bytes())), URL);
+        check.on_answer(Some((200, syncing_json(false, false).as_bytes())), URL);
 
         assert!(!check.is_due(start + Duration::from_secs(SLOT_SECS / 2), URL));
         assert!(check.is_due(start + Duration::from_secs(SLOT_SECS), URL));
@@ -165,7 +166,7 @@ pub mod tests {
         let mut check = HealthCheck::new(Duration::from_secs(SLOT_SECS), start);
         assert!(check.is_due(start, URL));
         check.sent(Some(next_id()), URL);
-        check.on_answer(Ok((200, syncing_json(false, false).as_bytes())), URL);
+        check.on_answer(Some((200, syncing_json(false, false).as_bytes())), URL);
 
         assert!(check.is_due(start + Duration::from_secs(SLOT_SECS), URL));
         check.sent(Some(next_id()), URL);
@@ -173,7 +174,7 @@ pub mod tests {
         assert!(!check.is_due(start + Duration::from_secs(2 * SLOT_SECS), URL));
         assert!(!check.is_healthy());
 
-        check.on_answer(Ok((200, syncing_json(false, false).as_bytes())), URL);
+        check.on_answer(Some((200, syncing_json(false, false).as_bytes())), URL);
         assert!(check.is_healthy());
         assert!(check.is_due(start + Duration::from_secs(3 * SLOT_SECS), URL));
     }

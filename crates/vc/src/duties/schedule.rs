@@ -1,16 +1,12 @@
 use std::ops::Range;
 
-use silver_common::{
-    SLOTS_PER_EPOCH,
-    ssz_view::{PROPOSER_PREFERENCES_SIZE, VRFProof, XMSSSignature},
-};
+use silver_common::{SLOTS_PER_EPOCH, ssz_view::VRFProof};
 
 use crate::{
     beacon_link::{
-        AttesterDuties, BeaconRequests, CommitteeSubscription, Head, RequestId, SignedPreferences,
-        SlotDuties,
+        AttesterDuties, BeaconRequests, CommitteeSubscription, Head, RequestId, SlotDuties,
     },
-    duties::{aggregations::AggregatorDuty, validators::Validators},
+    duties::validators::Validators,
 };
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -19,7 +15,6 @@ pub struct AttesterDuty {
     pub key: usize,
     pub validator_index: u64,
     pub committee_index: u64,
-    pub committee_length: u64,
     pub committees_at_slot: u64,
     pub slot: u64,
     /// Its place in the committee's aggregation committee, which staggers
@@ -28,11 +23,15 @@ pub struct AttesterDuty {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub enum Signing<T> {
+#[expect(
+    clippy::large_enum_variant,
+    reason = "inline in the reused duties Vec, so a proof costs no allocation"
+)]
+pub enum Reveal {
     Unasked,
-    Asked(RequestId),
-    Signed(Box<T>),
-    Done,
+    Asked,
+    Proved(VRFProof),
+    Refused,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -40,8 +39,7 @@ pub struct ProposerDuty {
     pub key: usize,
     pub validator_index: u64,
     pub slot: u64,
-    pub randao: Signing<VRFProof>,
-    pub preferences: Signing<XMSSSignature>,
+    pub randao: Reveal,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -59,7 +57,6 @@ pub enum Fetch {
 }
 
 struct Fetched<T> {
-    wanted: bool,
     dependent_root: Option<[u8; 32]>,
     duties: Vec<T>,
     fetch: Fetch,
@@ -67,20 +64,17 @@ struct Fetched<T> {
 
 impl<T> Fetched<T> {
     fn new() -> Self {
-        Self { wanted: false, dependent_root: None, duties: Vec::new(), fetch: Fetch::Done }
+        Self { dependent_root: None, duties: Vec::new(), fetch: Fetch::Done }
     }
 
-    fn reset(&mut self, wanted: bool) {
-        self.wanted = wanted;
+    fn reset(&mut self) {
         self.dependent_root = None;
         self.duties.clear();
         self.refetch();
     }
 
     fn refetch(&mut self) {
-        if self.wanted {
-            self.fetch = Fetch::Due { from_slot: 0 };
-        }
+        self.fetch = Fetch::Due { from_slot: 0 };
     }
 
     fn refetch_unless_rooted_at(&mut self, root: &[u8; 32]) -> bool {
@@ -95,24 +89,33 @@ impl<T> Fetched<T> {
         matches!(self.fetch, Fetch::Due { from_slot } if from_slot <= slot)
     }
 
+    /// A failed answer retries from the next slot.
     fn answered(
         &mut self,
         slot: u64,
-        answer: impl FnOnce(&mut Vec<T>) -> Result<[u8; 32], &'static str>,
-    ) -> Result<(), &'static str> {
+        epoch: Option<u64>,
+        kind: &'static str,
+        fill: impl FnOnce(&mut Vec<T>) -> Result<[u8; 32], &'static str>,
+    ) -> bool {
         self.duties.clear();
-        match answer(&mut self.duties) {
+        match fill(&mut self.duties) {
             Ok(dependent_root) => {
                 self.dependent_root = Some(dependent_root);
                 self.fetch = Fetch::Done;
-                Ok(())
+                silver_log::info!(epoch, kind, duties = self.duties.len(), "duties");
+                true
             }
             Err(error) => {
                 self.duties.clear();
                 self.fetch = Fetch::Due { from_slot: slot + 1 };
-                Err(error)
+                silver_log::warn!(epoch, kind, error, "duties");
+                false
             }
         }
+    }
+
+    fn fetched(&self) -> &[T] {
+        if self.fetch == Fetch::Done { &self.duties } else { &[] }
     }
 }
 
@@ -138,12 +141,11 @@ impl EpochDuties {
 
 pub struct DutySchedule {
     proposes: bool,
-    gloas_fork_epoch: u64,
     epochs: [EpochDuties; 2],
 }
 
 impl DutySchedule {
-    pub fn new(proposes: bool, gloas_fork_epoch: u64) -> Self {
+    pub fn new(proposes: bool) -> Self {
         let empty = || EpochDuties {
             epoch: None,
             attesters: Fetched::new(),
@@ -151,18 +153,17 @@ impl DutySchedule {
             ptc: Fetched::new(),
             subscription: Fetch::Done,
         };
-        Self { proposes, gloas_fork_epoch, epochs: [empty(), empty()] }
+        Self { proposes, epochs: [empty(), empty()] }
     }
 
     pub fn roll(&mut self, current_epoch: u64) {
-        let (proposes, gloas_fork_epoch) = (self.proposes, self.gloas_fork_epoch);
         for epoch in [current_epoch, current_epoch + 1] {
             let entry = self.entry_mut(epoch);
             if entry.epoch != Some(epoch) {
                 entry.epoch = Some(epoch);
-                entry.attesters.reset(true);
-                entry.proposers.reset(proposes);
-                entry.ptc.reset(epoch >= gloas_fork_epoch);
+                entry.attesters.reset();
+                entry.proposers.reset();
+                entry.ptc.reset();
                 entry.subscription = Fetch::Due { from_slot: 0 };
             }
         }
@@ -191,7 +192,7 @@ impl DutySchedule {
                 let id = requests.attester_duties(epoch, validators.known_indices());
                 entry.attesters.fetch = Fetch::InFlight(id);
             }
-            if entry.proposers.is_due(slot) {
+            if self.proposes && entry.proposers.is_due(slot) {
                 entry.proposers.fetch = Fetch::InFlight(requests.proposer_duties(epoch));
             }
             if entry.ptc.is_due(slot) {
@@ -213,14 +214,13 @@ impl DutySchedule {
         else {
             return;
         };
-        let answered = entry.attesters.answered(slot, |attesters| {
+        let fetched = entry.attesters.answered(slot, entry.epoch, "attester", |attesters| {
             let dependent_root = duties.for_each(validators.len(), |duty| {
                 if let Some(key) = validators.key(&duty.pubkey) {
                     attesters.push(AttesterDuty {
                         key,
                         validator_index: duty.validator_index,
                         committee_index: duty.committee_index,
-                        committee_length: duty.committee_length,
                         committees_at_slot: duty.committees_at_slot,
                         slot: duty.slot,
                         aggregator_position: duty.aggregator_position,
@@ -230,13 +230,8 @@ impl DutySchedule {
             attesters.sort_unstable_by_key(|duty| duty.slot);
             Ok(dependent_root)
         });
-        let duties = entry.attesters.duties.len();
-        match answered {
-            Ok(()) => {
-                entry.subscription = Fetch::Due { from_slot: 0 };
-                silver_log::info!(epoch = entry.epoch, duties, "attester duties");
-            }
-            Err(error) => silver_log::warn!(epoch = entry.epoch, error, "attester duties"),
+        if fetched {
+            entry.subscription = Fetch::Due { from_slot: 0 };
         }
     }
 
@@ -252,24 +247,20 @@ impl DutySchedule {
         else {
             return;
         };
-        let answered = entry.proposers.answered(slot, |proposers| {
-            duties.for_each(SLOTS_PER_EPOCH as usize, |duty| {
+        entry.proposers.answered(slot, entry.epoch, "proposer", |proposers| {
+            let dependent_root = duties.for_each(SLOTS_PER_EPOCH as usize, |duty| {
                 if let Some(key) = validators.key(&duty.pubkey) {
                     proposers.push(ProposerDuty {
                         key,
                         validator_index: duty.validator_index,
                         slot: duty.slot,
-                        randao: Signing::Unasked,
-                        preferences: Signing::Unasked,
+                        randao: Reveal::Unasked,
                     });
                 }
-            })
+            })?;
+            proposers.sort_unstable_by_key(|duty| duty.slot);
+            Ok(dependent_root)
         });
-        let proposals = entry.proposers.duties.len();
-        match answered {
-            Ok(()) => silver_log::info!(epoch = entry.epoch, proposals, "proposer duties"),
-            Err(error) => silver_log::warn!(epoch = entry.epoch, error, "proposer duties"),
-        }
     }
 
     pub fn on_ptc_duties(
@@ -283,7 +274,7 @@ impl DutySchedule {
         let Some(entry) = self.epochs.iter_mut().find(|entry| entry.ptc.fetch == in_flight) else {
             return;
         };
-        let answered = entry.ptc.answered(slot, |members| {
+        entry.ptc.answered(slot, entry.epoch, "PTC", |members| {
             let dependent_root = duties.for_each(validators.len(), |duty| {
                 if let Some(key) = validators.key(&duty.pubkey) {
                     members.push(PtcDuty {
@@ -296,11 +287,6 @@ impl DutySchedule {
             members.sort_unstable_by_key(|duty| duty.slot);
             Ok(dependent_root)
         });
-        let duties = entry.ptc.duties.len();
-        match answered {
-            Ok(()) => silver_log::info!(epoch = entry.epoch, duties, "PTC duties"),
-            Err(error) => silver_log::warn!(epoch = entry.epoch, error, "PTC duties"),
-        }
     }
 
     pub fn on_failed(&mut self, id: RequestId, slot: u64) {
@@ -344,9 +330,8 @@ impl DutySchedule {
     pub fn subscriptions_due(&mut self, slot: u64, requests: &mut BeaconRequests) {
         for entry in &mut self.epochs {
             let Fetch::Due { from_slot } = entry.subscription else { continue };
-            let attesters = &entry.attesters.duties;
-            let fetched = entry.attesters.fetch == Fetch::Done && !attesters.is_empty();
-            if !fetched || from_slot > slot {
+            let attesters = entry.attesters.fetched();
+            if attesters.is_empty() || from_slot > slot {
                 continue;
             }
             let subscriptions = attesters.iter().map(|duty| CommitteeSubscription {
@@ -374,17 +359,6 @@ impl DutySchedule {
         }
     }
 
-    pub fn aggregators_at(&self, slot: u64) -> impl Iterator<Item = AggregatorDuty> {
-        self.attesters_at(slot).iter().filter_map(|duty| {
-            duty.aggregator_position.map(|position| AggregatorDuty {
-                key: duty.key,
-                validator_index: duty.validator_index,
-                committee: duty.committee_index,
-                position,
-            })
-        })
-    }
-
     fn subscription_mut(&mut self, id: RequestId) -> Option<&mut EpochDuties> {
         self.epochs.iter_mut().find(|entry| entry.subscription == Fetch::InFlight(id))
     }
@@ -394,89 +368,63 @@ impl DutySchedule {
         &entry.attesters.duties[entry.slot_range(&entry.attesters.duties, slot, |duty| duty.slot)]
     }
 
+    pub fn aggregators_at(&self, slot: u64) -> impl Iterator<Item = &AttesterDuty> {
+        self.attesters_at(slot).iter().filter(|duty| duty.aggregator_position.is_some())
+    }
+
     pub fn ptc_at(&self, slot: u64) -> &[PtcDuty] {
         let entry = &self.epochs[(slot / SLOTS_PER_EPOCH % 2) as usize];
         &entry.ptc.duties[entry.slot_range(&entry.ptc.duties, slot, |duty| duty.slot)]
     }
 
-    pub fn ask_randao(&mut self, mut ask: impl FnMut(&ProposerDuty) -> RequestId) {
+    pub fn ask_randao(&mut self, mut ask: impl FnMut(&ProposerDuty)) {
         for entry in &mut self.epochs {
             if entry.proposers.fetch != Fetch::Done {
                 continue;
             }
             for duty in &mut entry.proposers.duties {
-                if duty.randao == Signing::Unasked {
-                    duty.randao = Signing::Asked(ask(duty));
+                if duty.randao == Reveal::Unasked {
+                    ask(duty);
+                    duty.randao = Reveal::Asked;
                 }
             }
         }
     }
 
-    pub fn on_randao(&mut self, id: RequestId, randao: Option<Box<VRFProof>>) {
-        let asked = self.epochs.iter_mut().flat_map(|entry| &mut entry.proposers.duties);
-        if let Some(duty) = asked.into_iter().find(|duty| duty.randao == Signing::Asked(id)) {
-            duty.randao = randao.map_or(Signing::Done, Signing::Signed);
+    pub fn on_randao(&mut self, slot: u64, validator_index: u64, proof: Option<&VRFProof>) {
+        let entry = self.entry_mut(slot / SLOTS_PER_EPOCH);
+        let asked = entry.proposers.duties.iter_mut().find(|duty| {
+            (duty.slot, duty.validator_index) == (slot, validator_index) &&
+                duty.randao == Reveal::Asked
+        });
+        if let Some(duty) = asked {
+            duty.randao = proof.map_or(Reveal::Refused, |proof| Reveal::Proved(*proof));
         }
     }
 
-    pub fn ask_preferences(
-        &mut self,
-        mut ask: impl FnMut(&ProposerDuty, &[u8; 32]) -> Option<RequestId>,
-    ) {
-        for entry in &mut self.epochs {
-            let (Fetch::Done, Some(dependent_root)) =
-                (entry.proposers.fetch, entry.proposers.dependent_root)
-            else {
-                continue;
-            };
-            for duty in &mut entry.proposers.duties {
-                if duty.preferences == Signing::Unasked {
-                    duty.preferences =
-                        ask(duty, &dependent_root).map_or(Signing::Done, Signing::Asked);
+    /// Proposals in slot order, with the dependent root they were fetched at.
+    /// An epoch not yet fetched ends them, so none is skipped.
+    pub fn proposals(&self) -> impl Iterator<Item = (&ProposerDuty, &[u8; 32])> {
+        let [first, second] = &self.epochs;
+        let in_order = if first.epoch <= second.epoch { [first, second] } else { [second, first] };
+        in_order
+            .into_iter()
+            .map_while(|entry| match (entry.proposers.fetch, &entry.proposers.dependent_root) {
+                (Fetch::Done, Some(root)) => {
+                    Some(entry.proposers.duties.iter().map(move |duty| (duty, root)))
                 }
-            }
-        }
-    }
-
-    pub fn on_preferences(&mut self, id: RequestId, signature: Option<Box<XMSSSignature>>) {
-        let asked = self.epochs.iter_mut().flat_map(|entry| &mut entry.proposers.duties);
-        if let Some(duty) = asked.into_iter().find(|duty| duty.preferences == Signing::Asked(id)) {
-            duty.preferences = signature.map_or(Signing::Done, Signing::Signed);
-        }
-    }
-
-    pub fn publish_preferences(
-        &mut self,
-        message: impl Fn(&ProposerDuty, &[u8; 32]) -> [u8; PROPOSER_PREFERENCES_SIZE],
-        requests: &mut BeaconRequests,
-    ) {
-        for entry in &mut self.epochs {
-            let Some(dependent_root) = entry.proposers.dependent_root else { continue };
-            let duties = &mut entry.proposers.duties;
-            let signed = |duty: &ProposerDuty| matches!(duty.preferences, Signing::Signed(_));
-            if !duties.iter().any(signed) {
-                continue;
-            }
-            requests.publish_proposer_preferences(duties.iter().filter_map(|duty| {
-                match &duty.preferences {
-                    Signing::Signed(signature) => Some(SignedPreferences {
-                        message: message(duty, &dependent_root),
-                        signature,
-                    }),
-                    _ => None,
-                }
-            }));
-            for duty in duties.iter_mut().filter(|duty| signed(duty)) {
-                duty.preferences = Signing::Done;
-            }
-        }
+                _ => None,
+            })
+            .flatten()
     }
 
     pub fn proposer_at(&self, slot: u64) -> Option<&ProposerDuty> {
         let entry = &self.epochs[(slot / SLOTS_PER_EPOCH % 2) as usize];
-        let fetched =
-            entry.epoch == Some(slot / SLOTS_PER_EPOCH) && entry.proposers.fetch == Fetch::Done;
-        let proposers = if fetched { &entry.proposers.duties[..] } else { &[] };
+        let proposers = if entry.epoch == Some(slot / SLOTS_PER_EPOCH) {
+            entry.proposers.fetched()
+        } else {
+            &[]
+        };
         proposers.iter().find(|duty| duty.slot == slot)
     }
 
@@ -535,7 +483,7 @@ mod tests {
     #[test]
     fn duties_for_both_epochs_are_fetched_once_and_sorted_by_slot() {
         let validators = validators();
-        let mut schedule = DutySchedule::new(false, u64::MAX);
+        let mut schedule = DutySchedule::new(false);
         let mut requests = BeaconRequests::default();
         schedule.roll(2);
         schedule.request_due(64, &validators, &mut requests);
@@ -544,7 +492,9 @@ mod tests {
         let paths = sent.iter().map(|(_, path)| path.as_str()).collect::<Vec<_>>();
         assert_eq!(paths, [
             "/eth/v1/validator/duties/attester/2",
-            "/eth/v1/validator/duties/attester/3"
+            "/eth/v1/validator/duties/ptc/2",
+            "/eth/v1/validator/duties/attester/3",
+            "/eth/v1/validator/duties/ptc/3"
         ]);
 
         let json = duties_json(1, &[(B, 9, 4, 70), (A, 7, 3, 65)]);
@@ -554,7 +504,6 @@ mod tests {
                 key,
                 validator_index,
                 committee_index,
-                committee_length: 1,
                 committees_at_slot: 1,
                 slot,
                 aggregator_position,
@@ -568,7 +517,7 @@ mod tests {
     #[test]
     fn failed_fetch_retries_from_the_next_slot() {
         let validators = validators();
-        let mut schedule = DutySchedule::new(false, u64::MAX);
+        let mut schedule = DutySchedule::new(false);
         let mut requests = BeaconRequests::default();
         schedule.roll(2);
         schedule.request_due(64, &validators, &mut requests);
@@ -593,7 +542,7 @@ mod tests {
     #[test]
     fn changed_dependent_root_refetches_only_its_epoch() {
         let validators = validators();
-        let mut schedule = DutySchedule::new(false, u64::MAX);
+        let mut schedule = DutySchedule::new(false);
         let mut requests = BeaconRequests::default();
         schedule.roll(2);
         schedule.request_due(64, &validators, &mut requests);
@@ -601,7 +550,7 @@ mod tests {
         let current = duties_json(0xc0, &[(A, 7, 3, 65)]);
         let next = duties_json(0xc1, &[(A, 7, 3, 100)]);
         schedule.on_duties(sent_ids[0].0, &AttesterDuties(current.as_bytes()), &validators, 64);
-        schedule.on_duties(sent_ids[1].0, &AttesterDuties(next.as_bytes()), &validators, 64);
+        schedule.on_duties(sent_ids[2].0, &AttesterDuties(next.as_bytes()), &validators, 64);
 
         schedule.on_head(&head(66, 0xc0, 0xc1));
         schedule.request_due(66, &validators, &mut requests);
@@ -616,7 +565,7 @@ mod tests {
     #[test]
     fn rolling_an_epoch_drops_the_old_duties() {
         let validators = validators();
-        let mut schedule = DutySchedule::new(false, u64::MAX);
+        let mut schedule = DutySchedule::new(false);
         let mut requests = BeaconRequests::default();
         schedule.roll(2);
         schedule.request_due(64, &validators, &mut requests);
@@ -628,13 +577,16 @@ mod tests {
         assert!(schedule.attesters_at(65).is_empty());
         schedule.request_due(96, &validators, &mut requests);
         let paths = sent(&mut requests).into_iter().map(|(_, path)| path).collect::<Vec<_>>();
-        assert_eq!(paths, ["/eth/v1/validator/duties/attester/4"]);
+        assert_eq!(paths, [
+            "/eth/v1/validator/duties/attester/4",
+            "/eth/v1/validator/duties/ptc/4"
+        ]);
     }
 
     #[test]
     fn aggregator_positions_mark_aggregators_and_subscribe_once() {
         let validators = validators();
-        let mut schedule = DutySchedule::new(false, u64::MAX);
+        let mut schedule = DutySchedule::new(false);
         let mut requests = BeaconRequests::default();
         schedule.roll(2);
         schedule.request_due(64, &validators, &mut requests);
@@ -654,13 +606,8 @@ mod tests {
         let flags = subscriptions.as_array().unwrap().iter().map(|s| s["is_aggregator"].clone());
         assert!(flags.eq([serde_json::Value::Bool(true), serde_json::Value::Bool(false)]));
 
-        let aggregators = schedule.aggregators_at(65).collect::<Vec<_>>();
-        assert_eq!(aggregators, [AggregatorDuty {
-            key: 0,
-            validator_index: 7,
-            committee: 3,
-            position: 0
-        }]);
+        let aggregators = schedule.aggregators_at(65).map(|duty| duty.validator_index);
+        assert!(aggregators.eq([7]));
         assert_eq!(schedule.aggregators_at(70).count(), 0);
 
         schedule.on_subscription_failed(bodies[0].0, 64);
@@ -692,12 +639,12 @@ mod tests {
     fn proposer_duties_are_fetched_only_when_proposing() {
         let validators = validators();
         let mut requests = BeaconRequests::default();
-        let mut attest_only = DutySchedule::new(false, u64::MAX);
+        let mut attest_only = DutySchedule::new(false);
         attest_only.roll(2);
         attest_only.request_due(64, &validators, &mut requests);
-        assert!(sent(&mut requests).iter().all(|(_, path)| path.contains("attester")));
+        assert!(sent(&mut requests).iter().all(|(_, path)| !path.contains("proposer")));
 
-        let mut schedule = DutySchedule::new(true, u64::MAX);
+        let mut schedule = DutySchedule::new(true);
         schedule.roll(2);
         schedule.request_due(64, &validators, &mut requests);
         let fetches = sent(&mut requests);
@@ -705,32 +652,26 @@ mod tests {
         assert_eq!(paths, [
             "/eth/v1/validator/duties/attester/2",
             "/eth/v2/validator/duties/proposer/2",
+            "/eth/v1/validator/duties/ptc/2",
             "/eth/v1/validator/duties/attester/3",
-            "/eth/v2/validator/duties/proposer/3"
+            "/eth/v2/validator/duties/proposer/3",
+            "/eth/v1/validator/duties/ptc/3"
         ]);
         let json = proposers_json(0xc0, &[(A, 7, 65), ([0xcc; 32], 100, 66)]);
         schedule.on_proposer_duties(fetches[1].0, &SlotDuties(json.as_bytes()), &validators, 64);
-        let duty = ProposerDuty {
-            key: 0,
-            validator_index: 7,
-            slot: 65,
-            randao: Signing::Unasked,
-            preferences: Signing::Unasked,
-        };
+        let duty = ProposerDuty { key: 0, validator_index: 7, slot: 65, randao: Reveal::Unasked };
         assert_eq!(schedule.proposer_at(65), Some(&duty));
         assert_eq!(schedule.proposer_at(66), None);
 
         let mut asked = Vec::new();
-        schedule.ask_randao(|duty| {
-            let id = requests.attestation_data(duty.slot);
-            asked.push(id);
-            id
-        });
+        schedule.ask_randao(|duty| asked.push((duty.slot, duty.validator_index)));
         schedule.ask_randao(|_| unreachable!("asked once"));
-        schedule.on_randao(asked[0], Some(Box::new([0x7a; VRF_PROOF_SIZE])));
+        assert_eq!(asked, [(65, 7)]);
+        schedule.on_randao(65, 8, Some(&[0x7b; VRF_PROOF_SIZE]));
+        schedule.on_randao(65, 7, Some(&[0x7a; VRF_PROOF_SIZE]));
         assert_eq!(
             schedule.proposer_at(65).unwrap().randao,
-            Signing::Signed(Box::new([0x7a; VRF_PROOF_SIZE]))
+            Reveal::Proved([0x7a; VRF_PROOF_SIZE])
         );
     }
 }

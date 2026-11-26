@@ -2,12 +2,12 @@ use flux::timing::{Duration, Instant};
 use flux_dns::Resolver;
 use flux_network::{
     NetworkCore, NetworkEvent,
-    http::{HttpEvent, HttpNetwork, HttpResponse, RequestId as HttpRequestId},
+    http::{Failure, HttpEvent, HttpNetwork, HttpResponse, RequestId as HttpRequestId},
 };
 use silver_common::Error;
 
 use crate::beacon_link::{
-    chain::{ChainInfo, ExpectedGenesis},
+    chain::ExpectedGenesis,
     endpoint::{HttpEndpoint, JSON_HEADERS},
     events::BeaconEvent,
     head_stream::HeadStream,
@@ -21,11 +21,14 @@ const GENESIS_RETRY_SECS: u64 = 2;
 /// Silver's BN answers at most 32768 ids per validators lookup, each in at
 /// most 550 bytes.
 const MAX_BODY_BYTES: usize = 32 * 1024 * 600;
+/// HTTP/1.1 answers one request per connection at a time. A slow answer, such
+/// as a block production, must not hold back a slot's publishes.
+const CONNECTIONS: usize = 4;
 
 enum Genesis {
     Due(Instant),
     InFlight(HttpRequestId),
-    Known(ChainInfo),
+    Known { genesis_time: u64 },
     Incompatible,
 }
 
@@ -63,9 +66,9 @@ impl BeaconNode {
         })
     }
 
-    pub fn chain_info(&self) -> Option<&ChainInfo> {
-        match &self.genesis {
-            Genesis::Known(chain) => Some(chain),
+    pub fn genesis_time(&self) -> Option<u64> {
+        match self.genesis {
+            Genesis::Known { genesis_time } => Some(genesis_time),
             Genesis::Due(_) | Genesis::InFlight(_) | Genesis::Incompatible => None,
         }
     }
@@ -122,7 +125,7 @@ impl BeaconNode {
                 silver_log::warn!(url = %endpoint.url, %e, "beacon node lookup not sent");
             }
         }
-        dns.poll(|_, addrs| endpoint.resolved(http, net, addrs, 1));
+        dns.poll(|_, addrs| endpoint.resolved(http, net, addrs, CONNECTIONS));
 
         if let Genesis::Due(at) = *genesis &&
             at <= now &&
@@ -134,7 +137,7 @@ impl BeaconNode {
             };
         }
 
-        if matches!(genesis, Genesis::Known(_)) && health.is_due(now, &endpoint.url) {
+        if matches!(genesis, Genesis::Known { .. }) && health.is_due(now, &endpoint.url) {
             let sent = endpoint.send(http, net, "GET", SYNCING_PATH, &JSON_HEADERS, &[]);
             health.sent(sent, &endpoint.url);
         }
@@ -142,7 +145,7 @@ impl BeaconNode {
         http.drive(net, |event| {
             let (http_id, answer) = match event {
                 HttpEvent::Response { id: Some(id), response, .. } => (id, Ok(response)),
-                HttpEvent::Failed { id, reason } => (id, Err(format!("{reason:?}"))),
+                HttpEvent::Failed { id, reason } => (id, Err(reason)),
                 _ => return,
             };
 
@@ -151,7 +154,7 @@ impl BeaconNode {
                 return;
             }
             if health.owns(http_id) {
-                let answer = answer.map(|response| (response.status, response.body));
+                let answer = answer.ok().map(|response| (response.status, response.body));
                 return health.on_answer(answer, &endpoint.url);
             }
 
@@ -165,8 +168,8 @@ impl BeaconNode {
                     silver_log::warn!(?request, status, "beacon node request refused");
                     on_event(BeaconEvent::Failed { id, request });
                 }
-                Err(error) => {
-                    silver_log::warn!(?request, error, "beacon node request failed");
+                Err(reason) => {
+                    silver_log::warn!(?request, ?reason, "beacon node request failed");
                     on_event(BeaconEvent::Failed { id, request });
                 }
             }
@@ -200,7 +203,7 @@ fn drive_head_stream(
 }
 
 fn on_genesis(
-    answer: Result<HttpResponse<'_>, String>,
+    answer: Result<HttpResponse<'_>, Failure>,
     expected: &ExpectedGenesis,
     url: &str,
     now: Instant,
@@ -212,20 +215,15 @@ fn on_genesis(
             silver_log::warn!(url, status, "beacon node genesis refused");
             return retry;
         }
-        Err(error) => {
-            silver_log::warn!(url, error, "beacon node genesis failed");
+        Err(reason) => {
+            silver_log::warn!(url, ?reason, "beacon node genesis failed");
             return retry;
         }
     };
     match expected.check(body) {
-        Ok(chain) => {
-            silver_log::info!(
-                url,
-                genesis_time = chain.genesis_time,
-                genesis_validators_root = %hex::encode(chain.genesis_validators_root),
-                "beacon node compatible"
-            );
-            Genesis::Known(chain)
+        Ok(genesis_time) => {
+            silver_log::info!(url, genesis_time, "beacon node compatible");
+            Genesis::Known { genesis_time }
         }
         Err(reason) => {
             silver_log::error!(url, reason, "beacon node incompatible");

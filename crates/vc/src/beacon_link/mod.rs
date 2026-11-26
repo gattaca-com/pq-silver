@@ -18,17 +18,14 @@ use mio::Waker;
 use mio::{Events, Poll, Token};
 use silver_common::Error;
 
-#[cfg(test)]
-pub use self::events::{AttestationData, PayloadAttestationData};
 use self::{beacon_node::BeaconNode, chain::ExpectedGenesis};
 pub use self::{
-    chain::ChainInfo,
-    events::{Aggregate, AttesterDuties, BeaconEvent, ProducedBlock, SlotDuties, ValidatorIndices},
-    head_stream::Head,
-    requests::{
-        BeaconRequest, BeaconRequests, CommitteeSubscription, IndexedSignature, RequestId,
-        SignedAggregate, SignedAttestation, SignedPreferences,
+    events::{
+        Aggregate, AttestationData, AttesterDuties, BeaconEvent, PayloadAttestationData,
+        ProducedBlock, SlotDuties, ValidatorIndices,
     },
+    head_stream::Head,
+    requests::{BeaconRequest, BeaconRequests, CommitteeSubscription, RequestId},
 };
 use crate::config::Config;
 
@@ -71,16 +68,22 @@ impl BeaconLink {
         Waker::new(self.poll.registry(), WAKER_TOKEN)
     }
 
-    pub fn chain_info(&self) -> Option<&ChainInfo> {
-        self.beacon_node.chain_info()
+    pub fn genesis_time(&self) -> Option<u64> {
+        self.beacon_node.genesis_time()
     }
 
+    /// Sends the queued requests before waiting on the sockets, so a request
+    /// queued since the last spin does not wait out the poll timeout.
     pub fn spin(
         &mut self,
         requests: &mut BeaconRequests,
         mut on_event: impl FnMut(BeaconEvent<'_>),
     ) {
         let Self { poll, events, net, beacon_node } = self;
+        requests.drain(|id, request, path, body| {
+            beacon_node.send(net, id, request, path, body, &mut on_event)
+        });
+
         let mut route = |event: NetworkEvent<'_>| beacon_node.on_event(&event);
         net.pre_poll(&mut route);
         if let Err(error) = poll.poll(events, Some(POLL_TIMEOUT.min(net.max_poll_interval()))) {
@@ -91,9 +94,6 @@ impl BeaconLink {
         }
         net.post_poll(&mut route);
         beacon_node.drive(net, &mut on_event);
-        requests.drain(|id, request, path, body| {
-            beacon_node.send(net, id, request, path, body, &mut on_event)
-        });
     }
 }
 
@@ -133,11 +133,11 @@ mod tests {
         let mut beacon_link = beacon_link();
         let mut requests = BeaconRequests::default();
         let deadline = Instant::now() + Duration::from_secs(5);
-        while beacon_link.chain_info().is_none() {
-            assert!(Instant::now() < deadline, "no chain info");
+        while beacon_link.genesis_time().is_none() {
+            assert!(Instant::now() < deadline, "no genesis");
             beacon_link.spin(&mut requests, |_| {});
         }
-        assert_eq!(beacon_link.chain_info().unwrap().genesis_time, 1606824023);
+        assert_eq!(beacon_link.genesis_time(), Some(1606824023));
     }
 
     #[test]

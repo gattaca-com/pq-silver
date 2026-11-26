@@ -20,10 +20,10 @@ use seacast_core::{
     Bytes32, ChunkBuffer, ChunkId, ChunkMsg, GroupId, PreallocVec, Shape, TypeCodec, TypeId,
     ValidationResult,
 };
-use seacast_gossipsub::{CHUNK_FIXED, CONTEXT_BYTES, PayloadCodec, build_chunk, topic_group};
+use seacast_gossipsub::{CONTEXT_BYTES, Layout, PayloadCodec, topic_group};
 use silver_common::{AcquiredRead, TCache, TCacheId, TCacheProducer, TProducer, TReservation};
 
-use super::{VOTES_AT, covers};
+use super::{CLAIM_BYTES, Claim, MAX_PEERS, Meta, VOTES_AT, claim_of, covers};
 
 /// A coded group has at most 256 chunks, an uncoded one this many.
 const MAX_N: usize = seacast_codec::MAX_PLAIN_CHUNKS;
@@ -107,6 +107,12 @@ struct Assembly {
     /// not the block root: every chunk kept names this block, and so do the
     /// chunks rebuilt.
     context: [u8; CONTEXT_BYTES],
+    layout: Layout,
+    /// What ranks the group: of its claim, or nothing.
+    claim: Claim,
+    /// The claim as it travels beside a chunk, and the peers that have it.
+    meta: Option<Meta>,
+    told: [u64; MAX_PEERS / 64],
     /// Not forwarded: no chunk of it is written to a peer, and it is not
     /// offered. The node has its chunks all the same, and asks for the rest.
     held: bool,
@@ -178,13 +184,13 @@ impl Assembly {
     }
 
     fn votes(&self) -> u32 {
-        self.context[VOTES_AT..].iter().map(|bits| bits.count_ones()).sum()
+        self.claim[VOTES_AT..].iter().map(|bits| bits.count_ones()).sum()
     }
 
-    /// An aggregate of the slot and committee of `context`. One whose votes
-    /// its context leaves out is not ranked.
-    fn ranks_with(&self, context: &[u8; CONTEXT_BYTES]) -> bool {
-        self.context[..VOTES_AT] == context[..VOTES_AT] && self.votes() > 0
+    /// An aggregate of the slot and committee of `claim`. One with no vote is
+    /// not ranked.
+    fn ranks_with(&self, claim: &Claim) -> bool {
+        self.claim[..VOTES_AT] == claim[..VOTES_AT] && self.votes() > 0
     }
 
     /// The one group of its slot and committee that is forwarded before its
@@ -252,7 +258,9 @@ impl Store {
         &mut self,
         key: &Bytes32,
         slot: u64,
+        layout: Layout,
         context: &[u8; CONTEXT_BYTES],
+        meta: Option<&Meta>,
         d: &SegmentDescriptor,
     ) -> Option<usize> {
         let of_slot = |s: &&Slot| s.assembly.as_ref().is_some_and(|a| a.slot == slot);
@@ -260,7 +268,7 @@ impl Store {
             return None;
         }
         let free = self.slots.iter().position(|s| s.assembly.is_none())?;
-        let head_len = CHUNK_FIXED + 32 * d.proof_len();
+        let head_len = layout.fixed() + 32 * d.proof_len();
         let (n, k, size) = (d.n() as usize, d.k() as usize, d.segment_size as usize);
         let len = n * (size + head_len + 32);
         let reservation = self.producer.reserve(len, false)?;
@@ -271,6 +279,10 @@ impl Store {
             key: *key,
             slot,
             context: *context,
+            layout,
+            claim: meta.map_or([0; CLAIM_BYTES], claim_of),
+            meta: meta.copied(),
+            told: [0; MAX_PEERS / 64],
             held: false,
             settled: false,
             d: *d,
@@ -367,10 +379,10 @@ impl Store {
         }
     }
 
-    fn ranked(&self, context: &[u8; CONTEXT_BYTES]) -> impl Iterator<Item = (usize, &Assembly)> {
+    fn ranked(&self, claim: &Claim) -> impl Iterator<Item = (usize, &Assembly)> {
         let held = self.slots.iter().enumerate();
         let assemblies = held.filter_map(|(at, slot)| Some((at, slot.assembly.as_ref()?)));
-        assemblies.filter(move |(_, a)| self.ranked && a.ranks_with(context))
+        assemblies.filter(move |(_, a)| self.ranked && a.ranks_with(claim))
     }
 
     fn assembly_mut(&mut self, at: usize) -> Option<&mut Assembly> {
@@ -382,18 +394,18 @@ impl Store {
     /// forwarded so far, which is then held, or if there is none and no
     /// group that passed level 2 has its votes. Otherwise it is held.
     pub(super) fn rank(&mut self, at: usize) {
-        let Some(new) = self.assembly(at).map(|a| a.context) else {
+        let Some(new) = self.assembly(at).map(|a| a.claim) else {
             return;
         };
         if self.ranked(&new).all(|(ranked, _)| ranked != at) {
             return;
         }
         let others = || self.ranked(&new).filter(|&(other, _)| other != at);
-        let primary = others().find(|(_, a)| a.primary()).map(|(at, a)| (at, a.context));
+        let primary = others().find(|(_, a)| a.primary()).map(|(at, a)| (at, a.claim));
         let (held, demoted) = match primary {
             Some((primary, of)) if covers(&new, &of) && new != of => (false, Some(primary)),
             Some(_) => (true, None),
-            None => (others().any(|(_, a)| a.passed() && covers(&a.context, &new)), None),
+            None => (others().any(|(_, a)| a.passed() && covers(&a.claim, &new)), None),
         };
         if let Some(a) = demoted.and_then(|demoted| self.assembly_mut(demoted)) {
             a.held = true;
@@ -401,6 +413,11 @@ impl Store {
         if let Some(a) = self.assembly_mut(at) {
             a.held = held;
         }
+    }
+
+    /// Whether a group that passed level 2 has every vote of `claim`.
+    pub(super) fn covered(&self, claim: &Claim) -> bool {
+        self.ranked(claim).any(|(_, a)| a.passed() && covers(&a.claim, claim))
     }
 
     /// Whether the group `key` is held. `None`: no assembly of it.
@@ -411,11 +428,11 @@ impl Store {
     /// Level 2 of the assembly `at` ran. Passed, the group is forwarded
     /// unless one that passed before has its votes.
     pub(super) fn settle(&mut self, at: usize, passed: bool) {
-        let Some(of) = self.assembly(at).map(|a| a.context) else {
+        let Some(of) = self.assembly(at).map(|a| a.claim) else {
             return;
         };
         let covering = |&(other, by): &(usize, &Assembly)| {
-            other != at && by.passed() && covers(&by.context, &of)
+            other != at && by.passed() && covers(&by.claim, &of)
         };
         let held = !passed || self.ranked(&of).any(|other| covering(&other));
         if let Some(a) = self.assembly_mut(at) {
@@ -438,14 +455,14 @@ impl Store {
     /// forwarded before its level 2, the held one with the most votes is,
     /// unless a group that passed has its votes.
     pub(super) fn promote(&mut self, at: usize) {
-        let Some(like) = self.assembly(at).map(|a| a.context) else {
+        let Some(like) = self.assembly(at).map(|a| a.claim) else {
             return;
         };
         if self.ranked(&like).any(|(_, a)| a.primary()) {
             return;
         }
         let covered = |a: &Assembly| {
-            self.ranked(&like).any(|(_, by)| by.passed() && covers(&by.context, &a.context))
+            self.ranked(&like).any(|(_, by)| by.passed() && covers(&by.claim, &a.claim))
         };
         let waiting = self.ranked(&like).filter(|(_, a)| a.held && !a.settled && !covered(a));
         let next = waiting.max_by_key(|(_, a)| a.votes()).map(|(next, _)| next);
@@ -491,6 +508,31 @@ impl Store {
         self.slots
             .get(buf.assembly as usize)
             .is_some_and(|s| s.assembly.is_some() && s.generation == buf.generation)
+    }
+
+    /// `peer` has the claim of the assembly `at`: it sent a chunk of the
+    /// group, or holds one.
+    pub(super) fn note_told(&mut self, at: usize, peer: usize) {
+        if let Some(a) = self.assembly_mut(at) &&
+            let Some(word) = a.told.get_mut(peer / 64)
+        {
+            *word |= 1 << (peer % 64);
+        }
+    }
+
+    /// The claim to send with the chunk `buf` to `peer`: that of an aggregate
+    /// whose claim the peer is not known to have. The peer then is.
+    pub(super) fn claim_for(&mut self, buf: &Buf, peer: usize) -> Option<&Meta> {
+        let a = self.assembly_mut(buf.assembly as usize)?;
+        let word = a.told.get_mut(peer / 64)?;
+        let told = *word >> (peer % 64) & 1 == 1;
+        *word |= 1 << (peer % 64);
+        a.meta.as_ref().filter(|_| !told)
+    }
+
+    /// The layout of the frames of `buf`'s group.
+    pub(super) fn layout(&self, buf: &Buf) -> Option<Layout> {
+        self.assembly(buf.assembly as usize).map(|a| a.layout)
     }
 
     /// Whether `buf` is of a group that is not forwarded.
@@ -627,14 +669,15 @@ impl TypeCodec<Buf> for StoreCodec {
         out_rebuilt: &mut PreallocVec<ChunkMsg<Buf>>,
     ) -> Option<Buf> {
         let at = self.store.find(&group.key)?;
-        let (d, had, key, context) = {
+        let (d, had, key, context, layout) = {
             let a = self.store.assembly(at)?;
-            (a.d, a.have, a.key, a.context)
+            (a.d, a.have, a.key, a.context, a.layout)
         };
+        let context = &context[..layout.context_len()];
         let tree = self.store.complete(at)?;
         for index in 0..d.n() as usize {
             if had[index / 64] >> (index % 64) & 1 == 0 {
-                let head = build_chunk(&context, &key, &d, index as u32, &tree.proof(index), &[]);
+                let head = layout.build(context, &key, &d, index as u32, &tree.proof(index), &[]);
                 let (data, len) = {
                     let a = self.store.assembly(at)?;
                     (a.at(index * a.size()), a.data_len(index))

@@ -4,6 +4,7 @@ use std::time::{Duration, Instant};
 
 use buffa::{MessageView, encoding::decode_varint};
 use seacast_codec::build_merkle_layers;
+use seacast_gossipsub::{build_chunk, group_key};
 use silver_common::{
     ForkName, GossipDomain, GossipTopic, PeerControl, TCache, TCacheId, TCacheProducer,
     TCacheTable, TProducer,
@@ -149,9 +150,9 @@ fn aggregate_of(len: usize, bits: u8) -> Vec<u8> {
     message[12..16].copy_from_slice(&(proof_at as u32).to_le_bytes());
     message[fixed..proof_at].copy_from_slice(&attestation);
     assert!(SignedAggregateAndProofPqView::check_size(&ssz));
-    let mut votes = [0; 32];
-    votes[VOTES_AT - 8] = bits;
-    assert_eq!(aggregate_context(&ssz), Some(context(SLOT, &votes)));
+    let claim = claim_of(&aggregate_meta(&ssz).unwrap());
+    assert_eq!((&claim[..8], claim[VOTES_AT]), (&SLOT.to_le_bytes()[..], bits));
+    assert!(claim[VOTES_AT + 1..].iter().all(|&bits| bits == 0));
     ssz
 }
 
@@ -211,22 +212,34 @@ fn body_crosses(
     let now = run(&mut a, &mut b, start, |_| true);
 
     assert_eq!(a.handler.seacast_publish(topic, &ssz), !whole);
-    // Every chunk carries the body's context, and the group key at its slot
-    // (`seacast-lite.md` §1, §2).
+    // A payload's chunk carries the body's context, and the group key at its
+    // slot (`seacast-lite.md` §1, §2). An aggregate's carries none: its claim
+    // goes before the first frame to the peer, and before no other.
     let kind = KINDS.iter().find(|kind| kind.whole == topic).unwrap();
     let context = (kind.context)(&ssz).unwrap();
-    let mut named = 0;
+    let claim = kind.meta.map(|meta| meta(&ssz).unwrap());
+    let (mut named, mut claims) = (0, 0);
     run(&mut a, &mut b, now, |frame| {
         for chunk in chunks(frame) {
-            let f = split_chunk(&chunk).unwrap();
-            assert_eq!(chunk[..CONTEXT_BYTES], context);
-            assert_eq!(f.slot, SLOT);
-            assert_eq!(f.group, group_key(&group_id(&f.descriptor), SLOT));
+            let (attachment, chunk) = match kind.layout {
+                Layout::Payload => (&[][..], &chunk[..]),
+                Layout::Attached => split_attached(&chunk).unwrap(),
+            };
+            let f = kind.layout.split(chunk, &[]).unwrap();
+            let context = &context[..kind.layout.context_len()];
+            assert_eq!(&chunk[..context.len()], context);
+            assert_eq!(f.group, kind.layout.group_key(&group_id(&f.descriptor), context));
+            if !attachment.is_empty() {
+                assert_eq!(Some(attachment), claim.as_ref().map(|claim| &claim[..]));
+                assert_eq!(named, 0);
+                claims += 1;
+            }
             named += 1;
         }
         keep(frame)
     });
     assert!(named > 0);
+    assert_eq!(claims, claim.is_some() as usize);
 
     let delivered = b.delivered(topic);
     assert_eq!(delivered.len(), 1);
@@ -261,11 +274,19 @@ fn a_covered_aggregate_is_taken_once_whole() {
     let start = Instant::now();
     let (mut a, mut b) = (Node::new(start), Node::new(start));
     let mut now = run(&mut a, &mut b, start, |_| true);
-    // One vote, the same vote from another aggregator, then two votes.
-    for (len, bits) in [(200_000, 0b11), (200_001, 0b11), (200_002, 0b111)] {
+    // One vote, the same vote from another aggregator, then two votes. The
+    // second is not ours to send: its frames are another's.
+    for (len, bits, ours) in [(200_000, 0b11, true), (200_001, 0b11, false), (200_002, 0b111, true)]
+    {
         let ssz = aggregate_of(len, bits);
-        a.handler.seacast_publish(topic, &ssz);
-        let mut sent = false;
+        let mut sent = !ours;
+        if ours {
+            a.handler.seacast_publish(topic, &ssz);
+        } else {
+            for frame in aggregate_frames(&mut a, &ssz, false).0 {
+                b.receive(&frame, now);
+            }
+        }
         now = run(&mut a, &mut b, now, |frame| {
             sent |= is_chunk(frame);
             true
@@ -417,12 +438,15 @@ fn aggregate_frames(node: &mut Node, ssz: &[u8], spoil: bool) -> (Vec<Vec<u8>>, 
     }
     let tree = build_merkle_layers(&segments);
     d.root = tree.root();
-    let context = aggregate_context(ssz).unwrap();
-    let key = group_key(&group_id(&d), SLOT);
+    let claim = aggregate_meta(ssz).unwrap();
+    let layout = Layout::Attached;
+    let key = layout.group_key(&group_id(&d), &[]);
     let topic = wire_topic(DOMAIN, GossipTopic::BeaconAggregateAndProofSegment);
     let mut encoder = snap::raw::Encoder::new();
     let frame = |(index, data): (usize, &Vec<u8>)| {
-        let chunk = build_chunk(&context, &key, &d, index as u32, &tree.proof(index), data);
+        let mut chunk = Vec::new();
+        seacast_gossipsub::attach(&claim, &mut chunk);
+        chunk.extend(layout.build(&[], &key, &d, index as u32, &tree.proof(index), data));
         let snappy = encoder.compress_vec(&chunk).unwrap();
         let publish = &mut node.handler.mcache_publish;
         let read = copy_compressed_to_protobuf_output(publish, &snappy, &topic).unwrap();
@@ -490,6 +514,51 @@ fn the_next_best_aggregate_is_forwarded_when_the_best_fails() {
     let delivered = node.delivered(topic);
     assert_eq!(delivered.len(), 1);
     assert!(delivered[0].0 == bodies[2]);
+}
+
+/// When the aggregate forwarded passes level 2 it stands for its slot and
+/// committee: no held one is forwarded in its place before its own level 2.
+#[test]
+fn no_aggregate_takes_the_place_of_one_that_passed() {
+    let start = Instant::now();
+    let mut node = Node::new(start);
+    let bodies = [0b011, 0b110].map(|bits| aggregate_of(200_000 + bits, bits as u8));
+    let (first, first_key) = aggregate_frames(&mut node, &bodies[0], false);
+    let (other, other_key) = aggregate_frames(&mut node, &bodies[1], false);
+    node.receive(&first[0], start);
+    node.receive(&other[0], start);
+    for frame in &first[1..] {
+        node.receive(frame, start);
+    }
+    node.tick(start + Duration::from_millis(50));
+    assert_eq!(node.delivered(GossipTopic::BeaconAggregateAndProof).len(), 1);
+    assert_eq!([first_key, other_key].map(|key| held(&node, &key)), [false, true].map(Some));
+}
+
+/// An aggregate of ours is not sent as chunks where one held whole has its
+/// votes. One with a vote more is.
+#[test]
+fn our_aggregate_is_not_sent_under_one_that_has_its_votes() {
+    let topic = GossipTopic::BeaconAggregateAndProof;
+    let start = Instant::now();
+    let (mut a, mut b) = (Node::new(start), Node::new(start));
+    let mut now = run(&mut a, &mut b, start, |_| true);
+    for frame in aggregate_frames(&mut b, &aggregate_of(200_000, 0b0111), false).0 {
+        a.receive(&frame, now);
+    }
+    now = run(&mut a, &mut b, now, |_| true);
+    assert_eq!(a.delivered(topic).len(), 1);
+    for (len, bits, ours) in
+        [(200_001, 0b0011, false), (200_002, 0b0111, false), (200_003, 0b1111, true)]
+    {
+        a.handler.seacast_publish(topic, &aggregate_of(len, bits));
+        let mut sent = false;
+        now = run(&mut a, &mut b, now, |frame| {
+            sent |= is_chunk(frame);
+            true
+        });
+        assert_eq!(sent, ours, "{bits:b}");
+    }
 }
 
 /// A held aggregate that is whole is decoded where it lies, and handed on

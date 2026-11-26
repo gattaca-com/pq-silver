@@ -8,7 +8,7 @@ use buffa::{
 };
 use seacast_codec::ChunkBytes;
 use seacast_core::{ChunkMsg, TypeId};
-use seacast_gossipsub::{PayloadCatalog, RpcOut};
+use seacast_gossipsub::{Layout, PayloadCatalog, RpcOut, attach};
 use silver_common::{
     Error, GossipMsgOut, GossipTraffic, TCacheProducer, TCacheRead, TCacheReader, TProducer,
 };
@@ -97,13 +97,22 @@ impl<F: FnMut(GossipHandlerEvent)> Out<'_, F> {
     }
 
     /// The chunk's message: written once, pinned, and sent again from there.
+    /// An aggregate's goes with its claim to a peer that is not known to have
+    /// it, and that message is the peer's alone.
     fn chunk_frame(&mut self, t: usize, frame: &Buf) -> Option<TCacheRead> {
         let store = &mut self.types[t].codec.store;
-        if let Some(pinned) = store.wire(frame) {
-            return Some(pinned.to_read());
-        }
+        let attached = store.layout(frame) == Some(Layout::Attached);
         let s = &mut *self.scratch;
         s.frame.clear();
+        let mut with_claim = false;
+        if attached {
+            let claim = store.claim_for(frame, self.peer);
+            with_claim = claim.is_some();
+            attach(claim.map_or(&[], |claim| &claim[..]), &mut s.frame);
+        }
+        if !with_claim && let Some(pinned) = store.wire(frame) {
+            return Some(pinned.to_read());
+        }
         s.frame.extend_from_slice(frame.as_bytes());
         s.frame.extend_from_slice(frame.tail());
         s.snappy.resize(snap::raw::max_compress_len(s.frame.len()), 0);
@@ -114,7 +123,9 @@ impl<F: FnMut(GossipHandlerEvent)> Out<'_, F> {
             &self.topics[t].name,
         )
         .ok()?;
-        *store.wire(frame) = Some(self.reader.acquire(read));
+        if !with_claim {
+            *store.wire(frame) = Some(self.reader.acquire(read));
+        }
         Some(read)
     }
 

@@ -30,16 +30,17 @@ use seacast_core::{
     TimerEvent, TypeCodec, TypeId, ValidationResult,
 };
 use seacast_gossipsub::{
-    CONTEXT_BYTES, Inbound, MAX_CHUNK_BYTES, MESSAGE_ID_BYTES, PayloadCatalog, PayloadCodec,
-    TopicCatalogs, build_chunk, chunk_id_on, group_key, is_seacast, read_holding, read_offer,
-    read_want, split_chunk, topic_group, topic_join, write_entry,
+    CONTEXT_BYTES, Inbound, Layout, MAX_CHUNK_BYTES, MESSAGE_ID_BYTES, PayloadCatalog,
+    PayloadCodec, TopicCatalogs, chunk_id_on, is_seacast, read_holding, read_offer, read_want,
+    split_attached, topic_group, topic_join, write_entry,
 };
 use silver_common::{
     BroadcastValidation, ForkName, GossipDomain, GossipTopic, LOCAL_GOSSIP_STREAM_ID, MessageId,
     Nanos, NewGossipMsg, PeerEvent, SszCache, TCacheId, TCacheProducer, msg_id_valid_snappy,
     ssz_view::{
-        COMMITTEE_BITS_SIZE_PQ, EXECUTION_PAYLOAD_FIXED_GLOAS, ExecutionPayloadEnvelopeView,
-        ExecutionPayloadView, SignedAggregateAndProofPqView, SignedExecutionPayloadEnvelopePqView,
+        ATTESTATION_DATA_SIZE, COMMITTEE_BITS_SIZE_PQ, EXECUTION_PAYLOAD_FIXED_GLOAS,
+        ExecutionPayloadEnvelopeView, ExecutionPayloadView, MAX_VALIDATORS_PER_COMMITTEE,
+        SignedAggregateAndProofPqView, SignedExecutionPayloadEnvelopePqView, XMSS_SIGNATURE_SIZE,
     },
 };
 
@@ -60,16 +61,50 @@ struct Kind {
     store_bytes: usize,
     /// Groups admitted in a slot. The store has room for one more, ours.
     groups_per_slot: usize,
-    /// The head of the frame of a local body's chunks.
+    layout: Layout,
+    /// The head of the frame of a local body's chunks, where the layout has
+    /// one.
     context: fn(&[u8]) -> Option<Context>,
-    /// The context carries the votes of the body: a group is not taken when
-    /// one admitted covers it.
+    /// What a local body's chunks carry beside the frame.
+    meta: Option<fn(&[u8]) -> Option<Meta>>,
+    /// The groups are ranked by their claims: of those of a slot and
+    /// committee one is forwarded.
     covers: bool,
 }
 
-/// The head of a chunk's frame: `slot | beacon_block_root`, or for an
-/// aggregate `slot | committee_bits | aggregation_bits`.
+/// The head of a payload chunk's frame: `slot | beacon_block_root`.
 pub(super) type Context = [u8; CONTEXT_BYTES];
+
+/// What an aggregate's chunks carry beside the frame, to a peer that is not
+/// known to have it: the aggregator's claim, as
+///
+/// ```text
+///   version            uint8, = 1
+///   aggregator_index   uint64
+///   data               AttestationData
+///   committee_bits     Bitvector[MAX_COMMITTEES_PER_SLOT_PQ]
+///   aggregation_bits   the bitlist of one committee, zero padded
+///   signature          the aggregate's own
+/// ```
+///
+/// It is not part of a chunk. Nothing in it is verified here yet: it is its
+/// sender's word until level 2, as the group's rank is. To hold it to the
+/// aggregator the signature is to be checked over the message these fields
+/// and the root of the proof give, by the tile that has the keys.
+pub(super) const META_BYTES: usize =
+    1 + 8 + ATTESTATION_DATA_SIZE + COMMITTEE_BITS_SIZE_PQ + META_BITS + XMSS_SIGNATURE_SIZE;
+pub(super) type Meta = [u8; META_BYTES];
+const META_VERSION: u8 = 1;
+const META_BITS: usize = MAX_VALIDATORS_PER_COMMITTEE / 8 + 1;
+const META_DATA_AT: usize = 1 + 8;
+const META_COMMITTEE_AT: usize = META_DATA_AT + ATTESTATION_DATA_SIZE;
+const META_SIGNATURE_AT: usize = META_COMMITTEE_AT + COMMITTEE_BITS_SIZE_PQ + META_BITS;
+
+/// What ranks an aggregate: `slot | committee_bits | aggregation_bits`.
+pub(super) const CLAIM_BYTES: usize = 8 + COMMITTEE_BITS_SIZE_PQ + META_BITS;
+pub(super) type Claim = [u8; CLAIM_BYTES];
+/// A message of the chunk topics at its longest.
+const MAX_MESSAGE: usize = MAX_CHUNK_BYTES + 2 + META_BYTES;
 
 fn context(slot: u64, block_root: &[u8; 32]) -> Context {
     let mut context = [0; CONTEXT_BYTES];
@@ -95,29 +130,52 @@ fn envelope_context(ssz: &[u8]) -> Option<Context> {
     })
 }
 
-/// The slot, committee and votes of the aggregate, in place of the block:
-/// what an aggregate that one seen covers is told from, before the body is
-/// held. The bitlist is zero padded; one too long for the frame
-/// is left out, and such a group neither covers nor is covered.
-fn aggregate_context(ssz: &[u8]) -> Option<Context> {
-    SignedAggregateAndProofPqView::check_size(ssz).then(|| {
-        let mut votes = [0; 32];
-        votes[..VOTES_AT - 8]
-            .copy_from_slice(SignedAggregateAndProofPqView::agg_committee_bits(ssz));
-        let bits = SignedAggregateAndProofPqView::agg_aggregation_bits(ssz);
-        if let Some(room) = votes[VOTES_AT - 8..].get_mut(..bits.len()) {
-            room.copy_from_slice(bits);
-        }
-        context(SignedAggregateAndProofPqView::agg_data(ssz).slot(), &votes)
-    })
+/// An aggregate's frames have no context.
+fn no_context(ssz: &[u8]) -> Option<Context> {
+    SignedAggregateAndProofPqView::check_size(ssz).then_some([0; CONTEXT_BYTES])
 }
 
-/// Where an aggregate's `aggregation_bits` start in its context.
+/// The claim of a local aggregate. `None`: its votes are of more than one
+/// committee, which a claim has no room for.
+fn aggregate_meta(ssz: &[u8]) -> Option<Meta> {
+    if !SignedAggregateAndProofPqView::check_size(ssz) {
+        return None;
+    }
+    let bits = SignedAggregateAndProofPqView::agg_aggregation_bits(ssz);
+    let mut meta = [0; META_BYTES];
+    meta[0] = META_VERSION;
+    meta[1..META_DATA_AT]
+        .copy_from_slice(&SignedAggregateAndProofPqView::aggregator_index(ssz).to_le_bytes());
+    // `Attestation`: the offset of its bits, then its data.
+    let data = SignedAggregateAndProofPqView::aggregate(ssz).get(4..4 + ATTESTATION_DATA_SIZE)?;
+    meta[META_DATA_AT..META_COMMITTEE_AT].copy_from_slice(data);
+    let committee_end = META_COMMITTEE_AT + COMMITTEE_BITS_SIZE_PQ;
+    meta[META_COMMITTEE_AT..committee_end]
+        .copy_from_slice(SignedAggregateAndProofPqView::agg_committee_bits(ssz));
+    meta[committee_end..META_SIGNATURE_AT].get_mut(..bits.len())?.copy_from_slice(bits);
+    meta[META_SIGNATURE_AT..].copy_from_slice(SignedAggregateAndProofPqView::signature(ssz));
+    Some(meta)
+}
+
+/// A received claim. `None`: not one of this version.
+fn read_meta(attachment: &[u8]) -> Option<&Meta> {
+    <&Meta>::try_from(attachment).ok().filter(|meta| meta[0] == META_VERSION)
+}
+
+/// The slot is the first field of `AttestationData`.
+fn claim_of(meta: &Meta) -> Claim {
+    let mut claim = [0; CLAIM_BYTES];
+    claim[..8].copy_from_slice(&meta[META_DATA_AT..META_DATA_AT + 8]);
+    claim[8..].copy_from_slice(&meta[META_COMMITTEE_AT..META_SIGNATURE_AT]);
+    claim
+}
+
+/// Where the `aggregation_bits` start in a claim.
 const VOTES_AT: usize = 8 + COMMITTEE_BITS_SIZE_PQ;
 
 /// Whether the aggregate of `held` has every vote of the aggregate of `new`,
 /// on the same slot and committee.
-pub(super) fn covers(held: &Context, new: &Context) -> bool {
+pub(super) fn covers(held: &Claim, new: &Claim) -> bool {
     held[..VOTES_AT] == new[..VOTES_AT] &&
         new[VOTES_AT..].iter().any(|&bits| bits != 0) &&
         held[VOTES_AT..].iter().zip(&new[VOTES_AT..]).all(|(held, new)| new & !held == 0)
@@ -132,7 +190,9 @@ const KINDS: [Kind; 2] = [
         cache: TCacheId::ControlSeacast,
         store_bytes: 128 << 20,
         groups_per_slot: 2,
+        layout: Layout::Payload,
         context: envelope_context,
+        meta: None,
         covers: false,
     },
     // An aggregate of every aggregator of every subnet.
@@ -142,7 +202,9 @@ const KINDS: [Kind; 2] = [
         cache: TCacheId::ControlSeacastAggregates,
         store_bytes: 512 << 20,
         groups_per_slot: 16 * 4,
-        context: aggregate_context,
+        layout: Layout::Attached,
+        context: no_context,
+        meta: Some(aggregate_meta),
         covers: true,
     },
 ];
@@ -255,7 +317,12 @@ impl Core {
         let of = |(t, topic): (usize, &Topic)| {
             let (object_type, kind) = (TypeId(t as u8), topic.kind);
             let codec = StoreCodec {
-                inner: PayloadCodec::of(object_type, NoPool, topic.name.as_bytes()),
+                inner: PayloadCodec::with_layout(
+                    object_type,
+                    kind.layout,
+                    NoPool,
+                    topic.name.as_bytes(),
+                ),
                 store: Store::new(
                     kind.cache,
                     kind.store_bytes,
@@ -278,7 +345,7 @@ impl Core {
             domain,
             start: now,
             heartbeat,
-            frame: vec![0; MAX_CHUNK_BYTES],
+            frame: vec![0; MAX_MESSAGE],
             decoder: snap::raw::Decoder::new(),
             out: Scratch::default(),
             rebuilt: PreallocVec::with_capacity(MAX_N),
@@ -342,22 +409,35 @@ impl Core {
             env.penalties.push((peer as PeerId, PenaltyReason::InvalidChunkLevel1));
             None
         };
-        let len = snap::raw::decompress_len(snappy).ok().filter(|&len| len <= MAX_CHUNK_BYTES);
+        let len = snap::raw::decompress_len(snappy).ok().filter(|&len| len <= MAX_MESSAGE);
         let Some(len) = len.filter(|_| self.decoder.decompress(snappy, &mut self.frame).is_ok())
         else {
             return bad(&mut self.env);
         };
-        let frame = &self.frame[..len];
+        let message = &self.frame[..len];
+        let layout = self.topics[t].kind.layout;
         let PayloadCatalog { host, codec, .. } = &mut self.catalog.types[t];
-        let read = codec.inner.read_message(snappy, |_, _| Some(Buf::scratch(frame)));
+        // An aggregate's message is its claim, where the sender sends it, then
+        // the frame.
+        let (attachment, frame) = match layout {
+            Layout::Payload => (&[][..], message),
+            Layout::Attached => match split_attached(message) {
+                Some(parts) => parts,
+                None => return bad(&mut self.env),
+            },
+        };
+        let read = codec.inner.read_frame(Buf::scratch(frame), snappy.len() as u32);
         let Some(chunk) = read.filter(|chunk| {
             codec.inner.check(chunk) && codec.inner.check_proof(chunk) == ValidationResult::Accept
         }) else {
             return bad(&mut self.env);
         };
-        let f = split_chunk(frame)?;
-        let context: &Context = frame[..CONTEXT_BYTES].try_into().ok()?;
-        // A block's root fixes its slot. An aggregate's context names no block.
+        let f = layout.split(frame, &[])?;
+        let context: Context = match layout {
+            Layout::Payload => frame[..CONTEXT_BYTES].try_into().ok()?,
+            Layout::Attached => [0; CONTEXT_BYTES],
+        };
+        // A block's root fixes its slot. An aggregate's frame names no block.
         if t == PAYLOADS && host.block_slot(f.beacon_block_root).is_some_and(|slot| slot != f.slot)
         {
             return bad(&mut self.env);
@@ -365,21 +445,32 @@ impl Core {
         // A group's slot is the wall slot at its first chunk.
         let (key, slot) = (f.group, host.wall_slot);
         let store = &mut codec.store;
+        let meta = read_meta(attachment);
         let at = match store.find(&key) {
             Some(at) => at,
             None => {
-                let at = store.open(&key, slot, context, &f.descriptor)?;
-                // The context is the sender's word until level 2.
+                // An aggregate's group opens with its claim. A chunk without
+                // one is of a sender that took this node to have it: not
+                // taken, and no fault of the sender.
+                if layout == Layout::Attached && meta.is_none() {
+                    return None;
+                }
+                let at = store.open(&key, slot, layout, &context, meta, &f.descriptor)?;
+                // The claim is the sender's word until level 2.
                 store.rank(at);
                 at
             }
         };
-        // The key binds the descriptor and the chunk's slot, which level 1 checked.
+        // A peer that has a chunk of the group has its claim.
+        store.note_told(at, peer);
+        // The key binds the descriptor, and the payload's the chunk's slot,
+        // which level 1 checked.
         debug_assert_eq!(store.descriptor(at), Some(&f.descriptor));
         // It does not bind the block root: the first chunk's stands.
-        if store.context(at) != Some(context) {
+        if store.context(at) != Some(&context) {
             return None;
         }
+        let len = frame.len();
         let (index, head) = (f.index as usize, &frame[..len - f.data.len()]);
         match store.head(at, index) {
             // Another copy of the chunk held.
@@ -473,6 +564,11 @@ impl Core {
                     };
                     if let Some(mut holding) = read_holding(entry) {
                         holding.group.type_id = t;
+                        // A peer that holds a chunk of the group has its claim.
+                        let store = &mut self.catalog.types[t.0 as usize].codec.store;
+                        if let Some(at) = store.find(&holding.group.key) {
+                            store.note_told(at, peer);
+                        }
                         frame.holding(holding, &mut self.part(id));
                     } else if let Some(chunk) = chunk_id_on(t, entry) {
                         self.unwanted.push(chunk);
@@ -525,8 +621,9 @@ impl Core {
         }
     }
 
-    /// Level 2 of `group` ran. Where it leaves its slot and committee with no
-    /// group forwarded, the next best held is.
+    /// Level 2 of `group` ran. Where it failed and so leaves its slot and
+    /// committee with no group forwarded, the next best held is. Passed, the
+    /// group stands for its slot and committee and none takes its place.
     fn settle(&mut self, group: &GroupId, passed: bool) {
         let t = group.type_id.0 as usize;
         let store = &mut self.catalog.types[t].codec.store;
@@ -534,7 +631,9 @@ impl Core {
             return;
         };
         store.settle(at, passed);
-        store.promote(at);
+        if !passed {
+            store.promote(at);
+        }
     }
 
     fn timers(&mut self, now: Instant) {
@@ -586,23 +685,34 @@ impl Core {
         let Some(context) = (kind.context)(ssz) else {
             return false;
         };
+        let (layout, meta) = (kind.layout, kind.meta.map(|meta| meta(ssz)));
+        if meta == Some(None) {
+            return false;
+        }
+        let meta = meta.flatten();
+        let context_bytes = &context[..layout.context_len()];
         let PayloadCatalog { host, codec, .. } = &mut self.catalog.types[t];
+        // An aggregate of ours adds nothing to one held whole that has its
+        // votes: it is not sent as chunks.
+        if meta.as_ref().is_some_and(|meta| codec.store.covered(&claim_of(meta))) {
+            return false;
+        }
         let slot = host.wall_slot;
         let (d, shards) =
             build_group::<Vec<u8>, _, _>(ssz, &mut VecBufferPool, &SnappyBlockCompressor);
-        let chunk_slot = u64::from_le_bytes(context[..8].try_into().unwrap());
-        let key = group_key(&group_id(&d), chunk_slot);
+        let key = layout.group_key(&group_id(&d), context_bytes);
         let group = topic_group(TypeId(t as u8), key);
         if codec.store.find(&key).is_some() {
             return true;
         }
-        let Some(at) = codec.store.open(&key, slot, &context, &d) else {
+        let opened = codec.store.open(&key, slot, layout, &context, meta.as_ref(), &d);
+        let Some(at) = opened else {
             silver_log::warn!(slot, topic = %kind.whole, "seacast: no room to publish");
             return false;
         };
         self.rebuilt.clear();
         for shard in &shards {
-            let head = build_chunk(&context, &key, &d, shard.index, &shard.proof, &[]);
+            let head = layout.build(context_bytes, &key, &d, shard.index, &shard.proof, &[]);
             let id = codec.inner.chunk_id(&group, shard.index, &head, &shard.data);
             let leaf = leaf_hash(&shard.data);
             let index = shard.index as usize;

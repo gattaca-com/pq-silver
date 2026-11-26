@@ -19,7 +19,7 @@ pub(crate) const GOSSIP_BODY_STALL_TIMEOUT: Duration = Duration::from_secs(1);
 /// A body holds its ingress reservation until complete, and the ring cannot
 /// reuse space past it: bound the hold whatever the trickle rate.
 const GOSSIP_BODY_DEADLINE_BASE: Duration = Duration::from_secs(2);
-const GOSSIP_BODY_MIN_BYTES_PER_SECOND: u64 = 512 * 1024;
+const GOSSIP_BODY_MIN_BYTES_PER_SECOND: u64 = 128 * 1024;
 /// Frames are emitted back to back while bytes are buffered; yield so one
 /// peer cannot hold the tile.
 const MAX_FRAMES_PER_SPIN: usize = 64;

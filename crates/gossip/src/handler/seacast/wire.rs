@@ -1,19 +1,23 @@
 //! What the node sends, as gossipsub frames in the outgoing tcache: a chunk as
-//! a message on the chunk topic, the strings as the ids of one IHAVE, IWANT
-//! and IDONTWANT frame each per drain of a peer's queue.
+//! a message on its chunk topic, the strings as the ids of one IHAVE frame a
+//! topic and one IWANT and IDONTWANT frame per drain of a peer's queue.
 
 use buffa::{
     encoding::{Tag, WireType, encode_varint, varint_len},
     types::{bytes_encoded_len, encode_bytes, encode_string, string_encoded_len},
 };
 use seacast_codec::ChunkBytes;
-use seacast_core::ChunkMsg;
-use seacast_gossipsub::RpcOut;
+use seacast_core::{ChunkMsg, TypeId};
+use seacast_gossipsub::{PayloadCatalog, RpcOut};
 use silver_common::{
     Error, GossipMsgOut, GossipTraffic, TCacheProducer, TCacheRead, TCacheReader, TProducer,
 };
 
-use super::store::{Buf, Store};
+use super::{
+    KINDS, Topic, entry_key,
+    host::Host,
+    store::{Buf, StoreCodec},
+};
 use crate::{GossipHandlerEvent, field_budget::MAX_RPC_FIELDS, message};
 
 /// `ControlMessage` fields.
@@ -48,7 +52,8 @@ impl Strings {
 }
 
 pub(super) struct Scratch {
-    ihave: Strings,
+    /// By type.
+    ihave: [Strings; KINDS.len()],
     iwant: Strings,
     idontwant: Strings,
     /// A chunk's frame gathered, then its snappy.
@@ -60,7 +65,7 @@ pub(super) struct Scratch {
 impl Default for Scratch {
     fn default() -> Self {
         Self {
-            ihave: Strings::default(),
+            ihave: Default::default(),
             iwant: Strings::default(),
             idontwant: Strings::default(),
             frame: Vec::new(),
@@ -73,11 +78,11 @@ impl Default for Scratch {
 /// The frames to one peer.
 pub(super) struct Out<'a, F> {
     pub(super) peer: usize,
-    pub(super) traffic: GossipTraffic,
-    pub(super) topic: &'a str,
+    /// By type: the topic, and its catalog for the store.
+    pub(super) topics: &'a [Topic],
+    pub(super) types: &'a mut [PayloadCatalog<Host, StoreCodec>],
     pub(super) producer: &'a mut TProducer,
     pub(super) reader: &'a mut TCacheReader,
-    pub(super) store: &'a mut Store,
     pub(super) scratch: &'a mut Scratch,
     pub(super) emit: &'a mut F,
 }
@@ -92,8 +97,9 @@ impl<F: FnMut(GossipHandlerEvent)> Out<'_, F> {
     }
 
     /// The chunk's message: written once, pinned, and sent again from there.
-    fn chunk_frame(&mut self, frame: &Buf) -> Option<TCacheRead> {
-        if let Some(pinned) = self.store.wire(frame) {
+    fn chunk_frame(&mut self, t: usize, frame: &Buf) -> Option<TCacheRead> {
+        let store = &mut self.types[t].codec.store;
+        if let Some(pinned) = store.wire(frame) {
             return Some(pinned.to_read());
         }
         let s = &mut *self.scratch;
@@ -105,30 +111,43 @@ impl<F: FnMut(GossipHandlerEvent)> Out<'_, F> {
         let read = message::copy_compressed_to_protobuf_output(
             self.producer,
             &s.snappy[..len],
-            self.topic,
+            &self.topics[t].name,
         )
         .ok()?;
-        *self.store.wire(frame) = Some(self.reader.acquire(read));
+        *store.wire(frame) = Some(self.reader.acquire(read));
         Some(read)
+    }
+
+    /// The chunk `frame` of type `t`, to the peer.
+    pub(super) fn chunk(&mut self, t: usize, frame: &Buf) {
+        let traffic = GossipTraffic::of(self.topics[t].kind.segments);
+        if let Some(read) = self.chunk_frame(t, frame) {
+            self.send(read, traffic);
+        }
     }
 
     /// Writes the strings gathered since the last call.
     pub(super) fn flush(&mut self) {
         let s = &mut *self.scratch;
-        let kinds = [
-            (IHAVE, Some(self.topic), &s.ihave, GossipTraffic::IHAVE),
-            (IWANT, None, &s.iwant, GossipTraffic::IWANT),
-            (IDONTWANT, None, &s.idontwant, GossipTraffic::IDONTWANT),
-        ];
-        let mut frames = [(None, GossipTraffic::CONTROL); 3];
-        for ((field, topic, strings, traffic), frame) in kinds.into_iter().zip(&mut frames) {
+        let mut frames = [(None, GossipTraffic::CONTROL); KINDS.len() + 2];
+        let (ihave, rest) = frames.split_at_mut(KINDS.len());
+        for ((strings, topic), frame) in s.ihave.iter_mut().zip(self.topics).zip(ihave) {
             if !strings.ends.is_empty() {
-                *frame = (control_frame(self.producer, field, topic, strings.iter()).ok(), traffic);
+                let read = control_frame(self.producer, IHAVE, Some(&topic.name), strings.iter());
+                *frame = (read.ok(), GossipTraffic::IHAVE);
+                strings.clear();
             }
         }
-        s.ihave.clear();
-        s.iwant.clear();
-        s.idontwant.clear();
+        let unnamed = [
+            (IWANT, &mut s.iwant, GossipTraffic::IWANT),
+            (IDONTWANT, &mut s.idontwant, GossipTraffic::IDONTWANT),
+        ];
+        for ((field, strings, traffic), frame) in unnamed.into_iter().zip(rest) {
+            if !strings.ends.is_empty() {
+                *frame = (control_frame(self.producer, field, None, strings.iter()).ok(), traffic);
+                strings.clear();
+            }
+        }
         for (read, traffic) in frames {
             if let Some(read) = read {
                 self.send(read, traffic);
@@ -139,17 +158,33 @@ impl<F: FnMut(GossipHandlerEvent)> Out<'_, F> {
 
 impl<F: FnMut(GossipHandlerEvent)> RpcOut<Buf> for Out<'_, F> {
     fn message(&mut self, chunk: &ChunkMsg<Buf>) {
+        let t = chunk.group.type_id.0 as usize;
         // A chunk of an assembly freed since it was queued is not sent.
-        if !self.store.live(&chunk.frame) {
+        let Some(store) = self.types.get_mut(t).map(|of| &mut of.codec.store) else {
+            return;
+        };
+        if !store.live(&chunk.frame) {
             return;
         }
-        if let Some(read) = self.chunk_frame(&chunk.frame) {
-            self.send(read, self.traffic);
+        if store.withheld(&chunk.frame) {
+            store.defer(&chunk.frame, self.peer);
+            return;
         }
+        self.chunk(t, &chunk.frame);
     }
 
-    fn ihave(&mut self, entry: &[u8]) {
-        self.scratch.ihave.push(entry);
+    fn ihave(&mut self, object_type: TypeId, entry: &[u8]) {
+        let t = object_type.0 as usize;
+        // A group that is held is not offered.
+        let held = |of: &PayloadCatalog<Host, StoreCodec>| {
+            entry_key(entry).and_then(|key| of.codec.store.held(key)) == Some(true)
+        };
+        if self.types.get(t).is_some_and(held) {
+            return;
+        }
+        if let Some(strings) = self.scratch.ihave.get_mut(t) {
+            strings.push(entry);
+        }
     }
 
     fn iwant(&mut self, entry: &[u8]) {

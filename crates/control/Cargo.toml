@@ -20,7 +20,7 @@ silver_peer.workspace = true
 fxhash.workspace = true
 
 [features]
-seacast = ["silver_gossip/seacast"]
+seacast = ["silver_gossip/seacast", "silver_peer/seacast"]
 
 [target.'cfg(target_os = "linux")'.dependencies]
 crc32c.workspace = true

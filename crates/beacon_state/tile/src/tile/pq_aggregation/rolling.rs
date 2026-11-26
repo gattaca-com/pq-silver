@@ -13,7 +13,7 @@ use super::{
 /// the range that still earns the timely-source flag.
 pub(super) const POOL_SLOTS: Slot = (MAX_GROUPS / MAX_COMMITTEES_PER_SLOT_PQ) as Slot;
 
-const LOG_INV_RATE: u8 = 2;
+const LOG_INV_RATE: u8 = 1;
 
 /// A proof and the votes it proves: `claims` is exactly the claims of
 /// `groups`.

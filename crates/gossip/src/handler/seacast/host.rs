@@ -12,16 +12,21 @@ use seacast_gossipsub::PayloadHost;
 use super::store::Buf;
 
 const ACCEPTED: usize = 256;
+const BLOCKS: usize = 64;
 
 /// The domain, as a stand-in: the bid commits no descriptor yet, so the first
 /// groups seen in a slot are taken as authentic, as Prysm's interim authority
-/// takes them. The slot and block a chunk names are not looked up.
+/// takes them. A chunk's slot is held to its block's where the block is known.
 /// A group's slot is the wall slot at its first chunk. Whether the body is a
 /// block's payload is Beacon State's to say, of the envelope decoded.
 pub(super) struct Host {
     /// The groups admitted, newest last written, each with its slot.
     accepted: [(GroupId, u64); ACCEPTED],
     next_accepted: usize,
+    /// The blocks Beacon State announced, newest last written, each with its
+    /// slot.
+    blocks: [(Bytes32, u64); BLOCKS],
+    next_block: usize,
     /// Groups admitted in one slot of our clock.
     groups_per_slot: usize,
     node_ids: Vec<NodeId>,
@@ -36,6 +41,8 @@ impl Host {
         Self {
             accepted: [(GroupId::default(), u64::MAX); ACCEPTED],
             next_accepted: 0,
+            blocks: [([0; 32], u64::MAX); BLOCKS],
+            next_block: 0,
             groups_per_slot,
             node_ids: vec![[0; 32]; max_peers],
             wall_slot: 0,
@@ -50,8 +57,19 @@ impl Host {
         }
     }
 
+    pub(super) fn note_block(&mut self, root: Bytes32, slot: u64) {
+        if self.block_slot(&root).is_none() {
+            self.blocks[self.next_block] = (root, slot);
+            self.next_block = (self.next_block + 1) % BLOCKS;
+        }
+    }
+
+    pub(super) fn block_slot(&self, root: &[u8]) -> Option<u64> {
+        self.blocks.iter().find(|(r, slot)| r == root && *slot != u64::MAX).map(|b| b.1)
+    }
+
     fn slot_of(&self, group: &GroupId) -> Option<u64> {
-        self.accepted.iter().find(|(g, slot)| g == group && *slot != u64::MAX).map(|&(_, s)| s)
+        self.accepted.iter().find(|(g, slot)| g == group && *slot != u64::MAX).map(|a| a.1)
     }
 
     /// Admits `group` in the wall slot. Our own group is admitted whatever
@@ -76,7 +94,7 @@ impl PayloadHost for Host {
         }
         let slot = self.wall_slot;
         // No fault of the sender: two peers that disagree prove nothing.
-        if self.accepted.iter().filter(|(_, of)| *of == slot).count() >= self.groups_per_slot {
+        if self.accepted.iter().filter(|a| a.1 == slot).count() >= self.groups_per_slot {
             return ValidationResult::Ignore;
         }
         self.admit(*group);
@@ -133,7 +151,8 @@ pub(super) struct Env {
     /// Peers the node has something to send to.
     pub(super) to_write: Vec<PeerId>,
     pub(super) to_decode: Vec<(GroupId, Shape)>,
-    pub(super) delivered: Vec<Buf>,
+    /// A decoded body, with its type.
+    pub(super) delivered: Vec<(u8, Buf)>,
     pub(super) penalties: Vec<(PeerId, PenaltyReason)>,
 }
 
@@ -177,8 +196,8 @@ impl RuntimeEnv<Buf> for Env {
         self.to_decode.push((group, *job.shape));
     }
 
-    fn deliver(&mut self, _group: GroupId, object: Buf) {
-        self.delivered.push(object);
+    fn deliver(&mut self, group: GroupId, object: Buf) {
+        self.delivered.push((group.type_id.0, object));
     }
 
     fn penalise(&mut self, peer: PeerId, reason: PenaltyReason) {

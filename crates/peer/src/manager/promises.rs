@@ -12,7 +12,7 @@ use silver_common::{
 };
 
 use super::PeerManager;
-use crate::{counters::GossipFlowCounters, scoring};
+use crate::{counters::GossipFlowCounters, scoring, state::PeerState};
 
 const MESH_MESSAGE_DELIVERIES_WINDOW_NS: u64 = 2_000_000_000;
 // Several times an honest mesh peer's per-heartbeat rate of large messages,
@@ -386,6 +386,10 @@ impl PeerManager {
                 // dontwant
                 continue;
             }
+            if sender == LOCAL_GOSSIP_STREAM_ID.peer() && takes_segments(peer_state, topic, digest)
+            {
+                continue;
+            }
             if partial_serving &&
                 peer_state.partial_extensions &&
                 peer_state.subscriptions.get(&(digest, topic)).is_some_and(|caps| caps.requests)
@@ -423,7 +427,9 @@ impl PeerManager {
         let subscribers = self.subscribers.of(digest, topic).iter().filter(|&conn| {
             !meshed.contains(conn) &&
                 self.peers.get(conn).is_some_and(|peer| {
-                    peer.cached_score >= publish_threshold && !peer.msg_cache_contains(&msg_hash)
+                    peer.cached_score >= publish_threshold &&
+                        !peer.msg_cache_contains(&msg_hash) &&
+                        !takes_segments(peer, topic, digest)
                 })
         });
         for &peer_id in subscribers.take(count) {
@@ -464,6 +470,15 @@ impl PeerManager {
             self.add_behaviour_penalty(conn, 1.0, "broken gossip promises");
         }
     }
+}
+
+/// An aggregate this node built or decoded from segments goes to a subscriber
+/// of the segment topic as segments, not whole. One received whole has no
+/// segments here and is forwarded to every mesh peer.
+fn takes_segments(peer: &PeerState, topic: GossipTopic, digest: [u8; 4]) -> bool {
+    cfg!(feature = "seacast") &&
+        topic == GossipTopic::BeaconAggregateAndProof &&
+        peer.subscriptions.contains_key(&(digest, GossipTopic::BeaconAggregateAndProofSegment))
 }
 
 #[cfg(test)]
@@ -1423,6 +1438,72 @@ mod tests {
             })
             .collect();
         assert_eq!(recipients, vec![1, 2, 3]);
+    }
+
+    #[cfg(feature = "seacast")]
+    #[test]
+    fn a_segment_subscriber_gets_no_whole_aggregate_of_ours() {
+        let now = Instant::now();
+        let mut params = ScoreParams::default();
+        params.d_low = 0;
+        params.d = 0;
+        params.d_high = 8;
+        let topic = GossipTopic::BeaconAggregateAndProof;
+        let (mut mgr, mut cap) = fixture(vec![topic], params);
+        // The segment topic is on the PQ digest alone.
+        let domain = silver_common::GossipDomain::new([0; 4], silver_common::ForkName::Pq);
+        mgr.set_active_gossip_domains(domain, None, &mut |_| {});
+
+        for i in 1..=3u8 {
+            connect(&mut mgr, &mut cap, i as usize, i, now);
+            let topics =
+                [Some(topic), (i == 2).then_some(GossipTopic::BeaconAggregateAndProofSegment)];
+            for topic in topics.into_iter().flatten() {
+                mgr.handle_event(
+                    PeerEvent::P2pGossipTopicSubscribe {
+                        p2p_peer: i as usize,
+                        topic,
+                        digest: [0; 4],
+                    },
+                    now,
+                    &mut |event| cap.0.push(event),
+                );
+            }
+            mgr.test_mesh_extend(topic, [i as usize]);
+        }
+
+        let remote =
+            silver_common::P2pStreamId::new(1, 0, silver_common::StreamProtocol::GossipSub, false);
+        for (id, originator_stream_id, expected) in
+            [(0xCD, silver_common::LOCAL_GOSSIP_STREAM_ID, vec![1, 3]), (0xCE, remote, vec![2, 3])]
+        {
+            cap.0.clear();
+            mgr.handle_event(
+                PeerEvent::SendGossip {
+                    originator_stream_id,
+                    topic,
+                    domain,
+                    ssz_cache: silver_common::SszCache::Gossip,
+                    msg_hash: silver_common::MessageId { id: [id; 20] },
+                    recv_ts: silver_common::Nanos::now(),
+                    protobuf: mk_tcache_read(),
+                    ssz: mk_tcache_read(),
+                },
+                now,
+                &mut |event| cap.0.push(event),
+            );
+            let recipients: Vec<usize> = cap
+                .0
+                .iter()
+                .filter_map(|event| match event {
+                    PeerControl::P2pSend(P2pSend::Gossip(GossipMsgOut { peer_id, .. })) => {
+                        Some(*peer_id)
+                    }
+                    _ => None,
+                })
+                .collect();
+            assert_eq!(recipients, expected);
+        }
     }
 
     #[test]

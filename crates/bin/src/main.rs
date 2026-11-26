@@ -193,6 +193,18 @@ fn main() -> Result<(), Box<dyn Error>> {
         local_enr.node_id().attestation_subnets(spec.fork_at(boot_epoch), boot_epoch, attnet_count);
     let boot_format = spec.fork_at(boot_epoch);
     let mut gossip_topics = config.gossip_topics()?;
+    // Bodies of a segmented kind come as segments, where the boot fork has the
+    // segment topics.
+    #[cfg(feature = "seacast")]
+    if config.seacast_segments_only() &&
+        GossipTopic::BeaconAggregateAndProofSegment.supports_format(boot_format)
+    {
+        let aggregates = config.seacast_aggregates();
+        gossip_topics.retain(|&topic| {
+            topic != GossipTopic::ExecutionPayload &&
+                (topic != GossipTopic::BeaconAggregateAndProof || !aggregates)
+        });
+    }
     let mut configured_attnets = 0u64;
     let mut long_lived_syncnets = config.sync_committee_subnets().long_lived();
     // Configured subnet topics subscribe at boot, so duties never leave them.
@@ -312,6 +324,10 @@ fn main() -> Result<(), Box<dyn Error>> {
     )?;
     #[cfg(feature = "seacast")]
     gossip_handler.set_seacast_payload_only(config.seacast_payload_only());
+    #[cfg(feature = "seacast")]
+    gossip_handler.set_seacast_segments_only(config.seacast_segments_only());
+    #[cfg(feature = "seacast")]
+    gossip_handler.set_seacast_aggregates(config.seacast_aggregates());
 
     let mut control_tile = Controller::new(
         PeerManager::new(

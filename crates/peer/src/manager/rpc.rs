@@ -56,11 +56,10 @@ fn severity_for_error_response(
         // Nothing was owed, so nothing was withheld: see `owed_the_request`.
         RPC_ERR_RESOURCE_UNAVAILABLE if !owed => None,
         RPC_ERR_RESOURCE_UNAVAILABLE => match protocol {
-            // Peer can't serve blocks they should have. Useless to keep
-            // around — ban (mirrors lighthouse for outbound block sync).
-            StreamProtocol::BeaconBlocksByRange | StreamProtocol::BeaconBlocksByRoot => {
-                Some(RpcSeverity::Fatal)
-            }
+            // A peer that lacks a block says so. A penalty here evicts the
+            // peers of a small network at once when a backfill range is
+            // missing on all of them. The requester moves to another peer.
+            StreamProtocol::BeaconBlocksByRange | StreamProtocol::BeaconBlocksByRoot => None,
             // By-root is naturally sparse: many peers won't custody every
             // requested root. No penalty.
             StreamProtocol::DataColumnSidecarsByRoot => None,
@@ -777,24 +776,23 @@ mod tests {
     }
 
     #[test]
-    fn resource_unavailable_blocks_outbound_is_fatal() {
-        // Ban: peer admits they can't serve us blocks we expected.
-        assert!(matches!(
+    fn resource_unavailable_blocks_outbound_is_silent() {
+        assert!(
             severity_for_error_response(
                 RPC_ERR_RESOURCE_UNAVAILABLE,
                 StreamProtocol::BeaconBlocksByRange,
                 true
-            ),
-            Some(RpcSeverity::Fatal)
-        ));
-        assert!(matches!(
+            )
+            .is_none()
+        );
+        assert!(
             severity_for_error_response(
                 RPC_ERR_RESOURCE_UNAVAILABLE,
                 StreamProtocol::BeaconBlocksByRoot,
                 true
-            ),
-            Some(RpcSeverity::Fatal)
-        ));
+            )
+            .is_none()
+        );
     }
 
     /// History nobody undertook to keep. Scoring the miss as `Fatal` bans a
@@ -812,6 +810,11 @@ mod tests {
                     .is_none(),
                 "{protocol:?}: unkept history is not misbehaviour"
             );
+        }
+        for protocol in [
+            StreamProtocol::DataColumnSidecarsByRange,
+            StreamProtocol::ExecutionPayloadEnvelopesByRange,
+        ] {
             assert!(
                 severity_for_error_response(RPC_ERR_RESOURCE_UNAVAILABLE, protocol, true).is_some(),
                 "{protocol:?}: what the peer undertook to serve still scores"

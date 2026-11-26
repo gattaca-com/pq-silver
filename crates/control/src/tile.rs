@@ -544,6 +544,10 @@ impl Controller {
             if self.scheduled_gossip_topics.contains(&topic) {
                 continue;
             }
+            #[cfg(feature = "seacast")]
+            if self.gossip_handler.seacast_skips(topic) {
+                continue;
+            }
             if !self.peer_manager.has_topic(topic) {
                 self.scheduled_gossip_topics.push(topic);
                 activate.push(topic);
@@ -742,6 +746,10 @@ impl Tile<SilverSpine> for Controller {
                 // rejected chain); the engine owns target invalidation.
                 BeaconStateEvent::BlockRejected { block_root, source } => {
                     self.peer_manager.record_block_rejected(block_root, source)
+                }
+                #[cfg(feature = "seacast")]
+                BeaconStateEvent::BlockReceived { slot, block_root, .. } => {
+                    self.gossip_handler.seacast_block(block_root, slot)
                 }
                 _ => {}
             }

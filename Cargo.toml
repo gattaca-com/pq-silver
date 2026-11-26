@@ -102,9 +102,9 @@ silver_stages = { path = "crates/stages" }
 silver_control = { path = "crates/control" }
 silver_discovery = {path = "crates/discovery" }
 silver_gossip = {path = "crates/gossip" }
-seacast-core = { git = "https://github.com/gattaca-com/seacast-rs", rev = "314cd6979982a99daabf32e859bee00158dfdd9e" }
-seacast-codec = { git = "https://github.com/gattaca-com/seacast-rs", rev = "314cd6979982a99daabf32e859bee00158dfdd9e" }
-seacast-gossipsub = { git = "https://github.com/gattaca-com/seacast-rs", rev = "314cd6979982a99daabf32e859bee00158dfdd9e" }
+seacast-core = { git = "https://github.com/gattaca-com/seacast-rs", rev = "4e8d39f6934d814474b39cdea5067016d4df8ca7" }
+seacast-codec = { git = "https://github.com/gattaca-com/seacast-rs", rev = "4e8d39f6934d814474b39cdea5067016d4df8ca7" }
+seacast-gossipsub = { git = "https://github.com/gattaca-com/seacast-rs", rev = "4e8d39f6934d814474b39cdea5067016d4df8ca7" }
 silver_httpcore = { path = "crates/httpcore" }
 silver_network = {path = "crates/network" }
 silver_observe = { path = "crates/observe" }

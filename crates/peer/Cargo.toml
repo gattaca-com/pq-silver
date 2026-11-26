@@ -16,5 +16,9 @@ silver_config.workspace = true
 silver_log.workspace = true
 slab.workspace = true
 
+[features]
+# Aggregates that go out as SEACAST segments are not also sent whole.
+seacast = []
+
 [lints]
 workspace = true

@@ -6,11 +6,13 @@
 //! group's key are `seacast-lite.md`'s `Chunk` and `group_key`. The
 //! aggregates' topic has the same frame.
 //!
-//! A kind of body has its own `seacast_core::SeacastNode`, run here on the
-//! control tile's thread with level 1 and level 2 inline. The mesh is the peer
-//! manager's: a peer is pushed to while it is in the mesh of the chunk topic
-//! and subscribed to it. A decoded body is handed on as a message received on
-//! the topic it is whole on.
+//! One `seacast_core::SeacastNode` runs every chunk topic, each a type of its
+//! own, on the control tile's thread with level 1 and level 2 inline. A chunk,
+//! an IHAVE and a subscription name their topic, which gives the type; an
+//! IWANT and an IDONTWANT entry name none and are of the type whose store has
+//! the group. The mesh is the peer manager's: a peer is pushed to while it is
+//! in the mesh of the chunk topic and subscribed to it. A decoded body is
+//! handed on as a message received on the topic it is whole on.
 
 mod host;
 mod store;
@@ -23,22 +25,21 @@ use seacast_codec::{
     ChunkBytes, SnappyBlockCompressor, VecBufferPool, build_group, group_id, leaf_hash,
 };
 use seacast_core::{
-    BoundedDeferredStore, ChunkId, ChunkMsg, DispatchOutcome, NodeConfig, NodeId, PeerId,
+    BoundedDeferredStore, ChunkId, ChunkMsg, DispatchOutcome, GroupId, NodeConfig, NodeId, PeerId,
     PenaltyReason, PreallocVec, Rpc, RuntimeEnv, SeacastNode, Shape, SourceOffers, SplitMix64,
-    TimerEvent, TypeCodec, ValidationResult,
+    TimerEvent, TypeCodec, TypeId, ValidationResult,
 };
 use seacast_gossipsub::{
-    CONTEXT_BYTES, Inbound, MAX_CHUNK_BYTES, MESSAGE_ID_BYTES, PAYLOAD, PayloadCatalog,
-    PayloadCodec, build_chunk, chunk_id_of, group_key, is_seacast, payload_group, payload_join,
-    read_holding, read_offer, read_want, split_chunk, write_entry,
+    CONTEXT_BYTES, Inbound, MAX_CHUNK_BYTES, MESSAGE_ID_BYTES, PayloadCatalog, PayloadCodec,
+    TopicCatalogs, build_chunk, chunk_id_on, group_key, is_seacast, read_holding, read_offer,
+    read_want, split_chunk, topic_group, topic_join, write_entry,
 };
 use silver_common::{
-    BroadcastValidation, ForkName, GossipDomain, GossipTopic, GossipTraffic,
-    LOCAL_GOSSIP_STREAM_ID, MessageId, Nanos, NewGossipMsg, PeerEvent, SszCache, TCacheId,
-    TCacheProducer, msg_id_valid_snappy,
+    BroadcastValidation, ForkName, GossipDomain, GossipTopic, LOCAL_GOSSIP_STREAM_ID, MessageId,
+    Nanos, NewGossipMsg, PeerEvent, SszCache, TCacheId, TCacheProducer, msg_id_valid_snappy,
     ssz_view::{
-        EXECUTION_PAYLOAD_FIXED_GLOAS, ExecutionPayloadEnvelopeView, ExecutionPayloadView,
-        SignedAggregateAndProofPqView, SignedExecutionPayloadEnvelopePqView,
+        COMMITTEE_BITS_SIZE_PQ, EXECUTION_PAYLOAD_FIXED_GLOAS, ExecutionPayloadEnvelopeView,
+        ExecutionPayloadView, SignedAggregateAndProofPqView, SignedExecutionPayloadEnvelopePqView,
     },
 };
 
@@ -59,12 +60,16 @@ struct Kind {
     store_bytes: usize,
     /// Groups admitted in a slot. The store has room for one more, ours.
     groups_per_slot: usize,
-    /// The slot and block a local body is of, which its chunks name.
+    /// The head of the frame of a local body's chunks.
     context: fn(&[u8]) -> Option<Context>,
+    /// The context carries the votes of the body: a group is not taken when
+    /// one admitted covers it.
+    covers: bool,
 }
 
-/// `slot | beacon_block_root`, the head of a chunk's frame.
-type Context = [u8; CONTEXT_BYTES];
+/// The head of a chunk's frame: `slot | beacon_block_root`, or for an
+/// aggregate `slot | committee_bits | aggregation_bits`.
+pub(super) type Context = [u8; CONTEXT_BYTES];
 
 fn context(slot: u64, block_root: &[u8; 32]) -> Context {
     let mut context = [0; CONTEXT_BYTES];
@@ -90,15 +95,36 @@ fn envelope_context(ssz: &[u8]) -> Option<Context> {
     })
 }
 
-/// The slot and block the aggregate's attestation votes for.
+/// The slot, committee and votes of the aggregate, in place of the block:
+/// what an aggregate that one seen covers is told from, before the body is
+/// held. The bitlist is zero padded; one too long for the frame
+/// is left out, and such a group neither covers nor is covered.
 fn aggregate_context(ssz: &[u8]) -> Option<Context> {
     SignedAggregateAndProofPqView::check_size(ssz).then(|| {
-        let data = SignedAggregateAndProofPqView::agg_data(ssz);
-        context(data.slot(), data.beacon_block_root())
+        let mut votes = [0; 32];
+        votes[..VOTES_AT - 8]
+            .copy_from_slice(SignedAggregateAndProofPqView::agg_committee_bits(ssz));
+        let bits = SignedAggregateAndProofPqView::agg_aggregation_bits(ssz);
+        if let Some(room) = votes[VOTES_AT - 8..].get_mut(..bits.len()) {
+            room.copy_from_slice(bits);
+        }
+        context(SignedAggregateAndProofPqView::agg_data(ssz).slot(), &votes)
     })
 }
 
+/// Where an aggregate's `aggregation_bits` start in its context.
+const VOTES_AT: usize = 8 + COMMITTEE_BITS_SIZE_PQ;
+
+/// Whether the aggregate of `held` has every vote of the aggregate of `new`,
+/// on the same slot and committee.
+pub(super) fn covers(held: &Context, new: &Context) -> bool {
+    held[..VOTES_AT] == new[..VOTES_AT] &&
+        new[VOTES_AT..].iter().any(|&bits| bits != 0) &&
+        held[VOTES_AT..].iter().zip(&new[VOTES_AT..]).all(|(held, new)| new & !held == 0)
+}
+
 const PAYLOADS: usize = 0;
+const AGGREGATES: usize = 1;
 const KINDS: [Kind; 2] = [
     Kind {
         segments: GossipTopic::ExecutionPayloadSegment,
@@ -107,6 +133,7 @@ const KINDS: [Kind; 2] = [
         store_bytes: 128 << 20,
         groups_per_slot: 2,
         context: envelope_context,
+        covers: false,
     },
     // An aggregate of every aggregator of every subnet.
     Kind {
@@ -116,6 +143,7 @@ const KINDS: [Kind; 2] = [
         store_bytes: 512 << 20,
         groups_per_slot: 16 * 4,
         context: aggregate_context,
+        covers: true,
     },
 ];
 const _: () = assert!(
@@ -128,47 +156,76 @@ const MAX_PEERS: usize = 1280;
 const WRITE_BUDGET: usize = 4096;
 const MAX_N: usize = seacast_codec::MAX_PLAIN_CHUNKS;
 
-type Catalog = PayloadCatalog<Host, StoreCodec>;
+type Catalog = TopicCatalogs<Host, StoreCodec>;
 
-/// The handler's SEACAST state. The nodes are made when the fork digest is
+/// The handler's SEACAST state. The node is made when the fork digest is
 /// known, since a chunk topic and its chunk ids bind it.
 pub(super) struct Seacast {
-    /// The connections, for the nodes made after them.
+    /// The connections, for the node made after them.
     peers: FxHashMap<usize, NodeId>,
-    /// By kind.
-    cores: [Option<Box<Core>>; KINDS.len()],
+    core: Option<Box<Core>>,
     /// An envelope sent as chunks is not sent whole, and one decoded from
     /// chunks is not forwarded whole. An aggregate goes both ways.
     payload_only: bool,
+    /// The whole topic of each kind is not subscribed.
+    segments_only: bool,
+    /// Off: aggregates travel whole only, and their segment topic is unused.
+    aggregates: bool,
+}
+
+impl Seacast {
+    fn enabled(&self, kind: usize) -> bool {
+        kind != AGGREGATES || self.aggregates
+    }
 }
 
 impl Default for Seacast {
     fn default() -> Self {
-        Self { peers: FxHashMap::default(), cores: [None, None], payload_only: true }
+        Self {
+            peers: FxHashMap::default(),
+            core: None,
+            payload_only: true,
+            segments_only: true,
+            aggregates: true,
+        }
     }
 }
 
-struct Core {
+/// A chunk topic of the node. Its type's id is its place in `Core::topics`,
+/// which is its kind's in `KINDS`.
+struct Topic {
     kind: &'static Kind,
+    /// The topic's wire name.
+    name: String,
+    /// By connection: in the topic's mesh, subscribed to it.
+    meshed: Vec<bool>,
+    joined: Vec<bool>,
+}
+
+struct Core {
+    topics: Vec<Topic>,
     node: SeacastNode<Buf>,
     catalog: Catalog,
     env: Env,
     rng: SplitMix64,
     deferred: BoundedDeferredStore,
     domain: GossipDomain,
-    /// The chunk topic's wire name.
-    chunk_topic: String,
     start: Instant,
     heartbeat: f64,
-    /// By connection: in the mesh of the chunk topic, subscribed to it.
-    meshed: Vec<bool>,
-    joined: Vec<bool>,
     /// A received chunk, decompressed.
     frame: Vec<u8>,
     decoder: snap::raw::Decoder,
     out: Scratch,
     rebuilt: PreallocVec<ChunkMsg<Buf>>,
     unwanted: Vec<ChunkId>,
+}
+
+/// The group key in a message id, or in an offer, holding or ask string.
+fn entry_key(entry: &[u8]) -> Option<&[u8; 32]> {
+    match entry.len() {
+        MESSAGE_ID_BYTES => entry.first_chunk(),
+        _ => entry.get(5..).and_then(|rest| rest.first_chunk()),
+    }
 }
 
 fn wire_topic(domain: GossipDomain, topic: GossipTopic) -> String {
@@ -180,33 +237,47 @@ fn node_id(peer: &silver_common::PeerId) -> NodeId {
 }
 
 impl Core {
-    fn new(kind: &'static Kind, domain: GossipDomain, now: Instant) -> Self {
+    fn new(kinds: &'static [Kind], domain: GossipDomain, now: Instant) -> Self {
         let mut config = NodeConfig::default();
         config.capacities.max_peers = MAX_PEERS;
         // No write is acknowledged to this tile.
         config.source_offers = SourceOffers::Publish;
         let heartbeat = config.heartbeat;
-        let chunk_topic = wire_topic(domain, kind.segments);
-        let codec = StoreCodec {
-            inner: PayloadCodec::new(NoPool, chunk_topic.as_bytes()),
-            store: Store::new(kind.cache, kind.store_bytes, kind.groups_per_slot + 1),
-        };
         let mut env = Env::new();
         env.schedule_after(heartbeat, TimerEvent::Heartbeat);
-        let host = Host::new(MAX_PEERS, kind.groups_per_slot);
-        Self {
+        let topic = |kind: &'static Kind| Topic {
             kind,
+            name: wire_topic(domain, kind.segments),
+            meshed: vec![false; MAX_PEERS],
+            joined: vec![false; MAX_PEERS],
+        };
+        let topics: Vec<Topic> = kinds.iter().map(topic).collect();
+        let of = |(t, topic): (usize, &Topic)| {
+            let (object_type, kind) = (TypeId(t as u8), topic.kind);
+            let codec = StoreCodec {
+                inner: PayloadCodec::of(object_type, NoPool, topic.name.as_bytes()),
+                store: Store::new(
+                    kind.cache,
+                    kind.store_bytes,
+                    kind.groups_per_slot + 1,
+                    kind.covers,
+                ),
+                object_type,
+            };
+            let host = Host::new(MAX_PEERS, kind.groups_per_slot);
+            PayloadCatalog::of(object_type, host, codec, domain.digest())
+        };
+        let catalog = TopicCatalogs::new(topics.iter().enumerate().map(of).collect());
+        Self {
+            topics,
             node: SeacastNode::new(config),
-            catalog: PayloadCatalog::new(host, codec, domain.digest()),
+            catalog,
             env,
             rng: SplitMix64::new(Nanos::now().0),
             deferred: BoundedDeferredStore::with_capacity(MAX_PEERS, 256, 4096),
             domain,
-            chunk_topic,
             start: now,
             heartbeat,
-            meshed: vec![false; MAX_PEERS],
-            joined: vec![false; MAX_PEERS],
             frame: vec![0; MAX_CHUNK_BYTES],
             decoder: snap::raw::Decoder::new(),
             out: Scratch::default(),
@@ -217,7 +288,9 @@ impl Core {
 
     fn connect(&mut self, peer: usize, id: NodeId) {
         if peer < MAX_PEERS {
-            self.catalog.host.set_node_id(peer as PeerId, id);
+            for of in &mut self.catalog.types {
+                of.host.set_node_id(peer as PeerId, id);
+            }
             self.node.connect_peer(peer as PeerId, true, &mut self.env, &self.catalog);
         }
     }
@@ -225,7 +298,9 @@ impl Core {
     fn disconnect(&mut self, peer: usize) {
         if peer < MAX_PEERS {
             self.node.disconnect_peer(peer as PeerId, &mut self.env, &mut self.deferred);
-            (self.meshed[peer], self.joined[peer]) = (false, false);
+            for topic in &mut self.topics {
+                (topic.meshed[peer], topic.joined[peer]) = (false, false);
+            }
         }
     }
 
@@ -235,25 +310,34 @@ impl Core {
         move |rpc, offered| node.on_frame_part(peer, rpc, offered, env, catalog, rng, deferred)
     }
 
-    /// The relation with `peer` follows the mesh, for a peer that is linked.
-    fn relate(&mut self, peer: usize) {
-        if self.meshed[peer] && self.joined[peer] {
-            self.node.relation_added(peer as PeerId, PAYLOAD, 0, 0, &mut self.env, &self.catalog);
+    /// The topic named `name`, as its type's place.
+    fn topic(&self, name: Option<&str>) -> Option<usize> {
+        self.topics.iter().position(|topic| name == Some(topic.name.as_str()))
+    }
+
+    /// The relation with `peer` on topic `t` follows the mesh, for a peer
+    /// that is linked.
+    fn relate(&mut self, peer: usize, t: usize) {
+        let (related, object_type) =
+            (self.topics[t].meshed[peer] && self.topics[t].joined[peer], TypeId(t as u8));
+        if related {
+            let (env, catalog) = (&mut self.env, &self.catalog);
+            self.node.relation_added(peer as PeerId, object_type, 0, 0, env, catalog);
         } else {
-            self.node.relation_removed(peer as PeerId, PAYLOAD, 0, 0);
+            self.node.relation_removed(peer as PeerId, object_type, 0, 0);
         }
     }
 
-    fn mesh(&mut self, peer: usize, meshed: bool) {
-        if peer < MAX_PEERS && self.meshed[peer] != meshed {
-            self.meshed[peer] = meshed;
-            self.relate(peer);
+    fn mesh(&mut self, peer: usize, t: usize, meshed: bool) {
+        if peer < MAX_PEERS && self.topics[t].meshed[peer] != meshed {
+            self.topics[t].meshed[peer] = meshed;
+            self.relate(peer, t);
         }
     }
 
-    /// A message on the chunk topic: level 1 in full, then the chunk in its
+    /// A message on chunk topic `t`: level 1 in full, then the chunk in its
     /// place in its group's assembly. `None`: not to be given to the node.
-    fn read_chunk(&mut self, peer: usize, snappy: &[u8]) -> Option<ChunkMsg<Buf>> {
+    fn read_chunk(&mut self, peer: usize, t: usize, snappy: &[u8]) -> Option<ChunkMsg<Buf>> {
         let bad = |env: &mut Env| {
             env.penalties.push((peer as PeerId, PenaltyReason::InvalidChunkLevel1));
             None
@@ -264,7 +348,7 @@ impl Core {
             return bad(&mut self.env);
         };
         let frame = &self.frame[..len];
-        let codec = &mut self.catalog.codec;
+        let PayloadCatalog { host, codec, .. } = &mut self.catalog.types[t];
         let read = codec.inner.read_message(snappy, |_, _| Some(Buf::scratch(frame)));
         let Some(chunk) = read.filter(|chunk| {
             codec.inner.check(chunk) && codec.inner.check_proof(chunk) == ValidationResult::Accept
@@ -273,10 +357,23 @@ impl Core {
         };
         let f = split_chunk(frame)?;
         let context: &Context = frame[..CONTEXT_BYTES].try_into().ok()?;
+        // A block's root fixes its slot. An aggregate's context names no block.
+        if t == PAYLOADS && host.block_slot(f.beacon_block_root).is_some_and(|slot| slot != f.slot)
+        {
+            return bad(&mut self.env);
+        }
         // A group's slot is the wall slot at its first chunk.
-        let (key, slot) = (f.group, self.catalog.host.wall_slot);
+        let (key, slot) = (f.group, host.wall_slot);
         let store = &mut codec.store;
-        let at = store.find(&key).or_else(|| store.open(&key, slot, context, &f.descriptor))?;
+        let at = match store.find(&key) {
+            Some(at) => at,
+            None => {
+                let at = store.open(&key, slot, context, &f.descriptor)?;
+                // The context is the sender's word until level 2.
+                store.rank(at);
+                at
+            }
+        };
         // The key binds the descriptor and the chunk's slot, which level 1 checked.
         debug_assert_eq!(store.descriptor(at), Some(&f.descriptor));
         // It does not bind the block root: the first chunk's stands.
@@ -306,75 +403,78 @@ impl Core {
         let id = peer as PeerId;
         let mut frame = Inbound::new();
         for subscription in &rpc.subscriptions {
-            if subscription.topic_id != Some(self.chunk_topic.as_str()) {
+            let Some(t) = self.topic(subscription.topic_id) else {
                 continue;
-            }
+            };
             match subscription.subscribe {
                 Some(true) => {
-                    self.joined[peer] = true;
-                    let join = payload_join(self.domain.digest());
+                    self.topics[t].joined[peer] = true;
+                    let join = topic_join(TypeId(t as u8), self.domain.digest());
                     frame.join(join, &mut self.part(id));
                 }
                 Some(false) => {
-                    self.joined[peer] = false;
-                    self.node.on_leave(id, PAYLOAD);
+                    self.topics[t].joined[peer] = false;
+                    self.node.on_leave(id, TypeId(t as u8));
                 }
                 None => continue,
             }
-            self.relate(peer);
+            self.relate(peer, t);
         }
         let control = rpc.control.as_option();
         if let Some(control) = control {
             for graft in &control.graft {
-                if graft.topic_id == Some(self.chunk_topic.as_str()) {
-                    self.mesh(peer, true);
+                if let Some(t) = self.topic(graft.topic_id) {
+                    self.mesh(peer, t, true);
                 }
             }
             for prune in &control.prune {
-                if prune.topic_id == Some(self.chunk_topic.as_str()) {
-                    self.mesh(peer, false);
+                if let Some(t) = self.topic(prune.topic_id) {
+                    self.mesh(peer, t, false);
                 }
             }
         }
         for message in &rpc.publish {
-            if message.topic == self.chunk_topic &&
+            if let Some(t) = self.topic(Some(message.topic)) &&
                 let Some(snappy) = message.data &&
-                let Some(chunk) = self.read_chunk(peer, snappy)
+                let Some(chunk) = self.read_chunk(peer, t, snappy)
             {
                 frame.chunk(chunk, &mut self.part(id));
             }
         }
         if let Some(control) = control {
-            let route_hops = self.catalog.params.route_hops;
+            let route_hops = self.catalog.types[0].params.route_hops;
             for ihave in &control.ihave {
-                if ihave.topic_id != Some(self.chunk_topic.as_str()) {
+                let Some(t) = self.topic(ihave.topic_id) else {
                     continue;
-                }
+                };
                 for entry in &ihave.message_ids {
-                    if let Some(offer) = read_offer(entry) {
+                    if let Some(mut offer) = read_offer(entry) {
+                        offer.group.type_id = TypeId(t as u8);
                         frame.offer(offer, &mut self.part(id));
                     }
                 }
             }
-            // An ask and a holding name no topic: they are this node's where
-            // it has the group.
+            // An ask and a holding name no topic: their type is that of the
+            // group on record, and one of no such group is not the node's.
             for iwant in &control.iwant {
                 for entry in &iwant.message_ids {
-                    if self.holds(entry) &&
-                        let Some(want) = read_want(entry, route_hops)
+                    if let Some(t) = self.holds(entry) &&
+                        let Some(mut want) = read_want(entry, route_hops)
                     {
+                        want.group.type_id = t;
                         frame.want(want, &mut self.part(id));
                     }
                 }
             }
             for idontwant in &control.idontwant {
                 for entry in &idontwant.message_ids {
-                    if !is_seacast(entry) || !self.holds(entry) {
+                    let Some(t) = self.holds(entry).filter(|_| is_seacast(entry)) else {
                         continue;
-                    }
-                    if let Some(holding) = read_holding(entry) {
+                    };
+                    if let Some(mut holding) = read_holding(entry) {
+                        holding.group.type_id = t;
                         frame.holding(holding, &mut self.part(id));
-                    } else if let Some(chunk) = chunk_id_of(entry) {
+                    } else if let Some(chunk) = chunk_id_on(t, entry) {
                         self.unwanted.push(chunk);
                     }
                 }
@@ -387,19 +487,21 @@ impl Core {
         self.decode();
     }
 
-    /// Whether the group an IWANT or IDONTWANT entry names has an assembly.
-    fn holds(&self, entry: &[u8]) -> bool {
-        let key = match entry.len() {
-            MESSAGE_ID_BYTES => entry.first_chunk::<32>(),
-            _ => entry.get(5..).and_then(|rest| rest.first_chunk::<32>()),
-        };
-        key.is_some_and(|key| self.catalog.codec.store.find(key).is_some())
+    /// The type of the group an IWANT or IDONTWANT entry names: the topic
+    /// whose store has an assembly of it.
+    fn holds(&self, entry: &[u8]) -> Option<TypeId> {
+        let key = entry_key(entry)?;
+        let t = self.catalog.types.iter().position(|of| of.codec.store.find(key).is_some())?;
+        Some(TypeId(t as u8))
     }
 
     /// Level 2 of the groups the node asked for, in place.
     fn decode(&mut self) {
         while let Some((group, shape)) = self.env.to_decode.pop() {
-            let codec = &self.catalog.codec;
+            let Some(of) = self.catalog.types.get(group.type_id.0 as usize) else {
+                continue;
+            };
+            let codec = &of.codec;
             // An assembly freed since: the group ends at its deadline.
             let Some(first) = codec
                 .store
@@ -410,6 +512,7 @@ impl Core {
             };
             self.rebuilt.clear();
             let object = self.catalog.decode(&group, &[first], &shape, &mut self.rebuilt);
+            let failed = object.is_none();
             self.node.on_decoded(
                 group,
                 object,
@@ -418,12 +521,27 @@ impl Core {
                 &mut self.catalog,
                 &mut self.rng,
             );
+            self.settle(&group, !failed);
         }
+    }
+
+    /// Level 2 of `group` ran. Where it leaves its slot and committee with no
+    /// group forwarded, the next best held is.
+    fn settle(&mut self, group: &GroupId, passed: bool) {
+        let t = group.type_id.0 as usize;
+        let store = &mut self.catalog.types[t].codec.store;
+        let Some(at) = store.find(&group.key) else {
+            return;
+        };
+        store.settle(at, passed);
+        store.promote(at);
     }
 
     fn timers(&mut self, now: Instant) {
         self.env.now = now.duration_since(self.start).as_secs_f64();
-        self.catalog.codec.store.loop_start();
+        for of in &mut self.catalog.types {
+            of.codec.store.loop_start();
+        }
         while let Some(event) = self.env.pop_due() {
             if event == TimerEvent::Heartbeat {
                 self.env.schedule_after(self.heartbeat, TimerEvent::Heartbeat);
@@ -440,43 +558,46 @@ impl Core {
     }
 
     fn clock(&mut self, wall_slot: u64, slot_start: Instant, slot: Duration) {
-        let host = &mut self.catalog.host;
-        if host.wall_slot != wall_slot {
-            self.catalog.codec.store.expire(wall_slot);
-        }
-        host.wall_slot = wall_slot;
-        host.slot_secs = slot.as_secs_f64();
-        host.slot_start = match slot_start.checked_duration_since(self.start) {
+        let slot_start = match slot_start.checked_duration_since(self.start) {
             Some(since) => since.as_secs_f64(),
             None => -self.start.duration_since(slot_start).as_secs_f64(),
         };
+        for PayloadCatalog { host, codec, .. } in &mut self.catalog.types {
+            if host.wall_slot != wall_slot {
+                codec.store.expire(wall_slot);
+            }
+            host.wall_slot = wall_slot;
+            host.slot_secs = slot.as_secs_f64();
+            host.slot_start = slot_start;
+        }
     }
 
     /// Publishes a local body as its source. `false`: its chunks do not go
     /// out.
-    fn publish(&mut self, ssz: &[u8]) -> bool {
-        let (format, whole) = (self.domain.format(), self.kind.whole);
+    fn publish(&mut self, t: usize, ssz: &[u8]) -> bool {
+        let kind = self.topics[t].kind;
+        let (format, whole) = (self.domain.format(), kind.whole);
         if format != ForkName::Pq ||
             ssz.len() < whole.min_uncompressed_size(format) ||
             ssz.len() > whole.max_uncompressed_size(format).min(seacast_codec::MAX_PLAIN_BODY)
         {
             return false;
         }
-        let Some(context) = (self.kind.context)(ssz) else {
+        let Some(context) = (kind.context)(ssz) else {
             return false;
         };
-        let slot = self.catalog.host.wall_slot;
+        let PayloadCatalog { host, codec, .. } = &mut self.catalog.types[t];
+        let slot = host.wall_slot;
         let (d, shards) =
             build_group::<Vec<u8>, _, _>(ssz, &mut VecBufferPool, &SnappyBlockCompressor);
         let chunk_slot = u64::from_le_bytes(context[..8].try_into().unwrap());
         let key = group_key(&group_id(&d), chunk_slot);
-        let group = payload_group(key);
-        let codec = &mut self.catalog.codec;
+        let group = topic_group(TypeId(t as u8), key);
         if codec.store.find(&key).is_some() {
             return true;
         }
         let Some(at) = codec.store.open(&key, slot, &context, &d) else {
-            silver_log::warn!(slot, topic = %self.kind.whole, "seacast: no room to publish");
+            silver_log::warn!(slot, topic = %kind.whole, "seacast: no room to publish");
             return false;
         };
         self.rebuilt.clear();
@@ -490,8 +611,10 @@ impl Core {
             }
             self.rebuilt.push(codec.chunk_msg(at, index, leaf).expect("stored"));
         }
-        // Our own group: authentic without the domain's word.
-        self.catalog.host.admit(group);
+        // Our own group: authentic without the domain's word, and level 2
+        // holds by construction.
+        codec.store.settle_ours(at);
+        host.admit(group);
         self.node.publish(
             group,
             Shape { n: d.n(), k: d.k() },
@@ -509,21 +632,49 @@ impl GossipHandler {
         self.seacast.payload_only = payload_only;
     }
 
-    /// The nodes exist once the current domain is known. A later change of
-    /// digest is not followed: a node keeps the topic it was made with.
-    fn seacast_cores(&mut self, now: Instant) -> impl Iterator<Item = &mut Core> {
-        if self.seacast.cores[PAYLOADS].is_none() &&
+    pub fn set_seacast_segments_only(&mut self, segments_only: bool) {
+        self.seacast.segments_only = segments_only;
+    }
+
+    pub fn set_seacast_aggregates(&mut self, aggregates: bool) {
+        self.seacast.aggregates = aggregates;
+    }
+
+    /// Whether `topic` is left unsubscribed: the segment topic of a kind that
+    /// is off, or a whole topic whose bodies come as segments, on a domain
+    /// that has the segment topic.
+    pub fn seacast_skips(&self, topic: GossipTopic) -> bool {
+        let Some(format) = self.current_domain().map(|domain| domain.format()) else {
+            return false;
+        };
+        KINDS.iter().enumerate().any(|(index, kind)| match self.seacast.enabled(index) {
+            false => kind.segments == topic,
+            true => {
+                self.seacast.segments_only &&
+                    kind.whole == topic &&
+                    kind.segments.supports_format(format)
+            }
+        })
+    }
+
+    /// The node exists once the current domain is known. A later change of
+    /// digest is not followed: the node keeps the topics it was made with.
+    fn seacast_core(&mut self, now: Instant) -> Option<&mut Core> {
+        if self.seacast.core.is_none() &&
             let Some(domain) = self.domains.current_domain()
         {
-            for (kind, slot) in KINDS.iter().zip(&mut self.seacast.cores) {
-                let mut core = Box::new(Core::new(kind, domain, now));
-                for (&peer, &id) in &self.seacast.peers {
-                    core.connect(peer, id);
-                }
-                *slot = Some(core);
+            // The aggregates' kind is the last: off, it has no topic.
+            let kinds = match self.seacast.aggregates {
+                true => &KINDS[..],
+                false => &KINDS[..AGGREGATES],
+            };
+            let mut core = Box::new(Core::new(kinds, domain, now));
+            for (&peer, &id) in &self.seacast.peers {
+                core.connect(peer, id);
             }
+            self.seacast.core = Some(core);
         }
-        self.seacast.cores.iter_mut().flatten().map(|core| &mut **core)
+        self.seacast.core.as_deref_mut()
     }
 
     /// Our GRAFT or PRUNE of `peer` on `topic`.
@@ -534,10 +685,11 @@ impl GossipHandler {
         digest: [u8; 4],
         meshed: bool,
     ) {
-        for core in self.seacast.cores.iter_mut().flatten() {
-            if core.kind.segments == topic && core.domain.digest() == digest {
-                core.mesh(peer, meshed);
-            }
+        if let Some(core) = self.seacast.core.as_deref_mut() &&
+            core.domain.digest() == digest &&
+            let Some(t) = core.topics.iter().position(|of| of.kind.segments == topic)
+        {
+            core.mesh(peer, t, meshed);
         }
     }
 
@@ -548,12 +700,16 @@ impl GossipHandler {
         now: Instant,
         emit: &mut impl FnMut(GossipHandlerEvent),
     ) {
-        self.seacast_cores(now).for_each(|core| core.on_rpc(peer, rpc));
+        if let Some(core) = self.seacast_core(now) {
+            core.on_rpc(peer, rpc);
+        }
         self.seacast_flush(emit);
     }
 
     pub(super) fn seacast_tick(&mut self, now: Instant, emit: &mut impl FnMut(GossipHandlerEvent)) {
-        self.seacast_cores(now).for_each(|core| core.timers(now));
+        if let Some(core) = self.seacast_core(now) {
+            core.timers(now);
+        }
         self.seacast_flush(emit);
     }
 
@@ -561,8 +717,11 @@ impl GossipHandler {
     /// is not to be sent whole.
     pub(super) fn seacast_publish(&mut self, topic: GossipTopic, ssz: &[u8]) -> bool {
         let only = self.seacast.payload_only && topic == KINDS[PAYLOADS].whole;
-        let mut cores = self.seacast_cores(Instant::now());
-        cores.find(|core| core.kind.whole == topic).is_some_and(|core| core.publish(ssz)) && only
+        let published = self.seacast_core(Instant::now()).is_some_and(|core| {
+            let t = core.topics.iter().position(|of| of.kind.whole == topic);
+            t.is_some_and(|t| core.publish(t, ssz))
+        });
+        published && only
     }
 
     /// Connections open and close.
@@ -571,13 +730,13 @@ impl GossipHandler {
             PeerEvent::P2pNewConnection { p2p_peer_id, ref peer_id_full, .. } => {
                 let id = node_id(peer_id_full);
                 self.seacast.peers.insert(p2p_peer_id, id);
-                for core in self.seacast.cores.iter_mut().flatten() {
+                if let Some(core) = self.seacast.core.as_deref_mut() {
                     core.connect(p2p_peer_id, id);
                 }
             }
             PeerEvent::P2pDisconnect { p2p_peer, .. } => {
                 self.seacast.peers.remove(&p2p_peer);
-                for core in self.seacast.cores.iter_mut().flatten() {
+                if let Some(core) = self.seacast.core.as_deref_mut() {
                     core.disconnect(p2p_peer);
                 }
             }
@@ -585,23 +744,24 @@ impl GossipHandler {
         }
     }
 
+    /// A block Beacon State announced.
+    pub fn seacast_block(&mut self, block_root: [u8; 32], slot: u64) {
+        if let Some(core) = self.seacast.core.as_deref_mut() {
+            core.catalog.types[PAYLOADS].host.note_block(block_root, slot);
+        }
+    }
+
     /// The slot clock: the wall slot, its start and a slot's length.
     pub fn seacast_clock(&mut self, wall_slot: u64, slot_start: Instant, slot: Duration) {
-        for core in self.seacast.cores.iter_mut().flatten() {
+        if let Some(core) = self.seacast.core.as_deref_mut() {
             core.clock(wall_slot, slot_start, slot);
         }
     }
 
-    fn seacast_flush(&mut self, emit: &mut impl FnMut(GossipHandlerEvent)) {
-        for kind in 0..KINDS.len() {
-            self.seacast_flush_kind(kind, emit);
-        }
-    }
-
-    /// Writes what a node has queued, reports its penalties and hands on the
+    /// Writes what the node has queued, reports its penalties and hands on the
     /// bodies it decoded.
-    fn seacast_flush_kind(&mut self, kind: usize, emit: &mut impl FnMut(GossipHandlerEvent)) {
-        let Some(core) = self.seacast.cores[kind].as_deref_mut() else {
+    fn seacast_flush(&mut self, emit: &mut impl FnMut(GossipHandlerEvent)) {
+        let Some(core) = self.seacast.core.as_deref_mut() else {
             return;
         };
         let mut budget = WRITE_BUDGET;
@@ -611,11 +771,10 @@ impl GossipHandler {
                 () => {
                     Out {
                         peer: peer as usize,
-                        traffic: GossipTraffic::of(core.kind.segments),
-                        topic: &core.chunk_topic,
+                        topics: &core.topics,
+                        types: &mut core.catalog.types,
                         producer: &mut self.mcache_publish,
                         reader: &mut self.reader,
-                        store: &mut core.catalog.codec.store,
                         scratch: &mut core.out,
                         emit: &mut *emit,
                     }
@@ -634,6 +793,21 @@ impl GossipHandler {
             out!().flush();
             !done
         });
+        // The chunks of the groups let go since they were held back.
+        for t in 0..core.catalog.types.len() {
+            while let Some((peer, chunk)) = core.catalog.types[t].codec.store.pop_deferred() {
+                let mut out = Out {
+                    peer,
+                    topics: &core.topics,
+                    types: &mut core.catalog.types,
+                    producer: &mut self.mcache_publish,
+                    reader: &mut self.reader,
+                    scratch: &mut core.out,
+                    emit: &mut *emit,
+                };
+                out.chunk(t, &chunk);
+            }
+        }
         // Peers woken by the writes above come after those left over.
         peers.append(&mut core.env.to_write);
         core.env.to_write = peers;
@@ -646,11 +820,13 @@ impl GossipHandler {
         }
         let domain = core.domain;
         let mut delivered = std::mem::take(&mut core.env.delivered);
-        delivered.retain(|body| core.catalog.codec.store.live(body));
-        for body in delivered.drain(..) {
+        delivered.retain(|(t, body)| core.catalog.types[*t as usize].codec.store.live(body));
+        for (t, body) in delivered.drain(..) {
+            let kind = t as usize;
             match self.seacast_deliver(kind, domain, &body, emit) {
                 Ok(new) => {
-                    let store = self.seacast.cores[kind].as_ref().map(|c| &c.catalog.codec.store);
+                    let core = self.seacast.core.as_ref();
+                    let store = core.map(|core| &core.catalog.types[kind].codec.store);
                     let Some((slot, block, d, received, peers)) =
                         store.and_then(|store| store.origin(&body))
                     else {
@@ -686,7 +862,7 @@ impl GossipHandler {
                 Err(e) => silver_log::warn!(?e, "seacast: decoded body not delivered"),
             }
         }
-        if let Some(core) = &mut self.seacast.cores[kind] {
+        if let Some(core) = &mut self.seacast.core {
             core.env.delivered = delivered;
         }
     }
@@ -729,6 +905,12 @@ impl GossipHandler {
                 &self.snap_scratch[..n]
             }
         };
+        // The group's key binds the slot its chunks name, not the body's.
+        let core = self.seacast.core.as_ref();
+        let named = core.and_then(|core| core.catalog.types[kind].codec.store.named_slot(body));
+        if (KINDS[kind].context)(ssz).is_none_or(|of_body| Some(&of_body[..8]) != named) {
+            return Err(Error::SeacastSlotMismatch);
+        }
         let msg_hash: MessageId = msg_id_valid_snappy(&wire, ssz);
         reservation.increment_offset(len);
         // A copy that came as a full message has been handed on already.

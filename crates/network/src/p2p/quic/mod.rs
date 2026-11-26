@@ -42,6 +42,8 @@ fn transport_config() -> Arc<quinn_proto::TransportConfig> {
     // `MAX_INBOUND_SUBSTREAMS`.
     tc.max_concurrent_bidi_streams(VarInt::from_u32(32));
     tc.datagram_receive_buffer_size(None);
+    tc.packet_threshold(REORDER_PACKET_THRESHOLD);
+    tc.time_threshold(REORDER_TIME_THRESHOLD);
 
     let mut ack_config = AckFrequencyConfig::default();
     ack_config.ack_eliciting_threshold(VarInt::from_u32(16));
@@ -52,6 +54,13 @@ fn transport_config() -> Arc<quinn_proto::TransportConfig> {
     Arc::new(tc)
 }
 
+/// Reordering tolerated before a packet is declared lost, in packets and as a
+/// factor of the RTT; either one tripping declares the loss. Quinn's defaults
+/// (3 and 9/8) take reordering within a burst for loss, and each such loss
+/// cuts the congestion window. The cost of more tolerance is a real loss
+/// found later, by at most the time threshold.
+const REORDER_PACKET_THRESHOLD: u32 = 32;
+const REORDER_TIME_THRESHOLD: f32 = 1.5;
 const IDLE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
 const KEEP_ALIVE_INTERVAL: std::time::Duration = std::time::Duration::from_secs(10);
 /// Quinn's default is unbounded. Throughput caps at window / RTT, so this

@@ -17,17 +17,21 @@ use std::{ptr::NonNull, slice};
 
 use seacast_codec::{BufferPool, ChunkBytes, MerkleTree, SegmentDescriptor, complete_in_place};
 use seacast_core::{
-    Bytes32, ChunkBuffer, ChunkId, ChunkMsg, GroupId, PreallocVec, Shape, TypeCodec,
+    Bytes32, ChunkBuffer, ChunkId, ChunkMsg, GroupId, PreallocVec, Shape, TypeCodec, TypeId,
     ValidationResult,
 };
-use seacast_gossipsub::{CHUNK_FIXED, CONTEXT_BYTES, PayloadCodec, build_chunk, payload_group};
+use seacast_gossipsub::{CHUNK_FIXED, CONTEXT_BYTES, PayloadCodec, build_chunk, topic_group};
 use silver_common::{AcquiredRead, TCache, TCacheId, TCacheProducer, TProducer, TReservation};
+
+use super::{VOTES_AT, covers};
 
 /// A coded group has at most 256 chunks, an uncoded one this many.
 const MAX_N: usize = seacast_codec::MAX_PLAIN_CHUNKS;
 const NO_ASSEMBLY: u16 = u16::MAX;
 /// Senders of a group that are kept for the log.
 const SENDERS: usize = 8;
+/// Writes kept of a group that is held; the rest are left to its offers.
+const DEFERRED: usize = 1024;
 
 /// A chunk's frame, or a body, where it lies. A chunk of an assembly is cut
 /// at its data: the head is in `heads`, the data in `data` or `parity`.
@@ -103,6 +107,12 @@ struct Assembly {
     /// not the block root: every chunk kept names this block, and so do the
     /// chunks rebuilt.
     context: [u8; CONTEXT_BYTES],
+    /// Not forwarded: no chunk of it is written to a peer, and it is not
+    /// offered. The node has its chunks all the same, and asks for the rest.
+    held: bool,
+    /// Level 2 ran. Failed, the group is held; passed, it is unless one that
+    /// passed before has its votes.
+    settled: bool,
     d: SegmentDescriptor,
     head_len: usize,
     have: [u64; MAX_N / 64],
@@ -166,6 +176,26 @@ impl Assembly {
     fn head(&self, index: usize) -> &[u8] {
         self.bytes(self.heads_at() + index * self.head_len, self.head_len)
     }
+
+    fn votes(&self) -> u32 {
+        self.context[VOTES_AT..].iter().map(|bits| bits.count_ones()).sum()
+    }
+
+    /// An aggregate of the slot and committee of `context`. One whose votes
+    /// its context leaves out is not ranked.
+    fn ranks_with(&self, context: &[u8; CONTEXT_BYTES]) -> bool {
+        self.context[..VOTES_AT] == context[..VOTES_AT] && self.votes() > 0
+    }
+
+    /// The one group of its slot and committee that is forwarded before its
+    /// level 2.
+    fn primary(&self) -> bool {
+        !self.held && !self.settled
+    }
+
+    fn passed(&self) -> bool {
+        self.settled && !self.held
+    }
 }
 
 struct Slot {
@@ -174,6 +204,9 @@ struct Slot {
     /// not live.
     generation: u32,
     ids: Box<[ChunkId; MAX_N]>,
+    /// The writes of chunks held back, as peer and index: made once the
+    /// group is let go.
+    deferred: Vec<(u16, u16)>,
     /// A chunk's message as written for a peer, pinned for the next.
     wire: Vec<Option<AcquiredRead>>,
 }
@@ -183,21 +216,25 @@ pub(super) struct Store {
     slots: Vec<Slot>,
     /// Groups of one slot assembled at once.
     per_slot: usize,
+    /// The bodies are aggregates whose contexts carry their votes: of those
+    /// of one slot and committee, one is forwarded before its level 2.
+    ranked: bool,
 }
 
 impl Store {
     /// Room for the groups of two slots: an assembly is freed at the first
     /// clock reading past its slot.
-    pub(super) fn new(cache: TCacheId, bytes: usize, per_slot: usize) -> Self {
+    pub(super) fn new(cache: TCacheId, bytes: usize, per_slot: usize, ranked: bool) -> Self {
         let slots = (0..2 * per_slot)
             .map(|_| Slot {
                 assembly: None,
                 generation: 0,
                 ids: Box::new([[0; 59]; MAX_N]),
+                deferred: Vec::with_capacity(DEFERRED),
                 wire: (0..MAX_N).map(|_| None).collect(),
             })
             .collect();
-        Self { producer: TCache::producer(cache, bytes), slots, per_slot }
+        Self { producer: TCache::producer(cache, bytes), slots, per_slot, ranked }
     }
 
     pub(super) fn loop_start(&mut self) {
@@ -234,6 +271,8 @@ impl Store {
             key: *key,
             slot,
             context: *context,
+            held: false,
+            settled: false,
             d: *d,
             head_len,
             have: [0; MAX_N / 64],
@@ -328,6 +367,109 @@ impl Store {
         }
     }
 
+    fn ranked(&self, context: &[u8; CONTEXT_BYTES]) -> impl Iterator<Item = (usize, &Assembly)> {
+        let held = self.slots.iter().enumerate();
+        let assemblies = held.filter_map(|(at, slot)| Some((at, slot.assembly.as_ref()?)));
+        assemblies.filter(move |(_, a)| self.ranked && a.ranks_with(context))
+    }
+
+    fn assembly_mut(&mut self, at: usize) -> Option<&mut Assembly> {
+        self.slots.get_mut(at)?.assembly.as_mut()
+    }
+
+    /// Ranks the assembly `at`, just opened for a group from a peer. It is
+    /// forwarded if its votes are a strict superset of those of the group
+    /// forwarded so far, which is then held, or if there is none and no
+    /// group that passed level 2 has its votes. Otherwise it is held.
+    pub(super) fn rank(&mut self, at: usize) {
+        let Some(new) = self.assembly(at).map(|a| a.context) else {
+            return;
+        };
+        if self.ranked(&new).all(|(ranked, _)| ranked != at) {
+            return;
+        }
+        let others = || self.ranked(&new).filter(|&(other, _)| other != at);
+        let primary = others().find(|(_, a)| a.primary()).map(|(at, a)| (at, a.context));
+        let (held, demoted) = match primary {
+            Some((primary, of)) if covers(&new, &of) && new != of => (false, Some(primary)),
+            Some(_) => (true, None),
+            None => (others().any(|(_, a)| a.passed() && covers(&a.context, &new)), None),
+        };
+        if let Some(a) = demoted.and_then(|demoted| self.assembly_mut(demoted)) {
+            a.held = true;
+        }
+        if let Some(a) = self.assembly_mut(at) {
+            a.held = held;
+        }
+    }
+
+    /// Whether the group `key` is held. `None`: no assembly of it.
+    pub(super) fn held(&self, key: &Bytes32) -> Option<bool> {
+        self.find(key).and_then(|at| self.assembly(at)).map(|a| a.held)
+    }
+
+    /// Level 2 of the assembly `at` ran. Passed, the group is forwarded
+    /// unless one that passed before has its votes.
+    pub(super) fn settle(&mut self, at: usize, passed: bool) {
+        let Some(of) = self.assembly(at).map(|a| a.context) else {
+            return;
+        };
+        let covering = |&(other, by): &(usize, &Assembly)| {
+            other != at && by.passed() && covers(&by.context, &of)
+        };
+        let held = !passed || self.ranked(&of).any(|other| covering(&other));
+        if let Some(a) = self.assembly_mut(at) {
+            (a.settled, a.held) = (true, held);
+        }
+        if held {
+            self.slots[at].deferred.clear();
+        }
+    }
+
+    /// The assembly `at` is of a body of ours: level 2 holds by
+    /// construction, and its chunks go out whatever its votes.
+    pub(super) fn settle_ours(&mut self, at: usize) {
+        if let Some(a) = self.assembly_mut(at) {
+            a.settled = true;
+        }
+    }
+
+    /// Where no group of the slot and committee of the assembly `at` is
+    /// forwarded before its level 2, the held one with the most votes is,
+    /// unless a group that passed has its votes.
+    pub(super) fn promote(&mut self, at: usize) {
+        let Some(like) = self.assembly(at).map(|a| a.context) else {
+            return;
+        };
+        if self.ranked(&like).any(|(_, a)| a.primary()) {
+            return;
+        }
+        let covered = |a: &Assembly| {
+            self.ranked(&like).any(|(_, by)| by.passed() && covers(&by.context, &a.context))
+        };
+        let waiting = self.ranked(&like).filter(|(_, a)| a.held && !a.settled && !covered(a));
+        let next = waiting.max_by_key(|(_, a)| a.votes()).map(|(next, _)| next);
+        if let Some(a) = next.and_then(|next| self.assembly_mut(next)) {
+            a.held = false;
+        }
+    }
+
+    /// The write of the held chunk `buf` to `peer` is put off.
+    pub(super) fn defer(&mut self, buf: &Buf, peer: usize) {
+        let slot = &mut self.slots[buf.assembly as usize];
+        if slot.assembly.as_ref().is_some_and(|a| !a.settled) && slot.deferred.len() < DEFERRED {
+            slot.deferred.push((peer as u16, buf.index));
+        }
+    }
+
+    /// A write put off of a group no longer held: the peer and the chunk.
+    pub(super) fn pop_deferred(&mut self) -> Option<(usize, Buf)> {
+        let due = |s: &Slot| !s.deferred.is_empty() && s.assembly.as_ref().is_some_and(|a| !a.held);
+        let at = self.slots.iter().position(due)?;
+        let (peer, index) = self.slots[at].deferred.pop()?;
+        Some((peer as usize, self.chunk(at, index as usize)?))
+    }
+
     /// Of the group `buf` is of: its slot, the block its chunks name, its
     /// descriptor, the chunks taken from peers and the first peers they came
     /// from.
@@ -339,11 +481,21 @@ impl Store {
         Some((a.slot, &a.context[8..], &a.d, a.received, &a.from[..a.senders as usize]))
     }
 
+    /// The slot the chunks of `buf`'s group name, as their frames carry it.
+    pub(super) fn named_slot(&self, buf: &Buf) -> Option<&[u8]> {
+        self.assembly(buf.assembly as usize).map(|a| &a.context[..8])
+    }
+
     /// Whether `buf` is of an assembly that is still held.
     pub(super) fn live(&self, buf: &Buf) -> bool {
         self.slots
             .get(buf.assembly as usize)
             .is_some_and(|s| s.assembly.is_some() && s.generation == buf.generation)
+    }
+
+    /// Whether `buf` is of a group that is not forwarded.
+    pub(super) fn withheld(&self, buf: &Buf) -> bool {
+        self.assembly(buf.assembly as usize).is_some_and(|a| a.held)
     }
 
     /// The pinned message of a live chunk.
@@ -357,6 +509,7 @@ impl Store {
         for slot in &mut self.slots {
             if slot.assembly.as_ref().is_some_and(|a| a.slot < wall_slot) {
                 slot.assembly = None;
+                slot.deferred.clear();
                 slot.wire.iter_mut().for_each(|read| *read = None);
             }
         }
@@ -419,6 +572,8 @@ impl BufferPool<Buf> for NoPool {
 pub(super) struct StoreCodec {
     pub(super) inner: PayloadCodec<NoPool, Buf>,
     pub(super) store: Store,
+    /// The type of the topic's groups, as `inner` has it.
+    pub(super) object_type: TypeId,
 }
 
 impl StoreCodec {
@@ -431,7 +586,7 @@ impl StoreCodec {
     ) -> Option<ChunkMsg<Buf>> {
         let a = self.store.assembly(at)?;
         Some(ChunkMsg {
-            group: payload_group(a.key),
+            group: topic_group(self.object_type, a.key),
             index: index as u32,
             cached_id: *self.store.id(at, index),
             frame: self.store.chunk(at, index)?,

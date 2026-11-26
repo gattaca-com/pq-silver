@@ -24,6 +24,7 @@ pub enum Error {
     ParseTopicError,
     TopicNotInFork,
     InvalidSnappy,
+    SeacastSlotMismatch,
     IoError(#[from] std::io::Error),
     JsonError(#[from] serde_json::Error),
     TomlError(#[from] toml::de::Error),

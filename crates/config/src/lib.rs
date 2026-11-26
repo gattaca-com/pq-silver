@@ -162,6 +162,15 @@ pub struct Config {
     /// Read by a build with the `seacast` feature only.
     #[serde(default = "default_bool::<true>")]
     seacast_payload_only: bool,
+    /// Read by a build with the `seacast` feature only: the whole topic of a
+    /// segmented kind is not subscribed. Off for a network with peers that
+    /// lack a segment topic.
+    #[serde(default = "default_bool::<true>")]
+    seacast_segments_only: bool,
+    /// Read by a build with the `seacast` feature only. Off: aggregates
+    /// travel whole only.
+    #[serde(default = "default_bool::<true>")]
+    seacast_aggregates: bool,
     #[serde(default)]
     sync_committee_subnets: SyncCommitteeSubnets,
     /// Full multiselect protocol strings.
@@ -531,6 +540,14 @@ impl Config {
 
     pub fn seacast_payload_only(&self) -> bool {
         self.seacast_payload_only
+    }
+
+    pub fn seacast_segments_only(&self) -> bool {
+        self.seacast_segments_only
+    }
+
+    pub fn seacast_aggregates(&self) -> bool {
+        self.seacast_aggregates
     }
 
     pub fn sync_committee_subnets(&self) -> SyncCommitteeSubnets {

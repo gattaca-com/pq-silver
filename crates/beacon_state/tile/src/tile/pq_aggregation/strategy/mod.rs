@@ -7,7 +7,7 @@ pub use bits::Bits;
 pub(super) use marginal_gain::MAX_GROUPS;
 pub use marginal_gain::{Committee, MarginalGain, Positions};
 
-const LOG_INV_RATE: u8 = 2;
+const LOG_INV_RATE: u8 = 1;
 
 /// Picks the batches of one aggregation. It keeps its own view of committee
 /// positions, fed by events, and never sees claim bytes.

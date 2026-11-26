@@ -160,7 +160,7 @@ itoa = "1"
 # The experimental prover makes the same proofs as the stable one, faster. It
 # compiles for the target's CPU features: `scripts/build-prod.sh` builds it
 # once per CPU tier, or the x86-64 baseline proves about 3x slower.
-lean_vm = { git = "https://github.com/leanEthereum/leanVM", tag = "bindings-v0.18.0", features = ["experimental_prover"] }
+lean_vm = { git = "https://github.com/leanEthereum/leanVM", tag = "bindings-v0.19.0", features = ["experimental_prover"] }
 libc = "0.2"
 linkme = "0.3.36"
 milhouse = { version = "0.9", default-features = false }

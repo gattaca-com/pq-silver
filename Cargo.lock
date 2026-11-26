@@ -1767,7 +1767,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "ccc2776f0c61eca1ca32528f85548abd1a4be8fb53d1b21c013e4f18da1e7090"
 dependencies = [
  "data-encoding",
- "syn 1.0.109",
+ "syn 2.0.118",
 ]
 
 [[package]]
@@ -7355,16 +7355,20 @@ dependencies = [
 name = "silver_vc"
 version = "0.1.0-alpha.17"
 dependencies = [
+ "aes",
  "clap",
+ "ctr",
  "flux",
  "flux-dns",
  "flux-network",
  "flux-sse",
  "hex",
+ "hmac",
  "lean_xmss 0.1.0 (git+https://github.com/leanEthereum/leanVM?rev=3d84ffc3c866d66f4c632848f8fc6f30a3350f76)",
  "mio",
  "serde",
  "serde_json",
+ "sha2",
  "silver_beacon_state_data",
  "silver_chain_spec",
  "silver_common",
@@ -7372,6 +7376,9 @@ dependencies = [
  "silver_crypto_simd",
  "silver_log",
  "tempfile",
+ "unicode-normalization",
+ "ureq",
+ "zeroize",
 ]
 
 [[package]]
@@ -8293,6 +8300,15 @@ name = "unicode-ident"
 version = "1.0.24"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "e6e4313cd5fcd3dad5cafa179702e2b244f760991f45397d14d4ebf38247da75"
+
+[[package]]
+name = "unicode-normalization"
+version = "0.1.26"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "75cd3fb03d5288b3ba9a1ee103ac7e9cbb59f0b03d64f8ddfcc04dd42758a85d"
+dependencies = [
+ "tinyvec",
+]
 
 [[package]]
 name = "unicode-segmentation"

@@ -7,6 +7,7 @@ mod tests;
 
 use delta::ValidatorsDelta;
 pub use delta::{ValidatorsView, ValidatorsWriteView};
+pub(crate) use finalized::VALIDATOR_PQ_SSZ_SIZE;
 pub use finalized::{FinalizedValidators, ValSeed, ValidatorsDecodeError};
 use flux_profiler::timed;
 use silver_ssz::ssz_view::XMSSPubkey;

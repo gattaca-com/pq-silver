@@ -6,7 +6,7 @@ use crate::{
     config::Config,
     duties::Duties,
     keys::load_keys,
-    signer::Signer,
+    signer::{RemoteCache, Signer},
     signing::{SignAnswer, SignRequests},
 };
 
@@ -20,11 +20,23 @@ pub struct ValidatorTile {
 
 impl ValidatorTile {
     pub fn new(config: &Config) -> Result<Self, Error> {
-        let keys = load_keys(&config.keys_dir)?;
-        silver_log::info!(keys = keys.len(), dir = %config.keys_dir.display(), "validator keys");
+        let keys = load_keys(config)?;
+        silver_log::info!(keys = keys.len(), "validator keys");
         let beacon_link = BeaconLink::new(config)?;
-        let signer = Signer::new(&keys, config.signer_threads, beacon_link.signer_waker()?)?;
-        let pubkeys = keys.iter().map(|key| key.pubkey).collect();
+        let remote = config.xmss_cache_url.as_deref().and_then(|url| {
+            RemoteCache::open(url, config.genesis_state.as_deref())
+                .inspect_err(|error| silver_log::warn!(url, error, "remote expanded keys unusable"))
+                .ok()
+        });
+        let signer = Signer::new(
+            &keys,
+            &config.data_dir,
+            remote.as_ref(),
+            config.init_leaf_records,
+            config.signer_threads,
+            wake_the_loop,
+        )?;
+        let pubkeys = signer.pubkeys().to_vec();
         Ok(Self {
             beacon_link,
             duties: Duties::new(config, pubkeys),
@@ -33,6 +45,13 @@ impl ValidatorTile {
             signs: SignRequests::default(),
         })
     }
+}
+
+/// Under `thread_park` the loop sleeps in `epoll` until flux's waker, which it
+/// registered, fires. Otherwise it never sleeps.
+fn wake_the_loop() {
+    #[cfg(feature = "thread_park")]
+    flux::park::SIGNAL.signal();
 }
 
 impl Tile<VcSpine> for ValidatorTile {

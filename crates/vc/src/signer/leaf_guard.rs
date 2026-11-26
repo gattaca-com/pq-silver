@@ -2,7 +2,7 @@ use std::{
     fs::{File, OpenOptions},
     io::Read,
     os::unix::fs::{FileExt, OpenOptionsExt},
-    path::Path,
+    path::{Path, PathBuf},
 };
 
 use silver_common::{
@@ -31,15 +31,22 @@ pub struct LeafGuard {
 }
 
 impl LeafGuard {
-    /// Opens or creates each key's record, `<key file>.leaves`, so it moves
-    /// with the key.
-    pub fn open<'a>(
-        key_files: impl IntoIterator<Item = &'a Path>,
+    /// Opens each key's record, creating a missing one only if `create`: a
+    /// record lost while its key signed elsewhere would let a leaf sign twice.
+    /// It must move with the key.
+    pub fn open(
+        paths: impl IntoIterator<Item = PathBuf>,
+        create: bool,
     ) -> Result<(Self, Vec<File>), Error> {
         let mut signed = Vec::new();
         let mut files = Vec::new();
-        for key_file in key_files {
-            let path = key_file.with_extension("leaves");
+        for path in paths {
+            if !create && !path.exists() {
+                return Err(Error::ConfigError(format!(
+                    "no leaf record {}: pass --init-leaf-records only for keys that never signed with another record",
+                    path.display()
+                )));
+            }
             let (record, file) = open_record(&path)
                 .map_err(|e| Error::ConfigError(format!("leaf record {}: {e}", path.display())))?;
             signed.push(record);
@@ -123,7 +130,7 @@ mod tests {
     use super::*;
 
     fn guard(dir: &Path) -> (LeafGuard, Vec<File>) {
-        LeafGuard::open([dir.join("a.json").as_path()]).unwrap()
+        LeafGuard::open([dir.join("a.leaves")], true).unwrap()
     }
 
     #[test]
@@ -168,6 +175,7 @@ mod tests {
         assert_eq!(files[0].metadata().unwrap().len(), RECORD_LEN as u64);
 
         std::fs::write(dir.path().join("b.leaves"), [0; 7]).unwrap();
-        assert!(LeafGuard::open([dir.path().join("b.json").as_path()]).is_err());
+        assert!(LeafGuard::open([dir.path().join("b.leaves")], true).is_err());
+        assert!(LeafGuard::open([dir.path().join("c.leaves")], false).is_err(), "not created");
     }
 }

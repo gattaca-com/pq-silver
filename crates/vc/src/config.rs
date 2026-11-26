@@ -7,7 +7,14 @@ pub struct Config {
     pub spec: SpecConfig,
     pub genesis_validators_root: [u8; 32],
     pub beacon_node: String,
-    pub keys_dir: PathBuf,
+    pub keys_dir: Option<PathBuf>,
+    pub keystores_dir: Option<PathBuf>,
+    pub secrets_dir: Option<PathBuf>,
+    pub data_dir: PathBuf,
+    pub init_leaf_records: bool,
+    /// A devnet's `genesis.ssz`, whose registry authenticates remote keys.
+    pub genesis_state: Option<PathBuf>,
+    pub xmss_cache_url: Option<String>,
     pub signer_threads: usize,
     pub proposals: Option<ProposalConfig>,
 }

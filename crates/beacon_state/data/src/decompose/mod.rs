@@ -1,8 +1,12 @@
-use common::F3;
+use common::{F3, F11_OFF, F12_OFF, OFFSET, u32_le};
 use flux_profiler::timed;
 use gloas::GloasLayout;
+use silver_ssz::ssz_view::XMSSPubkey;
 
-use crate::{BeaconState, SpecConfig, decode_checkpoint_pubkeys};
+use crate::{
+    BeaconState, SpecConfig, ValidatorsDecodeError, decode_checkpoint_pubkeys,
+    validators::VALIDATOR_PQ_SSZ_SIZE,
+};
 
 pub(crate) mod common;
 mod fulu;
@@ -60,9 +64,57 @@ impl BeaconState {
     }
 }
 
+/// Each validator's XMSS pubkey in a PQ state's SSZ, in index order, read
+/// without decomposing the state: a devnet's `genesis.ssz` so names its
+/// genesis registry.
+pub fn pq_validator_pubkeys(
+    ssz: &[u8],
+) -> Result<impl Iterator<Item = &XMSSPubkey>, DecomposeError> {
+    let need = F12_OFF + OFFSET;
+    if ssz.len() < need {
+        return Err(DecomposeError::TruncatedFixedPart { len: ssz.len(), need });
+    }
+    let (start, end) = (u32_le(ssz, F11_OFF) as usize, u32_le(ssz, F12_OFF) as usize);
+    if start > end {
+        return Err(DecomposeError::NonMonotonicOffsets { i: 0, a: start, b: end });
+    }
+    let records =
+        ssz.get(start..end).ok_or(DecomposeError::OffsetPastEnd { off: end, len: ssz.len() })?;
+    if !records.len().is_multiple_of(VALIDATOR_PQ_SSZ_SIZE) {
+        let error = ValidatorsDecodeError::LenNotMultiple {
+            len: records.len(),
+            size: VALIDATOR_PQ_SSZ_SIZE,
+        };
+        return Err(error.into());
+    }
+    Ok(records
+        .chunks_exact(VALIDATOR_PQ_SSZ_SIZE)
+        .map(|record| record.first_chunk().expect("a record starts with its pubkey")))
+}
+
 #[cfg(test)]
 mod tests {
     use std::path::PathBuf;
+
+    use super::{F11_OFF, F12_OFF, pq_validator_pubkeys};
+    use crate::validators::VALIDATOR_PQ_SSZ_SIZE;
+
+    #[test]
+    fn pq_validator_pubkeys_reads_each_record_and_refuses_misframing() {
+        let start = F12_OFF + 4;
+        let mut ssz = vec![0; start + 2 * VALIDATOR_PQ_SSZ_SIZE];
+        ssz[F11_OFF..F11_OFF + 4].copy_from_slice(&(start as u32).to_le_bytes());
+        let end = ssz.len() as u32;
+        ssz[F12_OFF..F12_OFF + 4].copy_from_slice(&end.to_le_bytes());
+        ssz[start..start + 32].fill(0xaa);
+        ssz[start + VALIDATOR_PQ_SSZ_SIZE..][..32].fill(0xbb);
+        let pubkeys = pq_validator_pubkeys(&ssz).unwrap().copied().collect::<Vec<_>>();
+        assert_eq!(pubkeys, [[0xaa; 32], [0xbb; 32]]);
+
+        ssz.pop();
+        assert!(pq_validator_pubkeys(&ssz).is_err(), "the list now ends past the state");
+        assert!(pq_validator_pubkeys(&ssz[..F12_OFF]).is_err());
+    }
 
     use super::common::{F2, FULU_FIXED_PART, u64_le};
     use crate::{BeaconState, SpecConfig, types::SLOTS_PER_EPOCH};

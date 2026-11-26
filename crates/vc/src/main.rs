@@ -28,7 +28,7 @@ fn main() -> Result<(), Box<dyn Error>> {
     silver_log::info!(
         network = %config.spec.network_name(),
         beacon_node = %config.beacon_node,
-        keys_dir = %config.keys_dir.display(),
+        data_dir = %config.data_dir.display(),
         signer_threads = config.signer_threads,
         proposals = ?config.proposals,
         "loaded config"

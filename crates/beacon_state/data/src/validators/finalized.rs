@@ -79,7 +79,7 @@ mod offset {
 }
 
 const VALIDATOR_SSZ_SIZE: usize = 48 + offset::END;
-const VALIDATOR_PQ_SSZ_SIZE: usize = 32 + 32 + offset::END;
+pub(crate) const VALIDATOR_PQ_SSZ_SIZE: usize = 32 + 32 + offset::END;
 
 #[derive(Debug, thiserror::Error)]
 pub enum ValidatorsDecodeError {

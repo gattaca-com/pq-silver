@@ -1,14 +1,14 @@
 use std::{num::NonZeroUsize, path::PathBuf, thread};
 
-use clap::Parser;
+use clap::{ArgGroup, Parser};
 use silver_common::Error;
-use silver_config::Network;
+use silver_config::{BootSource, Network};
 
 use crate::config::{Config, ProposalConfig};
 
 /// Silver validator client.
 #[derive(Debug, Parser)]
-#[command(version)]
+#[command(version, group(ArgGroup::new("keys").required(true).multiple(true)))]
 pub struct Args {
     /// `mainnet`, `hoodi`, `sepolia`, or a devnet's metadata directory
     /// holding its `config.yaml`.
@@ -18,8 +18,27 @@ pub struct Args {
     beacon_node: String,
     /// One JSON file per validator: `pubkey`, `privkey` and `vrf_seed`, each
     /// 0x-prefixed hex of 32 bytes. Files must be readable by their owner only.
+    #[arg(long, group = "keys")]
+    keys_dir: Option<PathBuf>,
+    /// EIP-2335 BLS keystores, `*.json` or `<0xpubkey>/voting-keystore.json`.
+    /// Each validator's XMSS and VRF seeds derive from its BLS secret key, as
+    /// the devnet genesis derives them.
+    #[arg(long, group = "keys", requires = "secrets_dir")]
+    keystores_dir: Option<PathBuf>,
+    /// The keystores' passwords, one file per `0x`-prefixed BLS pubkey.
+    #[arg(long, requires = "keystores_dir")]
+    secrets_dir: Option<PathBuf>,
+    /// Holds each key's leaf record and expanded-key cache.
     #[arg(long)]
-    keys_dir: PathBuf,
+    data_dir: PathBuf,
+    /// Creates the leaf record of a key that has none. Only for keys that
+    /// never signed with another record: a lost record lets a leaf sign twice.
+    #[arg(long)]
+    init_leaf_records: bool,
+    /// The devnet's precomputed expanded keys, one record per genesis
+    /// validator. A key whose record is missing or refused is built instead.
+    #[arg(long)]
+    xmss_cache_url: Option<String>,
     /// Threads leanVM signs on; every core when absent.
     #[arg(long)]
     signer_threads: Option<NonZeroUsize>,
@@ -48,6 +67,15 @@ impl Args {
             genesis_validators_root: self.network.genesis_validators_root()?,
             beacon_node: self.beacon_node,
             keys_dir: self.keys_dir,
+            keystores_dir: self.keystores_dir,
+            secrets_dir: self.secrets_dir,
+            data_dir: self.data_dir,
+            init_leaf_records: self.init_leaf_records,
+            genesis_state: match self.network.boot_source()? {
+                BootSource::Genesis(path) => Some(path),
+                _ => None,
+            },
+            xmss_cache_url: self.xmss_cache_url,
             signer_threads: self
                 .signer_threads
                 .or_else(|| thread::available_parallelism().ok())
@@ -74,7 +102,8 @@ fn parse_graffiti(text: &str) -> Result<[u8; 32], String> {
 mod tests {
     use super::*;
 
-    const REQUIRED: [&str; 3] = ["silver-vc", "--beacon-node=http://bn:5052", "--keys-dir=/keys"];
+    const REQUIRED: [&str; 4] =
+        ["silver-vc", "--beacon-node=http://bn:5052", "--keys-dir=/keys", "--data-dir=/data"];
 
     fn config(extra: &[&str]) -> Config {
         Args::try_parse_from([&REQUIRED[..], extra].concat()).unwrap().config().unwrap()
@@ -118,8 +147,21 @@ mod tests {
     }
 
     #[test]
-    fn node_and_keys_are_required() {
-        assert!(Args::try_parse_from(&REQUIRED[..2]).is_err());
-        assert!(Args::try_parse_from([REQUIRED[0], REQUIRED[2]]).is_err());
+    fn node_keys_and_data_dir_are_required() {
+        assert!(Args::try_parse_from(&REQUIRED[..3]).is_err());
+        assert!(Args::try_parse_from([REQUIRED[0], REQUIRED[2], REQUIRED[3]]).is_err());
+        assert!(Args::try_parse_from([REQUIRED[0], REQUIRED[1], REQUIRED[3]]).is_err());
+    }
+
+    #[test]
+    fn keystores_need_their_secrets() {
+        let keystores = [REQUIRED[0], REQUIRED[1], REQUIRED[3], "--keystores-dir=/k"];
+        assert!(Args::try_parse_from(keystores).is_err());
+        let config = Args::try_parse_from([&keystores[..], &["--secrets-dir=/s"]].concat())
+            .unwrap()
+            .config()
+            .unwrap();
+        assert_eq!(config.keys_dir, None);
+        assert_eq!(config.secrets_dir.as_deref(), Some(std::path::Path::new("/s")));
     }
 }

@@ -2,7 +2,7 @@ use silver_crypto_simd::xmss::keccak::keccak256;
 use silver_ssz::ssz_view::{VRFProof, XMSS_PUBKEY_SIZE, XMSSPubkey};
 
 use crate::{
-    merkle::{hash_fixed_bytes, sha256},
+    merkle::hash_fixed_bytes,
     types::{B256, BLSPubkey, Slot, Version},
 };
 
@@ -73,7 +73,7 @@ fn legacy_hash(pubkey: &BLSPubkey, domain: u8) -> B256 {
     let mut preimage = [0; 48 + 1];
     preimage[..48].copy_from_slice(pubkey);
     preimage[48] = domain;
-    sha256(&preimage)
+    keccak256(&preimage)
 }
 
 /// Spec `compute_deposit_vrf_root`: a PQ deposit carries its validator's VRF
@@ -101,36 +101,29 @@ pub fn xmss_pubkey(padded: &BLSPubkey) -> &XMSSPubkey {
     padded[XMSS_DEPOSIT_PREFIX_LEN..].try_into().unwrap()
 }
 
-/// The first element of `proof`, which the RANDAO mix takes in. On devnet-0
-/// it is the slot's leaf itself; under the current spec it is the secret the
-/// leaf commits to.
+/// The secret `proof` reveals, which the RANDAO mix takes in.
 pub fn vrf_secret(proof: &VRFProof) -> &B256 {
     proof[..32].try_into().unwrap()
 }
 
-// Spec `compute_vrf_leaf`, from consensus-specs `b5d422b25`. Unused while
-// devnet-0 reveals the leaf; see `is_valid_vrf_proof`.
-//
-// const VRF_LEAF_DOMAIN: &[u8; 8] = b"VRF_LEAF";
-//
-// fn vrf_leaf(secret: &B256, index: Slot) -> B256 {
-//     let mut preimage = [0; VRF_LEAF_DOMAIN.len() + 32 + 8];
-//     preimage[..8].copy_from_slice(VRF_LEAF_DOMAIN);
-//     preimage[8..40].copy_from_slice(secret);
-//     preimage[40..].copy_from_slice(&index.to_le_bytes());
-//     keccak256(&preimage)
-// }
+const VRF_LEAF_DOMAIN: &[u8; 8] = b"VRF_LEAF";
 
-/// Spec `is_valid_vrf_proof` as of consensus-specs `2f43bc0`: `proof` opens
-/// leaf `slot` of the tree under `vrf_root`, and reveals the leaf.
-///
-/// devnet-0 runs this rule: Lighthouse, Prysm and the genesis tool that
-/// writes the VRF roots all build the tree over revealed leaves. The current
-/// spec (`b5d422b25`) has the leaf commit to a secret instead. To follow it,
-/// start from the commented-out `vrf_leaf` line below.
+/// Spec `compute_vrf_leaf`.
+fn vrf_leaf(secret: &B256, index: Slot) -> B256 {
+    const SECRET_AT: usize = VRF_LEAF_DOMAIN.len();
+    const INDEX_AT: usize = SECRET_AT + 32;
+    let mut preimage = [0; INDEX_AT + 8];
+    preimage[..SECRET_AT].copy_from_slice(VRF_LEAF_DOMAIN);
+    preimage[SECRET_AT..INDEX_AT].copy_from_slice(secret);
+    preimage[INDEX_AT..].copy_from_slice(&index.to_le_bytes());
+    keccak256(&preimage)
+}
+
+/// Spec `is_valid_vrf_proof`: `proof` reveals the secret that leaf `slot` of
+/// the tree under `vrf_root` commits to. The leaf commits to the whole slot;
+/// only its low `VRF_TREE_DEPTH` bits choose the path.
 pub fn is_valid_vrf_proof(proof: &VRFProof, slot: Slot, vrf_root: &B256) -> bool {
-    // let mut node = vrf_leaf(vrf_secret(proof), slot);
-    let mut node = *vrf_secret(proof);
+    let mut node = vrf_leaf(vrf_secret(proof), slot);
     let mut pair = [0; 64];
     for (height, sibling) in proof[32..].as_chunks().0.iter().enumerate() {
         let (left, right) =
@@ -143,66 +136,4 @@ pub fn is_valid_vrf_proof(proof: &VRFProof, slot: Slot, vrf_root: &B256) -> bool
 }
 
 #[cfg(test)]
-mod tests {
-    use silver_ssz::ssz_view::VRF_PROOF_SIZE;
-
-    use super::*;
-
-    /// A BLS key's first byte has its compression flag set.
-    fn legacy_key() -> BLSPubkey {
-        let mut key = [0x11; 48];
-        key[0] = 0xa5;
-        key
-    }
-
-    #[test]
-    fn requests_name_xmss_keys_by_their_last_32_bytes() {
-        let xmss = xmss_pubkey_padded(&[0x22; 32]);
-        assert!(!KeyScheme::Xmss.is_legacy(&xmss));
-        assert!(KeyScheme::Xmss.is_legacy(&legacy_key()));
-        assert!(!KeyScheme::Bls.is_legacy(&legacy_key()), "a BLS registry has no legacy keys");
-
-        assert_eq!(KeyScheme::Xmss.request_pubkey(&legacy_key()), xmss_pubkey_padded(&[0x11; 32]));
-        assert_eq!(KeyScheme::Bls.request_pubkey(&legacy_key()), legacy_key());
-    }
-
-    /// Spec `compute_legacy_xmss_pubkey` and `compute_legacy_vrf_root`:
-    /// sha256 of the BLS key with a one-byte domain.
-    #[test]
-    fn legacy_deposits_derive_their_keys_from_the_bls_key() {
-        let mut preimage = legacy_key().to_vec();
-        preimage.push(0x00);
-        let xmss = sha256(&preimage);
-        *preimage.last_mut().unwrap() = 0x01;
-        let vrf_root = sha256(&preimage);
-
-        assert_eq!(KeyScheme::Xmss.deposit_pubkey(&legacy_key()), xmss_pubkey_padded(&xmss));
-        assert_eq!(deposit_vrf_root(&legacy_key(), &[0x33; 96]), vrf_root);
-
-        let fresh = xmss_pubkey_padded(&[0x22; 32]);
-        assert_eq!(KeyScheme::Xmss.deposit_pubkey(&fresh), fresh);
-        assert_eq!(deposit_vrf_root(&fresh, &[0x33; 96]), [0x33; 32]);
-    }
-
-    /// The root of the proof whose element `i` is `[i; 32]`, opened at slot
-    /// 1430 with the leaf revealed. The current spec's rule, where the leaf
-    /// commits to a secret, gives `95a44af3…d4688c` for the same proof.
-    #[test]
-    fn vrf_proof_opens_only_its_slot() {
-        let slot = 1430;
-        let mut proof = [0u8; VRF_PROOF_SIZE];
-        for (i, node) in proof.chunks_exact_mut(32).enumerate() {
-            node.fill(i as u8);
-        }
-        let root: B256 =
-            hex::decode("0bc38251c5d967c98bcea378bb51c169144b71a89fb11e49fa41f1f0aada8d05")
-                .unwrap()
-                .try_into()
-                .unwrap();
-        assert!(is_valid_vrf_proof(&proof, slot, &root));
-        assert!(!is_valid_vrf_proof(&proof, slot + 1, &root));
-
-        proof[VRF_PROOF_SIZE - 1] ^= 1;
-        assert!(!is_valid_vrf_proof(&proof, slot, &root));
-    }
-}
+mod tests;

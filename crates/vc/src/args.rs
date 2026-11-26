@@ -1,3 +1,5 @@
+use std::{num::NonZeroUsize, path::PathBuf, thread};
+
 use clap::Parser;
 use silver_common::Error;
 use silver_config::Network;
@@ -14,9 +16,13 @@ pub struct Args {
     network: Network,
     #[arg(long)]
     beacon_node: String,
-    /// Holds every key and signs.
+    /// One JSON file per validator: `pubkey`, `privkey` and `vrf_seed`, each
+    /// 0x-prefixed hex of 32 bytes. Files must be readable by their owner only.
     #[arg(long)]
-    web3signer_url: String,
+    keys_dir: PathBuf,
+    /// Threads leanVM signs on; every core when absent.
+    #[arg(long)]
+    signer_threads: Option<NonZeroUsize>,
     /// Proposes only when set.
     #[arg(long, value_parser = parse_fee_recipient)]
     suggested_fee_recipient: Option<[u8; 20]>,
@@ -41,7 +47,11 @@ impl Args {
             spec: self.network.spec()?,
             genesis_validators_root: self.network.genesis_validators_root()?,
             beacon_node: self.beacon_node,
-            web3signer_url: self.web3signer_url,
+            keys_dir: self.keys_dir,
+            signer_threads: self
+                .signer_threads
+                .or_else(|| thread::available_parallelism().ok())
+                .map_or(1, NonZeroUsize::get),
             proposals,
         })
     }
@@ -64,8 +74,7 @@ fn parse_graffiti(text: &str) -> Result<[u8; 32], String> {
 mod tests {
     use super::*;
 
-    const REQUIRED: [&str; 3] =
-        ["silver-vc", "--beacon-node=http://bn:5052", "--web3signer-url=http://signer:9000"];
+    const REQUIRED: [&str; 3] = ["silver-vc", "--beacon-node=http://bn:5052", "--keys-dir=/keys"];
 
     fn config(extra: &[&str]) -> Config {
         Args::try_parse_from([&REQUIRED[..], extra].concat()).unwrap().config().unwrap()
@@ -102,7 +111,14 @@ mod tests {
     }
 
     #[test]
-    fn node_and_signer_are_required() {
+    fn signer_threads_default_to_every_core() {
+        assert!(config(&[]).signer_threads >= 1);
+        assert_eq!(config(&["--signer-threads=3"]).signer_threads, 3);
+        assert!(Args::try_parse_from([&REQUIRED[..], &["--signer-threads=0"]].concat()).is_err());
+    }
+
+    #[test]
+    fn node_and_keys_are_required() {
         assert!(Args::try_parse_from(&REQUIRED[..2]).is_err());
         assert!(Args::try_parse_from([REQUIRED[0], REQUIRED[2]]).is_err());
     }

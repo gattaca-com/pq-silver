@@ -6,18 +6,12 @@ use std::{
 };
 
 use flux_network::http::HttpResponse;
-use silver_chain_spec::SpecConfig;
 use silver_common::{
     ForkName,
-    ssz_hash_gloas::ExecutionRequestsView,
     ssz_view::{
-        AttestationDataView, BEACON_BLOCK_HEADER_SIZE, BUILDER_DEPOSIT_REQUEST_SIZE,
-        BUILDER_EXIT_REQUEST_SIZE, BeaconBlockHeaderView, BuilderDepositRequestView,
-        BuilderExitRequestView, CONSOLIDATION_REQUEST_SIZE, ConsolidationRequestView,
-        DEPOSIT_REQUEST_SIZE, DepositRequestView, ExecutionPayloadEnvelopeView,
-        ExecutionPayloadView, PAYLOAD_ATTESTATION_DATA_SIZE, PROPOSER_PREFERENCES_SIZE,
-        PayloadAttestationDataView, ProposerPreferencesView, WITHDRAWAL_REQUEST_SIZE,
-        WITHDRAWAL_SIZE, WithdrawalRequestView, variable_list_items,
+        AttestationDataView, PAYLOAD_ATTESTATION_DATA_SIZE, PROPOSER_PREFERENCES_SIZE,
+        PayloadAttestationDataView, ProposerPreferencesView, VRFProof, XMSS_SIGNATURE_SIZE,
+        XMSSPubkey, XMSSSignature,
     },
 };
 
@@ -26,10 +20,11 @@ use crate::{
         endpoint::{JSON, SSZ},
         events::{
             Aggregate, AttestationData, AttesterDuties, BeaconEvent, PayloadAttestationData,
-            ProducedBlock, SlotDuties, ValidatorIndices, parse_signature,
+            ProducedBlock, SlotDuties, ValidatorIndices,
         },
     },
     block_contents::GloasBlockContents,
+    signing::{KeyWork, SignPurpose, SignRequest},
 };
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
@@ -53,7 +48,6 @@ pub enum BeaconRequest {
     PublishPayloadAttestations,
     PublishProposerPreferences,
     PublishEnvelope,
-    Sign(SignPurpose),
 }
 
 impl BeaconRequest {
@@ -74,8 +68,7 @@ impl BeaconRequest {
             Self::PtcDuties |
             Self::PublishPayloadAttestations |
             Self::PublishProposerPreferences |
-            Self::PublishEnvelope |
-            Self::Sign(_) => "POST",
+            Self::PublishEnvelope => "POST",
         }
     }
 
@@ -87,7 +80,7 @@ impl BeaconRequest {
             Self::PublishBlock(fork) => Some(fork.name()),
             Self::PublishPayloadAttestations |
             Self::PublishProposerPreferences |
-            Self::PublishEnvelope => Some(ForkName::Gloas.name()),
+            Self::PublishEnvelope => Some(ForkName::Pq.name()),
             Self::ValidatorIndices |
             Self::AttesterDuties |
             Self::AttestationData |
@@ -96,8 +89,7 @@ impl BeaconRequest {
             Self::ProposerDuties |
             Self::PrepareProposers |
             Self::PtcDuties |
-            Self::PayloadAttestationData |
-            Self::Sign(_) => None,
+            Self::PayloadAttestationData => None,
         }
     }
 
@@ -110,10 +102,6 @@ impl BeaconRequest {
 
     pub fn extra_header(self) -> Option<(&'static str, &'static str)> {
         matches!(self, Self::PublishEnvelope).then_some(("Eth-Blob-Data-Included", "true"))
-    }
-
-    pub fn is_signing(self) -> bool {
-        matches!(self, Self::Sign(_))
     }
 
     pub fn answered<'a>(self, id: RequestId, response: &HttpResponse<'a>) -> BeaconEvent<'a> {
@@ -151,34 +139,14 @@ impl BeaconRequest {
             Self::PublishPayloadAttestations |
             Self::PublishProposerPreferences |
             Self::PublishEnvelope => BeaconEvent::Accepted { id, request: self },
-            Self::Sign(purpose) => match parse_signature(body) {
-                Some(signature) => BeaconEvent::Signed { id, purpose, signature },
-                None => {
-                    silver_log::warn!(?purpose, "malformed web3signer signature");
-                    BeaconEvent::Failed { id, request: self }
-                }
-            },
         }
     }
 }
 
-/// What a web3signer signature is for, so its answer finds its duty.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum SignPurpose {
-    Attestation,
-    SelectionProof,
-    Aggregate,
-    Randao,
-    Block,
-    PayloadAttestation,
-    ProposerPreferences,
-    Envelope,
-}
-
-pub struct SignedAttestation {
+pub struct SignedAttestation<'a> {
     pub committee_index: u64,
     pub attester_index: u64,
-    pub signature: [u8; 96],
+    pub signature: &'a XMSSSignature,
 }
 
 pub struct CommitteeSubscription {
@@ -189,48 +157,22 @@ pub struct CommitteeSubscription {
     pub is_aggregator: bool,
 }
 
-pub struct IndexedSignature {
+pub struct IndexedSignature<'a> {
     pub validator_index: u64,
-    pub signature: [u8; 96],
+    pub signature: &'a XMSSSignature,
 }
 
-pub struct SignedPreferences {
+pub struct SignedPreferences<'a> {
     pub message: [u8; PROPOSER_PREFERENCES_SIZE],
-    pub signature: [u8; 96],
+    pub signature: &'a XMSSSignature,
 }
 
 pub struct SignedAggregate<'a> {
     pub aggregator_index: u64,
-    /// The aggregate's JSON object as the beacon node served it.
-    pub aggregate: &'a str,
-    pub selection_proof: [u8; 96],
-    pub signature: [u8; 96],
+    /// The served `{"aggregate": …, "proof": …}` object, passed on untouched.
+    pub proved: &'a str,
+    pub signature: &'a XMSSSignature,
 }
-
-/// web3signer's `Fork`: the fork in force at the signed epoch.
-pub struct ForkInfo {
-    pub previous_version: [u8; 4],
-    pub current_version: [u8; 4],
-    pub epoch: u64,
-    pub genesis_validators_root: [u8; 32],
-}
-
-impl ForkInfo {
-    /// The fork in force at `epoch`, as a beacon state's `fork` field holds it.
-    pub fn new(spec: &SpecConfig, epoch: u64, genesis_validators_root: [u8; 32]) -> Self {
-        let fork_epoch = spec.fork_epoch(spec.fork_at(epoch));
-        let current_version = spec.fork_version_at(epoch);
-        let previous_version = fork_epoch
-            .checked_sub(1)
-            .map_or(current_version, |before| spec.fork_version_at(before));
-        Self { previous_version, current_version, epoch: fork_epoch, genesis_validators_root }
-    }
-}
-
-/// A sign body written once and shared by every key's request; valid until the
-/// next drain.
-#[derive(Clone)]
-pub struct SignBody(Range<usize>);
 
 struct QueuedRequest {
     id: RequestId,
@@ -244,6 +186,7 @@ struct QueuedRequest {
 pub struct BeaconRequests {
     next_id: u64,
     queued: Vec<QueuedRequest>,
+    signing: Vec<SignRequest>,
     paths: String,
     bodies: Vec<u8>,
 }
@@ -251,7 +194,7 @@ pub struct BeaconRequests {
 impl BeaconRequests {
     pub fn validator_indices<'a>(
         &mut self,
-        pubkeys: impl IntoIterator<Item = &'a [u8; 48]>,
+        pubkeys: impl IntoIterator<Item = &'a XMSSPubkey>,
     ) -> RequestId {
         let path = self.path(format_args!("/eth/v1/beacon/states/head/validators"));
         let start = self.bodies.len();
@@ -278,11 +221,11 @@ impl BeaconRequests {
         self.push(BeaconRequest::AttestationData, path, start)
     }
 
-    pub fn publish_attestations(
+    pub fn publish_attestations<'a>(
         &mut self,
         fork: ForkName,
         data: AttestationDataView<'_>,
-        attestations: impl IntoIterator<Item = SignedAttestation>,
+        attestations: impl IntoIterator<Item = SignedAttestation<'a>>,
     ) -> RequestId {
         let path = self.path(format_args!("/eth/v2/beacon/pool/attestations"));
         let start = self.bodies.len();
@@ -303,7 +246,7 @@ impl BeaconRequests {
                 }
             }
             this.bodies.extend_from_slice(b",\"signature\":");
-            this.push_hex(&attestation.signature);
+            this.push_hex(attestation.signature);
             this.bodies.push(b'}');
         });
         self.push(BeaconRequest::PublishAttestations(fork), path, start)
@@ -348,14 +291,14 @@ impl BeaconRequests {
         let path = self.path(format_args!("/eth/v2/validator/aggregate_and_proofs"));
         let start = self.bodies.len();
         self.push_array(aggregates, |this, signed| {
-            this.bodies.extend_from_slice(b"{\"message\":");
-            this.push_aggregate_and_proof(
-                signed.aggregator_index,
-                signed.aggregate,
-                &signed.selection_proof,
-            );
-            this.bodies.extend_from_slice(b",\"signature\":");
-            this.push_hex(&signed.signature);
+            let fields = signed.proved.strip_prefix('{').expect("served as a JSON object");
+            write!(
+                this.bodies,
+                "{{\"message\":{{\"aggregator_index\":\"{}\",{fields},\"signature\":",
+                signed.aggregator_index
+            )
+            .expect("writes to a Vec");
+            this.push_hex(signed.signature);
             this.bodies.push(b'}');
         });
         self.push(BeaconRequest::PublishAggregates(fork), path, start)
@@ -387,7 +330,7 @@ impl BeaconRequests {
         &mut self,
         fork: ForkName,
         slot: u64,
-        randao_reveal: &[u8; 96],
+        randao_reveal: &VRFProof,
         graffiti: &[u8; 32],
     ) -> RequestId {
         const LOCAL_ONLY_BOOST: u64 = 0;
@@ -408,9 +351,9 @@ impl BeaconRequests {
         fork: ForkName,
         payload_included: bool,
         produced: &[u8],
-        signature: &[u8; 96],
+        signature: &XMSSSignature,
     ) -> RequestId {
-        const SIGNED_BLOCK_FIXED: usize = 4 + 96;
+        const SIGNED_BLOCK_FIXED: usize = 4 + XMSS_SIGNATURE_SIZE;
         let path = self.path(format_args!("/eth/v2/beacon/blocks"));
         let start = self.bodies.len();
         let block = match payload_included {
@@ -423,8 +366,8 @@ impl BeaconRequests {
         self.push(BeaconRequest::PublishBlock(fork), path, start)
     }
 
-    pub fn publish_envelope(&mut self, produced: &[u8], signature: &[u8; 96]) -> RequestId {
-        const SIGNED_ENVELOPE_FIXED: usize = 4 + 96;
+    pub fn publish_envelope(&mut self, produced: &[u8], signature: &XMSSSignature) -> RequestId {
+        const SIGNED_ENVELOPE_FIXED: usize = 4 + XMSS_SIGNATURE_SIZE;
         let path = self.path(format_args!("/eth/v1/beacon/execution_payload_envelopes"));
         let start = self.bodies.len();
         let contents = GloasBlockContents::parse(produced).expect("checked when served");
@@ -457,10 +400,10 @@ impl BeaconRequests {
         self.push(BeaconRequest::PayloadAttestationData, path, start)
     }
 
-    pub fn publish_payload_attestations(
+    pub fn publish_payload_attestations<'a>(
         &mut self,
         data: &[u8; PAYLOAD_ATTESTATION_DATA_SIZE],
-        attestations: impl IntoIterator<Item = IndexedSignature>,
+        attestations: impl IntoIterator<Item = IndexedSignature<'a>>,
     ) -> RequestId {
         let path = self.path(format_args!("/eth/v1/beacon/pool/payload_attestations"));
         let start = self.bodies.len();
@@ -473,15 +416,15 @@ impl BeaconRequests {
             .expect("writes to a Vec");
             this.push_payload_attestation_data(data);
             this.bodies.extend_from_slice(b",\"signature\":");
-            this.push_hex(&attestation.signature);
+            this.push_hex(attestation.signature);
             this.bodies.push(b'}');
         });
         self.push(BeaconRequest::PublishPayloadAttestations, path, start)
     }
 
-    pub fn publish_proposer_preferences(
+    pub fn publish_proposer_preferences<'a>(
         &mut self,
-        preferences: impl IntoIterator<Item = SignedPreferences>,
+        preferences: impl IntoIterator<Item = SignedPreferences<'a>>,
     ) -> RequestId {
         let path = self.path(format_args!("/eth/v1/validator/proposer_preferences"));
         let start = self.bodies.len();
@@ -489,158 +432,29 @@ impl BeaconRequests {
             this.bodies.extend_from_slice(b"{\"message\":");
             this.push_preferences(&signed.message);
             this.bodies.extend_from_slice(b",\"signature\":");
-            this.push_hex(&signed.signature);
+            this.push_hex(signed.signature);
             this.bodies.push(b'}');
         });
         self.push(BeaconRequest::PublishProposerPreferences, path, start)
     }
 
-    pub fn attestation_sign_body(
+    pub fn sign(
         &mut self,
-        fork_info: &ForkInfo,
+        pubkey: &XMSSPubkey,
+        purpose: SignPurpose,
+        leaf_index: u32,
         signing_root: &[u8; 32],
-        data: AttestationDataView<'_>,
-    ) -> SignBody {
-        let start = self.begin_sign_body("ATTESTATION", fork_info, Some(signing_root));
-        self.bodies.extend_from_slice(b",\"attestation\":");
-        self.push_attestation_data(data);
-        self.bodies.push(b'}');
-        SignBody(start..self.bodies.len())
+    ) -> RequestId {
+        let work = KeyWork::Sign { leaf_index, signing_root: *signing_root };
+        self.push_signing(pubkey, purpose, work)
     }
 
-    pub fn selection_sign_body(
-        &mut self,
-        fork_info: &ForkInfo,
-        signing_root: &[u8; 32],
-        slot: u64,
-    ) -> SignBody {
-        let start = self.begin_sign_body("AGGREGATION_SLOT", fork_info, Some(signing_root));
-        write!(self.bodies, ",\"aggregation_slot\":{{\"slot\":\"{slot}\"}}}}")
-            .expect("writes to a Vec");
-        SignBody(start..self.bodies.len())
+    pub fn vrf_proof(&mut self, pubkey: &XMSSPubkey, slot: u64) -> RequestId {
+        self.push_signing(pubkey, SignPurpose::Randao, KeyWork::VrfProof { slot })
     }
 
-    /// web3signer reads an unversioned aggregate as phase0, so it is sent
-    /// versioned; it derives the signing root itself.
-    pub fn aggregate_sign_body(
-        &mut self,
-        fork_info: &ForkInfo,
-        fork: ForkName,
-        aggregator_index: u64,
-        aggregate: &str,
-        selection_proof: &[u8; 96],
-    ) -> SignBody {
-        let start = self.begin_sign_body("AGGREGATE_AND_PROOF_V2", fork_info, None);
-        self.bodies.extend_from_slice(b",\"aggregate_and_proof\":{\"version\":\"");
-        self.bodies.extend(fork.name().bytes().map(|byte| byte.to_ascii_uppercase()));
-        self.bodies.extend_from_slice(b"\",\"data\":");
-        self.push_aggregate_and_proof(aggregator_index, aggregate, selection_proof);
-        self.bodies.extend_from_slice(b"}}");
-        SignBody(start..self.bodies.len())
-    }
-
-    pub fn randao_sign_body(
-        &mut self,
-        fork_info: &ForkInfo,
-        signing_root: &[u8; 32],
-        epoch: u64,
-    ) -> SignBody {
-        let start = self.begin_sign_body("RANDAO_REVEAL", fork_info, Some(signing_root));
-        write!(self.bodies, ",\"randao_reveal\":{{\"epoch\":\"{epoch}\"}}}}")
-            .expect("writes to a Vec");
-        SignBody(start..self.bodies.len())
-    }
-
-    pub fn block_sign_body(
-        &mut self,
-        fork_info: &ForkInfo,
-        fork: ForkName,
-        signing_root: &[u8; 32],
-        header: &[u8; BEACON_BLOCK_HEADER_SIZE],
-    ) -> SignBody {
-        let start = self.begin_sign_body("BLOCK_V2", fork_info, Some(signing_root));
-        self.bodies.extend_from_slice(b",\"beacon_block\":{\"version\":\"");
-        self.bodies.extend(fork.name().bytes().map(|byte| byte.to_ascii_uppercase()));
-        write!(
-            self.bodies,
-            "\",\"block_header\":{{\"slot\":\"{}\",\"proposer_index\":\"{}\",\"parent_root\":",
-            BeaconBlockHeaderView::slot(header),
-            BeaconBlockHeaderView::proposer_index(header),
-        )
-        .expect("writes to a Vec");
-        self.push_hex(BeaconBlockHeaderView::parent_root(header));
-        self.bodies.extend_from_slice(b",\"state_root\":");
-        self.push_hex(BeaconBlockHeaderView::state_root(header));
-        self.bodies.extend_from_slice(b",\"body_root\":");
-        self.push_hex(BeaconBlockHeaderView::body_root(header));
-        self.bodies.extend_from_slice(b"}}}");
-        SignBody(start..self.bodies.len())
-    }
-
-    pub fn payload_attestation_sign_body(
-        &mut self,
-        fork_info: &ForkInfo,
-        signing_root: &[u8; 32],
-        data: &[u8; PAYLOAD_ATTESTATION_DATA_SIZE],
-    ) -> SignBody {
-        let start =
-            self.begin_sign_body("PAYLOAD_ATTESTATION_MESSAGE", fork_info, Some(signing_root));
-        self.bodies.extend_from_slice(
-            b",\"payload_attestation_message\":{\"version\":\"GLOAS\",\"data\":",
-        );
-        self.push_payload_attestation_data(data);
-        self.bodies.extend_from_slice(b"}}");
-        SignBody(start..self.bodies.len())
-    }
-
-    pub fn preferences_sign_body(
-        &mut self,
-        fork_info: &ForkInfo,
-        signing_root: &[u8; 32],
-        preferences: &[u8; PROPOSER_PREFERENCES_SIZE],
-    ) -> SignBody {
-        let start = self.begin_sign_body("PROPOSER_PREFERENCES", fork_info, Some(signing_root));
-        self.bodies
-            .extend_from_slice(b",\"proposer_preferences\":{\"version\":\"GLOAS\",\"data\":");
-        self.push_preferences(preferences);
-        self.bodies.extend_from_slice(b"}}");
-        SignBody(start..self.bodies.len())
-    }
-
-    pub fn envelope_sign_body(
-        &mut self,
-        fork_info: &ForkInfo,
-        signing_root: &[u8; 32],
-        envelope: &[u8],
-    ) -> SignBody {
-        let start =
-            self.begin_sign_body("EXECUTION_PAYLOAD_ENVELOPE", fork_info, Some(signing_root));
-        self.bodies.extend_from_slice(
-            b",\"execution_payload_envelope\":{\"version\":\"GLOAS\",\"data\":{\"payload\":",
-        );
-        self.push_payload(ExecutionPayloadEnvelopeView::payload(envelope));
-        self.bodies.extend_from_slice(b",\"execution_requests\":");
-        self.push_execution_requests(ExecutionPayloadEnvelopeView::execution_requests(envelope));
-        write!(
-            self.bodies,
-            ",\"builder_index\":\"{}\",\"beacon_block_root\":",
-            ExecutionPayloadEnvelopeView::builder_index(envelope)
-        )
-        .expect("writes to a Vec");
-        self.push_hex(ExecutionPayloadEnvelopeView::beacon_block_root(envelope));
-        self.bodies.extend_from_slice(b",\"parent_beacon_block_root\":");
-        self.push_hex(ExecutionPayloadEnvelopeView::parent_beacon_block_root(envelope));
-        self.bodies.extend_from_slice(b"}}}");
-        SignBody(start..self.bodies.len())
-    }
-
-    pub fn sign(&mut self, pubkey: &[u8; 48], body: &SignBody, purpose: SignPurpose) -> RequestId {
-        let path = self.path(format_args!("/api/v1/eth2/sign/0x{}", Hex(pubkey)));
-        let id = RequestId(self.next_id);
-        self.next_id += 1;
-        let request = BeaconRequest::Sign(purpose);
-        self.queued.push(QueuedRequest { id, request, path, body: body.0.clone() });
-        id
+    pub fn drain_signing(&mut self, send: impl FnMut(SignRequest)) {
+        self.signing.drain(..).for_each(send);
     }
 
     pub fn drain(&mut self, mut send: impl FnMut(RequestId, BeaconRequest, &str, &[u8])) {
@@ -660,10 +474,28 @@ impl BeaconRequests {
     }
 
     fn push(&mut self, request: BeaconRequest, path: Range<usize>, body_start: usize) -> RequestId {
-        let id = RequestId(self.next_id);
-        self.next_id += 1;
+        let id = self.next_id();
         let body = body_start..self.bodies.len();
         self.queued.push(QueuedRequest { id, request, path, body });
+        id
+    }
+
+    fn push_signing(
+        &mut self,
+        pubkey: &XMSSPubkey,
+        purpose: SignPurpose,
+        work: KeyWork,
+    ) -> RequestId {
+        let id = self.next_id();
+        self.signing.push(SignRequest { id, purpose, pubkey: *pubkey, work });
+        id
+    }
+
+    /// Shared by beacon and signing requests, so a duty's ids ascend across
+    /// both.
+    fn next_id(&mut self) -> RequestId {
+        let id = RequestId(self.next_id);
+        self.next_id += 1;
         id
     }
 
@@ -673,34 +505,6 @@ impl BeaconRequests {
         self.bodies.resize(at + 2 * bytes.len(), 0);
         hex::encode_to_slice(bytes, &mut self.bodies[at..]).expect("sized for the hex");
         self.bodies.push(b'"');
-    }
-
-    /// Opens a web3signer body up to its optional `signingRoot`; the caller
-    /// adds the signed object and closes it.
-    fn begin_sign_body(
-        &mut self,
-        kind: &str,
-        fork_info: &ForkInfo,
-        signing_root: Option<&[u8; 32]>,
-    ) -> usize {
-        let start = self.bodies.len();
-        write!(
-            self.bodies,
-            "{{\"type\":\"{kind}\",\"fork_info\":{{\"fork\":{{\"previous_version\":"
-        )
-        .expect("writes to a Vec");
-        self.push_hex(&fork_info.previous_version);
-        self.bodies.extend_from_slice(b",\"current_version\":");
-        self.push_hex(&fork_info.current_version);
-        write!(self.bodies, ",\"epoch\":\"{}\"}},\"genesis_validators_root\":", fork_info.epoch)
-            .expect("writes to a Vec");
-        self.push_hex(&fork_info.genesis_validators_root);
-        self.bodies.push(b'}');
-        if let Some(root) = signing_root {
-            self.bodies.extend_from_slice(b",\"signingRoot\":");
-            self.push_hex(root);
-        }
-        start
     }
 
     fn duties(
@@ -761,157 +565,10 @@ impl BeaconRequests {
         .expect("writes to a Vec");
     }
 
-    fn push_payload(&mut self, payload: &[u8]) {
-        type View = ExecutionPayloadView;
-        self.bodies.extend_from_slice(b"{\"parent_hash\":");
-        self.push_hex(View::parent_hash(payload));
-        self.bodies.extend_from_slice(b",\"fee_recipient\":");
-        self.push_hex(View::fee_recipient(payload));
-        self.bodies.extend_from_slice(b",\"state_root\":");
-        self.push_hex(View::state_root(payload));
-        self.bodies.extend_from_slice(b",\"receipts_root\":");
-        self.push_hex(View::receipts_root(payload));
-        self.bodies.extend_from_slice(b",\"logs_bloom\":");
-        self.push_hex(View::logs_bloom(payload));
-        self.bodies.extend_from_slice(b",\"prev_randao\":");
-        self.push_hex(View::prev_randao(payload));
-        write!(
-            self.bodies,
-            ",\"block_number\":\"{}\",\"gas_limit\":\"{}\",\"gas_used\":\"{}\",\"timestamp\":\"{}\",\"extra_data\":",
-            View::block_number(payload),
-            View::gas_limit(payload),
-            View::gas_used(payload),
-            View::timestamp(payload),
-        )
-        .expect("writes to a Vec");
-        self.push_hex(View::extra_data(payload));
-        write!(
-            self.bodies,
-            ",\"base_fee_per_gas\":\"{}\",\"block_hash\":",
-            Uint256Decimal::new(View::base_fee_per_gas(payload))
-        )
-        .expect("writes to a Vec");
-        self.push_hex(View::block_hash(payload));
-        self.bodies.extend_from_slice(b",\"transactions\":");
-        self.push_array(variable_list_items(View::transactions(payload)), Self::push_hex);
-        self.bodies.extend_from_slice(b",\"withdrawals\":");
-        let withdrawals = View::withdrawals_gloas(payload).chunks_exact(WITHDRAWAL_SIZE);
-        self.push_array(withdrawals, |this, withdrawal| {
-            let number =
-                |at: usize| u64::from_le_bytes(withdrawal[at..at + 8].try_into().expect("8 bytes"));
-            write!(
-                this.bodies,
-                "{{\"index\":\"{}\",\"validator_index\":\"{}\",\"address\":",
-                number(0),
-                number(8)
-            )
-            .expect("writes to a Vec");
-            this.push_hex(&withdrawal[16..36]);
-            write!(this.bodies, ",\"amount\":\"{}\"}}", number(36)).expect("writes to a Vec");
-        });
-        write!(
-            self.bodies,
-            ",\"blob_gas_used\":\"{}\",\"excess_blob_gas\":\"{}\",\"block_access_list\":",
-            View::blob_gas_used(payload),
-            View::excess_blob_gas(payload),
-        )
-        .expect("writes to a Vec");
-        self.push_hex(View::block_access_list(payload));
-        write!(self.bodies, ",\"slot_number\":\"{}\"}}", View::slot_number(payload))
-            .expect("writes to a Vec");
-    }
-
-    fn push_execution_requests(&mut self, requests: &[u8]) {
-        let [deposits, withdrawals, consolidations, builder_deposits, builder_exits] =
-            ExecutionRequestsView::sections(requests);
-        self.bodies.extend_from_slice(b"{\"deposits\":");
-        self.push_array(deposits.chunks_exact(DEPOSIT_REQUEST_SIZE), |this, deposit| {
-            let deposit = deposit.try_into().expect("sized chunk");
-            this.bodies.extend_from_slice(b"{\"pubkey\":");
-            this.push_hex(DepositRequestView::pubkey(deposit));
-            this.bodies.extend_from_slice(b",\"withdrawal_credentials\":");
-            this.push_hex(DepositRequestView::withdrawal_credentials(deposit));
-            write!(
-                this.bodies,
-                ",\"amount\":\"{}\",\"signature\":",
-                DepositRequestView::amount(deposit)
-            )
-            .expect("writes to a Vec");
-            this.push_hex(DepositRequestView::signature(deposit));
-            write!(this.bodies, ",\"index\":\"{}\"}}", DepositRequestView::index(deposit))
-                .expect("writes to a Vec");
-        });
-        self.bodies.extend_from_slice(b",\"withdrawals\":");
-        self.push_array(withdrawals.chunks_exact(WITHDRAWAL_REQUEST_SIZE), |this, request| {
-            let request = request.try_into().expect("sized chunk");
-            this.bodies.extend_from_slice(b"{\"source_address\":");
-            this.push_hex(WithdrawalRequestView::source_address(request));
-            this.bodies.extend_from_slice(b",\"validator_pubkey\":");
-            this.push_hex(WithdrawalRequestView::validator_pubkey(request));
-            write!(this.bodies, ",\"amount\":\"{}\"}}", WithdrawalRequestView::amount(request))
-                .expect("writes to a Vec");
-        });
-        self.bodies.extend_from_slice(b",\"consolidations\":");
-        self.push_array(
-            consolidations.chunks_exact(CONSOLIDATION_REQUEST_SIZE),
-            |this, request| {
-                let request = request.try_into().expect("sized chunk");
-                this.bodies.extend_from_slice(b"{\"source_address\":");
-                this.push_hex(ConsolidationRequestView::source_address(request));
-                this.bodies.extend_from_slice(b",\"source_pubkey\":");
-                this.push_hex(ConsolidationRequestView::source_pubkey(request));
-                this.bodies.extend_from_slice(b",\"target_pubkey\":");
-                this.push_hex(ConsolidationRequestView::target_pubkey(request));
-                this.bodies.push(b'}');
-            },
-        );
-        self.bodies.extend_from_slice(b",\"builder_deposits\":");
-        self.push_array(
-            builder_deposits.chunks_exact(BUILDER_DEPOSIT_REQUEST_SIZE),
-            |this, deposit| {
-                let deposit = deposit.try_into().expect("sized chunk");
-                this.bodies.extend_from_slice(b"{\"pubkey\":");
-                this.push_hex(BuilderDepositRequestView::pubkey(deposit));
-                this.bodies.extend_from_slice(b",\"withdrawal_credentials\":");
-                this.push_hex(BuilderDepositRequestView::withdrawal_credentials(deposit));
-                write!(
-                    this.bodies,
-                    ",\"amount\":\"{}\",\"signature\":",
-                    BuilderDepositRequestView::amount(deposit)
-                )
-                .expect("writes to a Vec");
-                this.push_hex(BuilderDepositRequestView::signature(deposit));
-                this.bodies.push(b'}');
-            },
-        );
-        self.bodies.extend_from_slice(b",\"builder_exits\":");
-        self.push_array(builder_exits.chunks_exact(BUILDER_EXIT_REQUEST_SIZE), |this, exit| {
-            let exit = exit.try_into().expect("sized chunk");
-            this.bodies.extend_from_slice(b"{\"source_address\":");
-            this.push_hex(BuilderExitRequestView::source_address(exit));
-            this.bodies.extend_from_slice(b",\"pubkey\":");
-            this.push_hex(BuilderExitRequestView::pubkey(exit));
-            this.bodies.push(b'}');
-        });
-        self.bodies.push(b'}');
-    }
-
     fn push_quoted(&mut self, values: impl IntoIterator<Item = u64>) {
         self.push_array(values, |this, value| {
             write!(this.bodies, "\"{value}\"").expect("writes to a Vec")
         });
-    }
-
-    fn push_aggregate_and_proof(
-        &mut self,
-        aggregator_index: u64,
-        aggregate: &str,
-        selection_proof: &[u8; 96],
-    ) {
-        write!(self.bodies, "{{\"aggregator_index\":\"{aggregator_index}\",\"aggregate\":{aggregate},\"selection_proof\":")
-            .expect("writes to a Vec");
-        self.push_hex(selection_proof);
-        self.bodies.push(b'}');
     }
 
     fn push_attestation_data(&mut self, data: AttestationDataView<'_>) {
@@ -933,45 +590,6 @@ impl BeaconRequests {
     }
 }
 
-/// A little-endian `Uint256` in decimal, as the JSON schemas spell it.
-struct Uint256Decimal {
-    digits: [u8; Self::MAX_DIGITS],
-    start: usize,
-}
-
-impl Uint256Decimal {
-    const MAX_DIGITS: usize = 78;
-
-    fn new(little_endian: &[u8; 32]) -> Self {
-        let mut limbs = [0u64; 4];
-        for (limb, bytes) in limbs.iter_mut().zip(little_endian.chunks_exact(8)) {
-            *limb = u64::from_le_bytes(bytes.try_into().expect("8 bytes"));
-        }
-        let mut digits = [0u8; Self::MAX_DIGITS];
-        let mut start = Self::MAX_DIGITS;
-        loop {
-            let mut remainder = 0u128;
-            for limb in limbs.iter_mut().rev() {
-                let current = (remainder << 64) | u128::from(*limb);
-                *limb = (current / 10) as u64;
-                remainder = current % 10;
-            }
-            start -= 1;
-            digits[start] = b'0' + remainder as u8;
-            if limbs == [0; 4] {
-                break;
-            }
-        }
-        Self { digits, start }
-    }
-}
-
-impl fmt::Display for Uint256Decimal {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str(str::from_utf8(&self.digits[self.start..]).expect("ascii digits"))
-    }
-}
-
 struct Hex<'a>(&'a [u8]);
 
 impl fmt::Display for Hex<'_> {
@@ -989,7 +607,7 @@ impl fmt::Display for Hex<'_> {
 #[cfg(test)]
 pub mod tests {
     use serde_json::{Value, json};
-    use silver_common::ssz_view::ATTESTATION_DATA_SIZE;
+    use silver_common::ssz_view::{ATTESTATION_DATA_SIZE, VRF_PROOF_SIZE};
 
     use super::*;
 
@@ -1030,12 +648,12 @@ pub mod tests {
     #[test]
     fn validator_indices_body_lists_pubkeys_as_ids() {
         let mut requests = BeaconRequests::default();
-        let first = requests.validator_indices([&[0xaa; 48], &[0xbb; 48]]);
+        let first = requests.validator_indices([&[0xaa; 32], &[0xbb; 32]]);
         let second = requests.validator_indices([]);
         assert_ne!(first, second);
 
         let path = "/eth/v1/beacon/states/head/validators";
-        let ids = format!(r#"{{"ids":["0x{}","0x{}"]}}"#, "aa".repeat(48), "bb".repeat(48));
+        let ids = format!(r#"{{"ids":["0x{}","0x{}"]}}"#, "aa".repeat(32), "bb".repeat(32));
         assert_eq!(drained(&mut requests), [
             (first, "POST", path.into(), ids),
             (second, "POST", path.into(), r#"{"ids":[]}"#.into())
@@ -1063,19 +681,20 @@ pub mod tests {
     fn published_attestations_share_one_data_object() {
         let ssz = attestation_data_ssz();
         let mut requests = BeaconRequests::default();
-        let signed = |committee_index, attester_index, byte| SignedAttestation {
+        let signatures = [[0xc1; XMSS_SIGNATURE_SIZE], [0xc2; XMSS_SIGNATURE_SIZE]];
+        let signed = |committee_index, attester_index, signature| SignedAttestation {
             committee_index,
             attester_index,
-            signature: [byte; 96],
+            signature,
         };
-        requests.publish_attestations(ForkName::Fulu, AttestationDataView::new(&ssz), [
-            signed(4, 100, 0xc1),
-            signed(9, 200, 0xc2),
+        requests.publish_attestations(ForkName::Pq, AttestationDataView::new(&ssz), [
+            signed(4, 100, &signatures[0]),
+            signed(9, 200, &signatures[1]),
         ]);
 
         let mut sent = Vec::new();
         requests.drain(|_, request, path, body| {
-            assert_eq!(request.consensus_version(), Some("fulu"));
+            assert_eq!(request.consensus_version(), Some("pq"));
             sent.push((path.to_owned(), serde_json::from_slice::<Value>(body).unwrap()));
         });
         let entry = |committee: &str, attester: &str, byte: &str| {
@@ -1083,29 +702,13 @@ pub mod tests {
                 "committee_index": committee,
                 "attester_index": attester,
                 "data": attestation_data_json(),
-                "signature": format!("0x{}", byte.repeat(96)),
+                "signature": format!("0x{}", byte.repeat(XMSS_SIGNATURE_SIZE)),
             })
         };
         assert_eq!(sent, [(
             "/eth/v2/beacon/pool/attestations".to_owned(),
             json!([entry("4", "100", "c1"), entry("9", "200", "c2")])
         )]);
-    }
-
-    fn fork_info() -> ForkInfo {
-        ForkInfo {
-            previous_version: [1; 4],
-            current_version: [2; 4],
-            epoch: 3,
-            genesis_validators_root: [0x9e; 32],
-        }
-    }
-
-    fn fork_info_json() -> Value {
-        json!({
-            "fork": {"previous_version": "0x01010101", "current_version": "0x02020202", "epoch": "3"},
-            "genesis_validators_root": format!("0x{}", "9e".repeat(32)),
-        })
     }
 
     fn bodies(requests: &mut BeaconRequests) -> Vec<(String, Value)> {
@@ -1145,57 +748,18 @@ pub mod tests {
     }
 
     #[test]
-    fn selection_and_aggregate_sign_bodies_follow_web3signer() {
+    fn published_aggregates_carry_the_served_object_and_signature() {
         let mut requests = BeaconRequests::default();
-        let aggregate = r#"{"aggregation_bits":"0x03","data":{"slot":"65"},"signature":"0x00","committee_bits":"0x08"}"#;
-        let selection = requests.selection_sign_body(&fork_info(), &[0x5a; 32], 65);
-        requests.sign(&[0xaa; 48], &selection, SignPurpose::SelectionProof);
-        let body =
-            requests.aggregate_sign_body(&fork_info(), ForkName::Fulu, 7, aggregate, &[0xc1; 96]);
-        requests.sign(&[0xaa; 48], &body, SignPurpose::Aggregate);
-
-        let aggregate = serde_json::from_str::<Value>(aggregate).unwrap();
-        assert_eq!(bodies(&mut requests), [
-            (
-                format!("/api/v1/eth2/sign/0x{}", "aa".repeat(48)),
-                json!({
-                    "type": "AGGREGATION_SLOT",
-                    "fork_info": fork_info_json(),
-                    "signingRoot": format!("0x{}", "5a".repeat(32)),
-                    "aggregation_slot": {"slot": "65"},
-                })
-            ),
-            (
-                format!("/api/v1/eth2/sign/0x{}", "aa".repeat(48)),
-                json!({
-                    "type": "AGGREGATE_AND_PROOF_V2",
-                    "fork_info": fork_info_json(),
-                    "aggregate_and_proof": {
-                        "version": "FULU",
-                        "data": {
-                            "aggregator_index": "7",
-                            "aggregate": aggregate,
-                            "selection_proof": format!("0x{}", "c1".repeat(96)),
-                        },
-                    },
-                })
-            ),
-        ]);
-    }
-
-    #[test]
-    fn published_aggregates_carry_message_and_signature() {
-        let mut requests = BeaconRequests::default();
-        let aggregate = r#"{"aggregation_bits":"0x03"}"#;
-        requests.publish_aggregates(ForkName::Fulu, [SignedAggregate {
+        let proved = r#"{"aggregate":{"aggregation_bits":"0x03"},"proof":"0xc0ffee"}"#;
+        let signature = [0xc2; XMSS_SIGNATURE_SIZE];
+        requests.publish_aggregates(ForkName::Pq, [SignedAggregate {
             aggregator_index: 7,
-            aggregate,
-            selection_proof: [0xc1; 96],
-            signature: [0xc2; 96],
+            proved,
+            signature: &signature,
         }]);
         let mut sent = Vec::new();
         requests.drain(|_, request, path, body| {
-            assert_eq!(request.consensus_version(), Some("fulu"));
+            assert_eq!(request.consensus_version(), Some("pq"));
             sent.push((path.to_owned(), serde_json::from_slice::<Value>(body).unwrap()));
         });
         assert_eq!(sent, [(
@@ -1204,11 +768,39 @@ pub mod tests {
                 "message": {
                     "aggregator_index": "7",
                     "aggregate": {"aggregation_bits": "0x03"},
-                    "selection_proof": format!("0x{}", "c1".repeat(96)),
+                    "proof": "0xc0ffee",
                 },
-                "signature": format!("0x{}", "c2".repeat(96)),
+                "signature": format!("0x{}", "c2".repeat(XMSS_SIGNATURE_SIZE)),
             }])
         )]);
+    }
+
+    #[test]
+    fn signing_requests_queue_apart_and_share_ids() {
+        let mut requests = BeaconRequests::default();
+        let fetch = requests.attestation_data(65);
+        let signed = requests.sign(&[0xaa; 32], SignPurpose::Attestation, 7, &[0x5a; 32]);
+        let reveal = requests.vrf_proof(&[0xbb; 32], 66);
+        assert!(fetch < signed && signed < reveal);
+        assert_eq!(drained(&mut requests).len(), 1);
+
+        let mut queued = Vec::new();
+        requests.drain_signing(|request| queued.push(request));
+        assert_eq!(queued, [
+            SignRequest {
+                id: signed,
+                purpose: SignPurpose::Attestation,
+                pubkey: [0xaa; 32],
+                work: KeyWork::Sign { leaf_index: 7, signing_root: [0x5a; 32] },
+            },
+            SignRequest {
+                id: reveal,
+                purpose: SignPurpose::Randao,
+                pubkey: [0xbb; 32],
+                work: KeyWork::VrfProof { slot: 66 },
+            },
+        ]);
+        requests.drain_signing(|_| unreachable!("drained"));
     }
 
     #[test]
@@ -1228,16 +820,16 @@ pub mod tests {
             ),
         ]);
 
-        requests.produce_block(ForkName::Gloas, 65, &[0x7a; 96], &[0x67; 32]);
+        requests.produce_block(ForkName::Pq, 65, &[0x7a; VRF_PROOF_SIZE], &[0x67; 32]);
         let mut sent = Vec::new();
         requests.drain(|_, request, path, body| {
             assert_eq!(request.method(), "POST");
-            assert_eq!(request.consensus_version(), Some("gloas"));
+            assert_eq!(request.consensus_version(), Some("pq"));
             sent.push((path.to_owned(), body.to_vec()))
         });
         let path = format!(
             "/eth/v4/validator/blocks/65?randao_reveal=0x{}&graffiti=0x{}&include_payload=true",
-            "7a".repeat(96),
+            "7a".repeat(VRF_PROOF_SIZE),
             "67".repeat(32)
         );
         let builder_config = [&0u64.to_le_bytes()[..], &0u64.to_le_bytes(), &20u32.to_le_bytes()];
@@ -1245,159 +837,27 @@ pub mod tests {
     }
 
     #[test]
-    fn proposal_sign_bodies_follow_web3signer() {
-        let mut requests = BeaconRequests::default();
-        let randao = requests.randao_sign_body(&fork_info(), &[0x5a; 32], 2);
-        requests.sign(&[0xaa; 48], &randao, SignPurpose::Randao);
-        let mut header = [0; BEACON_BLOCK_HEADER_SIZE];
-        header[..8].copy_from_slice(&65u64.to_le_bytes());
-        header[8..16].copy_from_slice(&7u64.to_le_bytes());
-        header[16..48].fill(0x01);
-        header[48..80].fill(0x02);
-        header[80..].fill(0x03);
-        let block = requests.block_sign_body(&fork_info(), ForkName::Gloas, &[0x5b; 32], &header);
-        requests.sign(&[0xaa; 48], &block, SignPurpose::Block);
-
-        let bodies = bodies(&mut requests).into_iter().map(|(_, body)| body).collect::<Vec<_>>();
-        let root = |byte: &str| format!("0x{}", byte.repeat(32));
-        assert_eq!(bodies, [
-            json!({
-                "type": "RANDAO_REVEAL",
-                "fork_info": fork_info_json(),
-                "signingRoot": root("5a"),
-                "randao_reveal": {"epoch": "2"},
-            }),
-            json!({
-                "type": "BLOCK_V2",
-                "fork_info": fork_info_json(),
-                "signingRoot": root("5b"),
-                "beacon_block": {"version": "GLOAS", "block_header": {
-                    "slot": "65",
-                    "proposer_index": "7",
-                    "parent_root": root("01"),
-                    "state_root": root("02"),
-                    "body_root": root("03"),
-                }},
-            }),
-        ]);
-    }
-
-    #[test]
-    fn uint256_decimal_renders_every_limb() {
-        assert_eq!(Uint256Decimal::new(&[0; 32]).to_string(), "0");
-        let mut two_ether = [0; 32];
-        two_ether[..8].copy_from_slice(&2_000_000_000_000_000_000u64.to_le_bytes());
-        assert_eq!(Uint256Decimal::new(&two_ether).to_string(), "2000000000000000000");
-        let mut two_to_64 = [0; 32];
-        two_to_64[8] = 1;
-        assert_eq!(Uint256Decimal::new(&two_to_64).to_string(), "18446744073709551616");
-        assert_eq!(Uint256Decimal::new(&[0xff; 32]).to_string().len(), 78);
-    }
-
-    fn gloas_envelope() -> Vec<u8> {
-        let at = |offset: usize| (offset as u32).to_le_bytes();
-        let mut payload = vec![0u8; 540];
-        payload[..32].fill(0x01);
-        payload[404..412].copy_from_slice(&9u64.to_le_bytes());
-        payload[440..448].copy_from_slice(&7u64.to_le_bytes());
-        payload[532..540].copy_from_slice(&65u64.to_le_bytes());
-        let transactions = [&at(8)[..], &at(10), &[0x01, 0x02], &[0x03]].concat();
-        let mut withdrawal = [0u8; WITHDRAWAL_SIZE];
-        withdrawal[..8].copy_from_slice(&4u64.to_le_bytes());
-        withdrawal[8..16].copy_from_slice(&5u64.to_le_bytes());
-        withdrawal[16..36].fill(0xaa);
-        withdrawal[36..44].copy_from_slice(&6u64.to_le_bytes());
-        let transactions_at = 540 + 1;
-        let withdrawals_at = transactions_at + transactions.len();
-        let access_list_at = withdrawals_at + WITHDRAWAL_SIZE;
-        for (position, offset) in
-            [(436, 540), (504, transactions_at), (508, withdrawals_at), (528, access_list_at)]
-        {
-            payload[position..position + 4].copy_from_slice(&at(offset));
-        }
-        payload.extend_from_slice(&[0xab]);
-        payload.extend_from_slice(&transactions);
-        payload.extend_from_slice(&withdrawal);
-        payload.extend_from_slice(&[0xcd]);
-
-        let consolidation = [0x11u8; CONSOLIDATION_REQUEST_SIZE];
-        let after = 20 + CONSOLIDATION_REQUEST_SIZE;
-        let requests =
-            [&at(20)[..], &at(20), &at(20), &at(after), &at(after), &consolidation].concat();
-
-        let mut envelope = [&at(80)[..], &at(80 + payload.len())].concat();
-        envelope.extend_from_slice(&u64::MAX.to_le_bytes());
-        envelope.extend_from_slice(&[0x22; 32]);
-        envelope.extend_from_slice(&[0x33; 32]);
-        envelope.extend_from_slice(&payload);
-        envelope.extend_from_slice(&requests);
-        envelope
-    }
-
-    #[test]
-    fn envelope_sign_body_spells_the_whole_payload() {
-        let mut requests = BeaconRequests::default();
-        let envelope = gloas_envelope();
-        let body = requests.envelope_sign_body(&fork_info(), &[0x5d; 32], &envelope);
-        requests.sign(&[0xaa; 48], &body, SignPurpose::Envelope);
-        let sent = bodies(&mut requests).pop().unwrap().1;
-        assert_eq!(sent["type"], "EXECUTION_PAYLOAD_ENVELOPE");
-        let wrapped = &sent["execution_payload_envelope"];
-        assert_eq!(wrapped["version"], "GLOAS");
-        let data = &wrapped["data"];
-        assert_eq!(data["builder_index"], u64::MAX.to_string());
-        assert_eq!(data["beacon_block_root"], format!("0x{}", "22".repeat(32)));
-        assert_eq!(data["parent_beacon_block_root"], format!("0x{}", "33".repeat(32)));
-        let payload = &data["payload"];
-        assert_eq!(payload["parent_hash"], format!("0x{}", "01".repeat(32)));
-        assert_eq!(payload["block_number"], "9");
-        assert_eq!(payload["base_fee_per_gas"], "7");
-        assert_eq!(payload["extra_data"], "0xab");
-        assert_eq!(payload["transactions"], json!(["0x0102", "0x03"]));
-        assert_eq!(
-            payload["withdrawals"],
-            json!([{
-                "index": "4",
-                "validator_index": "5",
-                "address": format!("0x{}", "aa".repeat(20)),
-                "amount": "6",
-            }])
-        );
-        assert_eq!(payload["block_access_list"], "0xcd");
-        assert_eq!(payload["slot_number"], "65");
-        let execution_requests = &data["execution_requests"];
-        assert_eq!(execution_requests["deposits"], json!([]));
-        assert_eq!(execution_requests["builder_exits"], json!([]));
-        assert_eq!(
-            execution_requests["consolidations"],
-            json!([{
-                "source_address": format!("0x{}", "11".repeat(20)),
-                "source_pubkey": format!("0x{}", "11".repeat(48)),
-                "target_pubkey": format!("0x{}", "11".repeat(48)),
-            }])
-        );
-    }
-
-    #[test]
-    fn gloas_envelope_publishes_with_its_blob_flag() {
+    fn block_and_envelope_publish_signed_over_ssz() {
         let mut requests = BeaconRequests::default();
         let block = [0x0b; 84];
-        let envelope = gloas_envelope();
+        let envelope = [0x0e; 60];
         let at = |offset: usize| (offset as u32).to_le_bytes();
         let end = 16 + block.len() + envelope.len();
         let produced =
             [&at(16)[..], &at(16 + block.len()), &at(end), &at(end), &block, &envelope].concat();
-        requests.publish_block(ForkName::Gloas, true, &produced, &[0xc1; 96]);
-        requests.publish_envelope(&produced, &[0xc2; 96]);
+        let signatures = [[0xc1; XMSS_SIGNATURE_SIZE], [0xc2; XMSS_SIGNATURE_SIZE]];
+        requests.publish_block(ForkName::Pq, true, &produced, &signatures[0]);
+        requests.publish_envelope(&produced, &signatures[1]);
         let mut sent = Vec::new();
         requests.drain(|_, request, path, body| {
             sent.push((path.to_owned(), request.extra_header(), body.to_vec()))
         });
-        let signed_block = [&at(100)[..], &[0xc1; 96], &block].concat();
+        let signed_at = 4 + XMSS_SIGNATURE_SIZE;
+        let signed_block = [&at(signed_at)[..], &signatures[0], &block].concat();
         assert_eq!(sent[0], ("/eth/v2/beacon/blocks".to_owned(), None, signed_block));
         assert_eq!(sent[1].0, "/eth/v1/beacon/execution_payload_envelopes");
         assert_eq!(sent[1].1, Some(("Eth-Blob-Data-Included", "true")));
-        let signed_envelope = [&at(100)[..], &[0xc2; 96], &envelope].concat();
+        let signed_envelope = [&at(signed_at)[..], &signatures[1], &envelope].concat();
         let end = 12 + signed_envelope.len();
         assert_eq!(sent[1].2, [&at(12)[..], &at(end), &at(end), &signed_envelope].concat());
     }

@@ -99,3 +99,20 @@ impl SignedAggregateAndProofPqView {
         ])
     }
 }
+
+/// Root of an unsigned `AggregateAndProof`; `ZERO_HASH` when `aggregate` is
+/// not a canonical PQ `Attestation`.
+pub fn hash_tree_root_aggregate_and_proof(
+    aggregator_index: u64,
+    aggregate: &[u8],
+    proof: &[u8],
+) -> B256 {
+    if !AttestationPqView::check_canonical(aggregate) {
+        return ZERO_HASH;
+    }
+    merkleize(&[
+        uint64_chunk(aggregator_index),
+        AttestationPqView::root_of_canonical(aggregate),
+        attestation_proof_root(proof),
+    ])
+}

@@ -5,19 +5,26 @@ use crate::{
     beacon_link::{BeaconLink, BeaconRequests},
     config::Config,
     duties::Duties,
+    keys::load_keys,
+    signer::Signer,
 };
 
 pub struct ValidatorTile {
     beacon_link: BeaconLink,
     duties: Duties,
+    signer: Signer,
     requests: BeaconRequests,
 }
 
 impl ValidatorTile {
     pub fn new(config: &Config) -> Result<Self, Error> {
+        let keys = load_keys(&config.keys_dir)?;
+        silver_log::info!(keys = keys.len(), dir = %config.keys_dir.display(), "validator keys");
+        let pubkeys = keys.iter().map(|key| key.pubkey).collect();
         Ok(Self {
             beacon_link: BeaconLink::new(config)?,
-            duties: Duties::new(config),
+            duties: Duties::new(config, pubkeys),
+            signer: Signer::new(keys),
             requests: BeaconRequests::default(),
         })
     }
@@ -35,10 +42,13 @@ impl Tile<VcSpine> for ValidatorTile {
     }
 
     fn loop_body(&mut self, _adapter: &mut SpineAdapter<VcSpine>) {
-        let Self { beacon_link, duties, requests } = self;
+        let Self { beacon_link, duties, signer, requests } = self;
         beacon_link.spin(requests, |event| duties.on_beacon_event(event));
         if let Some(chain) = beacon_link.chain_info() {
             duties.on_tick(chain, requests);
         }
+        requests.drain_signing(|request| {
+            duties.on_signed(request.id, request.purpose, signer.answer(&request))
+        });
     }
 }

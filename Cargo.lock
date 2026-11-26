@@ -7356,6 +7356,7 @@ dependencies = [
  "silver_common",
  "silver_config",
  "silver_log",
+ "tempfile",
 ]
 
 [[package]]

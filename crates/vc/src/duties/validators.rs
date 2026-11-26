@@ -1,15 +1,17 @@
+use silver_common::ssz_view::XMSSPubkey;
+
 use crate::beacon_link::{BeaconRequests, RequestId, ValidatorIndices};
 
 pub struct Validators {
     /// Sorted, so answers find their key by binary search.
-    pubkeys: Vec<[u8; 48]>,
+    pubkeys: Vec<XMSSPubkey>,
     indices: Vec<Option<u64>>,
     lookup: Option<RequestId>,
     looked_up_epoch: Option<u64>,
 }
 
 impl Validators {
-    pub fn new(pubkeys: Vec<[u8; 48]>) -> Self {
+    pub fn new(pubkeys: Vec<XMSSPubkey>) -> Self {
         debug_assert!(pubkeys.is_sorted());
         Self { indices: vec![None; pubkeys.len()], pubkeys, lookup: None, looked_up_epoch: None }
     }
@@ -18,11 +20,11 @@ impl Validators {
         self.pubkeys.len()
     }
 
-    pub fn pubkey(&self, key: usize) -> &[u8; 48] {
+    pub fn pubkey(&self, key: usize) -> &XMSSPubkey {
         &self.pubkeys[key]
     }
 
-    pub fn key(&self, pubkey: &[u8; 48]) -> Option<usize> {
+    pub fn key(&self, pubkey: &XMSSPubkey) -> Option<usize> {
         self.pubkeys.binary_search(pubkey).ok()
     }
 
@@ -84,8 +86,8 @@ impl Validators {
 mod tests {
     use super::*;
 
-    const A: [u8; 48] = [0xaa; 48];
-    const B: [u8; 48] = [0xbb; 48];
+    const A: XMSSPubkey = [0xaa; 32];
+    const B: XMSSPubkey = [0xbb; 32];
 
     fn sent_bodies(requests: &mut BeaconRequests) -> Vec<(RequestId, String)> {
         let mut sent = Vec::new();

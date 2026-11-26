@@ -11,11 +11,13 @@ pub struct AggregatorDuty {
     pub key: usize,
     pub validator_index: u64,
     pub committee: u64,
+    /// Its place in the committee's aggregation committee.
+    pub position: u64,
 }
 
 enum Served {
     Awaiting,
-    Aggregate(Range<usize>),
+    Proved { json: Range<usize>, attestation: Vec<u8>, proof: Vec<u8> },
     SentForSigning,
     Dropped,
 }
@@ -23,14 +25,13 @@ enum Served {
 struct Fetch {
     id: RequestId,
     duty: AggregatorDuty,
-    selection_proof: [u8; 96],
     served: Served,
 }
 
 pub struct AggregateItem {
     duty: AggregatorDuty,
-    selection_proof: [u8; 96],
-    /// The aggregate's JSON object in `Aggregations::json`.
+    /// The served `{"aggregate": …, "proof": …}` object in
+    /// `Aggregations::json`.
     json: Range<usize>,
 }
 
@@ -55,16 +56,10 @@ impl Aggregations {
         }
     }
 
-    /// `fetches` pairs each aggregator duty and its selection proof with its
-    /// aggregate request.
-    pub fn fetching(
-        &mut self,
-        fetches: impl IntoIterator<Item = (RequestId, AggregatorDuty, [u8; 96])>,
-    ) {
-        self.fetches.extend(fetches.into_iter().map(|(id, duty, selection_proof)| Fetch {
+    pub fn fetching(&mut self, fetches: impl IntoIterator<Item = (RequestId, AggregatorDuty)>) {
+        self.fetches.extend(fetches.into_iter().map(|(id, duty)| Fetch {
             id,
             duty,
-            selection_proof,
             served: Served::Awaiting,
         }));
         if self.fetches.is_empty() { self.round.abandon() } else { self.round.working() }
@@ -72,11 +67,12 @@ impl Aggregations {
 
     pub fn on_aggregate(&mut self, id: RequestId, aggregate: &Aggregate<'_>) {
         let Some(fetch) = self.fetches.iter_mut().find(|fetch| fetch.id == id) else { return };
-        fetch.served = match aggregate.json() {
-            Ok(json) => {
+        fetch.served = match aggregate.parse() {
+            Ok(proved) => {
                 let start = self.json.len();
-                self.json.push_str(json);
-                Served::Aggregate(start..self.json.len())
+                self.json.push_str(proved.json);
+                let json = start..self.json.len();
+                Served::Proved { json, attestation: proved.attestation, proof: proved.proof }
             }
             Err(error) => {
                 silver_log::warn!(slot = self.round.slot(), error, "aggregate dropped");
@@ -91,24 +87,23 @@ impl Aggregations {
         }
     }
 
-    /// Hands each newly served aggregate to `sign`, which returns its
-    /// request.
+    /// Hands each newly served aggregate's attestation SSZ and proof to
+    /// `sign`, which returns its request, or `None` to drop it.
     pub fn sign_served(
         &mut self,
-        mut sign: impl FnMut(&AggregatorDuty, &[u8; 96], &str) -> RequestId,
+        mut sign: impl FnMut(&AggregatorDuty, &[u8], &[u8]) -> Option<RequestId>,
     ) {
-        let Self { round, fetches, json } = self;
+        let Self { round, fetches, .. } = self;
         for fetch in fetches.iter_mut() {
-            let Served::Aggregate(range) = &fetch.served else { continue };
-            let range = range.clone();
-            let id = sign(&fetch.duty, &fetch.selection_proof, &json[range.clone()]);
-            let aggregate = AggregateItem {
-                duty: fetch.duty,
-                selection_proof: fetch.selection_proof,
-                json: range,
+            let Served::Proved { json, attestation, proof } = &fetch.served else { continue };
+            let json = json.clone();
+            fetch.served = match sign(&fetch.duty, attestation, proof) {
+                Some(id) => {
+                    round.sign(id, AggregateItem { duty: fetch.duty, json });
+                    Served::SentForSigning
+                }
+                None => Served::Dropped,
             };
-            round.sign(id, aggregate);
-            fetch.served = Served::SentForSigning;
         }
     }
 
@@ -120,16 +115,15 @@ impl Aggregations {
         fetched && self.round.all_signatures_answered()
     }
 
-    pub fn publish<'a>(
-        &'a mut self,
-        send: impl FnOnce(&mut dyn Iterator<Item = SignedAggregate<'a>>) -> RequestId,
+    pub fn publish(
+        &mut self,
+        send: impl FnOnce(&mut dyn Iterator<Item = SignedAggregate<'_>>) -> RequestId,
     ) {
         let Self { round, json, .. } = self;
         round.publish(|round| {
             let mut signed = round.signed().map(|(aggregate, signature)| SignedAggregate {
                 aggregator_index: aggregate.duty.validator_index,
-                aggregate: &json[aggregate.json.clone()],
-                selection_proof: aggregate.selection_proof,
+                proved: &json[aggregate.json.clone()],
                 signature,
             });
             send(&mut signed)

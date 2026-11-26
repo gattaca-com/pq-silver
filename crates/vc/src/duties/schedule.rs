@@ -1,6 +1,9 @@
 use std::ops::Range;
 
-use silver_common::{SLOTS_PER_EPOCH, merkle::sha256, ssz_view::PROPOSER_PREFERENCES_SIZE};
+use silver_common::{
+    SLOTS_PER_EPOCH,
+    ssz_view::{PROPOSER_PREFERENCES_SIZE, VRFProof, XMSSSignature},
+};
 
 use crate::{
     beacon_link::{
@@ -9,15 +12,6 @@ use crate::{
     },
     duties::{aggregations::AggregatorDuty, validators::Validators},
 };
-
-/// Spec `is_aggregator`: a member aggregates when its selection proof hashes
-/// into the one in `committee_len / 16`, at least one, it is chosen by.
-pub(super) fn is_aggregator(committee_len: usize, selection_proof: &[u8; 96]) -> bool {
-    const TARGET_AGGREGATORS_PER_COMMITTEE: u64 = 16;
-    let modulo = (committee_len as u64 / TARGET_AGGREGATORS_PER_COMMITTEE).max(1);
-    let hash = sha256(selection_proof);
-    u64::from_le_bytes(hash[0..8].try_into().unwrap()).is_multiple_of(modulo)
-}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct AttesterDuty {
@@ -28,23 +22,26 @@ pub struct AttesterDuty {
     pub committee_length: u64,
     pub committees_at_slot: u64,
     pub slot: u64,
+    /// Its place in the committee's aggregation committee, which staggers
+    /// aggregators; `None` for an attester only.
+    pub aggregator_position: Option<u64>,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum Signing {
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Signing<T> {
     Unasked,
     Asked(RequestId),
-    Signed([u8; 96]),
+    Signed(Box<T>),
     Done,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ProposerDuty {
     pub key: usize,
     pub validator_index: u64,
     pub slot: u64,
-    pub randao: Signing,
-    pub preferences: Signing,
+    pub randao: Signing<VRFProof>,
+    pub preferences: Signing<XMSSSignature>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -52,38 +49,6 @@ pub struct PtcDuty {
     pub key: usize,
     pub validator_index: u64,
     pub slot: u64,
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum Role {
-    Unknown,
-    Aggregator([u8; 96]),
-    Attester,
-}
-
-/// Each duty's aggregation role, decided by its selection proof, and the
-/// subscription that tells beacon nodes which subnets to join.
-struct Selections {
-    /// The selection proof requests, in duty order, so ids ascend.
-    requests: Vec<RequestId>,
-    roles: Vec<Role>,
-    subscription: Fetch,
-}
-
-impl Selections {
-    fn clear(&mut self) {
-        self.requests.clear();
-        self.roles.clear();
-        self.subscription = Fetch::Due { from_slot: 0 };
-    }
-
-    fn position(&self, id: RequestId) -> Option<usize> {
-        self.requests.binary_search(&id).ok()
-    }
-
-    fn all_known(&self, duties: usize) -> bool {
-        self.roles.len() == duties && !self.roles.contains(&Role::Unknown)
-    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -156,7 +121,9 @@ struct EpochDuties {
     attesters: Fetched<AttesterDuty>,
     proposers: Fetched<ProposerDuty>,
     ptc: Fetched<PtcDuty>,
-    selections: Selections,
+    /// Tells the beacon node which subnets to join, and which of them to
+    /// aggregate.
+    subscription: Fetch,
 }
 
 impl EpochDuties {
@@ -182,11 +149,7 @@ impl DutySchedule {
             attesters: Fetched::new(),
             proposers: Fetched::new(),
             ptc: Fetched::new(),
-            selections: Selections {
-                requests: Vec::new(),
-                roles: Vec::new(),
-                subscription: Fetch::Done,
-            },
+            subscription: Fetch::Done,
         };
         Self { proposes, gloas_fork_epoch, epochs: [empty(), empty()] }
     }
@@ -200,7 +163,7 @@ impl DutySchedule {
                 entry.attesters.reset(true);
                 entry.proposers.reset(proposes);
                 entry.ptc.reset(epoch >= gloas_fork_epoch);
-                entry.selections.clear();
+                entry.subscription = Fetch::Due { from_slot: 0 };
             }
         }
     }
@@ -260,6 +223,7 @@ impl DutySchedule {
                         committee_length: duty.committee_length,
                         committees_at_slot: duty.committees_at_slot,
                         slot: duty.slot,
+                        aggregator_position: duty.aggregator_position,
                     });
                 }
             })?;
@@ -269,7 +233,7 @@ impl DutySchedule {
         let duties = entry.attesters.duties.len();
         match answered {
             Ok(()) => {
-                entry.selections.clear();
+                entry.subscription = Fetch::Due { from_slot: 0 };
                 silver_log::info!(epoch = entry.epoch, duties, "attester duties");
             }
             Err(error) => silver_log::warn!(epoch = entry.epoch, error, "attester duties"),
@@ -377,61 +341,28 @@ impl DutySchedule {
         }
     }
 
-    /// Asks once for every fetched duty's selection proof; `ask` returns the
-    /// request it queued.
-    pub fn ask_selections(&mut self, mut ask: impl FnMut(&AttesterDuty) -> RequestId) {
-        for entry in &mut self.epochs {
-            let selections = &mut entry.selections;
-            if entry.attesters.fetch != Fetch::Done || !selections.requests.is_empty() {
-                continue;
-            }
-            for duty in &entry.attesters.duties {
-                selections.requests.push(ask(duty));
-                selections.roles.push(Role::Unknown);
-            }
-        }
-    }
-
-    pub fn on_selection(&mut self, id: RequestId, selection_proof: [u8; 96]) {
-        self.set_role(id, |duty| {
-            if is_aggregator(duty.committee_length as usize, &selection_proof) {
-                Role::Aggregator(selection_proof)
-            } else {
-                Role::Attester
-            }
-        })
-    }
-
-    /// A duty whose selection proof failed only attests.
-    pub fn on_selection_failed(&mut self, id: RequestId) {
-        self.set_role(id, |_| Role::Attester)
-    }
-
     pub fn subscriptions_due(&mut self, slot: u64, requests: &mut BeaconRequests) {
         for entry in &mut self.epochs {
-            let selections = &mut entry.selections;
-            let Fetch::Due { from_slot } = selections.subscription else { continue };
+            let Fetch::Due { from_slot } = entry.subscription else { continue };
             let attesters = &entry.attesters.duties;
             let fetched = entry.attesters.fetch == Fetch::Done && !attesters.is_empty();
-            if !fetched || from_slot > slot || !selections.all_known(attesters.len()) {
+            if !fetched || from_slot > slot {
                 continue;
             }
-            let subscriptions =
-                attesters.iter().zip(&selections.roles).map(|(duty, role)| CommitteeSubscription {
-                    validator_index: duty.validator_index,
-                    committee_index: duty.committee_index,
-                    committees_at_slot: duty.committees_at_slot,
-                    slot: duty.slot,
-                    is_aggregator: matches!(role, Role::Aggregator(_)),
-                });
-            selections.subscription =
-                Fetch::InFlight(requests.committee_subscriptions(subscriptions));
+            let subscriptions = attesters.iter().map(|duty| CommitteeSubscription {
+                validator_index: duty.validator_index,
+                committee_index: duty.committee_index,
+                committees_at_slot: duty.committees_at_slot,
+                slot: duty.slot,
+                is_aggregator: duty.aggregator_position.is_some(),
+            });
+            entry.subscription = Fetch::InFlight(requests.committee_subscriptions(subscriptions));
         }
     }
 
     pub fn on_subscribed(&mut self, id: RequestId) {
         if let Some(entry) = self.subscription_mut(id) {
-            entry.selections.subscription = Fetch::Done;
+            entry.subscription = Fetch::Done;
             silver_log::info!(epoch = entry.epoch, "committee subscriptions sent");
         }
     }
@@ -439,40 +370,23 @@ impl DutySchedule {
     /// It retries at the next slot.
     pub fn on_subscription_failed(&mut self, id: RequestId, slot: u64) {
         if let Some(entry) = self.subscription_mut(id) {
-            entry.selections.subscription = Fetch::Due { from_slot: slot + 1 };
+            entry.subscription = Fetch::Due { from_slot: slot + 1 };
         }
     }
 
-    pub fn aggregators_at(&self, slot: u64) -> impl Iterator<Item = (AggregatorDuty, [u8; 96])> {
-        let entry = &self.epochs[(slot / SLOTS_PER_EPOCH % 2) as usize];
-        let range = entry.slot_range(&entry.attesters.duties, slot, |duty| duty.slot);
-        entry.attesters.duties[range.clone()]
-            .iter()
-            .zip(entry.selections.roles.get(range).unwrap_or_default())
-            .filter_map(|(duty, role)| match role {
-                Role::Aggregator(proof) => {
-                    let aggregator = AggregatorDuty {
-                        key: duty.key,
-                        validator_index: duty.validator_index,
-                        committee: duty.committee_index,
-                    };
-                    Some((aggregator, *proof))
-                }
-                Role::Unknown | Role::Attester => None,
+    pub fn aggregators_at(&self, slot: u64) -> impl Iterator<Item = AggregatorDuty> {
+        self.attesters_at(slot).iter().filter_map(|duty| {
+            duty.aggregator_position.map(|position| AggregatorDuty {
+                key: duty.key,
+                validator_index: duty.validator_index,
+                committee: duty.committee_index,
+                position,
             })
-    }
-
-    fn set_role(&mut self, id: RequestId, role: impl FnOnce(&AttesterDuty) -> Role) {
-        for entry in &mut self.epochs {
-            if let Some(at) = entry.selections.position(id) {
-                entry.selections.roles[at] = role(&entry.attesters.duties[at]);
-                return;
-            }
-        }
+        })
     }
 
     fn subscription_mut(&mut self, id: RequestId) -> Option<&mut EpochDuties> {
-        self.epochs.iter_mut().find(|entry| entry.selections.subscription == Fetch::InFlight(id))
+        self.epochs.iter_mut().find(|entry| entry.subscription == Fetch::InFlight(id))
     }
 
     pub fn attesters_at(&self, slot: u64) -> &[AttesterDuty] {
@@ -498,7 +412,7 @@ impl DutySchedule {
         }
     }
 
-    pub fn on_randao(&mut self, id: RequestId, randao: Option<[u8; 96]>) {
+    pub fn on_randao(&mut self, id: RequestId, randao: Option<Box<VRFProof>>) {
         let asked = self.epochs.iter_mut().flat_map(|entry| &mut entry.proposers.duties);
         if let Some(duty) = asked.into_iter().find(|duty| duty.randao == Signing::Asked(id)) {
             duty.randao = randao.map_or(Signing::Done, Signing::Signed);
@@ -524,7 +438,7 @@ impl DutySchedule {
         }
     }
 
-    pub fn on_preferences(&mut self, id: RequestId, signature: Option<[u8; 96]>) {
+    pub fn on_preferences(&mut self, id: RequestId, signature: Option<Box<XMSSSignature>>) {
         let asked = self.epochs.iter_mut().flat_map(|entry| &mut entry.proposers.duties);
         if let Some(duty) = asked.into_iter().find(|duty| duty.preferences == Signing::Asked(id)) {
             duty.preferences = signature.map_or(Signing::Done, Signing::Signed);
@@ -544,7 +458,7 @@ impl DutySchedule {
                 continue;
             }
             requests.publish_proposer_preferences(duties.iter().filter_map(|duty| {
-                match duty.preferences {
+                match &duty.preferences {
                     Signing::Signed(signature) => Some(SignedPreferences {
                         message: message(duty, &dependent_root),
                         signature,
@@ -573,11 +487,13 @@ impl DutySchedule {
 
 #[cfg(test)]
 mod tests {
+    use silver_common::ssz_view::{VRF_PROOF_SIZE, XMSSPubkey};
+
     use super::*;
     use crate::beacon_link::{AttesterDuties, SlotDuties, ValidatorIndices};
 
-    const A: [u8; 48] = [0xaa; 48];
-    const B: [u8; 48] = [0xbb; 48];
+    const A: XMSSPubkey = [0xaa; 32];
+    const B: XMSSPubkey = [0xbb; 32];
 
     fn validators() -> Validators {
         let mut validators = Validators::new(vec![A, B]);
@@ -594,12 +510,14 @@ mod tests {
         validators
     }
 
-    fn duties_json(root: u8, duties: &[([u8; 48], u64, u64, u64)]) -> String {
+    /// Index 7 is its committee's first aggregator.
+    fn duties_json(root: u8, duties: &[(XMSSPubkey, u64, u64, u64)]) -> String {
         let data = duties
             .iter()
             .map(|(pubkey, index, committee, slot)| {
+                let position = if *index == 7 { r#","aggregator_position":"0""# } else { "" };
                 format!(
-                    r#"{{"pubkey":"0x{}","validator_index":"{index}","committee_index":"{committee}","committee_length":"1","committees_at_slot":"1","validator_committee_index":"0","slot":"{slot}"}}"#,
+                    r#"{{"pubkey":"0x{}","validator_index":"{index}","committee_index":"{committee}","committee_length":"1","committees_at_slot":"1","validator_committee_index":"0","slot":"{slot}"{position}}}"#,
                     hex::encode(pubkey)
                 )
             })
@@ -631,16 +549,18 @@ mod tests {
 
         let json = duties_json(1, &[(B, 9, 4, 70), (A, 7, 3, 65)]);
         schedule.on_duties(sent[0].0, &AttesterDuties(json.as_bytes()), &validators, 64);
-        let duty = |key, validator_index, committee_index, slot| AttesterDuty {
-            key,
-            validator_index,
-            committee_index,
-            committee_length: 1,
-            committees_at_slot: 1,
-            slot,
-        };
-        assert_eq!(schedule.attesters_at(65), [duty(0, 7, 3, 65)]);
-        assert_eq!(schedule.attesters_at(70), [duty(1, 9, 4, 70)]);
+        let duty =
+            |key, validator_index, committee_index, slot, aggregator_position| AttesterDuty {
+                key,
+                validator_index,
+                committee_index,
+                committee_length: 1,
+                committees_at_slot: 1,
+                slot,
+                aggregator_position,
+            };
+        assert_eq!(schedule.attesters_at(65), [duty(0, 7, 3, 65, Some(0))]);
+        assert_eq!(schedule.attesters_at(70), [duty(1, 9, 4, 70, None)]);
         assert!(schedule.attesters_at(66).is_empty());
         assert!(schedule.attesters_at(97).is_empty());
     }
@@ -712,31 +632,16 @@ mod tests {
     }
 
     #[test]
-    fn selection_proofs_decide_roles_then_subscribe_once() {
+    fn aggregator_positions_mark_aggregators_and_subscribe_once() {
         let validators = validators();
         let mut schedule = DutySchedule::new(false, u64::MAX);
         let mut requests = BeaconRequests::default();
         schedule.roll(2);
         schedule.request_due(64, &validators, &mut requests);
         let fetched = sent(&mut requests)[0].0;
+        sent(&mut requests);
         let json = duties_json(1, &[(A, 7, 3, 65), (B, 9, 4, 70)]);
         schedule.on_duties(fetched, &AttesterDuties(json.as_bytes()), &validators, 64);
-
-        let mut asked = Vec::new();
-        schedule.ask_selections(|duty| {
-            let id = requests.attestation_data(duty.slot);
-            asked.push((id, duty.validator_index));
-            id
-        });
-        schedule.ask_selections(|_| unreachable!("asked once"));
-        assert_eq!(asked.iter().map(|(_, index)| *index).collect::<Vec<_>>(), [7, 9]);
-        sent(&mut requests);
-
-        schedule.subscriptions_due(64, &mut requests);
-        assert!(sent(&mut requests).is_empty(), "roles still unknown");
-
-        schedule.on_selection(asked[0].0, [0x77; 96]);
-        schedule.on_selection_failed(asked[1].0);
 
         schedule.subscriptions_due(64, &mut requests);
         let mut bodies = Vec::new();
@@ -750,8 +655,12 @@ mod tests {
         assert!(flags.eq([serde_json::Value::Bool(true), serde_json::Value::Bool(false)]));
 
         let aggregators = schedule.aggregators_at(65).collect::<Vec<_>>();
-        assert_eq!(aggregators.len(), 1);
-        assert_eq!((aggregators[0].0.validator_index, aggregators[0].1), (7, [0x77; 96]));
+        assert_eq!(aggregators, [AggregatorDuty {
+            key: 0,
+            validator_index: 7,
+            committee: 3,
+            position: 0
+        }]);
         assert_eq!(schedule.aggregators_at(70).count(), 0);
 
         schedule.on_subscription_failed(bodies[0].0, 64);
@@ -765,7 +674,7 @@ mod tests {
         assert!(sent(&mut requests).is_empty());
     }
 
-    fn proposers_json(root: u8, duties: &[([u8; 48], u64, u64)]) -> String {
+    fn proposers_json(root: u8, duties: &[(XMSSPubkey, u64, u64)]) -> String {
         let data = duties
             .iter()
             .map(|(pubkey, index, slot)| {
@@ -799,7 +708,7 @@ mod tests {
             "/eth/v1/validator/duties/attester/3",
             "/eth/v2/validator/duties/proposer/3"
         ]);
-        let json = proposers_json(0xc0, &[(A, 7, 65), ([0xcc; 48], 100, 66)]);
+        let json = proposers_json(0xc0, &[(A, 7, 65), ([0xcc; 32], 100, 66)]);
         schedule.on_proposer_duties(fetches[1].0, &SlotDuties(json.as_bytes()), &validators, 64);
         let duty = ProposerDuty {
             key: 0,
@@ -818,7 +727,10 @@ mod tests {
             id
         });
         schedule.ask_randao(|_| unreachable!("asked once"));
-        schedule.on_randao(asked[0], Some([0x7a; 96]));
-        assert_eq!(schedule.proposer_at(65).unwrap().randao, Signing::Signed([0x7a; 96]));
+        schedule.on_randao(asked[0], Some(Box::new([0x7a; VRF_PROOF_SIZE])));
+        assert_eq!(
+            schedule.proposer_at(65).unwrap().randao,
+            Signing::Signed(Box::new([0x7a; VRF_PROOF_SIZE]))
+        );
     }
 }

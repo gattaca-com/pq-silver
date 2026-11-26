@@ -4,7 +4,6 @@ mod endpoint;
 mod events;
 mod head_stream;
 mod health;
-mod remote_signer;
 mod requests;
 #[cfg(test)]
 mod stub_server;
@@ -21,17 +20,14 @@ use silver_common::Error;
 
 #[cfg(test)]
 pub use self::events::{AttestationData, PayloadAttestationData};
-use self::{beacon_node::BeaconNode, chain::ExpectedGenesis, remote_signer::RemoteSigner};
+use self::{beacon_node::BeaconNode, chain::ExpectedGenesis};
 pub use self::{
     chain::ChainInfo,
-    events::{
-        Aggregate, AttesterDuties, BeaconEvent, ProducedBlock, SignerKeys, SlotDuties,
-        ValidatorIndices,
-    },
+    events::{Aggregate, AttesterDuties, BeaconEvent, ProducedBlock, SlotDuties, ValidatorIndices},
     head_stream::Head,
     requests::{
-        BeaconRequest, BeaconRequests, CommitteeSubscription, ForkInfo, IndexedSignature,
-        RequestId, SignBody, SignPurpose, SignedAggregate, SignedAttestation, SignedPreferences,
+        BeaconRequest, BeaconRequests, CommitteeSubscription, IndexedSignature, RequestId,
+        SignedAggregate, SignedAttestation, SignedPreferences,
     },
 };
 use crate::config::Config;
@@ -51,7 +47,6 @@ pub struct BeaconLink {
     events: Events,
     net: NetworkWithExternalPoll,
     beacon_node: BeaconNode,
-    remote_signer: RemoteSigner,
 }
 
 impl BeaconLink {
@@ -68,7 +63,6 @@ impl BeaconLink {
                 expected,
                 config.spec.slot_duration_ms(),
             )?,
-            remote_signer: RemoteSigner::new(&config.web3signer_url)?,
         })
     }
 
@@ -86,12 +80,8 @@ impl BeaconLink {
         requests: &mut BeaconRequests,
         mut on_event: impl FnMut(BeaconEvent<'_>),
     ) {
-        let Self { poll, events, net, beacon_node, remote_signer } = self;
-        let mut route = |event: NetworkEvent<'_>| {
-            if !remote_signer.on_event(&event) {
-                beacon_node.on_event(&event);
-            }
-        };
+        let Self { poll, events, net, beacon_node } = self;
+        let mut route = |event: NetworkEvent<'_>| beacon_node.on_event(&event);
         net.pre_poll(&mut route);
         if let Err(error) = poll.poll(events, Some(POLL_TIMEOUT.min(net.max_poll_interval()))) {
             silver_log::error!(%error, "poll");
@@ -101,20 +91,15 @@ impl BeaconLink {
         }
         net.post_poll(&mut route);
         beacon_node.drive(net, &mut on_event);
-        remote_signer.drive(net, &mut on_event);
         requests.drain(|id, request, path, body| {
-            if request.is_signing() {
-                remote_signer.send(net, id, request, path, body, &mut on_event);
-            } else {
-                beacon_node.send(net, id, request, path, body, &mut on_event);
-            }
+            beacon_node.send(net, id, request, path, body, &mut on_event)
         });
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use std::time::Instant;
+    use std::{path::PathBuf, time::Instant};
 
     use silver_chain_spec::SpecConfig;
 
@@ -132,31 +117,25 @@ mod tests {
             (SYNCING_PATH, syncing_json(false, false)),
             (EVENTS_ROUTE, head_event(65, 0xab)),
         ]);
-        let signer = stub_node(vec![(
-            "/api/v1/eth2/publicKeys",
-            format!(r#"["0x{}"]"#, hex::encode([0xaa; 48])),
-        )]);
         BeaconLink::new(&Config {
             spec: SpecConfig::mainnet(),
             genesis_validators_root: chain::GENESIS_VALIDATORS_ROOT,
             beacon_node: node,
-            web3signer_url: signer,
+            keys_dir: PathBuf::new(),
+            signer_threads: 1,
             proposals: None,
         })
         .unwrap()
     }
 
     #[test]
-    fn spin_reaches_node_and_signer_over_its_own_poll() {
+    fn spin_reaches_the_node_over_its_own_poll() {
         let mut beacon_link = beacon_link();
         let mut requests = BeaconRequests::default();
-        let mut listed = false;
         let deadline = Instant::now() + Duration::from_secs(5);
-        while beacon_link.chain_info().is_none() || !listed {
-            assert!(Instant::now() < deadline, "no chain info or key listing");
-            beacon_link.spin(&mut requests, |event| {
-                listed |= matches!(event, BeaconEvent::SignerKeys(_));
-            });
+        while beacon_link.chain_info().is_none() {
+            assert!(Instant::now() < deadline, "no chain info");
+            beacon_link.spin(&mut requests, |_| {});
         }
         assert_eq!(beacon_link.chain_info().unwrap().genesis_time, 1606824023);
     }

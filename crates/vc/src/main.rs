@@ -15,6 +15,9 @@ mod block_contents;
 mod clock;
 mod config;
 mod duties;
+mod keys;
+mod signer;
+mod signing;
 mod tile;
 
 const VALIDATOR_CORE: usize = 1;
@@ -25,7 +28,8 @@ fn main() -> Result<(), Box<dyn Error>> {
     silver_log::info!(
         network = %config.spec.network_name(),
         beacon_node = %config.beacon_node,
-        web3signer = %config.web3signer_url,
+        keys_dir = %config.keys_dir.display(),
+        signer_threads = config.signer_threads,
         proposals = ?config.proposals,
         "loaded config"
     );

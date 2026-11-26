@@ -1,13 +1,16 @@
 use serde::Deserialize;
 use serde_json::value::RawValue;
 use silver_common::{
-    json_fields::{bytes, each_array_entry, uint64},
-    ssz_view::{ATTESTATION_DATA_SIZE, PAYLOAD_ATTESTATION_DATA_SIZE},
+    json_fields::{BoundedHex, HexBytes, bytes, each_array_entry, uint64},
+    ssz_view::{
+        ATTESTATION_DATA_SIZE, ATTESTATION_PQ_FIXED, COMMITTEE_BITS_SIZE_PQ, MAX_STARK_PROOF_SIZE,
+        MAX_VALIDATORS_PER_COMMITTEE, PAYLOAD_ATTESTATION_DATA_SIZE, XMSSPubkey,
+    },
 };
 
 use crate::beacon_link::{
     head_stream::Head,
-    requests::{BeaconRequest, RequestId, SignPurpose},
+    requests::{BeaconRequest, RequestId},
 };
 
 pub enum BeaconEvent<'a> {
@@ -20,8 +23,6 @@ pub enum BeaconEvent<'a> {
     PayloadAttestationData { id: RequestId, data: PayloadAttestationData<'a> },
     ProducedBlock { id: RequestId, block: ProducedBlock<'a> },
     Accepted { id: RequestId, request: BeaconRequest },
-    Signed { id: RequestId, purpose: SignPurpose, signature: [u8; 96] },
-    SignerKeys(SignerKeys<'a>),
     Failed { id: RequestId, request: BeaconRequest },
     Head(Head),
 }
@@ -33,8 +34,6 @@ pub struct AttesterDuties<'a>(pub(crate) &'a [u8]);
 pub struct AttestationData<'a>(pub(crate) &'a [u8]);
 
 pub struct Aggregate<'a>(pub(crate) &'a [u8]);
-
-pub struct SignerKeys<'a>(pub(crate) &'a [u8]);
 
 pub struct SlotDuties<'a>(pub(crate) &'a [u8]);
 
@@ -61,7 +60,7 @@ struct ValidatorEntry {
 #[derive(Deserialize)]
 struct Validator {
     #[serde(deserialize_with = "bytes")]
-    pubkey: [u8; 48],
+    pubkey: XMSSPubkey,
 }
 
 impl ValidatorIndices<'_> {
@@ -70,7 +69,7 @@ impl ValidatorIndices<'_> {
     pub fn for_each(
         &self,
         max: usize,
-        mut each: impl FnMut(&[u8; 48], u64),
+        mut each: impl FnMut(&XMSSPubkey, u64),
     ) -> Result<usize, &'static str> {
         let body = serde_json::from_slice::<DataBody>(self.0)
             .map_err(|_| "validators answer is not a data object")?;
@@ -79,33 +78,6 @@ impl ValidatorIndices<'_> {
         })
         .map_err(|_| "validators answer has a malformed or surplus entry")
     }
-}
-
-#[derive(Deserialize)]
-struct Pubkey(#[serde(deserialize_with = "bytes")] [u8; 48]);
-
-impl SignerKeys<'_> {
-    /// web3signer answers a bare JSON array of pubkeys.
-    pub fn for_each(
-        &self,
-        max: usize,
-        mut each: impl FnMut(&[u8; 48]),
-    ) -> Result<usize, &'static str> {
-        each_array_entry(self.0, max, |_, Pubkey(pubkey)| each(&pubkey))
-            .map_err(|_| "web3signer key listing is malformed or too long")
-    }
-}
-
-#[derive(Deserialize)]
-struct SignatureBody {
-    #[serde(deserialize_with = "bytes")]
-    signature: [u8; 96],
-}
-
-/// web3signer's JSON answer to a sign request, as `Accept: application/json`
-/// asks for.
-pub fn parse_signature(body: &[u8]) -> Option<[u8; 96]> {
-    serde_json::from_slice::<SignatureBody>(body).ok().map(|body| body.signature)
 }
 
 #[derive(Deserialize)]
@@ -119,7 +91,7 @@ struct DutiesBody<'a> {
 #[derive(Debug, PartialEq, Eq, Deserialize)]
 pub struct AttesterDuty {
     #[serde(deserialize_with = "bytes")]
-    pub pubkey: [u8; 48],
+    pub pubkey: XMSSPubkey,
     #[serde(deserialize_with = "uint64")]
     pub validator_index: u64,
     #[serde(deserialize_with = "uint64")]
@@ -130,6 +102,15 @@ pub struct AttesterDuty {
     pub committees_at_slot: u64,
     #[serde(deserialize_with = "uint64")]
     pub slot: u64,
+    /// Present only for a member of its committee's aggregation committee.
+    #[serde(default, deserialize_with = "optional_uint64")]
+    pub aggregator_position: Option<u64>,
+}
+
+fn optional_uint64<'de, D: serde::Deserializer<'de>>(
+    deserializer: D,
+) -> Result<Option<u64>, D::Error> {
+    uint64(deserializer).map(Some)
 }
 
 impl AttesterDuties<'_> {
@@ -147,7 +128,7 @@ impl AttesterDuties<'_> {
 #[derive(Debug, PartialEq, Eq, Deserialize)]
 pub struct SlotDuty {
     #[serde(deserialize_with = "bytes")]
-    pub pubkey: [u8; 48],
+    pub pubkey: XMSSPubkey,
     #[serde(deserialize_with = "uint64")]
     pub validator_index: u64,
     #[serde(deserialize_with = "uint64")]
@@ -251,13 +232,48 @@ impl AttestationData<'_> {
     }
 }
 
+/// A served aggregate with its STARK proof: the JSON to publish, and the SSZ
+/// its signing root is hashed over.
+pub struct ProvedAggregate<'a> {
+    pub json: &'a str,
+    pub attestation: Vec<u8>,
+    pub proof: Vec<u8>,
+}
+
+#[derive(Deserialize)]
+struct ProvedJson<'a> {
+    aggregate: AggregateJson,
+    #[serde(borrow)]
+    proof: HexBytes<'a, MAX_STARK_PROOF_SIZE>,
+}
+
+#[derive(Deserialize)]
+struct AggregateJson {
+    aggregation_bits: BoundedHex<{ MAX_VALIDATORS_PER_COMMITTEE / 8 + 1 }>,
+    data: AttestationDataJson,
+    #[serde(deserialize_with = "bytes")]
+    committee_bits: [u8; COMMITTEE_BITS_SIZE_PQ],
+}
+
 impl<'a> Aggregate<'a> {
-    /// The aggregate's JSON object, passed on to the signer and the publish
-    /// untouched.
-    pub fn json(&self) -> Result<&'a str, &'static str> {
+    pub fn parse(&self) -> Result<ProvedAggregate<'a>, &'static str> {
         let DataBody { data } =
             serde_json::from_slice(self.0).map_err(|_| "aggregate answer lacks data")?;
-        Ok(data.get())
+        let ProvedJson { aggregate, proof } =
+            serde_json::from_str(data.get()).map_err(|_| "aggregate answer is malformed")?;
+
+        let bits = aggregate.aggregation_bits.as_bytes();
+        let mut attestation = vec![0; ATTESTATION_PQ_FIXED + bits.len()];
+        attestation[..4].copy_from_slice(&(ATTESTATION_PQ_FIXED as u32).to_le_bytes());
+        let data_ssz = (&mut attestation[4..4 + ATTESTATION_DATA_SIZE]).try_into().expect("sized");
+        aggregate.data.write_ssz(data_ssz);
+        attestation[4 + ATTESTATION_DATA_SIZE..ATTESTATION_PQ_FIXED]
+            .copy_from_slice(&aggregate.committee_bits);
+        attestation[ATTESTATION_PQ_FIXED..].copy_from_slice(bits);
+
+        let mut proof_bytes = vec![0; proof.byte_len()];
+        proof.decode_into(&mut proof_bytes);
+        Ok(ProvedAggregate { json: data.get(), attestation, proof: proof_bytes })
     }
 }
 
@@ -268,10 +284,10 @@ pub mod tests {
     use super::*;
     use crate::beacon_link::requests::tests::{attestation_data_json, attestation_data_ssz};
 
-    pub const PUBKEY_A: [u8; 48] = [0xaa; 48];
-    pub const PUBKEY_B: [u8; 48] = [0xbb; 48];
+    pub const PUBKEY_A: XMSSPubkey = [0xaa; 32];
+    pub const PUBKEY_B: XMSSPubkey = [0xbb; 32];
 
-    pub fn validators_json(entries: &[([u8; 48], u64)]) -> String {
+    pub fn validators_json(entries: &[(XMSSPubkey, u64)]) -> String {
         let data = entries
             .iter()
             .map(|(pubkey, index)| {
@@ -285,7 +301,7 @@ pub mod tests {
         format!(r#"{{"execution_optimistic":false,"finalized":false,"data":[{data}]}}"#)
     }
 
-    pub fn duties_json(dependent_root: u8, duties: &[([u8; 48], u64, u64, u64)]) -> String {
+    pub fn duties_json(dependent_root: u8, duties: &[(XMSSPubkey, u64, u64, u64)]) -> String {
         let data = duties
             .iter()
             .map(|(pubkey, validator_index, committee_index, slot)| {
@@ -341,25 +357,12 @@ pub mod tests {
             committee_length: 128,
             committees_at_slot: 64,
             slot,
+            aggregator_position: None,
         };
         assert_eq!(seen, [duty(PUBKEY_A, 7, 3, 65), duty(PUBKEY_B, 9, 0, 70)]);
 
         assert!(AttesterDuties(json.as_bytes()).for_each(1, |_| {}).is_err());
         assert!(AttesterDuties(br#"{"data":[]}"#).for_each(1, |_| {}).is_err());
-    }
-
-    #[test]
-    fn signer_keys_and_signatures_parse() {
-        let json = format!(r#"["0x{}","0x{}"]"#, hex::encode(PUBKEY_A), hex::encode(PUBKEY_B));
-        let mut seen = Vec::new();
-        SignerKeys(json.as_bytes()).for_each(2, |pubkey| seen.push(*pubkey)).unwrap();
-        assert_eq!(seen, [PUBKEY_A, PUBKEY_B]);
-        assert!(SignerKeys(json.as_bytes()).for_each(1, |_| {}).is_err());
-        assert!(SignerKeys(br#"{"keys":[]}"#).for_each(2, |_| {}).is_err());
-
-        let signature = format!(r#"{{"signature":"0x{}"}}"#, "c1".repeat(96));
-        assert_eq!(parse_signature(signature.as_bytes()), Some([0xc1; 96]));
-        assert_eq!(parse_signature(format!("0x{}", "c1".repeat(96)).as_bytes()), None);
     }
 
     #[test]
@@ -370,11 +373,27 @@ pub mod tests {
     }
 
     #[test]
-    fn aggregate_answer_yields_its_json() {
-        let aggregate = json!({"aggregation_bits": "0x0b", "data": attestation_data_json()});
-        let body = json!({"version": "fulu", "data": aggregate}).to_string();
-        let json = Aggregate(body.as_bytes()).json().unwrap();
-        assert_eq!(serde_json::from_str::<serde_json::Value>(json).unwrap(), aggregate);
-        assert!(Aggregate(b"{}").json().is_err());
+    fn proved_aggregate_answer_yields_its_json_and_ssz() {
+        let proved = json!({
+            "aggregate": {
+                "aggregation_bits": "0x0b",
+                "data": attestation_data_json(),
+                "committee_bits": "0x0800",
+            },
+            "proof": "0xc0ffee",
+        });
+        let body = json!({"version": "pq", "data": proved}).to_string();
+        let parsed = Aggregate(body.as_bytes()).parse().unwrap();
+        assert_eq!(serde_json::from_str::<serde_json::Value>(parsed.json).unwrap(), proved);
+        let expected = [
+            &(ATTESTATION_PQ_FIXED as u32).to_le_bytes()[..],
+            &attestation_data_ssz(),
+            &[0x08, 0x00],
+            &[0x0b],
+        ]
+        .concat();
+        assert_eq!(parsed.attestation, expected);
+        assert_eq!(parsed.proof, [0xc0, 0xff, 0xee]);
+        assert!(Aggregate(b"{}").parse().is_err());
     }
 }

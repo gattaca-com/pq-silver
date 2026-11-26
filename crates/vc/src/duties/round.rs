@@ -1,3 +1,5 @@
+use silver_common::ssz_view::XMSSSignature;
+
 use crate::beacon_link::RequestId;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -9,10 +11,9 @@ pub enum Stage {
     Done,
 }
 
-#[derive(Clone, Copy)]
 enum Signature {
     Awaiting,
-    Signed([u8; 96]),
+    Signed(Box<XMSSSignature>),
     Refused,
 }
 
@@ -72,16 +73,10 @@ impl<T> SlotRound<T> {
         self.pending.push(Pending { id, item, signature: Signature::Awaiting });
     }
 
-    pub fn on_signed(&mut self, id: RequestId, signature: [u8; 96]) {
+    /// A refusal drops only that item's signature.
+    pub fn on_answer(&mut self, id: RequestId, signature: Option<Box<XMSSSignature>>) {
         if let Some(pending) = self.pending_mut(id) {
-            pending.signature = Signature::Signed(signature);
-        }
-    }
-
-    /// Drops only that item's signature.
-    pub fn on_sign_failed(&mut self, id: RequestId) {
-        if let Some(pending) = self.pending_mut(id) {
-            pending.signature = Signature::Refused;
+            pending.signature = signature.map_or(Signature::Refused, Signature::Signed);
         }
     }
 
@@ -89,9 +84,9 @@ impl<T> SlotRound<T> {
         self.pending.iter().all(|pending| !matches!(pending.signature, Signature::Awaiting))
     }
 
-    pub fn signed(&self) -> impl Iterator<Item = (&T, [u8; 96])> {
-        self.pending.iter().filter_map(|pending| match pending.signature {
-            Signature::Signed(signature) => Some((&pending.item, signature)),
+    pub fn signed(&self) -> impl Iterator<Item = (&T, &XMSSSignature)> {
+        self.pending.iter().filter_map(|pending| match &pending.signature {
+            Signature::Signed(signature) => Some((&pending.item, &**signature)),
             Signature::Awaiting | Signature::Refused => None,
         })
     }

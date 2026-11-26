@@ -36,6 +36,7 @@ members = [
   "crates/surfer",
   "crates/columns",
   "crates/telemetry",
+  "crates/vc",
 ]
 resolver = "2"
 
@@ -115,6 +116,8 @@ silver_engine_api = { path = "crates/engine_api" }
 flux = { git = "https://github.com/gattaca-com/flux", rev = "539bf86d97f5d56ff5b7f58cfea6c1bbafbe6714"}
 flux-clickhouse = { git = "https://github.com/gattaca-com/flux", rev = "539bf86d97f5d56ff5b7f58cfea6c1bbafbe6714"}
 flux-disk = { git = "https://github.com/gattaca-com/flux", rev = "539bf86d97f5d56ff5b7f58cfea6c1bbafbe6714"}
+flux-dns = { git = "https://github.com/gattaca-com/flux", rev = "539bf86d97f5d56ff5b7f58cfea6c1bbafbe6714"}
+flux-sse = { git = "https://github.com/gattaca-com/flux", rev = "539bf86d97f5d56ff5b7f58cfea6c1bbafbe6714"}
 flux-network = { git = "https://github.com/gattaca-com/flux", rev = "539bf86d97f5d56ff5b7f58cfea6c1bbafbe6714"}
 flux-utils = { git = "https://github.com/gattaca-com/flux", rev = "539bf86d97f5d56ff5b7f58cfea6c1bbafbe6714", features = ["bytes"]}
 flux-profiler = { git = "https://github.com/gattaca-com/flux", rev = "539bf86d97f5d56ff5b7f58cfea6c1bbafbe6714"}

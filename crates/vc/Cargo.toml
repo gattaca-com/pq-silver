@@ -1,0 +1,36 @@
+[package]
+name = "silver_vc"
+edition.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+version.workspace = true
+
+[[bin]]
+name = "silver-vc"
+path = "src/main.rs"
+
+[dependencies]
+clap.workspace = true
+flux.workspace = true
+flux-dns.workspace = true
+flux-network = { workspace = true, features = ["tls"] }
+flux-sse = { workspace = true, features = ["tls"] }
+hex.workspace = true
+mio.workspace = true
+serde.workspace = true
+serde_json = { workspace = true, features = ["raw_value"] }
+silver_beacon_state_data.workspace = true
+silver_chain_spec.workspace = true
+silver_common.workspace = true
+silver_config.workspace = true
+silver_log.workspace = true
+
+[dev-dependencies]
+silver_common = { workspace = true, features = ["test-util"] }
+
+[features]
+default = ["thread_park"]
+thread_park = ["flux/park"]
+
+[lints]
+workspace = true

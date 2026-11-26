@@ -2886,6 +2886,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "flux-dns"
+version = "0.13.2"
+source = "git+https://github.com/gattaca-com/flux?rev=539bf86d97f5d56ff5b7f58cfea6c1bbafbe6714#539bf86d97f5d56ff5b7f58cfea6c1bbafbe6714"
+dependencies = [
+ "flux-timing",
+ "flux-utils",
+ "rand 0.9.4",
+]
+
+[[package]]
 name = "flux-network"
 version = "0.13.2"
 source = "git+https://github.com/gattaca-com/flux?rev=539bf86d97f5d56ff5b7f58cfea6c1bbafbe6714#539bf86d97f5d56ff5b7f58cfea6c1bbafbe6714"
@@ -2903,9 +2913,11 @@ dependencies = [
  "mio",
  "rand 0.9.4",
  "rustc-hash",
+ "rustls",
  "serde",
  "sha1",
  "tracing",
+ "webpki-roots 1.0.9",
 ]
 
 [[package]]
@@ -2936,6 +2948,15 @@ source = "git+https://github.com/gattaca-com/flux?rev=539bf86d97f5d56ff5b7f58cfe
 dependencies = [
  "quote",
  "syn 2.0.118",
+]
+
+[[package]]
+name = "flux-sse"
+version = "0.13.2"
+source = "git+https://github.com/gattaca-com/flux?rev=539bf86d97f5d56ff5b7f58cfea6c1bbafbe6714#539bf86d97f5d56ff5b7f58cfea6c1bbafbe6714"
+dependencies = [
+ "flux-network",
+ "flux-timing",
 ]
 
 [[package]]
@@ -7315,6 +7336,26 @@ dependencies = [
  "silver_stages",
  "tempfile",
  "toml",
+]
+
+[[package]]
+name = "silver_vc"
+version = "0.1.0-alpha.17"
+dependencies = [
+ "clap",
+ "flux",
+ "flux-dns",
+ "flux-network",
+ "flux-sse",
+ "hex",
+ "mio",
+ "serde",
+ "serde_json",
+ "silver_beacon_state_data",
+ "silver_chain_spec",
+ "silver_common",
+ "silver_config",
+ "silver_log",
 ]
 
 [[package]]

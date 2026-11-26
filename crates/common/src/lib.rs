@@ -56,11 +56,13 @@ pub use silver_ssz::{
     ssz_view,
 };
 pub use tape_scratch::{FrameOut, TapeError, TapeScratch};
+pub use vc_spine::VcSpine;
 #[cfg(any(test, feature = "test-util"))]
 pub mod test_util;
 pub mod ticker;
 pub mod tracing;
 mod util;
+mod vc_spine;
 mod wheel;
 mod wither;
 pub mod xmss;

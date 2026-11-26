@@ -3,20 +3,24 @@ use std::{
     net::{TcpListener, TcpStream},
     sync::Arc,
     thread,
+    time::Duration,
 };
 
 use crate::beacon_link::head_stream::tests::EVENTS_ROUTE;
 
 /// Answers each request on one connection from `routes`, by path. The events
-/// route streams its body as one chunk and stays open.
-pub fn stub_node(routes: Vec<(&'static str, String)>) -> String {
+/// route streams its body as one chunk and stays open. A connection idle for
+/// `idle` is closed, as a node's keep-alive timeout closes it.
+pub fn stub_node(routes: Vec<(&'static str, String)>, idle: Option<Duration>) -> String {
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     let url = format!("http://{}", listener.local_addr().unwrap());
     let routes = Arc::new(routes);
     thread::spawn(move || {
         for stream in listener.incoming() {
             let routes = Arc::clone(&routes);
-            thread::spawn(move || serve(stream.unwrap(), &routes));
+            let stream = stream.unwrap();
+            stream.set_read_timeout(idle).unwrap();
+            thread::spawn(move || serve(stream, &routes));
         }
     });
     url

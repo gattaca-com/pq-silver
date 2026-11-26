@@ -4193,7 +4193,7 @@ source = "git+https://github.com/leanEthereum/leanVM?tag=bindings-v0.19.0#351f7a
 [[package]]
 name = "keccak256"
 version = "0.1.0"
-source = "git+https://github.com/leanEthereum/leanVM?rev=3d84ffc3c866d66f4c632848f8fc6f30a3350f76#3d84ffc3c866d66f4c632848f8fc6f30a3350f76"
+source = "git+https://github.com/leanEthereum/leanVM?rev=351f7ae421529ce164ed747eee1f78bdeaec3e80#351f7ae421529ce164ed747eee1f78bdeaec3e80"
 
 [[package]]
 name = "keccak256_armaes"
@@ -4322,9 +4322,9 @@ dependencies = [
 [[package]]
 name = "lean_xmss"
 version = "0.1.0"
-source = "git+https://github.com/leanEthereum/leanVM?rev=3d84ffc3c866d66f4c632848f8fc6f30a3350f76#3d84ffc3c866d66f4c632848f8fc6f30a3350f76"
+source = "git+https://github.com/leanEthereum/leanVM?rev=351f7ae421529ce164ed747eee1f78bdeaec3e80#351f7ae421529ce164ed747eee1f78bdeaec3e80"
 dependencies = [
- "keccak256 0.1.0 (git+https://github.com/leanEthereum/leanVM?rev=3d84ffc3c866d66f4c632848f8fc6f30a3350f76)",
+ "keccak256 0.1.0 (git+https://github.com/leanEthereum/leanVM?rev=351f7ae421529ce164ed747eee1f78bdeaec3e80)",
 ]
 
 [[package]]
@@ -7364,7 +7364,7 @@ dependencies = [
  "flux-sse",
  "hex",
  "hmac",
- "lean_xmss 0.1.0 (git+https://github.com/leanEthereum/leanVM?rev=3d84ffc3c866d66f4c632848f8fc6f30a3350f76)",
+ "lean_xmss 0.1.0 (git+https://github.com/leanEthereum/leanVM?rev=351f7ae421529ce164ed747eee1f78bdeaec3e80)",
  "mio",
  "serde",
  "serde_json",

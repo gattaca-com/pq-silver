@@ -73,6 +73,14 @@ impl DataRound {
         }
     }
 
+    /// The node has no data for the slot, so there is nothing to sign.
+    pub fn on_no_data(&mut self, id: RequestId) {
+        if self.stage == Stage::Fetching(id) {
+            silver_log::info!(slot = self.slot, kind = self.kind, "nothing to sign: no data");
+            self.stage = Stage::Done;
+        }
+    }
+
     pub fn signed_root(&self, slot: u64) -> Option<&[u8; 32]> {
         match &self.stage {
             Stage::Signing(root) if self.slot == slot => Some(root),

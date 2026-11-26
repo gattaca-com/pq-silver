@@ -69,9 +69,8 @@ impl RemoteCache {
             registered.get(parameter).is_some_and(|(_, registered)| registered == pubkey)
         });
         let unregistered = before - by_parameter.len();
-        if unregistered > 0 {
-            silver_log::warn!(unregistered, url = metadata_url, "listed keys not in genesis");
-        }
+        let usable = by_parameter.len();
+        silver_log::info!(usable, unregistered, url = metadata_url, "remote expanded keys listed");
         Ok(Self { agent, url: url.to_owned(), by_parameter })
     }
 

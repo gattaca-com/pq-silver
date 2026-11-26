@@ -14,6 +14,10 @@ const MAX_HEADERS: usize = 1 + 4;
 
 /// A failed lookup retries at this pace.
 const RESOLVE_RETRY_SECS: u64 = 2;
+/// A node closes a keep-alive connection once it idles (silver's after 5 s),
+/// and a request can go out on it before the close is seen. One resend
+/// covers that; it costs flux a copy of the body.
+const RESENDS: u8 = 1;
 
 enum Connection {
     Resolving { retry_at: Option<Instant> },
@@ -128,7 +132,7 @@ impl HttpEndpoint {
         let Connection::Pooled { pool, .. } = self.connection else { return None };
         let mut all = [("Host", self.authority.as_str()); MAX_HEADERS];
         all[1..=headers.len()].copy_from_slice(headers);
-        http.send(net, pool, method, path, &all[..=headers.len()], body, 0)
+        http.send(net, pool, method, path, &all[..=headers.len()], body, RESENDS)
     }
 }
 

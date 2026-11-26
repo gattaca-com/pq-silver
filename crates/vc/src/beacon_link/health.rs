@@ -3,6 +3,9 @@ use flux_network::http::RequestId;
 use serde::Deserialize;
 
 pub const SYNCING_PATH: &str = "/eth/v1/node/syncing";
+/// A node not yet healthy, such as one syncing after a start, is checked
+/// this often, so duties resume within it rather than within a slot.
+const UNHEALTHY_RECHECK_SECS: u64 = 1;
 
 #[derive(Deserialize)]
 struct SyncingBody {
@@ -41,9 +44,10 @@ impl HealthCheck {
         if now < self.due {
             return false;
         }
-        self.due = now + self.interval;
+        let recheck = Duration::from_secs(UNHEALTHY_RECHECK_SECS);
+        self.due = now + if self.is_healthy() { self.interval } else { recheck };
         if self.in_flight.is_some() {
-            self.judge(Err("no answer within a slot"), url);
+            self.judge(Err("no answer before the next check"), url);
             return false;
         }
         true
@@ -145,18 +149,29 @@ pub mod tests {
     }
 
     #[test]
-    fn checks_fall_due_once_per_interval() {
+    fn an_unhealthy_node_is_checked_each_second_and_a_healthy_one_each_slot() {
         let start = Instant::now();
+        let at = |millis| start + Duration::from_millis(millis);
         let mut next_id = request_ids();
         let mut check = HealthCheck::new(Duration::from_secs(SLOT_SECS), start);
-        assert!(check.is_due(start, URL));
-        let id = next_id();
-        check.sent(Some(id), URL);
-        assert!(check.owns(id) && !check.owns(next_id()));
-        check.on_answer(Some((200, syncing_json(false, false).as_bytes())), URL);
+        let mut answer = |check: &mut HealthCheck, syncing| {
+            let id = next_id();
+            check.sent(Some(id), URL);
+            assert!(check.owns(id));
+            check.on_answer(Some((200, syncing_json(syncing, false).as_bytes())), URL);
+        };
 
-        assert!(!check.is_due(start + Duration::from_secs(SLOT_SECS / 2), URL));
-        assert!(check.is_due(start + Duration::from_secs(SLOT_SECS), URL));
+        assert!(check.is_due(start, URL));
+        answer(&mut check, true);
+        assert!(!check.is_due(at(500), URL));
+        assert!(check.is_due(at(1_000), URL), "a syncing node is checked again within a second");
+        answer(&mut check, false);
+        assert!(check.is_healthy());
+
+        assert!(check.is_due(at(2_000), URL));
+        answer(&mut check, false);
+        assert!(!check.is_due(at(8_000), URL));
+        assert!(check.is_due(at(2_000 + 1_000 * SLOT_SECS), URL), "a healthy one each slot");
     }
 
     #[test]

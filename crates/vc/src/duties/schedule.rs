@@ -17,9 +17,7 @@ pub struct AttesterDuty {
     pub committee_index: u64,
     pub committees_at_slot: u64,
     pub slot: u64,
-    /// Its place in the committee's aggregation committee, which staggers
-    /// aggregators; `None` for an attester only.
-    pub aggregator_position: Option<u64>,
+    pub is_aggregator: bool,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -223,7 +221,7 @@ impl DutySchedule {
                         committee_index: duty.committee_index,
                         committees_at_slot: duty.committees_at_slot,
                         slot: duty.slot,
-                        aggregator_position: duty.aggregator_position,
+                        is_aggregator: duty.is_aggregator(),
                     });
                 }
             })?;
@@ -339,7 +337,7 @@ impl DutySchedule {
                 committee_index: duty.committee_index,
                 committees_at_slot: duty.committees_at_slot,
                 slot: duty.slot,
-                is_aggregator: duty.aggregator_position.is_some(),
+                is_aggregator: duty.is_aggregator,
             });
             entry.subscription = Fetch::InFlight(requests.committee_subscriptions(subscriptions));
         }
@@ -369,7 +367,7 @@ impl DutySchedule {
     }
 
     pub fn aggregators_at(&self, slot: u64) -> impl Iterator<Item = &AttesterDuty> {
-        self.attesters_at(slot).iter().filter(|duty| duty.aggregator_position.is_some())
+        self.attesters_at(slot).iter().filter(|duty| duty.is_aggregator)
     }
 
     pub fn ptc_at(&self, slot: u64) -> &[PtcDuty] {
@@ -463,7 +461,7 @@ mod tests {
         let data = duties
             .iter()
             .map(|(pubkey, index, committee, slot)| {
-                let position = if *index == 7 { r#","aggregator_position":"0""# } else { "" };
+                let position = if *index == 7 { r#","is_aggregator":true"# } else { "" };
                 format!(
                     r#"{{"pubkey":"0x{}","validator_index":"{index}","committee_index":"{committee}","committee_length":"1","committees_at_slot":"1","validator_committee_index":"0","slot":"{slot}"{position}}}"#,
                     hex::encode(pubkey)
@@ -499,17 +497,16 @@ mod tests {
 
         let json = duties_json(1, &[(B, 9, 4, 70), (A, 7, 3, 65)]);
         schedule.on_duties(sent[0].0, &AttesterDuties(json.as_bytes()), &validators, 64);
-        let duty =
-            |key, validator_index, committee_index, slot, aggregator_position| AttesterDuty {
-                key,
-                validator_index,
-                committee_index,
-                committees_at_slot: 1,
-                slot,
-                aggregator_position,
-            };
-        assert_eq!(schedule.attesters_at(65), [duty(0, 7, 3, 65, Some(0))]);
-        assert_eq!(schedule.attesters_at(70), [duty(1, 9, 4, 70, None)]);
+        let duty = |key, validator_index, committee_index, slot, is_aggregator| AttesterDuty {
+            key,
+            validator_index,
+            committee_index,
+            committees_at_slot: 1,
+            slot,
+            is_aggregator,
+        };
+        assert_eq!(schedule.attesters_at(65), [duty(0, 7, 3, 65, true)]);
+        assert_eq!(schedule.attesters_at(70), [duty(1, 9, 4, 70, false)]);
         assert!(schedule.attesters_at(66).is_empty());
         assert!(schedule.attesters_at(97).is_empty());
     }
@@ -584,7 +581,7 @@ mod tests {
     }
 
     #[test]
-    fn aggregator_positions_mark_aggregators_and_subscribe_once() {
+    fn aggregators_are_marked_and_subscribe_once() {
         let validators = validators();
         let mut schedule = DutySchedule::new(false);
         let mut requests = BeaconRequests::default();

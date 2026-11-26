@@ -73,6 +73,10 @@ impl BeaconNode {
         }
     }
 
+    pub fn is_healthy(&self) -> bool {
+        self.health.is_healthy()
+    }
+
     pub fn on_event(&mut self, event: &NetworkEvent<'_>) {
         if !self.http.on_event(event) &&
             let Some(stream) = &mut self.head_stream
@@ -164,6 +168,9 @@ impl BeaconNode {
             let InFlight { id, request, .. } = in_flight.swap_remove(at);
             match answer {
                 Ok(response) if response.status == 200 => on_event(request.answered(id, &response)),
+                Ok(HttpResponse { status: 204, .. }) => {
+                    on_event(BeaconEvent::NoContent { id, request })
+                }
                 Ok(HttpResponse { status, .. }) => {
                     silver_log::warn!(?request, status, "beacon node request refused");
                     on_event(BeaconEvent::Failed { id, request });

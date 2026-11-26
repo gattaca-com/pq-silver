@@ -89,6 +89,11 @@ impl Duties {
             }
             BeaconEvent::Accepted { id, request } => self.on_answered(id, request, true, signs),
             BeaconEvent::Failed { id, request } => self.on_failed(id, request, slot, signs),
+            BeaconEvent::NoContent { id, request } => match request {
+                BeaconRequest::AttestationData => self.attestations.on_no_data(id),
+                BeaconRequest::PayloadAttestationData => self.payload_attestations.on_no_data(id),
+                _ => self.on_failed(id, request, slot, signs),
+            },
             BeaconEvent::Head(head) => {
                 silver_log::debug!(slot = head.slot, block = %hex::encode(head.block), "head");
                 self.schedule.on_head(&head);
@@ -501,7 +506,7 @@ mod tests {
                 })
             };
             let mut aggregator = duty(PUBKEY_A, "7", "3");
-            aggregator["aggregator_position"] = "0".into();
+            aggregator["is_aggregator"] = true.into();
             let answer = json!({
                 "dependent_root": hex32(0xd0),
                 "data": [aggregator, duty(PUBKEY_B, "9", "4")],
@@ -710,6 +715,18 @@ mod tests {
     }
 
     #[test]
+    fn a_slot_the_node_has_no_data_for_signs_nothing() {
+        let mut harness = Harness::attesters();
+        harness.duties.attestations.due(SLOT);
+        harness.duties.fetch_due_data(SLOT, &mut harness.requests);
+        let id = harness.sent()[0].0;
+        harness.event(BeaconEvent::NoContent { id, request: BeaconRequest::AttestationData });
+        assert!(harness.signing().is_empty());
+        harness.duties.fetch_due_data(SLOT, &mut harness.requests);
+        assert!(harness.sent().is_empty(), "the slot's round ended");
+    }
+
+    #[test]
     fn slot_without_duties_asks_for_no_data() {
         let mut harness = Harness::attesters();
         harness.duties.attestations.due(SLOT + 1);
@@ -718,7 +735,7 @@ mod tests {
     }
 
     #[test]
-    fn aggregator_position_subscribes_then_signs_the_proved_aggregate() {
+    fn an_aggregator_subscribes_then_signs_the_proved_aggregate() {
         let mut harness = Harness::attesters();
         harness.duties.schedule.subscriptions_due(SLOT, &mut harness.requests);
         let subscription = harness.sent_json();

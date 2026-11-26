@@ -14,16 +14,52 @@ use crate::beacon_link::{
 };
 
 pub enum BeaconEvent<'a> {
-    ValidatorIndices { id: RequestId, validators: ValidatorIndices<'a> },
-    AttesterDuties { id: RequestId, duties: AttesterDuties<'a> },
-    AttestationData { id: RequestId, data: AttestationData<'a> },
-    AggregateAttestation { id: RequestId, aggregate: Aggregate<'a> },
-    ProposerDuties { id: RequestId, duties: SlotDuties<'a> },
-    PtcDuties { id: RequestId, duties: SlotDuties<'a> },
-    PayloadAttestationData { id: RequestId, data: PayloadAttestationData<'a> },
-    ProducedBlock { id: RequestId, block: ProducedBlock<'a> },
-    Accepted { id: RequestId, request: BeaconRequest },
-    Failed { id: RequestId, request: BeaconRequest },
+    ValidatorIndices {
+        id: RequestId,
+        validators: ValidatorIndices<'a>,
+    },
+    AttesterDuties {
+        id: RequestId,
+        duties: AttesterDuties<'a>,
+    },
+    AttestationData {
+        id: RequestId,
+        data: AttestationData<'a>,
+    },
+    AggregateAttestation {
+        id: RequestId,
+        aggregate: Aggregate<'a>,
+    },
+    ProposerDuties {
+        id: RequestId,
+        duties: SlotDuties<'a>,
+    },
+    PtcDuties {
+        id: RequestId,
+        duties: SlotDuties<'a>,
+    },
+    PayloadAttestationData {
+        id: RequestId,
+        data: PayloadAttestationData<'a>,
+    },
+    ProducedBlock {
+        id: RequestId,
+        block: ProducedBlock<'a>,
+    },
+    Accepted {
+        id: RequestId,
+        request: BeaconRequest,
+    },
+    Failed {
+        id: RequestId,
+        request: BeaconRequest,
+    },
+    /// A 204: the node has nothing to give, such as payload attestation data
+    /// for a slot without a block.
+    NoContent {
+        id: RequestId,
+        request: BeaconRequest,
+    },
     Head(Head),
 }
 
@@ -100,9 +136,20 @@ pub struct AttesterDuty {
     pub committees_at_slot: u64,
     #[serde(deserialize_with = "uint64")]
     pub slot: u64,
-    /// Present only for a member of its committee's aggregation committee.
+    /// Spec `2f43bc0`'s field, which pq-devnet-0 serves.
+    #[serde(default)]
+    is_aggregator: Option<bool>,
+    /// The later spec's staggered aggregators: present only for a member of
+    /// its committee's aggregation committee.
     #[serde(default, deserialize_with = "optional_uint64")]
-    pub aggregator_position: Option<u64>,
+    aggregator_position: Option<u64>,
+}
+
+impl AttesterDuty {
+    /// Whether the node names it an aggregator, in either spec's field.
+    pub fn is_aggregator(&self) -> bool {
+        self.is_aggregator.unwrap_or(self.aggregator_position.is_some())
+    }
 }
 
 fn optional_uint64<'de, D: serde::Deserializer<'de>>(
@@ -350,12 +397,33 @@ pub mod tests {
             committee_index,
             committees_at_slot: 64,
             slot,
+            is_aggregator: None,
             aggregator_position: None,
         };
         assert_eq!(seen, [duty(PUBKEY_A, 7, 3, 65), duty(PUBKEY_B, 9, 0, 70)]);
+        assert!(!seen[0].is_aggregator());
 
         assert!(AttesterDuties(json.as_bytes()).for_each(1, |_| {}).is_err());
         assert!(AttesterDuties(br#"{"data":[]}"#).for_each(1, |_| {}).is_err());
+    }
+
+    #[test]
+    fn either_spec_names_an_aggregator() {
+        let duty = |extra: &str| {
+            let json = format!(
+                r#"{{"pubkey":"0x{}","validator_index":"7","committee_index":"3","committees_at_slot":"1","slot":"65"{extra}}}"#,
+                hex::encode(PUBKEY_A)
+            );
+            serde_json::from_str::<AttesterDuty>(&json).unwrap().is_aggregator()
+        };
+        assert!(!duty(""));
+        assert!(duty(r#","is_aggregator":true"#), "pq-devnet-0's field");
+        assert!(duty(r#","aggregator_position":"2""#), "the later spec's");
+        assert!(!duty(r#","is_aggregator":false"#));
+        assert!(
+            duty(r#","is_aggregator":true,"aggregator_position":"0""#),
+            "both, as silver serves"
+        );
     }
 
     #[test]

@@ -68,7 +68,11 @@ impl Tile<VcSpine> for ValidatorTile {
     fn loop_body(&mut self, _adapter: &mut SpineAdapter<VcSpine>) {
         let Self { beacon_link, duties, signer, requests, signs } = self;
         beacon_link.spin(requests, |event| duties.on_beacon_event(event, signs));
-        if let Some(genesis_time) = beacon_link.genesis_time() {
+        // A request to an unhealthy node fails at once, and its duty retries
+        // only from the next slot. The first tick once healthy starts the slot.
+        if let Some(genesis_time) = beacon_link.genesis_time() &&
+            beacon_link.is_healthy()
+        {
             duties.on_tick(genesis_time, requests, signs);
         }
         if let Some(slot) = duties.current_slot() {

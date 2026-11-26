@@ -74,6 +74,11 @@ impl BeaconLink {
         self.beacon_node.genesis_time()
     }
 
+    /// Requests are refused until it is, so duties wait for it.
+    pub fn is_healthy(&self) -> bool {
+        self.beacon_node.is_healthy()
+    }
+
     /// Sends the queued requests before waiting on the sockets, so a request
     /// queued since the last spin does not wait out the poll timeout.
     pub fn spin(
@@ -113,12 +118,22 @@ mod tests {
         stub_server::stub_node,
     };
 
+    const DATA_PATH: &str = "/eth/v1/validator/attestation_data?slot=65&committee_index=0";
+
     fn beacon_link() -> BeaconLink {
-        let node = stub_node(vec![
-            ("/eth/v1/beacon/genesis", chain::GENESIS.into()),
-            (SYNCING_PATH, syncing_json(false, false)),
-            (EVENTS_ROUTE, head_event(65, 0xab)),
-        ]);
+        beacon_link_closing_after(None)
+    }
+
+    fn beacon_link_closing_after(idle: Option<Duration>) -> BeaconLink {
+        let node = stub_node(
+            vec![
+                ("/eth/v1/beacon/genesis", chain::GENESIS.into()),
+                (SYNCING_PATH, syncing_json(false, false)),
+                (EVENTS_ROUTE, head_event(65, 0xab)),
+                (DATA_PATH, r#"{"data":{}}"#.into()),
+            ],
+            idle,
+        );
         BeaconLink::new(&Config {
             spec: SpecConfig::mainnet(),
             genesis_validators_root: chain::GENESIS_VALIDATORS_ROOT,
@@ -165,6 +180,41 @@ mod tests {
         let head = head.unwrap();
         assert_eq!((head.slot, head.block), (65, [0xab; 32]));
         assert_eq!(head.current_duty_dependent_root, [0xd1; 32]);
+    }
+
+    /// Spins until the node is healthy: its heads count only then.
+    fn healthy(beacon_link: &mut BeaconLink, requests: &mut BeaconRequests) {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let mut head = false;
+        while !head {
+            assert!(Instant::now() < deadline, "never healthy");
+            beacon_link.spin(requests, |event| head |= matches!(event, BeaconEvent::Head(_)));
+        }
+    }
+
+    #[test]
+    fn a_request_on_a_connection_the_node_closed_is_sent_again() {
+        let mut beacon_link = beacon_link_closing_after(Some(Duration::from_millis(50)));
+        let mut requests = BeaconRequests::default();
+        healthy(&mut beacon_link, &mut requests);
+        // The node closes every pooled connection, unseen until the next poll;
+        // the request goes out on one before that poll.
+        std::thread::sleep(Duration::from_millis(200));
+
+        let id = requests.attestation_data(65);
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let mut answer = None;
+        while answer.is_none() {
+            assert!(Instant::now() < deadline, "no answer");
+            beacon_link.spin(&mut requests, |event| match event {
+                BeaconEvent::AttestationData { id: answered, .. } if answered == id => {
+                    answer = Some(true)
+                }
+                BeaconEvent::Failed { id: failed, .. } if failed == id => answer = Some(false),
+                _ => {}
+            });
+        }
+        assert_eq!(answer, Some(true), "the request failed instead of being sent again");
     }
 
     #[test]

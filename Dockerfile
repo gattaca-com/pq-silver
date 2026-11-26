@@ -39,6 +39,10 @@ LABEL org.opencontainers.image.source="https://github.com/gattaca-com/silver" \
 # where `docker logs` never sees them.
 ENV LOG_STDOUT=1
 
+# ethereum-package starts PQ networks with `silver-pq-bn`, the pq-devnet-0
+# sidecar wrapper. leanVM now runs in-process, so the name is plain silver.
+RUN ln -s silver /usr/local/bin/silver-pq-bn
+
 ENTRYPOINT ["/usr/local/bin/silver"]
 
 # Release builds package the exact binaries attached to the GitHub release.

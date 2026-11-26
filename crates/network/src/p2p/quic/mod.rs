@@ -8,6 +8,7 @@ use silver_common::{Keypair, P2pSend, PeerId};
 
 use super::tls;
 
+mod congestion;
 mod gossip_frame;
 mod leased;
 mod peer;
@@ -44,6 +45,7 @@ fn transport_config() -> Arc<quinn_proto::TransportConfig> {
     tc.datagram_receive_buffer_size(None);
     tc.packet_threshold(REORDER_PACKET_THRESHOLD);
     tc.time_threshold(REORDER_TIME_THRESHOLD);
+    tc.congestion_controller_factory(Arc::new(congestion::TolerantCubicConfig));
 
     let mut ack_config = AckFrequencyConfig::default();
     ack_config.ack_eliciting_threshold(VarInt::from_u32(16));

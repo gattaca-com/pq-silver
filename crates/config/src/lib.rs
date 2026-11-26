@@ -135,8 +135,9 @@ impl Default for MetricsConfig {
 
 /// The core each tile's thread is pinned to, and the logger's. Cores may
 /// repeat: an idle tile parks, so tiles can share a core. The leanVM prover
-/// takes physical cores after the highest of these.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+/// takes physical cores after the highest of these. By default every tile
+/// shares core 0, so the prover gets all the other cores.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct TileCores {
     pub control: usize,
@@ -146,20 +147,6 @@ pub struct TileCores {
     pub application_boundary: usize,
     pub data_columns: usize,
     pub log: usize,
-}
-
-impl Default for TileCores {
-    fn default() -> Self {
-        Self {
-            control: 1,
-            network: 2,
-            beacon_state: 3,
-            storage: 4,
-            application_boundary: 5,
-            data_columns: 6,
-            log: silver_log::DEFAULT_LOG_CORE,
-        }
-    }
 }
 
 impl TileCores {
@@ -660,14 +647,13 @@ mod tests {
     }
 
     #[test]
-    fn tile_cores_default_to_one_core_each_and_may_share_one() {
+    fn tile_cores_default_to_core_zero_and_may_spread() {
         let cfg = Config::from_toml("", Overrides::default()).unwrap();
-        assert_eq!(cfg.tile_cores, TileCores::default());
-        assert_eq!(cfg.tile_cores.highest(), silver_log::DEFAULT_LOG_CORE);
-        let toml = "[tile_cores]\ncontrol = 0\nnetwork = 0\nbeacon_state = 0\nstorage = 0\n\
-                    application_boundary = 0\ndata_columns = 0\nlog = 0";
-        let one = Config::from_toml(toml, Overrides::default()).unwrap();
-        assert_eq!(one.tile_cores.highest(), 0);
+        assert_eq!(cfg.tile_cores.highest(), 0);
+        let toml = "[tile_cores]\ncontrol = 1\nnetwork = 2\nbeacon_state = 3\nstorage = 4\n\
+                    application_boundary = 5\ndata_columns = 6\nlog = 7";
+        let spread = Config::from_toml(toml, Overrides::default()).unwrap();
+        assert_eq!(spread.tile_cores.highest(), 7);
         let partial = Config::from_toml("[tile_cores]\nlog = 9", Overrides::default()).unwrap();
         assert_eq!(partial.tile_cores, TileCores { log: 9, ..TileCores::default() });
         assert!(Config::from_toml("[tile_cores]\nleanvm = 1", Overrides::default()).is_err());

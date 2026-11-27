@@ -88,7 +88,7 @@ impl VotePick {
 }
 
 #[derive(Default)]
-pub(in crate::tile::pq_aggregation) struct Merge {
+pub struct Merge {
     running: Option<ProofId>,
     proofs: ArrayVec<ProofPick, MAX_PROOFS>,
     votes: ArrayVec<VotePick, MAX_GROUPS>,
@@ -201,7 +201,7 @@ impl Merge {
         self.proofs.len() + self.shape.signatures
     }
 
-    pub(in crate::tile::pq_aggregation) fn shape(&self) -> &MergeShape {
+    pub fn shape(&self) -> &MergeShape {
         &self.shape
     }
 
@@ -220,12 +220,7 @@ impl Merge {
 
     /// Tells surfer what the merge takes: each picked aggregate, and each
     /// committee's picked votes.
-    pub(in crate::tile::pq_aggregation) fn report(
-        &self,
-        request_id: u64,
-        sources: &ProofSources,
-        producers: &mut Producers,
-    ) {
+    pub fn report(&self, request_id: u64, sources: &ProofSources, producers: &mut Producers) {
         for picked in self.proofs.iter() {
             let group = &picked.aggregate;
             producers.produce(PqEvent::MergeProof {
@@ -244,11 +239,11 @@ impl Merge {
         }
     }
 
-    pub(in crate::tile::pq_aggregation) fn running_id(&self) -> Option<ProofId> {
+    pub fn running_id(&self) -> Option<ProofId> {
         self.running
     }
 
-    pub(in crate::tile::pq_aggregation) fn visit_members(
+    pub fn visit_members(
         &self,
         proofs: &ProofStore,
         sources: &ProofSources,
@@ -279,18 +274,11 @@ impl Merge {
         true
     }
 
-    pub(in crate::tile::pq_aggregation) fn proof_ids(
-        &self,
-    ) -> impl Iterator<Item = ProofId> + use<'_> {
+    pub fn proof_ids(&self) -> impl Iterator<Item = ProofId> + use<'_> {
         self.running.into_iter().chain(self.proofs.iter().map(|picked| picked.id))
     }
 
-    pub(in crate::tile::pq_aggregation) fn write(
-        &self,
-        out: &mut [u8],
-        proofs: &ProofStore,
-        sources: &ProofSources,
-    ) {
+    pub fn write(&self, out: &mut [u8], proofs: &ProofStore, sources: &ProofSources) {
         let proofs = self.proof_ids().map(|id| proofs.bytes(id));
         let votes = self.votes.iter().flat_map(|picked| {
             let group = sources.slot(picked.slot).unwrap().votes.at(picked.index);
@@ -299,12 +287,7 @@ impl Merge {
         RequestBody::write(out, votes, proofs);
     }
 
-    pub(in crate::tile::pq_aggregation) fn request(
-        &self,
-        request_id: u64,
-        body: TCacheRead,
-        proofs: &ProofStore,
-    ) -> LeanVmReq {
+    pub fn request(&self, request_id: u64, body: TCacheRead, proofs: &ProofStore) -> LeanVmReq {
         let mut children = [ProofLen::default(); MAX_PROOFS];
         for (child, id) in children.iter_mut().zip(self.proof_ids()) {
             *child = proofs.len(id);

@@ -414,7 +414,9 @@ impl PqAggregate {
             VALIDATORS,
         );
         let aggregator = (0..VALIDATORS as u64)
-            .find(|&validator| view.is_aggregator(AGGREGATE_SLOT, 0, validator) == Some(true))
+            .find(|&validator| {
+                view.aggregator_position(AGGREGATE_SLOT, 0, validator).flatten().is_some()
+            })
             .expect("committee zero has an aggregator");
         let mut indices = Vec::new();
         let epoch = AGGREGATE_SLOT / SLOTS_PER_EPOCH;

@@ -86,16 +86,6 @@ impl StateReadView<'_> {
         self.epoch.is_pq(self.imm)
     }
 
-    pub fn is_aggregator(
-        &self,
-        slot: Slot,
-        committee_index: usize,
-        validator_index: u64,
-    ) -> Option<bool> {
-        self.aggregator_position(slot, committee_index, validator_index)
-            .map(|position| position.is_some())
-    }
-
     /// The validator's place in the committee's aggregators; `None` outside
     /// the window, `Some(None)` when it is no aggregator.
     pub fn aggregator_position(

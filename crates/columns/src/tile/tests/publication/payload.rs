@@ -2,7 +2,7 @@ use silver_common::{
     BeaconApiRequest, BeaconApiResponse, LocalGossipFailure, PayloadFrame, ProposedPayload,
     column_util::{KzgScratch, verify_data_column_sidecar_kzg_proofs_gloas},
     ssz_view::{ExecutionPayloadEnvelopeView, SignedExecutionPayloadEnvelopeView},
-    test_util::empty_signed_envelope,
+    test_util::{empty_signed_envelope, empty_signed_envelope_pq},
 };
 
 use super::*;
@@ -35,7 +35,16 @@ fn local_gloas_block_persistence_reads_boundary_cache() {
 }
 
 fn proposal(rig: &mut Rig, blobs: &[BlockBlob], cached: bool, bad_proofs: bool) -> ProposedPayload {
-    let signed = empty_signed_envelope(SLOT, ROOT);
+    proposal_signed(rig, empty_signed_envelope(SLOT, ROOT), blobs, cached, bad_proofs)
+}
+
+fn proposal_signed(
+    rig: &mut Rig,
+    signed: Vec<u8>,
+    blobs: &[BlockBlob],
+    cached: bool,
+    bad_proofs: bool,
+) -> ProposedPayload {
     let mut proofs: Vec<_> = blobs
         .iter()
         .flat_map(|blob| blob.proofs.iter().flat_map(|proof| proof.to_bytes().into_inner()))
@@ -81,6 +90,36 @@ fn proposal(rig: &mut Rig, blobs: &[BlockBlob], cached: bool, bad_proofs: bool) 
         payload,
         commitments: tcache_write(&mut rig.state_p, &commitments),
     }
+}
+
+#[test]
+fn submitted_pq_signed_envelope_with_blobs_publishes() {
+    let blobs = [BlockBlob::counting()];
+    let mut rig = Box::new(Rig::gloas(CUSTODY_COLUMNS));
+    rig.follow([0; 32]);
+    rig.turn();
+    rig.drain();
+    rig.inj.consume(|_: BeaconApiRequest, _| {});
+    rig.inj.consume(|_: BeaconApiResponse, _| {});
+    let proposal =
+        proposal_signed(&mut rig, empty_signed_envelope_pq(SLOT, ROOT), &blobs, false, false);
+    rig.inj.produce(BeaconStateEvent::ProposedPayload(proposal));
+    rig.turn();
+    let out = rig.drain();
+    assert_eq!(out.available, 1);
+    assert_eq!(out.receipts.len(), CUSTODY_COLUMNS.count_ones() as usize);
+    let mut responses = Vec::new();
+    rig.inj.consume(|response: BeaconApiResponse, _| responses.push(response));
+    assert!(responses.is_empty(), "{responses:?}");
+    let mut requests = Vec::new();
+    rig.inj.consume(|request: BeaconApiRequest, _| requests.push(request));
+    assert_eq!(requests, [BeaconApiRequest::LocalGossip {
+        request_id: 42,
+        topic: GossipTopic::ExecutionPayload,
+        ssz: proposal.ssz,
+        validation: silver_common::BroadcastValidation::Gossip,
+        hashed_body: None,
+    }]);
 }
 
 #[test]

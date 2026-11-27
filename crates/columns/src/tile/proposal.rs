@@ -17,7 +17,8 @@ use silver_common::{
     ssz_view::{
         BYTES_PER_BLOB, BYTES_PER_CELL, BYTES_PER_KZG_PROOF, BeaconBlockBodyFuluView,
         ExecutionPayloadEnvelopeView, ExecutionPayloadView, NUMBER_OF_COLUMNS,
-        SignedBeaconBlockView, SignedExecutionPayloadEnvelopeView,
+        SignedBeaconBlockView, SignedExecutionPayloadEnvelopePqView,
+        SignedExecutionPayloadEnvelopeView,
     },
 };
 
@@ -270,10 +271,13 @@ impl DataColumnsTile {
         if signed_read.buffer().map_err(|_| LocalGossipFailure::Internal)?.0 != signed {
             return Err(LocalGossipFailure::Internal);
         }
-        if !SignedExecutionPayloadEnvelopeView::check_canonical(signed) {
+        let envelope = if SignedExecutionPayloadEnvelopePqView::check_canonical(signed) {
+            SignedExecutionPayloadEnvelopePqView::message(signed)
+        } else if SignedExecutionPayloadEnvelopeView::check_canonical(signed) {
+            SignedExecutionPayloadEnvelopeView::message(signed)
+        } else {
             return Err(LocalGossipFailure::Invalid);
-        }
-        let envelope = SignedExecutionPayloadEnvelopeView::message(signed);
+        };
         let block_root = *ExecutionPayloadEnvelopeView::beacon_block_root(envelope);
         let slot =
             ExecutionPayloadView::slot_number(ExecutionPayloadEnvelopeView::payload(envelope));

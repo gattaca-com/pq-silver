@@ -1731,6 +1731,7 @@ fn empty_parent_owes_no_columns() {
         source: BlockSource::Rpc,
         parent_slot: Some(1),
         parent_empty: true,
+        stf: None,
     });
 
     let issued = drive_all(&mut e, now);

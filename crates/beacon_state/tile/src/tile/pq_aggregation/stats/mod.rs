@@ -39,7 +39,7 @@ impl Stats {
         ticker: &SlotTicker,
     ) {
         let tracker = &mut self.aggregate_proof_deadlines[deadline_index(last_position)];
-        tracker.record_read(due,  ticker.since_genesis(), ticker.slot_start(slot));
+        tracker.record_read(due, ticker.since_genesis(), ticker.slot_start(slot));
         let early_read_ms = tracker.early_read().as_millis();
         silver_log::debug!(slot, last_position, early_read_ms, "aggregate proof read");
     }

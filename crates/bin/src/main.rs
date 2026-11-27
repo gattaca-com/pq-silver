@@ -1,12 +1,4 @@
-use std::{
-    error::Error,
-    io,
-    net::IpAddr,
-    path::Path,
-    sync::Arc,
-    thread,
-    time::Instant,
-};
+use std::{error::Error, io, net::IpAddr, path::Path, sync::Arc, thread, time::Instant};
 
 use clap::Parser;
 use flux::{

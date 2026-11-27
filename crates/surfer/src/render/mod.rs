@@ -76,7 +76,7 @@ fn draw_footer(f: &mut Frame, area: Rect, app: &App) {
     ];
     if app.pane == Pane::Attestations {
         spans.push(Span::raw(" select ("));
-        spans.push(Span::styled("S", bold));
+        spans.push(Span::styled("Shift", bold));
         spans.push(Span::raw(": page)  "));
     } else {
         spans.push(Span::raw(" select  "));
@@ -87,13 +87,13 @@ fn draw_footer(f: &mut Frame, area: Rect, app: &App) {
             spans.push(Span::raw(action));
         }
     } else if app.pane == Pane::Attestations {
-        let keys = [
-            ("←/→", " slot  "),
-            ("Enter", " expand·jump  "),
-            ("c/v/a", " committees/votes/aggregates  "),
-            ("+/-", " zoom  "),
-        ];
-        for (key, action) in keys {
+        spans.push(Span::styled("←/→", bold));
+        spans.push(Span::raw(" slot  "));
+        if let Some(enter) = app.attestations.enter_action() {
+            spans.push(Span::styled("Enter", bold));
+            spans.push(Span::raw(format!(" {}  ", enter.label())));
+        }
+        for (key, action) in [("c/v/a", " committees/votes/aggregates  "), ("+/-", " zoom  ")] {
             spans.push(Span::styled(key, bold));
             spans.push(Span::raw(action));
         }

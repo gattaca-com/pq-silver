@@ -41,6 +41,29 @@ pub enum Item {
     Job(usize),
 }
 
+#[derive(Clone, Copy)]
+pub enum Enter {
+    ShowCommittee(u8),
+    ShowAllCommittees,
+    FindInTable { index: usize, committee: u8 },
+    ShowMerge { job: usize, select: Item },
+    Expand(Item),
+    Collapse(Item),
+}
+
+impl Enter {
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::ShowCommittee(_) => "only this committee",
+            Self::ShowAllCommittees => "all committees",
+            Self::FindInTable { .. } => "go to table",
+            Self::ShowMerge { .. } => "go to leanVM merge",
+            Self::Expand(_) => "expand",
+            Self::Collapse(_) => "collapse",
+        }
+    }
+}
+
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub enum Focus {
     Timeline,
@@ -224,41 +247,50 @@ impl AttestationsPane {
     /// A committee row filters every part to it; a target or job expands.
     /// From a table, a vote or aggregate opens the proof that took it; from a
     /// proof, an aggregate goes to its row in the table.
-    fn toggle(&mut self) {
-        match self.focused().selected_item() {
-            Some(Item::Committee(committee)) => {
-                self.committee_filter =
-                    (self.committee_filter != Some(committee)).then_some(committee);
+    pub fn enter_action(&self) -> Option<Enter> {
+        let enter = match self.focused().selected_item()? {
+            Item::Committee(committee) if self.committee_filter == Some(committee) => {
+                Enter::ShowAllCommittees
             }
-            Some(Item::Aggregate(index)) if self.focus == Focus::Timeline => {
-                let Some(committee) =
-                    self.data().aggregates.get(index).map(|aggregate| aggregate.committee)
-                else {
-                    return;
-                };
+            Item::Committee(committee) => Enter::ShowCommittee(committee),
+            Item::Aggregate(index) if self.focus == Focus::Timeline => {
+                let committee = self.data().aggregates.get(index)?.committee;
+                Enter::FindInTable { index, committee }
+            }
+            Item::Aggregate(index) => {
+                let (job, _) = self.data().aggregates.get(index)?.used_in?;
+                Enter::ShowMerge { job, select: Item::Aggregate(index) }
+            }
+            Item::Vote(index) => {
+                let vote = self.data().votes.get(index)?;
+                let job = vote.proved_by.or(vote.block_job)?;
+                Enter::ShowMerge { job, select: Item::Job(job) }
+            }
+            item if self.expanded.contains(&item) => Enter::Collapse(item),
+            item => Enter::Expand(item),
+        };
+        Some(enter)
+    }
+
+    fn enter(&mut self) {
+        let Some(enter) = self.enter_action() else { return };
+        match enter {
+            Enter::ShowCommittee(committee) => self.committee_filter = Some(committee),
+            Enter::ShowAllCommittees => self.committee_filter = None,
+            Enter::FindInTable { index, committee } => {
                 if self.committee_filter.is_some_and(|only| only != committee) {
                     self.committee_filter = None;
                 }
                 self.focus = Focus::Aggregates;
                 self.aggregates.pending = Some(Item::Aggregate(index));
             }
-            Some(Item::Aggregate(index)) => {
-                let merged =
-                    self.data().aggregates.get(index).and_then(|aggregate| aggregate.used_in);
-                if let Some((job, _)) = merged {
-                    self.open_job(job, Item::Aggregate(index));
-                }
-            }
-            Some(Item::Vote(index)) => {
-                let vote = self.data().votes.get(index);
-                if let Some(job) = vote.and_then(|vote| vote.proved_by.or(vote.block_job)) {
-                    self.open_job(job, Item::Job(job));
-                }
-            }
-            Some(item @ (Item::Target(_) | Item::Job(_))) if !self.expanded.remove(&item) => {
+            Enter::ShowMerge { job, select } => self.open_job(job, select),
+            Enter::Expand(item) => {
                 self.expanded.insert(item);
             }
-            Some(Item::Target(_) | Item::Job(_)) | None => {}
+            Enter::Collapse(item) => {
+                self.expanded.remove(&item);
+            }
         }
     }
 
@@ -310,7 +342,7 @@ impl AttestationsPane {
             KeyCode::Char('v') => self.focus_on(Focus::Votes),
             KeyCode::Char('a') => self.focus_on(Focus::Aggregates),
             KeyCode::Esc => self.focus = Focus::Timeline,
-            KeyCode::Enter => self.toggle(),
+            KeyCode::Enter => self.enter(),
             KeyCode::Char('+') | KeyCode::Char('=') => self.zoom(0.5),
             KeyCode::Char('-') => self.zoom(2.0),
             _ => return false,

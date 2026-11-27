@@ -1,7 +1,7 @@
 use std::{
-    fs,
+    fs::{self, File},
+    io::Write,
     path::{Path, PathBuf},
-    sync::Mutex,
     time::Instant,
 };
 
@@ -10,66 +10,63 @@ use lean_xmss::{
     internals::{CACHED_BOTTOM_SIZE, CACHED_TREE_SIZE, public_param, scheme_seed},
 };
 use silver_common::{Error, ssz_view::XMSSPubkey};
+use zeroize::Zeroize;
 
-use super::{in_parallel, remote_cache::RemoteCache};
+use super::remote_cache::RemoteCache;
 use crate::keys::ValidatorKey;
 
 pub struct LoadedKey {
     pub pubkey: XMSSPubkey,
     pub xmss: LeanXmssExpandedSecretKey,
-    /// Its expanded-key cache in the data directory.
-    cache: PathBuf,
-    /// The bottom trees the cache file holds, sorted; `None` before the
-    /// file is written.
-    persisted: Mutex<Option<Vec<u32>>>,
+    pub vrf_seed: Box<[u8; 32]>,
 }
 
-/// Expands every key across `threads`: from its cache in `data_dir`, else
-/// from `remote`, else by building its top tree. A cache loads in ~50 µs; a
-/// build takes ~0.3 s, and ~0.3 s more for each bottom tree it then signs in.
+/// A key's expanded-key cache in the data directory.
+pub struct CacheFile {
+    path: PathBuf,
+    /// The bottom trees the file holds, sorted; `None` before it is written.
+    trees: Option<Vec<u32>>,
+}
+
+/// Expands every key: from its cache in `data_dir`, else from `remote`, else
+/// by building its top tree. A cache loads in ~50 µs; a build takes ~0.3 s,
+/// and ~0.3 s more for each bottom tree it then signs in.
 pub fn load(
     keys: &[ValidatorKey],
     data_dir: &Path,
     remote: Option<&RemoteCache>,
-    threads: usize,
-) -> Result<Vec<LoadedKey>, Error> {
+) -> Result<Vec<(LoadedKey, CacheFile)>, Error> {
     let started = Instant::now();
     let caches = keys.iter().map(|key| Cache::of(key, data_dir)).collect::<Vec<_>>();
-    let mut loaded = in_parallel(&caches, threads, |cache| cache.load_local());
+    let mut loaded = caches.iter().map(Cache::load_local).collect::<Vec<_>>();
     let local = loaded.iter().flatten().count();
 
-    let missing = (0..keys.len()).filter(|&i| loaded[i].is_none()).collect::<Vec<_>>();
-    let mut fetched = vec![None; missing.len()];
+    let mut remote_loaded = 0;
     if let Some(remote) = remote {
+        let missing = (0..keys.len()).filter(|&i| loaded[i].is_none()).collect::<Vec<_>>();
         let parameters = missing.iter().map(|&i| caches[i].parameter).collect::<Vec<_>>();
-        let runs = remote.runs(&parameters);
-        for run in
-            in_parallel(&runs, threads, |run| remote.fetch(run).map(Iterator::collect::<Vec<_>>))
-        {
-            match run {
-                Ok(records) => records
-                    .into_iter()
-                    .for_each(|(at, pubkey, bytes)| fetched[at] = Some((pubkey, bytes))),
-                Err(error) => silver_log::warn!(error, "remote expanded keys not fetched"),
+        for run in remote.runs(&parameters) {
+            let bytes = match remote.fetch(&run) {
+                Ok(bytes) => bytes,
+                Err(error) => {
+                    silver_log::warn!(error, "remote expanded keys not fetched");
+                    continue;
+                }
+            };
+            for (at, pubkey, record) in run.records(&bytes) {
+                let i = missing[at];
+                loaded[i] = caches[i].load_remote(pubkey, record);
+                remote_loaded += usize::from(loaded[i].is_some());
             }
         }
     }
 
-    let jobs = missing.iter().copied().zip(fetched).collect::<Vec<_>>();
-    let finished = in_parallel(&jobs, threads, |(i, fetched)| {
-        caches[*i].load_remote_or_build(&keys[*i], fetched.as_ref())
-    });
-    let (mut remote, mut built) = (0, 0);
-    for ((i, _), result) in jobs.iter().zip(finished) {
-        let (key, from_remote) = result?;
-        if from_remote {
-            remote += 1
-        } else {
-            built += 1
-        }
-        loaded[*i] = Some(key);
+    let mut built = 0;
+    for (cache, key) in caches.iter().zip(&mut loaded).filter(|(_, key)| key.is_none()) {
+        *key = Some(cache.build()?);
+        built += 1;
     }
-    silver_log::info!(local, remote, built, elapsed = ?started.elapsed(), "keys expanded");
+    silver_log::info!(local, remote = remote_loaded, built, elapsed = ?started.elapsed(), "keys expanded");
     Ok(loaded.into_iter().map(|key| key.expect("every key loaded")).collect())
 }
 
@@ -94,69 +91,80 @@ impl<'a> Cache<'a> {
 
     /// A cache file is the pubkey, then leanVM's `cache_to_bytes`. It holds no
     /// secret, and loads only through `from_cache_bytes`.
-    fn load_local(&self) -> Option<LoadedKey> {
+    fn load_local(&self) -> Option<(LoadedKey, CacheFile)> {
         let file = fs::read(&self.path).ok()?;
         let (pubkey, bytes) = file.split_first_chunk::<32>()?;
         let xmss = self.stated(pubkey).then(|| from_cache(&self.key.privkey, pubkey, bytes))??;
-        let persisted = Mutex::new(Some(cached_trees(bytes)));
-        Some(LoadedKey { pubkey: *pubkey, xmss, cache: self.path.clone(), persisted })
+        let vrf_seed = self.key.vrf_seed.clone();
+        let cache = CacheFile { path: self.path.clone(), trees: Some(cached_trees(bytes)) };
+        Some((LoadedKey { pubkey: *pubkey, xmss, vrf_seed }, cache))
     }
 
-    /// Whether it loaded from `fetched`.
-    fn load_remote_or_build(
-        &self,
-        key: &ValidatorKey,
-        fetched: Option<&(XMSSPubkey, Vec<u8>)>,
-    ) -> Result<(LoadedKey, bool), Error> {
-        let source = key.source.display();
-        let remote = fetched.and_then(|(pubkey, bytes)| {
-            if !self.stated(pubkey) {
-                silver_log::warn!(%source, "remote key differs from the stated one");
-                return None;
-            }
-            let xmss = from_cache(&key.privkey, pubkey, bytes);
-            if xmss.is_none() {
-                silver_log::warn!(%source, "remote expanded key refused");
-            }
-            Some((*pubkey, xmss?))
-        });
-        let from_remote = remote.is_some();
-        let (pubkey, xmss) = match remote {
-            Some(loaded) => loaded,
-            None => {
-                let (xmss, pubkey) = lean_xmss::key_gen(&key.privkey);
-                (pubkey.to_bytes(), xmss)
-            }
+    /// A refused record leaves the key to be built.
+    fn load_remote(&self, pubkey: &XMSSPubkey, bytes: &[u8]) -> Option<(LoadedKey, CacheFile)> {
+        let source = self.key.source.display();
+        if !self.stated(pubkey) {
+            silver_log::warn!(%source, "remote key differs from the stated one");
+            return None;
+        }
+        let Some(xmss) = from_cache(&self.key.privkey, pubkey, bytes) else {
+            silver_log::warn!(%source, "remote expanded key refused");
+            return None;
         };
+        Some(self.persisted(*pubkey, xmss))
+    }
+
+    fn build(&self) -> Result<(LoadedKey, CacheFile), Error> {
+        let (xmss, pubkey) = lean_xmss::key_gen(&self.key.privkey);
+        let pubkey = pubkey.to_bytes();
         if !self.stated(&pubkey) {
+            let source = self.key.source.display();
             return Err(Error::ConfigError(format!(
                 "key file {source}: privkey does not derive pubkey"
             )));
         }
-        let key = LoadedKey { pubkey, xmss, cache: self.path.clone(), persisted: Mutex::default() };
-        key.persist();
-        Ok((key, from_remote))
+        Ok(self.persisted(pubkey, xmss))
+    }
+
+    fn persisted(
+        &self,
+        pubkey: XMSSPubkey,
+        xmss: LeanXmssExpandedSecretKey,
+    ) -> (LoadedKey, CacheFile) {
+        let key = LoadedKey { pubkey, xmss, vrf_seed: self.key.vrf_seed.clone() };
+        let mut cache = CacheFile { path: self.path.clone(), trees: None };
+        cache.persist(&key);
+        (key, cache)
     }
 }
 
-impl LoadedKey {
-    /// Rewrites the cache file when the key holds trees the file lacks, so a
-    /// restart signs without building them again. The file is replaced whole:
-    /// a crash leaves the old one or the new one.
-    pub fn persist(&self) {
-        let bytes = self.xmss.cache_to_bytes();
+impl Drop for LoadedKey {
+    fn drop(&mut self) {
+        self.vrf_seed.zeroize();
+    }
+}
+
+impl CacheFile {
+    /// Rewrites the file when `key` holds trees the file lacks, so a restart
+    /// signs without building them again. The file is replaced whole: a
+    /// crash leaves the old one or the new one.
+    pub fn persist(&mut self, key: &LoadedKey) {
+        let bytes = key.xmss.cache_to_bytes();
         let trees = cached_trees(&bytes);
-        let mut persisted = self.persisted.lock().expect("cache lock");
-        if persisted.as_ref() == Some(&trees) {
+        if self.trees.as_ref() == Some(&trees) {
             return;
         }
-        let partial = self.cache.with_extension("xmss.partial");
-        let written = fs::write(&partial, [&self.pubkey[..], &bytes].concat())
-            .and_then(|()| fs::rename(&partial, &self.cache));
+        let partial = self.path.with_extension("xmss.partial");
+        let written = File::create(&partial)
+            .and_then(|mut file| {
+                file.write_all(&key.pubkey)?;
+                file.write_all(&bytes)
+            })
+            .and_then(|()| fs::rename(&partial, &self.path));
         match written {
-            Ok(()) => *persisted = Some(trees),
+            Ok(()) => self.trees = Some(trees),
             Err(error) => {
-                silver_log::warn!(%error, path = %self.cache.display(), "expanded key not cached")
+                silver_log::warn!(%error, path = %self.path.display(), "expanded key not cached")
             }
         }
     }
@@ -179,7 +187,9 @@ fn from_cache(
 fn cached_trees(cache: &[u8]) -> Vec<u32> {
     let bottoms = cache.get(CACHED_TREE_SIZE..).unwrap_or_default();
     let mut trees = bottoms
-        .chunks_exact(CACHED_BOTTOM_SIZE)
+        .as_chunks::<CACHED_BOTTOM_SIZE>()
+        .0
+        .iter()
         .map(|tree| u32::from_le_bytes(*tree.first_chunk().expect("4 bytes")))
         .collect::<Vec<_>>();
     trees.sort_unstable();
@@ -250,37 +260,42 @@ mod tests {
         url
     }
 
-    fn load_alone(key: &ValidatorKey, dir: &Path, remote: Option<&RemoteCache>) -> LoadedKey {
-        load(std::slice::from_ref(key), dir, remote, 1).unwrap().pop().unwrap()
+    fn load_alone(
+        key: &ValidatorKey,
+        dir: &Path,
+        remote: Option<&RemoteCache>,
+    ) -> (LoadedKey, CacheFile) {
+        load(std::slice::from_ref(key), dir, remote).unwrap().pop().unwrap()
     }
 
     #[test]
     fn a_built_key_is_cached_and_reloads_from_the_cache() {
         let dir = tempfile::tempdir().unwrap();
-        let built = load_alone(&key(1), dir.path(), None);
-        let local = Cache::of(&key(1), dir.path()).load_local().expect("cached");
+        let (built, cache) = load_alone(&key(1), dir.path(), None);
+        let (local, _) = Cache::of(&key(1), dir.path()).load_local().expect("cached");
         assert_eq!(local.pubkey, built.pubkey);
 
-        fs::write(&built.cache, [0; 40]).unwrap();
+        fs::write(&cache.path, [0; 40]).unwrap();
         assert!(Cache::of(&key(1), dir.path()).load_local().is_none(), "a refused cache");
-        assert_eq!(load_alone(&key(1), dir.path(), None).pubkey, built.pubkey);
+        assert_eq!(load_alone(&key(1), dir.path(), None).0.pubkey, built.pubkey);
     }
 
     #[test]
     fn a_cache_is_rewritten_only_for_a_new_tree() {
         let dir = tempfile::tempdir().unwrap();
-        let loaded = load_alone(&key(1), dir.path(), None);
+        let (loaded, mut cache) = load_alone(&key(1), dir.path(), None);
         loaded.xmss.prepare(1 << 15);
-        loaded.persist();
-        assert_eq!(*loaded.persisted.lock().unwrap(), Some(vec![0]));
+        cache.persist(&loaded);
+        assert_eq!(cache.trees, Some(vec![0]));
 
-        fs::remove_file(&loaded.cache).unwrap();
+        fs::remove_file(&cache.path).unwrap();
         loaded.xmss.prepare((1 << 15) + 1);
-        loaded.persist();
-        assert!(!loaded.cache.exists(), "the same tree is not written again");
+        cache.persist(&loaded);
+        assert!(!cache.path.exists(), "the same tree is not written again");
         loaded.xmss.prepare(FIRST_SLOT_TREE);
-        loaded.persist();
-        assert_eq!(Cache::of(&key(1), dir.path()).load_local().unwrap().pubkey, loaded.pubkey);
+        cache.persist(&loaded);
+        let (reloaded, _) = Cache::of(&key(1), dir.path()).load_local().unwrap();
+        assert_eq!(reloaded.pubkey, loaded.pubkey);
     }
 
     #[test]
@@ -295,20 +310,19 @@ mod tests {
         let three = key(3);
         let fetched = Cache::of(&three, dir.path());
         let runs = remote.runs(&[fetched.parameter]);
-        let (_, pubkey, bytes) = remote.fetch(&runs[0]).unwrap().next().unwrap();
-        assert_eq!(pubkey, pubkeys[1]);
-        let (loaded, from_remote) =
-            fetched.load_remote_or_build(&key(3), Some(&(pubkey, bytes))).unwrap();
-        assert!(from_remote);
+        let bytes = remote.fetch(&runs[0]).unwrap();
+        let (_, pubkey, record) = runs[0].records(&bytes).next().unwrap();
+        assert_eq!(*pubkey, pubkeys[1]);
+        let (loaded, _) = fetched.load_remote(pubkey, record).expect("from the remote record");
         assert_eq!(loaded.pubkey, pubkeys[1]);
         assert!(fetched.load_local().is_some(), "the record was cached locally");
 
-        assert_eq!(load_alone(&key(2), dir.path(), Some(&remote)).pubkey, pubkeys[0]);
+        assert_eq!(load_alone(&key(2), dir.path(), Some(&remote)).0.pubkey, pubkeys[0]);
         assert!(remote.runs(&[Cache::of(&key(4), dir.path()).parameter]).is_empty());
         let mut stated = key(2);
         stated.pubkey = Some([0xee; 32]);
         let fresh = tempfile::tempdir().unwrap();
-        assert!(load(&[stated], fresh.path(), Some(&remote), 1).is_err());
+        assert!(load(&[stated], fresh.path(), Some(&remote)).is_err());
     }
 
     #[test]

@@ -22,7 +22,7 @@ use crate::{
             ProducedBlock, SlotDuties, ValidatorIndices,
         },
     },
-    block_contents::GloasBlockContents,
+    block_contents::BlockContents,
 };
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -41,7 +41,10 @@ pub enum BeaconRequest {
     PublishBlock,
     PtcDuties,
     PayloadAttestationData,
-    PublishEnvelope,
+    /// With its blobs, or bare.
+    PublishEnvelope {
+        blobs: bool,
+    },
     Publish(Batch),
 }
 
@@ -86,16 +89,17 @@ impl BeaconRequest {
             Self::ProduceBlock |
             Self::PublishBlock |
             Self::PtcDuties |
-            Self::PublishEnvelope |
+            Self::PublishEnvelope { .. } |
             Self::Publish(_) => "POST",
         }
     }
 
     pub fn consensus_version(self) -> Option<&'static str> {
         match self {
-            Self::ProduceBlock | Self::PublishBlock | Self::PublishEnvelope | Self::Publish(_) => {
-                Some(ForkName::Pq.name())
-            }
+            Self::ProduceBlock |
+            Self::PublishBlock |
+            Self::PublishEnvelope { .. } |
+            Self::Publish(_) => Some(ForkName::Pq.name()),
             Self::ValidatorIndices |
             Self::AttesterDuties |
             Self::AttestationData |
@@ -110,13 +114,14 @@ impl BeaconRequest {
 
     pub fn media_type(self) -> &'static str {
         match self {
-            Self::ProduceBlock | Self::PublishBlock | Self::PublishEnvelope => SSZ,
+            Self::ProduceBlock | Self::PublishBlock | Self::PublishEnvelope { .. } => SSZ,
             _ => JSON,
         }
     }
 
     pub fn extra_header(self) -> Option<(&'static str, &'static str)> {
-        matches!(self, Self::PublishEnvelope).then_some(("Eth-Blob-Data-Included", "true"))
+        let Self::PublishEnvelope { blobs } = self else { return None };
+        Some(("Eth-Blob-Data-Included", if blobs { "true" } else { "false" }))
     }
 
     pub fn answered<'a>(self, id: RequestId, response: &HttpResponse<'a>) -> BeaconEvent<'a> {
@@ -149,7 +154,7 @@ impl BeaconRequest {
             Self::CommitteeSubscriptions |
             Self::PrepareProposers |
             Self::PublishBlock |
-            Self::PublishEnvelope |
+            Self::PublishEnvelope { .. } |
             Self::Publish(_) => BeaconEvent::Accepted { id, request: self },
         }
     }
@@ -249,11 +254,12 @@ impl BeaconRequests {
         &mut self,
         slot: u64,
         committee_index: u64,
+        aggregator_position: u8,
         attestation_data_root: &[u8; 32],
     ) -> RequestId {
         let root = Hex(attestation_data_root);
         let path = self.path(format_args!(
-            "/eth/v2/validator/aggregate_attestation?attestation_data_root=0x{root}&slot={slot}&committee_index={committee_index}"
+            "/eth/v2/validator/aggregate_attestation?attestation_data_root=0x{root}&slot={slot}&committee_index={committee_index}&aggregator_position={aggregator_position}"
         ));
         let start = self.bodies.len();
         self.push(BeaconRequest::AggregateAttestation, path, start)
@@ -331,25 +337,32 @@ impl BeaconRequests {
         self.push(BeaconRequest::PublishBlock, path, start)
     }
 
+    /// The signed envelope alone when it has no blobs, else with its blobs
+    /// and their proofs.
     pub fn publish_envelope(
         &mut self,
-        contents: &GloasBlockContents<'_>,
+        contents: &BlockContents<'_>,
         signature: &XMSSSignature,
     ) -> RequestId {
         const SIGNED_ENVELOPE_FIXED: usize = 4 + XMSS_SIGNATURE_SIZE;
         let path = self.path(format_args!("/eth/v1/beacon/execution_payload_envelopes"));
         let start = self.bodies.len();
-        let proofs_at = 3 * 4 + SIGNED_ENVELOPE_FIXED + contents.envelope.len();
-        let blobs_at = proofs_at + contents.kzg_proofs.len();
-        for offset in [3 * 4, proofs_at, blobs_at] {
-            self.bodies.extend_from_slice(&(offset as u32).to_le_bytes());
+        let blobs = !contents.blobs.is_empty();
+        if blobs {
+            let proofs_at = 3 * 4 + SIGNED_ENVELOPE_FIXED + contents.envelope.len();
+            let blobs_at = proofs_at + contents.kzg_proofs.len();
+            for offset in [3 * 4, proofs_at, blobs_at] {
+                self.bodies.extend_from_slice(&(offset as u32).to_le_bytes());
+            }
         }
         self.bodies.extend_from_slice(&(SIGNED_ENVELOPE_FIXED as u32).to_le_bytes());
         self.bodies.extend_from_slice(signature);
         self.bodies.extend_from_slice(contents.envelope);
-        self.bodies.extend_from_slice(contents.kzg_proofs);
-        self.bodies.extend_from_slice(contents.blobs);
-        self.push(BeaconRequest::PublishEnvelope, path, start)
+        if blobs {
+            self.bodies.extend_from_slice(contents.kzg_proofs);
+            self.bodies.extend_from_slice(contents.blobs);
+        }
+        self.push(BeaconRequest::PublishEnvelope { blobs }, path, start)
     }
 
     pub fn ptc_duties(
@@ -668,7 +681,7 @@ pub mod tests {
             slot: 65,
             is_aggregator: true,
         }]);
-        requests.aggregate_attestation(65, 3, &[0xab; 32]);
+        requests.aggregate_attestation(65, 3, 2, &[0xab; 32]);
         assert_eq!(bodies(&mut requests), [
             (
                 "/eth/v1/validator/beacon_committee_subscriptions".to_owned(),
@@ -676,7 +689,7 @@ pub mod tests {
             ),
             (
                 format!(
-                    "/eth/v2/validator/aggregate_attestation?attestation_data_root=0x{}&slot=65&committee_index=3",
+                    "/eth/v2/validator/aggregate_attestation?attestation_data_root=0x{}&slot=65&committee_index=3&aggregator_position=2",
                     "ab".repeat(32)
                 ),
                 Value::Null
@@ -747,7 +760,7 @@ pub mod tests {
         let end = 16 + block.len() + envelope.len();
         let produced =
             [&at(16)[..], &at(16 + block.len()), &at(end), &at(end), &block, &envelope].concat();
-        let contents = GloasBlockContents::parse(&produced).unwrap();
+        let contents = BlockContents::parse(&produced).unwrap();
         let signatures = [[0xc1; XMSS_SIGNATURE_SIZE], [0xc2; XMSS_SIGNATURE_SIZE]];
         requests.publish_block(contents.block, &signatures[0]);
         requests.publish_envelope(&contents, &signatures[1]);
@@ -759,9 +772,41 @@ pub mod tests {
         let signed_block = [&at(signed_at)[..], &signatures[0], &block].concat();
         assert_eq!(sent[0], ("/eth/v2/beacon/blocks".to_owned(), None, signed_block));
         assert_eq!(sent[1].0, "/eth/v1/beacon/execution_payload_envelopes");
-        assert_eq!(sent[1].1, Some(("Eth-Blob-Data-Included", "true")));
+        assert_eq!(sent[1].1, Some(("Eth-Blob-Data-Included", "false")), "no blobs");
         let signed_envelope = [&at(signed_at)[..], &signatures[1], &envelope].concat();
-        let end = 12 + signed_envelope.len();
-        assert_eq!(sent[1].2, [&at(12)[..], &at(end), &at(end), &signed_envelope].concat());
+        assert_eq!(sent[1].2, signed_envelope, "the signed envelope alone");
+    }
+
+    #[test]
+    fn an_envelope_with_blobs_publishes_them_with_it() {
+        let mut requests = BeaconRequests::default();
+        let (block, envelope, proofs, blobs) = ([0x0b; 84], [0x0e; 60], [0x0f; 48], [0x0a; 64]);
+        let at = |offset: usize| (offset as u32).to_le_bytes();
+        let proofs_at = 16 + block.len() + envelope.len();
+        let blobs_at = proofs_at + proofs.len();
+        let produced = [
+            &at(16)[..],
+            &at(16 + block.len()),
+            &at(proofs_at),
+            &at(blobs_at),
+            &block,
+            &envelope,
+            &proofs,
+            &blobs,
+        ]
+        .concat();
+        let contents = BlockContents::parse(&produced).unwrap();
+        let signature = [0xc2; XMSS_SIGNATURE_SIZE];
+        requests.publish_envelope(&contents, &signature);
+        let mut sent = Vec::new();
+        requests.drain(|_, request, _, body| sent.push((request.extra_header(), body.to_vec())));
+        assert_eq!(sent[0].0, Some(("Eth-Blob-Data-Included", "true")));
+        let signed_envelope = [&at(4 + XMSS_SIGNATURE_SIZE)[..], &signature, &envelope].concat();
+        let proofs_at = 12 + signed_envelope.len();
+        let blobs_at = proofs_at + proofs.len();
+        let expected =
+            [&at(12)[..], &at(proofs_at), &at(blobs_at), &signed_envelope, &proofs, &blobs]
+                .concat();
+        assert_eq!(sent[0].1, expected);
     }
 }

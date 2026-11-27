@@ -4,24 +4,25 @@ use silver_beacon_state_data::{
 };
 use silver_common::{
     ssz_hash::hash_beacon_block_header_bytes,
-    ssz_hash_gloas::ExecutionRequestsView,
+    ssz_hash_pq::ExecutionRequestsPqView,
     ssz_view::{
-        BEACON_BLOCK_HEADER_SIZE, BeaconBlockBodyGloasView, BeaconBlockHeaderView,
+        BEACON_BLOCK_HEADER_SIZE, BeaconBlockBodyPqView, BeaconBlockHeaderView,
         ExecutionPayloadEnvelopeView, ExecutionPayloadView, PROPOSER_PREFERENCES_SIZE,
         ProposerPreferencesView, XMSSSignature,
     },
+    vc_spine::SignPurpose,
     xmss::SlotDuty,
 };
 
 use crate::{
     beacon_link::{BeaconRequests, ProducedBlock, RequestId},
-    block_contents::GloasBlockContents,
+    block_contents::BlockContents,
     config::ProposalConfig,
     duties::{
         schedule::{DutySchedule, Fetch, Reveal},
         validators::Validators,
     },
-    signing::{SignPurpose, SignRequests, SigningDomains},
+    signing::{SignRequests, SigningDomains},
 };
 
 const BEACON_BLOCK_FIXED: usize = 8 + 8 + 32 + 32 + 4;
@@ -41,9 +42,8 @@ impl Produced {
         self.payload_included = block.payload_included;
     }
 
-    fn contents(&self) -> Option<Result<GloasBlockContents<'_>, &'static str>> {
-        self.payload_included
-            .then(|| GloasBlockContents::parse(&self.ssz).ok_or("contents misframed"))
+    fn contents(&self) -> Option<Result<BlockContents<'_>, &'static str>> {
+        self.payload_included.then(|| BlockContents::parse(&self.ssz).ok_or("contents misframed"))
     }
 
     fn block(&self) -> &[u8] {
@@ -61,7 +61,7 @@ impl Produced {
                 ExecutionPayloadView::check_canonical_gloas(
                     ExecutionPayloadEnvelopeView::payload(envelope),
                 ) &&
-                ExecutionRequestsView::check_canonical(
+                ExecutionRequestsPqView::check_canonical(
                     ExecutionPayloadEnvelopeView::execution_requests(envelope),
                 );
             if !envelope_ok {
@@ -75,13 +75,13 @@ impl Produced {
             return Err("block body offset is not canonical");
         }
         let body = &block[BEACON_BLOCK_FIXED..];
-        if !BeaconBlockBodyGloasView::check_canonical(body) {
+        if !BeaconBlockBodyPqView::check_canonical(body) {
             return Err("block body malformed");
         }
         let mut header = [0; BEACON_BLOCK_HEADER_SIZE];
         header[..HEADER_BEFORE_BODY_ROOT].copy_from_slice(&fixed[..HEADER_BEFORE_BODY_ROOT]);
         header[HEADER_BEFORE_BODY_ROOT..]
-            .copy_from_slice(&BeaconBlockBodyGloasView::hash_tree_root(body));
+            .copy_from_slice(&BeaconBlockBodyPqView::hash_tree_root(body));
         Ok(header)
     }
 }
@@ -336,7 +336,7 @@ impl Proposer {
             silver_log::error!(slot = self.slot, "no XMSS leaf for the envelope");
             return false;
         };
-        let root = ExecutionPayloadEnvelopeView::hash_tree_root(envelope);
+        let root = ExecutionPayloadEnvelopeView::hash_tree_root_pq(envelope);
         let signing_root = domains.signing_root(DOMAIN_BEACON_BUILDER, self.slot, &root);
         signs.sign(self.slot, SignPurpose::Envelope, validators.pubkey(key), leaf, signing_root);
         true

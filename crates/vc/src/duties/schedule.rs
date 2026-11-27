@@ -1,5 +1,6 @@
 use std::ops::Range;
 
+use silver_beacon_state_data::AGGREGATORS_PER_COMMITTEE;
 use silver_common::{SLOTS_PER_EPOCH, ssz_view::VRFProof};
 
 use crate::{
@@ -17,7 +18,8 @@ pub struct AttesterDuty {
     pub committee_index: u64,
     pub committees_at_slot: u64,
     pub slot: u64,
-    pub is_aggregator: bool,
+    /// Spec `get_aggregate_due_ms(position)` sets when it broadcasts.
+    pub aggregator_position: Option<u8>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -221,7 +223,9 @@ impl DutySchedule {
                         committee_index: duty.committee_index,
                         committees_at_slot: duty.committees_at_slot,
                         slot: duty.slot,
-                        is_aggregator: duty.is_aggregator(),
+                        aggregator_position: duty.aggregator_position().map(|position| {
+                            position.min(AGGREGATORS_PER_COMMITTEE as u64 - 1) as u8
+                        }),
                     });
                 }
             })?;
@@ -337,7 +341,7 @@ impl DutySchedule {
                 committee_index: duty.committee_index,
                 committees_at_slot: duty.committees_at_slot,
                 slot: duty.slot,
-                is_aggregator: duty.is_aggregator,
+                is_aggregator: duty.aggregator_position.is_some(),
             });
             entry.subscription = Fetch::InFlight(requests.committee_subscriptions(subscriptions));
         }
@@ -366,8 +370,10 @@ impl DutySchedule {
         &entry.attesters.duties[entry.slot_range(&entry.attesters.duties, slot, |duty| duty.slot)]
     }
 
-    pub fn aggregators_at(&self, slot: u64) -> impl Iterator<Item = &AttesterDuty> {
-        self.attesters_at(slot).iter().filter(|duty| duty.is_aggregator)
+    pub fn aggregators_at(&self, slot: u64, position: u8) -> impl Iterator<Item = &AttesterDuty> {
+        self.attesters_at(slot)
+            .iter()
+            .filter(move |duty| duty.aggregator_position == Some(position))
     }
 
     pub fn ptc_at(&self, slot: u64) -> &[PtcDuty] {
@@ -461,7 +467,8 @@ mod tests {
         let data = duties
             .iter()
             .map(|(pubkey, index, committee, slot)| {
-                let position = if *index == 7 { r#","is_aggregator":true"# } else { "" };
+                let position =
+                    if *index == 7 { r#","is_aggregator":true,"aggregator_position":"2""# } else { "" };
                 format!(
                     r#"{{"pubkey":"0x{}","validator_index":"{index}","committee_index":"{committee}","committee_length":"1","committees_at_slot":"1","validator_committee_index":"0","slot":"{slot}"{position}}}"#,
                     hex::encode(pubkey)
@@ -497,16 +504,17 @@ mod tests {
 
         let json = duties_json(1, &[(B, 9, 4, 70), (A, 7, 3, 65)]);
         schedule.on_duties(sent[0].0, &AttesterDuties(json.as_bytes()), &validators, 64);
-        let duty = |key, validator_index, committee_index, slot, is_aggregator| AttesterDuty {
-            key,
-            validator_index,
-            committee_index,
-            committees_at_slot: 1,
-            slot,
-            is_aggregator,
-        };
-        assert_eq!(schedule.attesters_at(65), [duty(0, 7, 3, 65, true)]);
-        assert_eq!(schedule.attesters_at(70), [duty(1, 9, 4, 70, false)]);
+        let duty =
+            |key, validator_index, committee_index, slot, aggregator_position| AttesterDuty {
+                key,
+                validator_index,
+                committee_index,
+                committees_at_slot: 1,
+                slot,
+                aggregator_position,
+            };
+        assert_eq!(schedule.attesters_at(65), [duty(0, 7, 3, 65, Some(2))]);
+        assert_eq!(schedule.attesters_at(70), [duty(1, 9, 4, 70, None)]);
         assert!(schedule.attesters_at(66).is_empty());
         assert!(schedule.attesters_at(97).is_empty());
     }
@@ -603,9 +611,10 @@ mod tests {
         let flags = subscriptions.as_array().unwrap().iter().map(|s| s["is_aggregator"].clone());
         assert!(flags.eq([serde_json::Value::Bool(true), serde_json::Value::Bool(false)]));
 
-        let aggregators = schedule.aggregators_at(65).map(|duty| duty.validator_index);
+        let aggregators = schedule.aggregators_at(65, 2).map(|duty| duty.validator_index);
         assert!(aggregators.eq([7]));
-        assert_eq!(schedule.aggregators_at(70).count(), 0);
+        assert_eq!(schedule.aggregators_at(65, 0).count(), 0, "another position");
+        assert_eq!(schedule.aggregators_at(70, 2).count(), 0);
 
         schedule.on_subscription_failed(bodies[0].0, 64);
         schedule.subscriptions_due(64, &mut requests);

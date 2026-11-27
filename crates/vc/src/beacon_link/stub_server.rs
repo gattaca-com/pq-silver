@@ -6,7 +6,7 @@ use std::{
     time::Duration,
 };
 
-use crate::beacon_link::head_stream::tests::EVENTS_ROUTE;
+use crate::beacon_link::event_stream::tests::EVENTS_ROUTE;
 
 /// Answers each request on one connection from `routes`, by path. The events
 /// route streams its body as one chunk and stays open. A connection idle for

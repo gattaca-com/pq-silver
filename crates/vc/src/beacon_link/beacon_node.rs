@@ -9,8 +9,8 @@ use silver_common::Error;
 use crate::beacon_link::{
     chain::ExpectedGenesis,
     endpoint::{HttpEndpoint, JSON_HEADERS},
+    event_stream::{ChainEvent, EventStream},
     events::BeaconEvent,
-    head_stream::HeadStream,
     health::{HealthCheck, SYNCING_PATH},
     requests::{BeaconRequest, RequestId},
 };
@@ -45,7 +45,7 @@ pub struct BeaconNode {
     expected: ExpectedGenesis,
     genesis: Genesis,
     health: HealthCheck,
-    head_stream: Option<HeadStream>,
+    event_stream: Option<EventStream>,
     in_flight: Vec<InFlight>,
 }
 
@@ -61,7 +61,7 @@ impl BeaconNode {
             expected,
             genesis: Genesis::Due(now),
             health: HealthCheck::new(Duration::from_millis(slot_duration_ms), now),
-            head_stream: None,
+            event_stream: None,
             in_flight: Vec::new(),
         })
     }
@@ -79,7 +79,7 @@ impl BeaconNode {
 
     pub fn on_event(&mut self, event: &NetworkEvent<'_>) {
         if !self.http.on_event(event) &&
-            let Some(stream) = &mut self.head_stream
+            let Some(stream) = &mut self.event_stream
         {
             stream.on_event(event);
         }
@@ -122,7 +122,7 @@ impl BeaconNode {
 
     pub fn drive(&mut self, net: &mut NetworkCore, mut on_event: impl FnMut(BeaconEvent<'_>)) {
         let now = Instant::now();
-        let Self { http, dns, endpoint, expected, genesis, health, head_stream, in_flight } = self;
+        let Self { http, dns, endpoint, expected, genesis, health, event_stream, in_flight } = self;
 
         if endpoint.wants_resolving(now) {
             if let Err(e) = dns.query(0, &endpoint.host) {
@@ -182,29 +182,32 @@ impl BeaconNode {
             }
         });
 
-        drive_head_stream(head_stream, endpoint, health, net, on_event);
+        drive_event_stream(event_stream, endpoint, health, net, on_event);
     }
 }
 
 /// Opens once the node is first healthy; its heads count only while it stays
 /// healthy.
-fn drive_head_stream(
-    head_stream: &mut Option<HeadStream>,
+fn drive_event_stream(
+    event_stream: &mut Option<EventStream>,
     endpoint: &HttpEndpoint,
     health: &HealthCheck,
     net: &mut NetworkCore,
     mut on_event: impl FnMut(BeaconEvent<'_>),
 ) {
     let healthy = health.is_healthy();
-    if head_stream.is_none() {
+    if event_stream.is_none() {
         let (Some(addr), true) = (endpoint.addr(), healthy) else { return };
-        let stream = HeadStream::open(net, addr, endpoint.authority(), endpoint.tls_host());
-        *head_stream = Some(stream);
+        let stream = EventStream::open(net, addr, endpoint.authority(), endpoint.tls_host());
+        *event_stream = Some(stream);
     }
-    let stream = head_stream.as_mut().expect("opened above");
-    stream.drive(net, &endpoint.url, |head| {
+    let stream = event_stream.as_mut().expect("opened above");
+    stream.drive(net, &endpoint.url, |event| {
         if healthy {
-            on_event(BeaconEvent::Head(head));
+            on_event(match event {
+                ChainEvent::Head(head) => BeaconEvent::Head(head),
+                ChainEvent::PayloadAvailable { slot } => BeaconEvent::PayloadAvailable { slot },
+            });
         }
     });
 }

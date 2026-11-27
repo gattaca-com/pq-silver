@@ -2,49 +2,9 @@ use silver_chain_spec::SpecConfig;
 use silver_common::{
     SLOTS_PER_EPOCH,
     ssz_hash::{compute_domain, compute_signing_root},
-    ssz_view::{VRFProof, XMSSPubkey, XMSSSignature},
+    ssz_view::XMSSPubkey,
+    vc_spine::{KeyWork, SignPurpose, SignRequest},
 };
-
-use crate::duties::ServedAggregate;
-
-/// What a signature is for, carrying what its publish needs, so an answer is
-/// published without finding its duty again.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum SignPurpose {
-    Attestation { validator_index: u64, committee_index: u64 },
-    Aggregate { validator_index: u64, served: ServedAggregate },
-    PayloadAttestation { validator_index: u64 },
-    ProposerPreferences { validator_index: u64, dependent_root: [u8; 32] },
-    Randao { validator_index: u64 },
-    Block,
-    Envelope,
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum KeyWork {
-    Sign {
-        leaf_index: u32,
-        signing_root: [u8; 32],
-    },
-    /// The RANDAO reveal, which PQ makes a VRF proof of the slot rather than a
-    /// signature.
-    VrfProof,
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct SignRequest {
-    pub slot: u64,
-    pub purpose: SignPurpose,
-    pub pubkey: XMSSPubkey,
-    pub work: KeyWork,
-}
-
-pub enum SignAnswer<'a> {
-    Signature(&'a XMSSSignature),
-    #[cfg_attr(not(test), expect(dead_code, reason = "answered by the VRF prover"))]
-    VrfProof(&'a VRFProof),
-    Refused,
-}
 
 #[derive(Default)]
 pub struct SignRequests(Vec<SignRequest>);

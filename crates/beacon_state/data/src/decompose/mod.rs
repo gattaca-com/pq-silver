@@ -64,12 +64,12 @@ impl BeaconState {
     }
 }
 
-/// Each validator's XMSS pubkey in a PQ state's SSZ, in index order, read
-/// without decomposing the state: a devnet's `genesis.ssz` so names its
-/// genesis registry.
-pub fn pq_validator_pubkeys(
+/// Each validator's XMSS pubkey and VRF root in a PQ state's SSZ, in index
+/// order, read without decomposing the state: a devnet's `genesis.ssz` so
+/// names its genesis registry.
+pub fn pq_validator_keys(
     ssz: &[u8],
-) -> Result<impl Iterator<Item = &XMSSPubkey>, DecomposeError> {
+) -> Result<impl Iterator<Item = (&XMSSPubkey, &[u8; 32])>, DecomposeError> {
     let need = F12_OFF + OFFSET;
     if ssz.len() < need {
         return Err(DecomposeError::TruncatedFixedPart { len: ssz.len(), need });
@@ -87,33 +87,35 @@ pub fn pq_validator_pubkeys(
         };
         return Err(error.into());
     }
-    Ok(records
-        .chunks_exact(VALIDATOR_PQ_SSZ_SIZE)
-        .map(|record| record.first_chunk().expect("a record starts with its pubkey")))
+    Ok(records.as_chunks::<VALIDATOR_PQ_SSZ_SIZE>().0.iter().map(|record| {
+        let (pubkey, rest) = record.split_first_chunk().expect("a record starts with its pubkey");
+        (pubkey, rest.first_chunk().expect("then its VRF root"))
+    }))
 }
 
 #[cfg(test)]
 mod tests {
     use std::path::PathBuf;
 
-    use super::{F11_OFF, F12_OFF, pq_validator_pubkeys};
+    use super::{F11_OFF, F12_OFF, pq_validator_keys};
     use crate::validators::VALIDATOR_PQ_SSZ_SIZE;
 
     #[test]
-    fn pq_validator_pubkeys_reads_each_record_and_refuses_misframing() {
+    fn pq_validator_keys_reads_each_record_and_refuses_misframing() {
         let start = F12_OFF + 4;
         let mut ssz = vec![0; start + 2 * VALIDATOR_PQ_SSZ_SIZE];
         ssz[F11_OFF..F11_OFF + 4].copy_from_slice(&(start as u32).to_le_bytes());
         let end = ssz.len() as u32;
         ssz[F12_OFF..F12_OFF + 4].copy_from_slice(&end.to_le_bytes());
         ssz[start..start + 32].fill(0xaa);
+        ssz[start + 32..start + 64].fill(0xa1);
         ssz[start + VALIDATOR_PQ_SSZ_SIZE..][..32].fill(0xbb);
-        let pubkeys = pq_validator_pubkeys(&ssz).unwrap().copied().collect::<Vec<_>>();
-        assert_eq!(pubkeys, [[0xaa; 32], [0xbb; 32]]);
+        let keys = pq_validator_keys(&ssz).unwrap().map(|(k, r)| (*k, *r)).collect::<Vec<_>>();
+        assert_eq!(keys, [([0xaa; 32], [0xa1; 32]), ([0xbb; 32], [0; 32])]);
 
         ssz.pop();
-        assert!(pq_validator_pubkeys(&ssz).is_err(), "the list now ends past the state");
-        assert!(pq_validator_pubkeys(&ssz[..F12_OFF]).is_err());
+        assert!(pq_validator_keys(&ssz).is_err(), "the list now ends past the state");
+        assert!(pq_validator_keys(&ssz[..F12_OFF]).is_err());
     }
 
     use super::common::{F2, FULU_FIXED_PART, u64_le};

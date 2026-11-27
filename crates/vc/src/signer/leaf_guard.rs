@@ -64,8 +64,13 @@ impl LeafGuard {
             return false;
         };
         let last = &mut self.signed[key][class];
-        if leaf < last.leaf || (leaf == last.leaf && *root != last.root) {
-            silver_log::error!(leaf, last = last.leaf, "not signed: leaf already used");
+        if leaf < last.leaf {
+            // A duty asked again after a restart, its leaf already passed.
+            silver_log::warn!(leaf, last = last.leaf, "not signed: leaf below the last signed");
+            return false;
+        }
+        if leaf == last.leaf && *root != last.root {
+            silver_log::error!(leaf, "not signed: leaf already signed another root");
             return false;
         }
         if leaf == last.leaf {

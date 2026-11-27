@@ -19,13 +19,28 @@ pub struct Head {
     pub current_duty_dependent_root: [u8; 32],
 }
 
-pub struct HeadStream {
+#[derive(Deserialize)]
+struct PayloadAvailable {
+    #[serde(deserialize_with = "uint64")]
+    slot: u64,
+}
+
+/// A node event the duties act on.
+pub enum ChainEvent {
+    Head(Head),
+    /// The slot's payload envelope arrived, so its PTC can vote.
+    PayloadAvailable {
+        slot: u64,
+    },
+}
+
+pub struct EventStream {
     sse: Sse,
     /// The refusal last logged, so a node that keeps refusing logs once.
     refused_with: Option<u16>,
 }
 
-impl HeadStream {
+impl EventStream {
     pub fn open(
         net: &mut NetworkCore,
         addr: SocketAddr,
@@ -33,7 +48,7 @@ impl HeadStream {
         tls_host: Option<&str>,
     ) -> Self {
         let mut sse = Sse::new(addr, EVENTS_PATH)
-            .with_query(&[("topics", "head")])
+            .with_query(&[("topics", "head"), ("topics", "execution_payload_available")])
             .with_header("Host", authority);
         match tls_host {
             Some(host) => sse.connect_tls(net, host),
@@ -46,24 +61,37 @@ impl HeadStream {
         self.sse.on_event(event)
     }
 
-    pub fn drive(&mut self, net: &mut NetworkCore, url: &str, mut on_head: impl FnMut(Head)) {
+    pub fn drive(
+        &mut self,
+        net: &mut NetworkCore,
+        url: &str,
+        mut on_event: impl FnMut(ChainEvent),
+    ) {
         let refused_with = &mut self.refused_with;
         self.sse.drive(net, |event| match event {
             SseEvent::Open => {
                 *refused_with = None;
-                silver_log::info!(url, "head stream open");
+                silver_log::info!(url, "event stream open");
             }
             SseEvent::Message { kind: "head", data } => match serde_json::from_slice(data) {
-                Ok(head) => on_head(head),
+                Ok(head) => on_event(ChainEvent::Head(head)),
                 Err(e) => silver_log::warn!(url, %e, "malformed head event"),
             },
+            SseEvent::Message { kind: "execution_payload_available", data } => {
+                match serde_json::from_slice::<PayloadAvailable>(data) {
+                    Ok(PayloadAvailable { slot }) => {
+                        on_event(ChainEvent::PayloadAvailable { slot })
+                    }
+                    Err(e) => silver_log::warn!(url, %e, "malformed execution_payload_available"),
+                }
+            }
             SseEvent::Message { .. } => {}
             SseEvent::Gap => {
-                silver_log::warn!(url, "head stream dropped; its heads until reopen are lost")
+                silver_log::warn!(url, "event stream dropped; its events until reopen are lost")
             }
             SseEvent::Status(status) => {
                 if refused_with.replace(status) != Some(status) {
-                    silver_log::warn!(url, status, "head stream refused");
+                    silver_log::warn!(url, status, "event stream refused");
                 }
             }
         });
@@ -72,7 +100,14 @@ impl HeadStream {
 
 #[cfg(test)]
 pub mod tests {
-    pub const EVENTS_ROUTE: &str = "/eth/v1/events?topics=head";
+    pub const EVENTS_ROUTE: &str = "/eth/v1/events?topics=head&topics=execution_payload_available";
+
+    pub fn payload_available_event(slot: u64) -> String {
+        format!(
+            "event: execution_payload_available\ndata: {{\"slot\":\"{slot}\",\"block_root\":\"0x{}\"}}\n\n",
+            hex::encode([0xab; 32])
+        )
+    }
 
     pub fn head_event(slot: u64, block: u8) -> String {
         format!(

@@ -6,6 +6,7 @@ pub struct Validators {
     /// Sorted, so answers find their key by binary search.
     pubkeys: Vec<XMSSPubkey>,
     indices: Vec<Option<u64>>,
+    known: usize,
     lookup: Option<RequestId>,
     looked_up_epoch: Option<u64>,
 }
@@ -13,7 +14,21 @@ pub struct Validators {
 impl Validators {
     pub fn new(pubkeys: Vec<XMSSPubkey>) -> Self {
         debug_assert!(pubkeys.is_sorted());
-        Self { indices: vec![None; pubkeys.len()], pubkeys, lookup: None, looked_up_epoch: None }
+        Self {
+            indices: vec![None; pubkeys.len()],
+            pubkeys,
+            known: 0,
+            lookup: None,
+            looked_up_epoch: None,
+        }
+    }
+
+    /// Keys arrive sorted. A new one is looked up from the next slot.
+    pub fn add(&mut self, pubkey: XMSSPubkey) {
+        debug_assert!(self.pubkeys.last().is_none_or(|last| *last < pubkey));
+        self.pubkeys.push(pubkey);
+        self.indices.push(None);
+        self.looked_up_epoch = None;
     }
 
     pub fn len(&self) -> usize {
@@ -29,7 +44,7 @@ impl Validators {
     }
 
     pub fn any_index_known(&self) -> bool {
-        self.indices.iter().any(Option::is_some)
+        self.known > 0
     }
 
     pub fn known_indices(&self) -> impl Iterator<Item = u64> + '_ {
@@ -41,7 +56,7 @@ impl Validators {
     pub fn request_indices(&mut self, epoch: u64, requests: &mut BeaconRequests) {
         if self.lookup.is_some() ||
             self.looked_up_epoch == Some(epoch) ||
-            self.indices.iter().all(Option::is_some)
+            self.known == self.indices.len()
         {
             return;
         }
@@ -57,11 +72,11 @@ impl Validators {
         }
         self.lookup = None;
 
-        let Self { pubkeys, indices, .. } = self;
-        let mut learned = false;
+        let Self { pubkeys, indices, known, .. } = self;
+        let known_before = *known;
         let answered = validators.for_each(pubkeys.len(), |pubkey, index| {
             if let Ok(at) = pubkeys.binary_search(pubkey) {
-                learned |= indices[at].replace(index).is_none();
+                *known += usize::from(indices[at].replace(index).is_none());
             }
         });
         if let Err(error) = answered {
@@ -69,9 +84,9 @@ impl Validators {
             self.looked_up_epoch = None;
         }
 
-        let unknown = indices.iter().filter(|index| index.is_none()).count();
-        silver_log::info!(known = indices.len() - unknown, unknown, "validator indices");
-        learned
+        let (known, unknown) = (self.known, self.indices.len() - self.known);
+        silver_log::info!(known, unknown, "validator indices");
+        known > known_before
     }
 
     pub fn on_failed(&mut self, id: RequestId) {

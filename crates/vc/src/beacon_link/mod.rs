@@ -1,8 +1,8 @@
 mod beacon_node;
 mod chain;
 mod endpoint;
+mod event_stream;
 mod events;
-mod head_stream;
 mod health;
 mod requests;
 #[cfg(test)]
@@ -20,11 +20,11 @@ use silver_common::Error;
 
 use self::{beacon_node::BeaconNode, chain::ExpectedGenesis};
 pub use self::{
+    event_stream::Head,
     events::{
         Aggregate, AttestationData, AttesterDuties, BeaconEvent, PayloadAttestationData,
         ProducedBlock, SlotDuties, ValidatorIndices,
     },
-    head_stream::Head,
     requests::{BeaconRequest, BeaconRequests, CommitteeSubscription, RequestId},
 };
 use crate::config::Config;
@@ -106,16 +106,19 @@ impl BeaconLink {
 
 #[cfg(test)]
 mod tests {
-    use std::{path::PathBuf, time::Instant};
+    use std::time::Instant;
 
     use silver_chain_spec::SpecConfig;
 
     use super::*;
-    use crate::beacon_link::{
-        chain::tests as chain,
-        head_stream::tests::{EVENTS_ROUTE, head_event},
-        health::{SYNCING_PATH, tests::syncing_json},
-        stub_server::stub_node,
+    use crate::{
+        beacon_link::{
+            chain::tests as chain,
+            event_stream::tests::{EVENTS_ROUTE, head_event, payload_available_event},
+            health::{SYNCING_PATH, tests::syncing_json},
+            stub_server::stub_node,
+        },
+        config::SignerConfig,
     };
 
     const DATA_PATH: &str = "/eth/v1/validator/attestation_data?slot=65&committee_index=0";
@@ -129,7 +132,7 @@ mod tests {
             vec![
                 ("/eth/v1/beacon/genesis", chain::GENESIS.into()),
                 (SYNCING_PATH, syncing_json(false, false)),
-                (EVENTS_ROUTE, head_event(65, 0xab)),
+                (EVENTS_ROUTE, head_event(65, 0xab) + &payload_available_event(65)),
                 (DATA_PATH, r#"{"data":{}}"#.into()),
             ],
             idle,
@@ -138,14 +141,8 @@ mod tests {
             spec: SpecConfig::mainnet(),
             genesis_validators_root: chain::GENESIS_VALIDATORS_ROOT,
             beacon_node: node,
-            keys_dir: None,
-            keystores_dir: None,
-            secrets_dir: None,
-            data_dir: PathBuf::new(),
-            init_leaf_records: false,
-            genesis_state: None,
-            xmss_cache_url: None,
-            signer_threads: 1,
+            signer: SignerConfig::default(),
+            signer_tiles: 1,
             proposals: None,
         })
         .unwrap()
@@ -215,6 +212,23 @@ mod tests {
             });
         }
         assert_eq!(answer, Some(true), "the request failed instead of being sent again");
+    }
+
+    #[test]
+    fn payload_arrivals_stream_beside_heads() {
+        let mut beacon_link = beacon_link();
+        let mut requests = BeaconRequests::default();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let mut available = None;
+        while available.is_none() {
+            assert!(Instant::now() < deadline, "no payload event");
+            beacon_link.spin(&mut requests, |event| {
+                if let BeaconEvent::PayloadAvailable { slot } = event {
+                    available = Some(slot);
+                }
+            });
+        }
+        assert_eq!(available, Some(65));
     }
 
     #[test]

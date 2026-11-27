@@ -1,13 +1,13 @@
-/// A Gloas block produced with its payload: the block, its envelope, and the
+/// A block produced with its payload: the block, its envelope, and the
 /// envelope's blobs with their cell proofs.
-pub struct GloasBlockContents<'a> {
+pub struct BlockContents<'a> {
     pub block: &'a [u8],
     pub envelope: &'a [u8],
     pub kzg_proofs: &'a [u8],
     pub blobs: &'a [u8],
 }
 
-impl<'a> GloasBlockContents<'a> {
+impl<'a> BlockContents<'a> {
     pub const FIXED: usize = 4 * 4;
 
     pub fn parse(buf: &'a [u8]) -> Option<Self> {
@@ -33,7 +33,7 @@ mod tests {
 
     fn framed(parts: [&[u8]; 4]) -> Vec<u8> {
         let mut out = Vec::new();
-        let mut at = GloasBlockContents::FIXED;
+        let mut at = BlockContents::FIXED;
         for part in parts {
             out.extend_from_slice(&(at as u32).to_le_bytes());
             at += part.len();
@@ -45,7 +45,7 @@ mod tests {
     #[test]
     fn splits_at_its_offsets_and_refuses_misframing() {
         let buf = framed([b"block", b"envelope", b"", b"blob"]);
-        let contents = GloasBlockContents::parse(&buf).unwrap();
+        let contents = BlockContents::parse(&buf).unwrap();
         assert_eq!(contents.block, b"block");
         assert_eq!(contents.envelope, b"envelope");
         assert_eq!(contents.kzg_proofs, b"");
@@ -53,7 +53,7 @@ mod tests {
 
         let mut shifted = buf.clone();
         shifted[0] += 1;
-        assert!(GloasBlockContents::parse(&shifted).is_none());
-        assert!(GloasBlockContents::parse(&buf[..GloasBlockContents::FIXED - 1]).is_none());
+        assert!(BlockContents::parse(&shifted).is_none());
+        assert!(BlockContents::parse(&buf[..BlockContents::FIXED - 1]).is_none());
     }
 }

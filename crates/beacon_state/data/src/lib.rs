@@ -7,7 +7,7 @@ pub use checkpoint_state::CheckpointState;
 pub use committee::{
     CommitteeSlot, ShufflingId, committee_at_position, committee_range, committees_per_slot,
 };
-pub use decompose::{DecomposeError, pq_validator_pubkeys};
+pub use decompose::{DecomposeError, pq_validator_keys};
 pub use delta_view::{StateView, StateWriterView};
 pub use encode::{FULU_CHECKPOINT_SECTIONS, PubkeysDecodeError, decode_checkpoint_pubkeys};
 pub use epoch::{

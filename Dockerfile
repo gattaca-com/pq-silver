@@ -23,8 +23,8 @@ ARG SILVER_BUILD_COMMIT
 RUN --mount=type=cache,target=/usr/local/cargo/registry \
     --mount=type=cache,target=/usr/local/cargo/git \
     --mount=type=cache,target=/silver/target \
-    scripts/build-prod.sh --features silver/metrics --bin silver --bin silver_surfer && \
-    cp target/release-prod/silver target/release-prod/silver_surfer /usr/local/bin/
+    scripts/build-prod.sh --features silver/metrics --bin silver --bin silver_surfer --bin silver-vc && \
+    cp target/release-prod/silver target/release-prod/silver_surfer target/release-prod/silver-vc /usr/local/bin/
 
 FROM debian:bookworm-slim AS runtime
 
@@ -45,6 +45,7 @@ ENTRYPOINT ["/usr/local/bin/silver"]
 FROM runtime AS release
 COPY --chmod=755 silver-linux-x86_64 /usr/local/bin/silver
 COPY --chmod=755 silver_surfer-linux-x86_64 /usr/local/bin/silver_surfer
+COPY --chmod=755 silver-vc-linux-x86_64 /usr/local/bin/silver-vc
 
 FROM runtime AS silver
-COPY --from=builder /usr/local/bin/silver /usr/local/bin/silver_surfer /usr/local/bin/
+COPY --from=builder /usr/local/bin/silver /usr/local/bin/silver_surfer /usr/local/bin/silver-vc /usr/local/bin/

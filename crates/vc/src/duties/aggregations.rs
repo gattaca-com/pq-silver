@@ -1,17 +1,11 @@
-use silver_common::{merkle::ZERO_HASH, ssz_hash_pq::hash_tree_root_aggregate_and_proof};
+use silver_common::{
+    merkle::ZERO_HASH, ssz_hash_pq::hash_tree_root_aggregate_and_proof, vc_spine::ServedAggregate,
+};
 
 use crate::{
     beacon_link::{Aggregate, RequestId},
     duties::schedule::AttesterDuty,
 };
-
-/// Where a served `{"aggregate", "proof"}` object sits in its slot's
-/// `Aggregations`.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct ServedAggregate {
-    start: u32,
-    end: u32,
-}
 
 struct Fetch {
     id: RequestId,
@@ -19,6 +13,8 @@ struct Fetch {
 }
 
 /// One slot's aggregates: one fetch per aggregator, each hashed once served.
+/// A slot's positions fetch in turn, so its fetches and served objects
+/// accumulate until the next slot.
 pub struct Aggregations {
     slot: u64,
     fetches: Vec<Fetch>,
@@ -44,9 +40,11 @@ impl Aggregations {
         slot: u64,
         fetches: impl IntoIterator<Item = (RequestId, AttesterDuty)>,
     ) {
-        self.slot = slot;
-        self.served.clear();
-        self.fetches.clear();
+        if self.slot != slot {
+            self.slot = slot;
+            self.served.clear();
+            self.fetches.clear();
+        }
         self.fetches.extend(fetches.into_iter().map(|(id, aggregator)| Fetch { id, aggregator }));
     }
 

@@ -28,6 +28,7 @@ silver_beacon_state_data.workspace = true
 silver_chain_spec.workspace = true
 silver_common.workspace = true
 silver_config.workspace = true
+silver_crypto_simd.workspace = true
 silver_log.workspace = true
 unicode-normalization.workspace = true
 ureq = { workspace = true, features = ["tls"] }
@@ -35,7 +36,6 @@ zeroize.workspace = true
 
 [dev-dependencies]
 silver_common = { workspace = true, features = ["test-util"] }
-silver_crypto_simd.workspace = true
 tempfile = "3"
 
 [features]

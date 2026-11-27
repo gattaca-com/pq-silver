@@ -4,7 +4,7 @@ use clap::{ArgGroup, Parser};
 use silver_common::Error;
 use silver_config::{BootSource, Network};
 
-use crate::config::{Config, ProposalConfig};
+use crate::config::{Config, ProposalConfig, SignerConfig};
 
 /// Silver validator client.
 #[derive(Debug, Parser)]
@@ -39,9 +39,14 @@ pub struct Args {
     /// validator. A key whose record is missing or refused is built instead.
     #[arg(long)]
     xmss_cache_url: Option<String>,
-    /// Threads leanVM signs on; every core when absent.
+    /// The devnet's published slot-zero VRF records, an HTTP(S) URL or a local
+    /// path. RANDAO reveals, and so proposals, need it.
     #[arg(long)]
-    signer_threads: Option<NonZeroUsize>,
+    vrf_state_url: Option<String>,
+    /// Signer tiles, each signing for its share of the keys on its own
+    /// thread. Half the cores, up to 4, when absent.
+    #[arg(long)]
+    signer_tiles: Option<NonZeroUsize>,
     /// Proposes only when set.
     #[arg(long, value_parser = parse_fee_recipient)]
     suggested_fee_recipient: Option<[u8; 20]>,
@@ -54,6 +59,10 @@ pub struct Args {
 }
 
 const DEFAULT_GAS_LIMIT: u64 = 60_000_000;
+/// Four sign ~2600 times a slot, far more than a devnet's keys need. Each
+/// downloads the whole `--vrf-state-url` artifact when it first builds a VRF
+/// tree.
+const MAX_DEFAULT_SIGNER_TILES: usize = 4;
 
 impl Args {
     pub fn config(self) -> Result<Config, Error> {
@@ -66,23 +75,29 @@ impl Args {
             spec: self.network.spec()?,
             genesis_validators_root: self.network.genesis_validators_root()?,
             beacon_node: self.beacon_node,
-            keys_dir: self.keys_dir,
-            keystores_dir: self.keystores_dir,
-            secrets_dir: self.secrets_dir,
-            data_dir: self.data_dir,
-            init_leaf_records: self.init_leaf_records,
-            genesis_state: match self.network.boot_source()? {
-                BootSource::Genesis(path) => Some(path),
-                _ => None,
+            signer: SignerConfig {
+                keys_dir: self.keys_dir,
+                keystores_dir: self.keystores_dir,
+                secrets_dir: self.secrets_dir,
+                data_dir: self.data_dir,
+                init_leaf_records: self.init_leaf_records,
+                genesis_state: match self.network.boot_source()? {
+                    BootSource::Genesis(path) => Some(path),
+                    _ => None,
+                },
+                xmss_cache_url: self.xmss_cache_url,
+                vrf_state_url: self.vrf_state_url,
             },
-            xmss_cache_url: self.xmss_cache_url,
-            signer_threads: self
-                .signer_threads
-                .or_else(|| thread::available_parallelism().ok())
-                .map_or(1, NonZeroUsize::get),
+            signer_tiles: self.signer_tiles.map_or_else(default_signer_tiles, NonZeroUsize::get),
             proposals,
         })
     }
+}
+
+/// The other half is left to the beacon node and leanVM beside it.
+fn default_signer_tiles() -> usize {
+    let cores = thread::available_parallelism().map_or(1, NonZeroUsize::get);
+    (cores / 2).clamp(1, MAX_DEFAULT_SIGNER_TILES)
 }
 
 fn parse_fee_recipient(text: &str) -> Result<[u8; 20], String> {
@@ -107,6 +122,13 @@ mod tests {
 
     fn config(extra: &[&str]) -> Config {
         Args::try_parse_from([&REQUIRED[..], extra].concat()).unwrap().config().unwrap()
+    }
+
+    #[test]
+    fn signer_tiles_default_to_spare_cores() {
+        assert!((1..=MAX_DEFAULT_SIGNER_TILES).contains(&config(&[]).signer_tiles));
+        assert_eq!(config(&["--signer-tiles=12"]).signer_tiles, 12);
+        assert!(Args::try_parse_from([&REQUIRED[..], &["--signer-tiles=0"]].concat()).is_err());
     }
 
     #[test]
@@ -140,13 +162,6 @@ mod tests {
     }
 
     #[test]
-    fn signer_threads_default_to_every_core() {
-        assert!(config(&[]).signer_threads >= 1);
-        assert_eq!(config(&["--signer-threads=3"]).signer_threads, 3);
-        assert!(Args::try_parse_from([&REQUIRED[..], &["--signer-threads=0"]].concat()).is_err());
-    }
-
-    #[test]
     fn node_keys_and_data_dir_are_required() {
         assert!(Args::try_parse_from(&REQUIRED[..3]).is_err());
         assert!(Args::try_parse_from([REQUIRED[0], REQUIRED[2], REQUIRED[3]]).is_err());
@@ -161,7 +176,7 @@ mod tests {
             .unwrap()
             .config()
             .unwrap();
-        assert_eq!(config.keys_dir, None);
-        assert_eq!(config.secrets_dir.as_deref(), Some(std::path::Path::new("/s")));
+        assert_eq!(config.signer.keys_dir, None);
+        assert_eq!(config.signer.secrets_dir.as_deref(), Some(std::path::Path::new("/s")));
     }
 }

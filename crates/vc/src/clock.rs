@@ -1,26 +1,40 @@
 use std::time::{SystemTime, UNIX_EPOCH};
 
+use silver_beacon_state_data::AGGREGATORS_PER_COMMITTEE;
 use silver_common::ticker::{
-    AGGREGATE_DUE_BPS_GLOAS, ATTESTATION_DUE_BPS_GLOAS, BASIS_POINTS, PAYLOAD_ATTESTATION_DUE_BPS,
+    AGGREGATE_DUE_BPS_PQ, AGGREGATOR_DELAY_BPS, ATTESTATION_DUE_BPS_GLOAS, BASIS_POINTS,
+    PAYLOAD_ATTESTATION_DUE_BPS,
 };
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum DutyPhase {
     SlotStart,
     AttestationDue,
-    AggregateDue,
+    /// Spec `get_aggregate_due_ms(position)`.
+    AggregateDue {
+        position: u8,
+    },
     PayloadAttestationDue,
 }
 
 impl DutyPhase {
-    const ORDER: [Self; 4] =
-        [Self::SlotStart, Self::AttestationDue, Self::AggregateDue, Self::PayloadAttestationDue];
+    const ORDER: [Self; 3 + AGGREGATORS_PER_COMMITTEE] = [
+        Self::SlotStart,
+        Self::AttestationDue,
+        Self::AggregateDue { position: 0 },
+        Self::AggregateDue { position: 1 },
+        Self::AggregateDue { position: 2 },
+        Self::AggregateDue { position: 3 },
+        Self::PayloadAttestationDue,
+    ];
 
     fn offset_bps(self) -> u64 {
         match self {
             Self::SlotStart => 0,
             Self::AttestationDue => ATTESTATION_DUE_BPS_GLOAS,
-            Self::AggregateDue => AGGREGATE_DUE_BPS_GLOAS,
+            Self::AggregateDue { position } => {
+                AGGREGATE_DUE_BPS_PQ + u64::from(position) * AGGREGATOR_DELAY_BPS
+            }
             Self::PayloadAttestationDue => PAYLOAD_ATTESTATION_DUE_BPS,
         }
     }
@@ -95,6 +109,13 @@ mod tests {
         let slot = clock.current_slot();
         assert_eq!(clock.tick(), Some(Tick { slot, phase: DutyPhase::SlotStart }));
         assert_eq!(clock.tick(), None, "every later phase already passed");
+    }
+
+    #[test]
+    fn phases_are_in_slot_order() {
+        let offsets = DutyPhase::ORDER.map(DutyPhase::offset_bps);
+        assert!(offsets.is_sorted(), "{offsets:?}");
+        assert_eq!(offsets[2..6], [6000, 6500, 7000, 7500], "spec's 7.2s to 9.0s of 12s");
     }
 
     #[test]

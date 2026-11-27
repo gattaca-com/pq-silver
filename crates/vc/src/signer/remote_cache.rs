@@ -1,7 +1,6 @@
-use std::{collections::HashMap, fs, io::Read, ops::Range, path::Path, thread, time::Duration};
+use std::{collections::HashMap, io::Read, ops::Range, thread, time::Duration};
 
 use lean_xmss::internals::{CACHED_BOTTOM_SIZE, CACHED_TREE_SIZE};
-use silver_beacon_state_data::pq_validator_pubkeys;
 use silver_common::ssz_view::XMSSPubkey;
 
 /// A top tree and the first attestation and slot-duty bottom trees.
@@ -38,14 +37,6 @@ pub struct Run {
 }
 
 impl RemoteCache {
-    pub fn open(url: &str, genesis_state: Option<&Path>) -> Result<Self, String> {
-        let genesis_state = genesis_state.ok_or("needs the network's genesis.ssz")?;
-        let state =
-            fs::read(genesis_state).map_err(|e| format!("{}: {e}", genesis_state.display()))?;
-        let genesis = pq_validator_pubkeys(&state).map_err(|e| format!("genesis registry: {e}"))?;
-        Self::with_registry(url, genesis.copied())
-    }
-
     /// `registry` is the genesis validators' pubkeys, in index order.
     pub fn with_registry(
         url: &str,
@@ -100,17 +91,14 @@ impl RemoteCache {
         runs
     }
 
-    /// Each record of `run`, in order.
-    pub fn fetch<'a>(
-        &self,
-        run: &'a Run,
-    ) -> Result<impl Iterator<Item = (usize, XMSSPubkey, Vec<u8>)> + 'a, String> {
+    /// The bytes of `run`'s records, which `Run::records` splits.
+    pub fn fetch(&self, run: &Run) -> Result<Vec<u8>, String> {
         let start = run.first * RECORD_LEN;
         let len = run.keys.len() * RECORD_LEN;
         let mut attempt = 1;
-        let bytes = loop {
+        loop {
             match get(&self.agent, &self.url, Some(start..start + len), len) {
-                Ok(bytes) if bytes.len() == len => break bytes,
+                Ok(bytes) if bytes.len() == len => return Ok(bytes),
                 Ok(bytes) => return Err(format!("{} bytes, expected {len}", bytes.len())),
                 Err(error) if attempt == ATTEMPTS => return Err(error),
                 Err(_) => {
@@ -118,13 +106,21 @@ impl RemoteCache {
                     thread::sleep(RETRY_AFTER);
                 }
             }
-        };
-        let records = bytes.chunks_exact(RECORD_LEN).map(<[u8]>::to_vec).collect::<Vec<_>>();
-        Ok(run
-            .keys
+        }
+    }
+}
+
+impl Run {
+    /// Each record in `bytes`, with its key's position and pubkey.
+    pub fn records<'a>(
+        &'a self,
+        bytes: &'a [u8],
+    ) -> impl Iterator<Item = (usize, &'a XMSSPubkey, &'a [u8; RECORD_LEN])> {
+        let records = bytes.as_chunks::<RECORD_LEN>().0;
+        self.keys
             .iter()
             .zip(records)
-            .map(|(&(position, pubkey), record)| (position, pubkey, record)))
+            .map(|((position, pubkey), record)| (*position, pubkey, record))
     }
 }
 
@@ -163,7 +159,7 @@ fn get(
     if response.status() != expected {
         return Err(format!("HTTP {} from {url}, expected {expected}", response.status()));
     }
-    let mut bytes = Vec::new();
+    let mut bytes = Vec::with_capacity(if range.is_some() { max } else { 0 });
     response
         .into_reader()
         .take(max as u64 + 1)

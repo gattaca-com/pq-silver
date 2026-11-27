@@ -23,15 +23,17 @@ const XMSS_SEED_DOMAIN: &[u8] = b"leanxmss-seed";
 const VRF_SEED_DOMAIN: &[u8] = b"vrf-seed";
 const LIGHTHOUSE_KEYSTORE: &str = "voting-keystore.json";
 
-/// Every EIP-2335 keystore in `dir`, either `*.json` or the Lighthouse layout
-/// `<0xpubkey>/voting-keystore.json`, each opened with the password in
+/// Every EIP-2335 keystore of `entries`, either `*.json` or the Lighthouse
+/// layout `<0xpubkey>/voting-keystore.json`, each opened with the password in
 /// `secrets/<0xpubkey>`. Both seeds derive from the BLS secret key, as the
 /// devnet genesis derives them.
-pub fn load(dir: &Path, secrets: &Path) -> Result<Vec<ValidatorKey>, Error> {
+pub fn load(
+    entries: impl Iterator<Item = PathBuf>,
+    secrets: &Path,
+) -> Result<Vec<ValidatorKey>, Error> {
     let mut keys = Vec::new();
     let mut readable_passwords = 0;
-    for entry in fs::read_dir(dir)? {
-        let path = entry?.path();
+    for path in entries {
         let keystore = match path.is_dir() {
             true => path.join(LIGHTHOUSE_KEYSTORE),
             false if path.extension().is_some_and(|extension| extension == "json") => path,
@@ -57,9 +59,14 @@ pub fn load(dir: &Path, secrets: &Path) -> Result<Vec<ValidatorKey>, Error> {
 
 /// The seeds are hashed straight into the key, so no copy of them is left.
 fn derive(bls_secret: &[u8; 32], source: PathBuf) -> ValidatorKey {
-    let mut key = ValidatorKey { privkey: [0; 32], vrf_seed: [0; 32], pubkey: None, source };
+    let mut key = ValidatorKey {
+        privkey: Box::new([0; 32]),
+        vrf_seed: Box::new([0; 32]),
+        pubkey: None,
+        source,
+    };
     for (domain, seed) in
-        [(XMSS_SEED_DOMAIN, &mut key.privkey), (VRF_SEED_DOMAIN, &mut key.vrf_seed)]
+        [(XMSS_SEED_DOMAIN, &mut *key.privkey), (VRF_SEED_DOMAIN, &mut *key.vrf_seed)]
     {
         Sha256::new().chain_update(domain).chain_update(bls_secret).finalize_into(seed.into());
     }
@@ -190,6 +197,7 @@ fn pbkdf2_sha256(password: &[u8], salt: &[u8], rounds: u32) -> Zeroizing<[u8; 32
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::keys::Shard;
 
     /// The EIP-2335 PBKDF2 test vector. Its password, `𝔱𝔢𝔰𝔱𝔭𝔞𝔰𝔰𝔴𝔬𝔯𝔡🔑`, is
     /// `testpassword🔑` once NFKD-normalised.
@@ -242,16 +250,19 @@ mod tests {
         fs::write(keys.join(pubkey).join(LIGHTHOUSE_KEYSTORE), VECTOR).unwrap();
         fs::write(secrets.join(pubkey), "testpassword🔑\n").unwrap();
 
-        let loaded = load(&keys, &secrets).unwrap();
+        let loaded = load(Shard::WHOLE.entries(&keys).unwrap(), &secrets).unwrap();
         assert_eq!(loaded.len(), 1);
         let bls_secret: [u8; 32] = hex::decode(SECRET).unwrap().try_into().unwrap();
         let expect =
             |domain: &[u8]| -> [u8; 32] { Sha256::digest([domain, &bls_secret].concat()).into() };
-        assert_eq!(loaded[0].privkey, expect(b"leanxmss-seed"));
-        assert_eq!(loaded[0].vrf_seed, expect(b"vrf-seed"));
+        assert_eq!(*loaded[0].privkey, expect(b"leanxmss-seed"));
+        assert_eq!(*loaded[0].vrf_seed, expect(b"vrf-seed"));
         assert_eq!(loaded[0].pubkey, None);
 
         fs::write(secrets.join(pubkey), "wrong").unwrap();
-        assert!(matches!(load(&keys, &secrets), Err(Error::ConfigError(_))));
+        assert!(matches!(
+            load(Shard::WHOLE.entries(&keys).unwrap(), &secrets),
+            Err(Error::ConfigError(_))
+        ));
     }
 }

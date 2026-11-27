@@ -11,10 +11,10 @@ use silver_common::{
     SLOTS_PER_EPOCH,
     ssz_hash::hash_attestation_data,
     ssz_view::{AttestationDataView, PayloadAttestationDataView, XMSSPubkey},
+    vc_spine::{SignAnswer, SignPurpose, SignRequest},
     xmss::{SlotDuty, attestation_leaf},
 };
 
-pub use self::aggregations::ServedAggregate;
 use self::{
     aggregations::Aggregations, proposer::Proposer, round::DataRound, schedule::DutySchedule,
     validators::Validators,
@@ -26,7 +26,7 @@ use crate::{
     },
     clock::{DutyClock, DutyPhase, Tick},
     config::Config,
-    signing::{SignAnswer, SignPurpose, SignRequest, SignRequests, SigningDomains},
+    signing::{SignRequests, SigningDomains},
 };
 
 pub struct Duties {
@@ -55,6 +55,10 @@ impl Duties {
             payload_attestations: DataRound::new("payload attestations"),
             proposer: config.proposals.map(Proposer::new),
         }
+    }
+
+    pub fn key_loaded(&mut self, pubkey: XMSSPubkey) {
+        self.validators.add(pubkey);
     }
 
     pub fn on_beacon_event(&mut self, event: BeaconEvent<'_>, signs: &mut SignRequests) {
@@ -94,6 +98,13 @@ impl Duties {
                 BeaconRequest::PayloadAttestationData => self.payload_attestations.on_no_data(id),
                 _ => self.on_failed(id, request, slot, signs),
             },
+            BeaconEvent::PayloadAvailable { slot: payload_slot } => {
+                // The spec asks for the PTC vote as soon as the payload is
+                // seen; the due time is only the deadline.
+                if payload_slot == slot {
+                    self.payload_attestations.due(slot);
+                }
+            }
             BeaconEvent::Head(head) => {
                 silver_log::debug!(slot = head.slot, block = %hex::encode(head.block), "head");
                 self.schedule.on_head(&head);
@@ -109,7 +120,7 @@ impl Duties {
     pub fn on_signed(
         &mut self,
         request: &SignRequest,
-        answer: SignAnswer<'_>,
+        answer: &SignAnswer,
         requests: &mut BeaconRequests,
     ) {
         let slot = request.slot;
@@ -190,11 +201,13 @@ impl Duties {
             self.clock = DutyClock::start(genesis_time, self.slot_duration_ms);
         }
         let Some(clock) = &mut self.clock else { return };
-        let tick = clock.tick();
-        let slot = clock.current_slot();
-        if let Some(Tick { slot, phase }) = tick {
-            self.on_phase(slot, phase, requests);
-        }
+        let slot = match clock.tick() {
+            Some(Tick { slot, phase }) => {
+                self.on_phase(slot, phase, requests);
+                slot
+            }
+            None => clock.current_slot(),
+        };
 
         self.schedule.request_due(slot, &self.validators, requests);
         self.schedule.subscriptions_due(slot, requests);
@@ -225,7 +238,7 @@ impl Duties {
                 }
             }
             DutyPhase::AttestationDue => self.attestations.due(slot),
-            DutyPhase::AggregateDue => self.fetch_aggregates(slot, requests),
+            DutyPhase::AggregateDue { position } => self.fetch_aggregates(slot, position, requests),
             DutyPhase::PayloadAttestationDue => self.payload_attestations.due(slot),
         }
     }
@@ -270,7 +283,7 @@ impl Duties {
             (BeaconRequest::PublishBlock, Some(proposer)) => {
                 proposer.on_block_answered(id, accepted, validators, domains, signs)
             }
-            (BeaconRequest::PublishEnvelope, Some(proposer)) => {
+            (BeaconRequest::PublishEnvelope { .. }, Some(proposer)) => {
                 proposer.on_envelope_answered(id, accepted)
             }
             _ => {}
@@ -305,7 +318,7 @@ impl Duties {
             }
             BeaconRequest::Publish(_) |
             BeaconRequest::PublishBlock |
-            BeaconRequest::PublishEnvelope => self.on_answered(id, request, false, signs),
+            BeaconRequest::PublishEnvelope { .. } => self.on_answered(id, request, false, signs),
         }
     }
 
@@ -367,11 +380,14 @@ impl Duties {
         });
     }
 
-    /// Fetches the aggregate of what this slot attested, once per aggregator.
-    fn fetch_aggregates(&mut self, slot: u64, requests: &mut BeaconRequests) {
+    /// Fetches the aggregate of what this slot attested, once per aggregator
+    /// at `position`, which the node proved for that position's cutoff.
+    fn fetch_aggregates(&mut self, slot: u64, position: u8, requests: &mut BeaconRequests) {
         let Some(data_root) = self.attestations.signed_root(slot) else { return };
-        let fetches = self.schedule.aggregators_at(slot).map(|duty| {
-            (requests.aggregate_attestation(slot, duty.committee_index, data_root), *duty)
+        let fetches = self.schedule.aggregators_at(slot, position).map(|duty| {
+            let id =
+                requests.aggregate_attestation(slot, duty.committee_index, position, data_root);
+            (id, *duty)
         });
         self.aggregations.fetching(slot, fetches);
     }
@@ -399,27 +415,25 @@ impl Duties {
 
 #[cfg(test)]
 mod tests {
-    use std::path::PathBuf;
-
     use serde_json::{Value, json};
     use silver_beacon_state_data::{DOMAIN_BEACON_BUILDER, bls::DOMAIN_BEACON_PROPOSER};
     use silver_chain_spec::SpecConfig;
     use silver_common::{
-        block_root_gloas,
+        block_root_pq,
         ssz_hash::{compute_domain, compute_signing_root},
         ssz_hash_pq::hash_tree_root_aggregate_and_proof,
         ssz_view::{
             ATTESTATION_DATA_SIZE, ATTESTATION_PQ_FIXED, ExecutionPayloadEnvelopeView,
             PAYLOAD_ATTESTATION_DATA_SIZE, VRF_PROOF_SIZE, XMSS_SIGNATURE_SIZE,
         },
-        test_util::{SynthBid, SynthBlock, empty_signed_envelope},
+        test_util::{SynthBid, SynthBlock, empty_signed_envelope_pq},
+        vc_spine::KeyWork,
     };
 
     use super::*;
     use crate::{
         beacon_link::{AttesterDuties, ProducedBlock, SlotDuties, ValidatorIndices},
-        config::ProposalConfig,
-        signing::KeyWork,
+        config::{ProposalConfig, SignerConfig},
     };
 
     const SLOT: u64 = 65;
@@ -463,14 +477,8 @@ mod tests {
                 spec: SpecConfig::mainnet(),
                 genesis_validators_root: GVR,
                 beacon_node: "http://localhost:5052".into(),
-                keys_dir: None,
-                keystores_dir: None,
-                secrets_dir: None,
-                data_dir: PathBuf::new(),
-                init_leaf_records: false,
-                genesis_state: None,
-                xmss_cache_url: None,
-                signer_threads: 1,
+                signer: SignerConfig::default(),
+                signer_tiles: 1,
                 proposals: Some(ProposalConfig {
                     fee_recipient: FEE_RECIPIENT,
                     graffiti: [0x67; 32],
@@ -507,6 +515,7 @@ mod tests {
             };
             let mut aggregator = duty(PUBKEY_A, "7", "3");
             aggregator["is_aggregator"] = true.into();
+            aggregator["aggregator_position"] = "1".into();
             let answer = json!({
                 "dependent_root": hex32(0xd0),
                 "data": [aggregator, duty(PUBKEY_B, "9", "4")],
@@ -550,12 +559,12 @@ mod tests {
 
         fn sign(&mut self, request: &SignRequest, byte: u8) {
             let signature = [byte; XMSS_SIGNATURE_SIZE];
-            let answer = SignAnswer::Signature(&signature);
-            self.duties.on_signed(request, answer, &mut self.requests);
+            let answer = SignAnswer::Signature(signature);
+            self.duties.on_signed(request, &answer, &mut self.requests);
         }
 
         fn refuse(&mut self, request: &SignRequest) {
-            self.duties.on_signed(request, SignAnswer::Refused, &mut self.requests);
+            self.duties.on_signed(request, &SignAnswer::Refused, &mut self.requests);
         }
 
         fn accept(&mut self, id: RequestId, request: BeaconRequest) {
@@ -609,8 +618,8 @@ mod tests {
             assert_eq!(reveal.len(), 1, "only our proposal");
             assert_eq!((reveal[0].slot, reveal[0].work), (SLOT, KeyWork::VrfProof));
             let proof = [0x7a; VRF_PROOF_SIZE];
-            let answer = SignAnswer::VrfProof(&proof);
-            self.duties.on_signed(&reveal[0], answer, &mut self.requests);
+            let answer = SignAnswer::VrfProof(proof);
+            self.duties.on_signed(&reveal[0], &answer, &mut self.requests);
             self.proposer().slot_started(SLOT);
         }
     }
@@ -749,7 +758,9 @@ mod tests {
         }
         harness.sent();
 
-        harness.duties.fetch_aggregates(SLOT, &mut harness.requests);
+        harness.duties.fetch_aggregates(SLOT, 0, &mut harness.requests);
+        assert!(harness.sent().is_empty(), "not its position");
+        harness.duties.fetch_aggregates(SLOT, 1, &mut harness.requests);
         let fetch = harness.sent();
         let data = AttestationData(leaked(json!({"data": data_json(SLOT, EPOCH)})));
         let (data, _) = data.parse().unwrap();
@@ -757,7 +768,7 @@ mod tests {
         assert_eq!(
             fetch[0].1,
             format!(
-                "/eth/v2/validator/aggregate_attestation?attestation_data_root=0x{}&slot=65&committee_index=3",
+                "/eth/v2/validator/aggregate_attestation?attestation_data_root=0x{}&slot=65&committee_index=3&aggregator_position=1",
                 hex::encode(hash_attestation_data(&data))
             )
         );
@@ -798,7 +809,7 @@ mod tests {
     #[test]
     fn slot_without_own_attestation_aggregates_nothing() {
         let mut harness = Harness::attesters();
-        harness.duties.fetch_aggregates(SLOT, &mut harness.requests);
+        harness.duties.fetch_aggregates(SLOT, 1, &mut harness.requests);
         assert!(harness.sent().is_empty());
     }
 
@@ -829,6 +840,23 @@ mod tests {
         assert_eq!(prepare(&mut harness, SLOT), 0);
         harness.proposer().prepare_again();
         assert_eq!(prepare(&mut harness, SLOT + 1), 1);
+    }
+
+    #[test]
+    fn a_payload_seen_in_the_slot_starts_the_ptc_vote_before_its_deadline() {
+        let mut harness = Harness::attesters();
+        harness.answer_slot_duties(
+            "/eth/v1/validator/duties/ptc/2",
+            json!({"dependent_root": hex32(0xd0), "data": [
+                {"pubkey": pubkey_hex(PUBKEY_A), "validator_index": "7", "slot": SLOT.to_string()},
+            ]}),
+        );
+        harness.duties.clock = DutyClock::start(0, 12_000);
+        let now = harness.duties.clock.as_ref().unwrap().current_slot();
+        harness.event(BeaconEvent::PayloadAvailable { slot: now - 1 });
+        assert!(!harness.duties.payload_attestations.is_due(now - 1), "a past slot's payload");
+        harness.event(BeaconEvent::PayloadAvailable { slot: now });
+        assert!(harness.duties.payload_attestations.is_due(now));
     }
 
     #[test]
@@ -916,12 +944,13 @@ mod tests {
     /// A block produced with its payload, signed by `proposer_index`, and its
     /// envelope.
     fn produced(proposer_index: u64) -> (Vec<u8>, [u8; 32], Vec<u8>) {
-        let mut signed_block = SynthBlock::gloas(SLOT, SynthBid::new(&[])).into_bytes();
-        signed_block[108..116].copy_from_slice(&proposer_index.to_le_bytes());
-        let block_root = block_root_gloas(&signed_block);
-        let mut envelope = empty_signed_envelope(SLOT, block_root).split_off(100);
+        const SIGNED_PQ_FIXED: usize = 4 + XMSS_SIGNATURE_SIZE;
+        let mut signed_block = SynthBlock::pq(SLOT, SynthBid::new(&[])).into_bytes();
+        signed_block[SIGNED_PQ_FIXED + 8..][..8].copy_from_slice(&proposer_index.to_le_bytes());
+        let block_root = block_root_pq(&signed_block);
+        let mut envelope = empty_signed_envelope_pq(SLOT, block_root).split_off(SIGNED_PQ_FIXED);
         envelope[8..16].copy_from_slice(&u64::MAX.to_le_bytes());
-        let block = &signed_block[100..];
+        let block = &signed_block[SIGNED_PQ_FIXED..];
         let at = |offset: usize| (offset as u32).to_le_bytes();
         let end = 16 + block.len() + envelope.len();
         let contents =
@@ -974,7 +1003,7 @@ mod tests {
 
         harness.accept(publish[0].0, BeaconRequest::PublishBlock);
         let signing = harness.signing();
-        let envelope_root = ExecutionPayloadEnvelopeView::hash_tree_root(&envelope);
+        let envelope_root = ExecutionPayloadEnvelopeView::hash_tree_root_pq(&envelope);
         assert_eq!(signing[0].work, KeyWork::Sign {
             leaf_index: SlotDuty::ExecutionPayloadEnvelope.leaf(SLOT).unwrap(),
             signing_root: signing_root(DOMAIN_BEACON_BUILDER, &envelope_root),
@@ -982,7 +1011,7 @@ mod tests {
         harness.sign(&signing[0], 0xe1);
         let envelope_publish = harness.sent();
         assert_eq!(envelope_publish[0].1, "/eth/v1/beacon/execution_payload_envelopes");
-        let signed_envelope = &envelope_publish[0].2[12..];
+        let signed_envelope = &envelope_publish[0].2;
         assert_eq!(&signed_envelope[..4], &signed_at.to_le_bytes());
         assert_eq!(&signed_envelope[4..4 + XMSS_SIGNATURE_SIZE], &[0xe1; XMSS_SIGNATURE_SIZE]);
         assert_eq!(&signed_envelope[4 + XMSS_SIGNATURE_SIZE..], &envelope[..]);

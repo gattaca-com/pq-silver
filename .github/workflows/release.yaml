@@ -76,16 +76,17 @@ jobs:
           setup_only: true
 
       - name: Build
-        run: scripts/build-prod.sh --features silver/metrics --bin silver --bin silver_surfer
+        run: scripts/build-prod.sh --features silver/metrics --bin silver --bin silver_surfer --bin silver-vc
 
       - name: Package
         run: |
           mkdir dist && cd dist
-          for bin in silver silver_surfer; do
+          for bin in silver silver_surfer silver-vc; do
             cp ../target/release-prod/$bin $bin-linux-x86_64
             sha256sum $bin-linux-x86_64 > $bin-linux-x86_64.sha256
           done
           ./silver-linux-x86_64 --version
+          ./silver-vc-linux-x86_64 --version
 
       - uses: actions/upload-artifact@v4
         with:
@@ -153,9 +154,10 @@ jobs:
           docker run --rm --network none "$IMAGE:$TAG" --version
           docker run --rm --network none "$IMAGE:$TAG" --help
           docker run --rm --network none --entrypoint /usr/bin/test "$IMAGE:$TAG" -x /usr/local/bin/silver_surfer
+          docker run --rm --network none --entrypoint /usr/local/bin/silver-vc "$IMAGE:$TAG" --version
           container=$(docker create "$IMAGE:$TAG")
           trap 'docker rm "$container" > /dev/null' EXIT
-          for bin in silver silver_surfer; do
+          for bin in silver silver_surfer silver-vc; do
             docker cp "$container:/usr/local/bin/$bin" "packaged-$bin"
             cmp "dist/$bin-linux-x86_64" "packaged-$bin"
           done

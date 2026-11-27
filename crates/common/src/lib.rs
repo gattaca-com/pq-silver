@@ -62,7 +62,7 @@ pub mod test_util;
 pub mod ticker;
 pub mod tracing;
 mod util;
-mod vc_spine;
+pub mod vc_spine;
 mod wheel;
 mod wither;
 pub mod xmss;

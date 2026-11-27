@@ -9,7 +9,7 @@ use silver_common::{
 };
 
 use crate::beacon_link::{
-    head_stream::Head,
+    event_stream::Head,
     requests::{BeaconRequest, RequestId},
 };
 
@@ -61,6 +61,10 @@ pub enum BeaconEvent<'a> {
         request: BeaconRequest,
     },
     Head(Head),
+    /// The slot's payload envelope arrived.
+    PayloadAvailable {
+        slot: u64,
+    },
 }
 
 pub struct ValidatorIndices<'a>(pub(crate) &'a [u8]);
@@ -136,19 +140,22 @@ pub struct AttesterDuty {
     pub committees_at_slot: u64,
     #[serde(deserialize_with = "uint64")]
     pub slot: u64,
-    /// Spec `2f43bc0`'s field, which pq-devnet-0 serves.
     #[serde(default)]
     is_aggregator: Option<bool>,
-    /// The later spec's staggered aggregators: present only for a member of
-    /// its committee's aggregation committee.
+    /// Present only for a member of its committee's aggregation committee.
     #[serde(default, deserialize_with = "optional_uint64")]
     aggregator_position: Option<u64>,
 }
 
 impl AttesterDuty {
-    /// Whether the node names it an aggregator, in either spec's field.
-    pub fn is_aggregator(&self) -> bool {
-        self.is_aggregator.unwrap_or(self.aggregator_position.is_some())
+    /// Its place in the order its committee's aggregators broadcast in. A
+    /// node that flags an aggregator without a position puts it first.
+    pub fn aggregator_position(&self) -> Option<u64> {
+        match (self.aggregator_position, self.is_aggregator) {
+            (Some(position), _) => Some(position),
+            (None, Some(true)) => Some(0),
+            (None, _) => None,
+        }
     }
 }
 
@@ -401,29 +408,30 @@ pub mod tests {
             aggregator_position: None,
         };
         assert_eq!(seen, [duty(PUBKEY_A, 7, 3, 65), duty(PUBKEY_B, 9, 0, 70)]);
-        assert!(!seen[0].is_aggregator());
+        assert_eq!(seen[0].aggregator_position(), None);
 
         assert!(AttesterDuties(json.as_bytes()).for_each(1, |_| {}).is_err());
         assert!(AttesterDuties(br#"{"data":[]}"#).for_each(1, |_| {}).is_err());
     }
 
     #[test]
-    fn either_spec_names_an_aggregator() {
+    fn an_aggregator_is_named_by_its_position() {
         let duty = |extra: &str| {
             let json = format!(
                 r#"{{"pubkey":"0x{}","validator_index":"7","committee_index":"3","committees_at_slot":"1","slot":"65"{extra}}}"#,
                 hex::encode(PUBKEY_A)
             );
-            serde_json::from_str::<AttesterDuty>(&json).unwrap().is_aggregator()
+            serde_json::from_str::<AttesterDuty>(&json).unwrap().aggregator_position()
         };
-        assert!(!duty(""));
-        assert!(duty(r#","is_aggregator":true"#), "pq-devnet-0's field");
-        assert!(duty(r#","aggregator_position":"2""#), "the later spec's");
-        assert!(!duty(r#","is_aggregator":false"#));
-        assert!(
-            duty(r#","is_aggregator":true,"aggregator_position":"0""#),
-            "both, as silver serves"
+        assert_eq!(duty(""), None);
+        assert_eq!(duty(r#","is_aggregator":false"#), None);
+        assert_eq!(duty(r#","aggregator_position":"2""#), Some(2), "as lighthouse serves");
+        assert_eq!(
+            duty(r#","is_aggregator":true,"aggregator_position":"3""#),
+            Some(3),
+            "as silver serves"
         );
+        assert_eq!(duty(r#","is_aggregator":true"#), Some(0), "no position");
     }
 
     #[test]

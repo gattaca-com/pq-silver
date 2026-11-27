@@ -90,14 +90,11 @@ impl Syncing {
         let Some(d) = self.ranges.on_terminator(request_id, delivered, now) else {
             return;
         };
-        // Silence across a span the peer holds is the one emptiness proof
-        // beacon state cannot supply: with no block above the run, no
-        // `parent_slot` ever spans it, and the tail would owe these slots
-        // forever. Which *delivered* slots settle is beacon state's call, not
-        // the wire's — a block it has not reported may still be in its hands.
-        // Likewise for envelopes: a withheld payload's child may sit past the
-        // window, so its `parent_empty` never arrives. Column silence proves
-        // nothing: the peer may custody none of ours.
+        // Silence across a span the peer holds proves it has no blocks, or no
+        // revealed payloads. Beacon state cannot prove this when no child
+        // above the run reports `parent_slot` or `parent_empty`. Column
+        // silence proves nothing: the peer may custody none of ours. A partial
+        // delivery proves nothing either: beacon state settles those slots.
         if d.served != 0 || !ctx.peers.claims_span(peer, d.span.0..=d.span.1) {
             return;
         }

@@ -197,7 +197,6 @@ impl SyncWindow {
         self.update(slot, |e| e.coverage.envelope_covered = true);
     }
 
-    /// A payload never revealed has no envelope, and no columns for its blobs.
     pub fn payload_withheld(&mut self, slot: Slot) {
         self.update(slot, |e| {
             e.coverage.envelope_covered = true;

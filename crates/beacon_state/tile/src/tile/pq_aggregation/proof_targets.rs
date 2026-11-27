@@ -1,5 +1,5 @@
 use std::{
-    collections::BTreeMap,
+    collections::{BTreeMap, hash_map::Entry},
     ops::{Bound, RangeInclusive},
 };
 
@@ -8,7 +8,7 @@ use silver_beacon_state_data::{
     AGGREGATORS_PER_COMMITTEE, B256, Slot, pq::MIN_ATTESTATION_INCLUSION_DELAY_PQ,
 };
 use silver_common::{
-    Nanos,
+    Nanos, PqTarget,
     leanvm::ProofBody,
     ssz_view::SingleAttestationPqView,
     ticker::{BASIS_POINTS, SlotTicker, attestation_due_bps},
@@ -55,6 +55,15 @@ impl TargetKey {
         match self {
             Self::AggregateProof(target) => target.slot,
             Self::BlockProof(slot) => *slot,
+        }
+    }
+
+    pub(super) fn pq_target(&self) -> PqTarget {
+        match self {
+            Self::AggregateProof(target) => {
+                PqTarget::Aggregate { slot: target.slot, committee: target.committee_index as u16 }
+            }
+            Self::BlockProof(slot) => PqTarget::Block { slot: *slot },
         }
     }
 
@@ -174,15 +183,27 @@ impl ProofTargets {
             .find_map(|(&slot, target)| target.proof.id.is_none().then_some(slot))
     }
 
+    /// Returns whether the target is new.
     pub(super) fn open_aggregate_proof(
         &mut self,
         key: LeafKey,
         committee: Committee,
         due: Nanos,
         last_position: u64,
-    ) {
-        let target = AggregateTarget { committee, due, last_position, proof: Default::default() };
-        self.aggregate_proofs.entry(key).or_insert(target);
+    ) -> bool {
+        let Entry::Vacant(entry) = self.aggregate_proofs.entry(key) else { return false };
+        entry.insert(AggregateTarget { committee, due, last_position, proof: Default::default() });
+        true
+    }
+
+    pub(super) fn has_block_proof(&self, slot: Slot) -> bool {
+        self.block_proofs.contains_key(&slot)
+    }
+
+    /// Claims the block proof for `slot` holds.
+    pub(super) fn block_claims(&self, slot: Slot, proofs: &ProofStore) -> usize {
+        let id = self.block_proofs.get(&slot).and_then(|block| block.proof.id);
+        id.map_or(0, |id| proofs.claims(id).len())
     }
 
     /// `slots` are coming block slots a local validator proposes. A slot no

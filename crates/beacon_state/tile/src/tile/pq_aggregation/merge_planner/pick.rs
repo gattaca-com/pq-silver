@@ -1,7 +1,7 @@
 use flux::utils::ArrayVec;
 use silver_beacon_state_data::Slot;
 use silver_common::{
-    LeanVmReq, Nanos, TCacheRead,
+    LeanVmReq, Nanos, PqEvent, PqMergeVotes, TCacheRead,
     leanvm::{
         MAX_PROOF_CLAIMS, MAX_PROOFS, MAX_REQUEST_LEN, MAX_SIGNATURES, ProofLen, RequestBody,
         SIGNED_CLAIM_SIZE,
@@ -14,6 +14,7 @@ use super::{
         bits::Bits,
         claims::MAX_GROUPS,
         cost_model::MergeShape,
+        outbox::Outbox,
         proof_sources::ProofSources,
         proof_store::{ProofId, ProofStore},
         proved::DATA_PER_SLOT,
@@ -215,6 +216,32 @@ impl Merge {
     /// Of the proof the answer must hold.
     pub(super) fn claims(&self) -> usize {
         self.claims
+    }
+
+    /// Tells surfer what the merge takes: each picked aggregate, and each
+    /// committee's picked votes.
+    pub(in crate::tile::pq_aggregation) fn report(
+        &self,
+        request_id: u64,
+        sources: &ProofSources,
+        outbox: &mut Outbox,
+    ) {
+        for picked in self.proofs.iter() {
+            let group = &picked.aggregate;
+            outbox.push(PqEvent::MergeProof {
+                request_id,
+                slot: AttestationDataView::new(&group.committee.data).slot(),
+                committee: group.committee.index as u16,
+                proof: picked.id.raw(),
+                new_votes: picked.new_positions.count() as u16,
+            });
+        }
+        for picked in self.votes.iter() {
+            let Some(entry) = sources.slot(picked.slot) else { continue };
+            let committee = entry.votes.at(picked.index).committee().index as u16;
+            let positions = picked.positions.words();
+            outbox.push_votes(PqMergeVotes { request_id, slot: picked.slot, committee, positions });
+        }
     }
 
     pub(in crate::tile::pq_aggregation) fn running_id(&self) -> Option<ProofId> {

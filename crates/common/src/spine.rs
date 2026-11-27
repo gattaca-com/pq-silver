@@ -11,6 +11,7 @@ use flux::{
 };
 pub use leanvm::{LeanVmReq, LeanVmResp, RefusalCode};
 pub use messages::*;
+pub use pq_events::*;
 pub use stream_id::{LOCAL_GOSSIP_STREAM_ID, P2pStreamId};
 pub use stream_protocol::{
     ALL_PROTOCOLS, MULTISTREAM_V1, REJECT_RESPONSE, RPC_PROTOCOLS, StreamProtocol,
@@ -22,6 +23,7 @@ use crate::cell_store::{CellStoreEvent, RetentionEvent};
 mod cluster_admin;
 pub mod leanvm;
 mod messages;
+mod pq_events;
 mod stream_id;
 mod stream_protocol;
 mod tcache;
@@ -91,6 +93,11 @@ pub struct SilverSpine {
     pub leanvm_resps: SpineQueue<LeanVmResp>,
     #[queue(size(2usize.pow(8)))]
     pub leanvm_ready: SpineQueue<LeanVmReady>,
+    /// Sized for a mainnet slot's votes, read every 100 ms by surfer.
+    #[queue(size(2usize.pow(16)))]
+    pub pq_events: SpineQueue<PqEvent>,
+    #[queue(size(2usize.pow(10)))]
+    pub pq_merge_votes: SpineQueue<PqMergeVotes>,
 
     #[queue(size(2usize.pow(6)))]
     pub sidecar_bid_requests: SpineQueue<SidecarBidRequest>,

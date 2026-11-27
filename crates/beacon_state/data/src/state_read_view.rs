@@ -92,6 +92,18 @@ impl StateReadView<'_> {
         committee_index: usize,
         validator_index: u64,
     ) -> Option<bool> {
+        self.aggregator_position(slot, committee_index, validator_index)
+            .map(|position| position.is_some())
+    }
+
+    /// The validator's place in the committee's aggregators; `None` outside
+    /// the window, `Some(None)` when it is no aggregator.
+    pub fn aggregator_position(
+        &self,
+        slot: Slot,
+        committee_index: usize,
+        validator_index: u64,
+    ) -> Option<Option<usize>> {
         let window_epoch = (slot / SLOTS_PER_EPOCH + 1).checked_sub(self.slot.current_epoch())?;
         if window_epoch > MIN_SEED_LOOKAHEAD + 1 {
             return None;
@@ -99,7 +111,7 @@ impl StateReadView<'_> {
         let window_slot = (window_epoch * SLOTS_PER_EPOCH + slot % SLOTS_PER_EPOCH) as usize;
         let mut aggregators =
             self.epoch.aggregation_committee_window().aggregators(window_slot, committee_index);
-        Some(aggregators.any(|aggregator| aggregator == validator_index))
+        Some(aggregators.position(|aggregator| aggregator == validator_index))
     }
 
     #[inline]

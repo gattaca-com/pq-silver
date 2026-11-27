@@ -107,6 +107,33 @@ lower half plots the selected tile's load over time.
 | `util avg %`, `util peak %` | Share of time the tile was busy |
 | `busy avg`, `busy max` | Average and worst busy time per sample, in nanoseconds |
 
+## Attestations
+
+PQ votes and aggregates for one slot, and the leanVM work done during it.
+`←` / `→` change the slot; the newest one follows live.
+
+The left side shares one time axis, from the slot start:
+
+- Votes arriving, stacked by committee, with the attestation and
+  aggregation deadlines (`p0`–`p3`, one per aggregator position).
+- Aggregates received: `◆` from other nodes, `◇` our own.
+- One row per proof leanVM worked on in this slot. A bar is a merge job:
+  teal for an aggregate proof, blue for a block proof, red when it finished
+  after the proof was requested, purple when it failed. `▼` marks the
+  request, by the VC or block production.
+- `leanVM work`: every job in the slot, and how busy leanVM was.
+
+The right column is what the proof held when requested, over the votes the
+node had by then. `Enter` on a proof lists its jobs. `Enter` on a job lists
+its inputs, with their arrival times.
+
+The right side holds the committees table and the votes and aggregates
+tables. `c`, `v` and `a` move the keys there; `Esc` returns. `Enter` on a
+committee filters every part to it. `Enter` on a vote or aggregate opens the
+job that proved it.
+
+The data comes from the node's `pq_events` and `pq_merge_votes` queues.
+
 ## Other tabs
 
 - **Counters**: raw node counters with history; `Enter` plots one.

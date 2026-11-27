@@ -2,7 +2,7 @@ use silver_beacon_state_data::Slot;
 
 use super::{
     claims::{Claim, VerifiedVote},
-    proof_store::ProofStore,
+    proof_store::{ProofId, ProofStore},
     proved::POOL_SLOTS,
     slot_aggregates::{AggregateRefused, SlotAggregates},
     slot_votes::{SlotVotes, VoteRefused},
@@ -117,7 +117,7 @@ impl ProofSources {
         claims: &[Claim],
         proof: &[u8],
         proofs: &mut ProofStore,
-    ) -> Result<(), AggregateRefused> {
+    ) -> Result<ProofId, AggregateRefused> {
         SlotAggregates::add(attestation, attesters, claims, proof, proofs, |slot, proofs| {
             let arrival = self.next_arrival();
             let entry = self.store_slot(slot, proofs)?;

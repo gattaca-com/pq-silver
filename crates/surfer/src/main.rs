@@ -16,13 +16,14 @@ use std::{
 };
 
 use crossterm::{
-    event::{self, Event, KeyCode, KeyEventKind},
+    event::{self, Event, KeyCode, KeyEvent, KeyEventKind},
     execute,
     style::Print,
     terminal::{EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode},
 };
+use flux::timing::Nanos;
 use ratatui::{Terminal, backend::CrosstermBackend};
-use silver_beacon_state_data::FAR_FUTURE_EPOCH;
+use silver_beacon_state_data::{FAR_FUTURE_EPOCH, SLOTS_PER_EPOCH};
 use silver_common::NodeChain;
 use silver_observe::discover;
 use silver_stages::SlotClock;
@@ -36,7 +37,10 @@ mod sources;
 use crate::{
     app::{App, Pane},
     flamegraph::Flamegraph,
-    render::events::{EventsPane, Theme},
+    render::{
+        attestations::AttestationsPane,
+        events::{EventsPane, Theme},
+    },
     sources::{
         counters::CounterSet,
         events::{MAINNET_GENESIS_UNIX_SECS, MAINNET_SLOT_MS},
@@ -132,14 +136,23 @@ fn main() -> io::Result<()> {
         }
         None => (SlotClock::new(MAINNET_GENESIS_UNIX_SECS, MAINNET_SLOT_MS), FAR_FUTURE_EPOCH),
     };
+    let gloas = clock.slot_at(Nanos::now()) / SLOTS_PER_EPOCH >= gloas_fork_epoch;
+    let attestations = AttestationsPane::open(&base_dir, &clock, gloas);
     let events = EventsPane::open(&base_dir, clock, gloas_fork_epoch, Theme::default());
 
     let peers = sources::peers::Peers::open(&base_dir);
 
     let flamegraph = Flamegraph::attach(&app_name);
-    let mut app =
-        App::new(counter_sets, tcache_sets, timing_sets, tile_sets, peers, events, flamegraph);
-    app.attestations.attach(&sources.timings);
+    let mut app = App::new(
+        counter_sets,
+        tcache_sets,
+        timing_sets,
+        tile_sets,
+        peers,
+        events,
+        attestations,
+        flamegraph,
+    );
     app.build_info = sources.build_info;
 
     // Restore the terminal before the panic message prints, else it lands
@@ -182,7 +195,7 @@ fn run<B: ratatui::backend::Backend>(
         if event::poll(timeout)? {
             if let Event::Key(key) = event::read()? {
                 if key.kind == KeyEventKind::Press {
-                    handle_key(app, key.code, app_name);
+                    handle_key(app, key, app_name);
                 }
             }
         }
@@ -207,7 +220,8 @@ fn run<B: ratatui::backend::Backend>(
     }
 }
 
-fn handle_key(app: &mut App, code: KeyCode, app_name: &str) {
+fn handle_key(app: &mut App, key: KeyEvent, app_name: &str) {
+    let code = key.code;
     if app.search.is_open() {
         if app.search.type_key(code) {
             app.search_step(1);
@@ -215,6 +229,10 @@ fn handle_key(app: &mut App, code: KeyCode, app_name: &str) {
         return;
     }
     app.search.not_found = false;
+    let pane_keys = !matches!(code, KeyCode::Tab | KeyCode::BackTab | KeyCode::Char('q'));
+    if app.pane == Pane::Attestations && pane_keys && app.attestations.on_key(key) {
+        return;
+    }
     match code {
         KeyCode::Char('q') => app.quit = true,
         KeyCode::Char('/') => app.search.open(),

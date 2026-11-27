@@ -18,6 +18,13 @@ const MAX_BUFFERS: usize = SOURCE_SLOTS * MAX_COMMITTEES_PER_SLOT_PQ * AGGREGATO
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub(super) struct ProofId(u16);
 
+impl ProofId {
+    /// Names the proof outside the aggregator, until the store frees it.
+    pub(super) fn raw(self) -> u16 {
+        self.0
+    }
+}
+
 #[derive(Default)]
 struct Buffer {
     bytes: Box<[u8]>,

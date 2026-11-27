@@ -93,7 +93,7 @@ impl SlotAggregates {
         proof: &[u8],
         proofs: &mut ProofStore,
         store: impl FnOnce(Slot, &mut ProofStore) -> Option<(u64, &'a mut Self, &'a OnChain)>,
-    ) -> Result<(), AggregateRefused> {
+    ) -> Result<ProofId, AggregateRefused> {
         let (index, positions) = AttestationPqView::one_committee_positions(attestation)
             .ok_or(AggregateRefused::Malformed)?;
         if index >= MAX_COMMITTEES_PER_SLOT_PQ {
@@ -167,7 +167,7 @@ impl SlotAggregates {
             arrival,
             useful,
         });
-        Ok(())
+        Ok(id)
     }
 }
 

@@ -12,6 +12,7 @@ mod claims;
 mod cost_model;
 mod deadline_tracker;
 mod merge_planner;
+mod outbox;
 mod proof_sources;
 mod proof_store;
 mod proof_targets;

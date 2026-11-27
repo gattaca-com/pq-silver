@@ -1,4 +1,7 @@
-use std::{collections::HashMap, io::Read, ops::Range, thread, time::Duration};
+use std::{
+    collections::HashMap, fs::File, io::Read, ops::Range, os::unix::fs::FileExt, path::PathBuf,
+    thread, time::Duration,
+};
 
 use lean_xmss::internals::{CACHED_BOTTOM_SIZE, CACHED_TREE_SIZE};
 use silver_common::ssz_view::XMSSPubkey;
@@ -22,11 +25,37 @@ const RETRY_AFTER: Duration = Duration::from_secs(1);
 /// so pubkeys come from the network's own `genesis.ssz`: `.bin` only says
 /// where each key's record is.
 pub struct RemoteCache {
-    agent: ureq::Agent,
-    url: String,
+    source: Source,
     /// Each genesis key's record index, by its public parameter, which a seed
     /// derives without building a tree.
     by_parameter: HashMap<[u8; 16], (usize, XMSSPubkey)>,
+}
+
+enum Source {
+    Http { agent: ureq::Agent, url: String },
+    File(PathBuf),
+}
+
+impl Source {
+    fn parse(location: &str) -> Self {
+        match location.strip_prefix("file://") {
+            Some(path) => Self::File(path.into()),
+            None if !location.contains("://") => Self::File(location.into()),
+            None => Self::Http {
+                agent: ureq::AgentBuilder::new().timeout(REQUEST_TIMEOUT).build(),
+                url: location.to_owned(),
+            },
+        }
+    }
+
+    fn read(&self, range: Option<Range<usize>>, max: usize) -> Result<Vec<u8>, String> {
+        match self {
+            Self::Http { agent, url } => get(agent, url, range, max),
+            Self::File(path) => {
+                read_file(path, range, max).map_err(|e| format!("{}: {e}", path.display()))
+            }
+        }
+    }
 }
 
 /// Records at consecutive indices, fetched in one request.
@@ -48,8 +77,7 @@ impl RemoteCache {
             .strip_suffix(".xmss")
             .map(|stem| format!("{stem}.bin"))
             .ok_or("the cache URL does not end in .xmss")?;
-        let agent = ureq::AgentBuilder::new().timeout(REQUEST_TIMEOUT).build();
-        let metadata = get(&agent, &metadata_url, None, MAX_METADATA_LEN)?;
+        let metadata = Source::parse(&metadata_url).read(None, MAX_METADATA_LEN)?;
         let (records, []) = metadata.as_chunks::<METADATA_RECORD_LEN>() else {
             return Err(format!("{metadata_url} is not whole {METADATA_RECORD_LEN}-byte records"));
         };
@@ -62,7 +90,7 @@ impl RemoteCache {
         let unregistered = before - by_parameter.len();
         let usable = by_parameter.len();
         silver_log::info!(usable, unregistered, url = metadata_url, "remote expanded keys listed");
-        Ok(Self { agent, url: url.to_owned(), by_parameter })
+        Ok(Self { source: Source::parse(url), by_parameter })
     }
 
     /// The runs holding the records of `parameters`. A key without a genesis
@@ -97,7 +125,7 @@ impl RemoteCache {
         let len = run.keys.len() * RECORD_LEN;
         let mut attempt = 1;
         loop {
-            match get(&self.agent, &self.url, Some(start..start + len), len) {
+            match self.source.read(Some(start..start + len), len) {
                 Ok(bytes) if bytes.len() == len => return Ok(bytes),
                 Ok(bytes) => return Err(format!("{} bytes, expected {len}", bytes.len())),
                 Err(error) if attempt == ATTEMPTS => return Err(error),
@@ -171,14 +199,28 @@ fn get(
     Ok(bytes)
 }
 
+fn read_file(path: &PathBuf, range: Option<Range<usize>>, max: usize) -> std::io::Result<Vec<u8>> {
+    let Some(range) = range else {
+        let file = File::open(path)?;
+        let mut bytes = Vec::new();
+        file.take(max as u64 + 1).read_to_end(&mut bytes)?;
+        if bytes.len() > max {
+            return Err(std::io::Error::other(format!("more than {max} bytes")));
+        }
+        return Ok(bytes);
+    };
+    let mut bytes = vec![0; range.len().min(max)];
+    File::open(path)?.read_exact_at(&mut bytes, range.start as u64)?;
+    Ok(bytes)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
     fn cache(listed: &[XMSSPubkey]) -> RemoteCache {
         RemoteCache {
-            agent: ureq::agent(),
-            url: String::new(),
+            source: Source::File(PathBuf::new()),
             by_parameter: by_parameter(listed.iter().copied().enumerate()),
         }
     }

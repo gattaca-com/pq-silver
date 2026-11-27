@@ -326,6 +326,28 @@ mod tests {
     }
 
     #[test]
+    fn a_local_cache_path_loads_records_like_a_url() {
+        let (pubkeys, records): (Vec<_>, Vec<_>) = [2, 3].map(record).into_iter().unzip();
+        let metadata: Vec<u8> =
+            pubkeys.iter().flat_map(|pubkey| [&pubkey[..], &[0x77; 32]].concat()).collect();
+        let files = tempfile::tempdir().unwrap();
+        fs::write(files.path().join("keys.bin"), metadata).unwrap();
+        fs::write(files.path().join("keys.xmss"), records.concat()).unwrap();
+        let path = files.path().join("keys.xmss").display().to_string();
+
+        for location in [path.clone(), format!("file://{path}")] {
+            let remote = RemoteCache::with_registry(&location, pubkeys.iter().copied()).unwrap();
+            let dir = tempfile::tempdir().unwrap();
+            let runs = remote.runs(&[Cache::of(&key(3), dir.path()).parameter]);
+            assert_eq!(remote.fetch(&runs[0]).unwrap(), records[1]);
+            assert_eq!(load_alone(&key(3), dir.path(), Some(&remote)).0.pubkey, pubkeys[1]);
+        }
+        assert!(
+            RemoteCache::with_registry("/nonexistent/keys.xmss", pubkeys.iter().copied()).is_err()
+        );
+    }
+
+    #[test]
     fn a_listed_key_outside_genesis_is_not_fetched() {
         let (pubkey, record) = record(5);
         let metadata = [&pubkey[..], &[0x77; 32]].concat();

@@ -190,7 +190,7 @@ impl PqAggregator {
         claims: &[Claim],
         proof: &[u8],
         ticker: &SlotTicker,
-    ) -> Option<u16> {
+    ) -> Option<u64> {
         let ceiling = ticker.current_slot().saturating_add(1);
         let slot = (attestation.len() >= ATTESTATION_PQ_FIXED)
             .then(|| AttestationPqView::data(attestation).slot());
@@ -202,9 +202,9 @@ impl PqAggregator {
             return None;
         }
         match self.sources.add_aggregate(attestation, attesters, claims, proof, &mut self.proofs) {
-            Ok(id) => {
+            Ok(arrival) => {
                 self.notify(Trigger::Event);
-                return Some(id.raw());
+                return Some(arrival);
             }
             Err(AggregateRefused::Malformed) => {
                 silver_log::error!(?slot, "verified aggregate does not fit a merge");
@@ -228,14 +228,14 @@ impl PqAggregator {
         });
     }
 
-    /// A verified aggregate, stored as `proof` when a local block wants it.
+    /// A verified aggregate, stored at `arrival` when a local block wants it.
     pub fn note_aggregate(
         &mut self,
         attestation: &[u8],
         aggregator: u32,
         position: u8,
         attesters: usize,
-        proof: Option<u16>,
+        arrival: Option<u64>,
         producers: &mut Producers,
     ) {
         if attestation.len() < ATTESTATION_PQ_FIXED {
@@ -251,7 +251,7 @@ impl PqAggregator {
             position,
             attesters: attesters as u16,
             committee_len: bitlist_len(AttestationPqView::aggregation_bits(attestation)) as u16,
-            proof,
+            arrival,
         });
     }
 

@@ -2685,7 +2685,7 @@ impl BeaconStateTile {
         }
         let attesters = &self.stf_scratch.active;
         let attestation = SignedAggregateAndProofPqView::aggregate(signed);
-        let proof = merges
+        let arrival = merges
             .then(|| {
                 self.pq_aggregator.add_aggregate(
                     attestation,
@@ -2702,7 +2702,7 @@ impl BeaconStateTile {
             aggregator,
             position,
             attesters.len(),
-            proof,
+            arrival,
             producers,
         );
         Feedback::Accept

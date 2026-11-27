@@ -67,6 +67,7 @@ impl NamedData {
 #[derive(Clone, Copy)]
 struct ProofPick {
     id: ProofId,
+    arrival: u64,
     aggregate: ProvedGroup,
     new_positions: Bits,
 }
@@ -222,14 +223,8 @@ impl Merge {
     /// committee's picked votes.
     pub fn report(&self, request_id: u64, sources: &ProofSources, producers: &mut Producers) {
         for picked in self.proofs.iter() {
-            let group = &picked.aggregate;
-            producers.produce(PqEvent::MergeProof {
-                request_id,
-                slot: AttestationDataView::new(&group.committee.data).slot(),
-                committee: group.committee.index as u16,
-                proof: picked.id.raw(),
-                new_votes: picked.new_positions.count() as u16,
-            });
+            let (arrival, new_votes) = (picked.arrival, picked.new_positions.count() as u16);
+            producers.produce(PqEvent::MergeProof { request_id, arrival, new_votes });
         }
         for picked in self.votes.iter() {
             let Some(entry) = sources.slot(picked.slot) else { continue };
@@ -337,7 +332,8 @@ impl Merge {
         }
         let new_positions = stored.group.positions.outside(covered);
         self.commit(shape, touched, &new_positions, claims, gain);
-        self.proofs.push(ProofPick { id: stored.proof, aggregate: stored.group, new_positions });
+        let (id, arrival, aggregate) = (stored.proof, stored.arrival, stored.group);
+        self.proofs.push(ProofPick { id, arrival, aggregate, new_positions });
     }
 
     /// Takes the longest prefix of the waiting votes that every check allows.

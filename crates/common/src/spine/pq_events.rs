@@ -15,8 +15,8 @@ pub enum PqEvent {
         committee_len: u16,
         validator: u32,
     },
-    /// An aggregate passed its STARK check. `proof` names it in later merges
-    /// while the aggregator holds it; `None` when no local block wants it.
+    /// An aggregate passed its STARK check. `arrival` names it in later
+    /// merges; `None` when no local block wants it.
     Aggregate {
         slot: u64,
         committee: u16,
@@ -25,7 +25,7 @@ pub enum PqEvent {
         position: u8,
         attesters: u16,
         committee_len: u16,
-        proof: Option<u16>,
+        arrival: Option<u64>,
     },
     /// A local aggregator's proof for a committee opened.
     AggregateDuty {
@@ -47,13 +47,11 @@ pub enum PqEvent {
         predicted: Nanos,
         idle: bool,
     },
-    /// A proof merged by `request_id`: a received aggregate, or a proof of
-    /// this node's. `new_votes` are the positions it adds to the merge.
+    /// A received aggregate merged by `request_id`. `new_votes` are the
+    /// positions it adds to the merge.
     MergeProof {
         request_id: u64,
-        slot: u64,
-        committee: u16,
-        proof: u16,
+        arrival: u64,
         new_votes: u16,
     },
     MergeSettled {

@@ -217,7 +217,7 @@ pub struct PqData {
     target_ids: HashMap<PqTarget, usize>,
     job_ids: HashMap<u64, usize>,
     vote_ids: HashMap<(u64, u8, u16), usize>,
-    proof_ids: HashMap<(u64, u8, u16), usize>,
+    arrivals: HashMap<u64, usize>,
 }
 
 impl PqData {
@@ -232,7 +232,7 @@ impl PqData {
             target_ids: HashMap::new(),
             job_ids: HashMap::new(),
             vote_ids: HashMap::new(),
-            proof_ids: HashMap::new(),
+            arrivals: HashMap::new(),
         }
     }
 
@@ -279,7 +279,7 @@ impl PqData {
                 position,
                 attesters,
                 committee_len,
-                proof,
+                arrival,
             } => {
                 let committee = committee as u8;
                 let id = self.aggregates.push(Aggregate {
@@ -296,8 +296,8 @@ impl PqData {
                 let info = self.slots.entry(slot).or_default();
                 info.note_committee(committee, committee_len);
                 info.aggregates.push(id);
-                if let Some(proof) = proof {
-                    self.proof_ids.insert((slot, committee, proof), id);
+                if let Some(arrival) = arrival {
+                    self.arrivals.insert(arrival, id);
                 }
             }
             PqEvent::AggregateDuty { slot, committee, position, .. } => {
@@ -332,11 +332,9 @@ impl PqData {
                 self.targets.get_mut(target).expect("just made").jobs.push(job);
                 self.job_ids.insert(request_id, job);
             }
-            PqEvent::MergeProof { request_id, slot, committee, proof, new_votes } => {
+            PqEvent::MergeProof { request_id, arrival, new_votes } => {
                 let Some(&job) = self.job_ids.get(&request_id) else { return };
-                let Some(&index) = self.proof_ids.get(&(slot, committee as u8, proof)) else {
-                    return
-                };
+                let Some(&index) = self.arrivals.get(&arrival) else { return };
                 let gain = usize::from(new_votes);
                 if let Some(job) = self.jobs.get_mut(job) {
                     job.members.push(Member::Aggregate { index, gain });
@@ -563,7 +561,7 @@ impl PqData {
         self.target_ids.retain(|_, id| *id >= self.targets.base);
         self.job_ids.retain(|_, id| *id >= self.jobs.base);
         self.vote_ids.retain(|&(slot, ..), _| slot >= input_floor);
-        self.proof_ids.retain(|&(slot, ..), _| slot >= input_floor);
+        self.arrivals.retain(|_, id| *id >= self.aggregates.base);
     }
 }
 
@@ -702,7 +700,7 @@ mod tests {
             position: 2,
             attesters: 6,
             committee_len: 8,
-            proof: Some(42),
+            arrival: Some(42),
         };
         data.apply(at(SLOT, 8_500), aggregate);
         let block = PqTarget::Block { slot: SLOT + 2 };
@@ -710,9 +708,7 @@ mod tests {
         data.apply(at(SLOT, 9_000), sent(8, block, 0));
         data.apply(at(SLOT, 9_000), PqEvent::MergeProof {
             request_id: 8,
-            slot: SLOT,
-            committee: 0,
-            proof: 42,
+            arrival: 42,
             new_votes: 6,
         });
         data.apply(at(SLOT, 10_000), settled(8, 6, None));

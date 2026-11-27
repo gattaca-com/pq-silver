@@ -16,7 +16,6 @@ use super::{
     claims::ClaimCheck,
     cost_model::MergeShape,
     merge_planner::{Merge, MergePlanner, Scratch, Sent},
-    outbox::Outbox,
     proof_sources::ProofSources,
     proof_store::ProofStore,
     proof_targets::{LeafKey, ProofTargets},
@@ -105,7 +104,6 @@ pub struct PqAggregator {
     claim_check: ClaimCheck,
     next_request_id: u64,
     round_trip: Timer,
-    outbox: Outbox,
 }
 
 impl Default for PqAggregator {
@@ -124,7 +122,6 @@ impl Default for PqAggregator {
             claim_check: ClaimCheck::default(),
             next_request_id: 0,
             round_trip: Timer::new("silver", "leanvm_merge"),
-            outbox: Outbox::default(),
         }
     }
 }
@@ -139,6 +136,7 @@ impl PqAggregator {
         vote: &VerifiedVote,
         last_position: Option<u64>,
         ticker: &SlotTicker,
+        producers: &mut Producers,
     ) {
         let key = LeafKey::new(vote);
         if vote.committee_position >= vote.committee_len.min(MAX_VALIDATORS_PER_COMMITTEE) {
@@ -173,7 +171,7 @@ impl PqAggregator {
         if let Some((last_position, due)) = aggregate_proof_due &&
             self.targets.open_aggregate_proof(key, vote.committee(), due, last_position)
         {
-            self.outbox.push(PqEvent::AggregateDuty {
+            producers.produce(PqEvent::AggregateDuty {
                 slot: key.slot,
                 committee: key.committee_index as u16,
                 position: last_position as u8,
@@ -219,9 +217,9 @@ impl PqAggregator {
         None
     }
 
-    pub fn note_vote(&mut self, vote: &VerifiedVote) {
+    pub fn note_vote(&mut self, vote: &VerifiedVote, producers: &mut Producers) {
         let key = LeafKey::new(vote);
-        self.outbox.push(PqEvent::Vote {
+        producers.produce(PqEvent::Vote {
             slot: key.slot,
             committee: key.committee_index as u16,
             position: vote.committee_position as u16,
@@ -238,6 +236,7 @@ impl PqAggregator {
         position: u8,
         attesters: usize,
         proof: Option<u16>,
+        producers: &mut Producers,
     ) {
         if attestation.len() < ATTESTATION_PQ_FIXED {
             return;
@@ -245,7 +244,7 @@ impl PqAggregator {
         let Some((committee, _)) = AttestationPqView::one_committee_positions(attestation) else {
             return
         };
-        self.outbox.push(PqEvent::Aggregate {
+        producers.produce(PqEvent::Aggregate {
             slot: AttestationPqView::data(attestation).slot(),
             committee: committee as u16,
             aggregator,
@@ -258,7 +257,13 @@ impl PqAggregator {
 
     /// A response to a request that is not in flight is logged and dropped.
     /// A body that cannot be read counts as no answer.
-    pub fn on_response(&mut self, resp: LeanVmResp, now: Nanos, reader: &mut TCacheReader) {
+    pub fn on_response(
+        &mut self,
+        resp: LeanVmResp,
+        now: Nanos,
+        reader: &mut TCacheReader,
+        producers: &mut Producers,
+    ) {
         let request_id = resp.request_id();
         let Some(in_flight) = self.leanvm.take_answered(request_id) else {
             silver_log::error!(request_id, "leanvm response to no request in flight");
@@ -300,7 +305,7 @@ impl PqAggregator {
             }
             LeanVmResp::NoAnswer { .. } => Err("no answer"),
         };
-        self.settle(request_id, in_flight, response, refusal, now);
+        self.settle(request_id, in_flight, response, refusal, now, producers);
         self.notify(Trigger::Answer);
     }
 
@@ -337,10 +342,16 @@ impl PqAggregator {
 
     /// `slots` are the block slots of `proposal_window` a local validator
     /// proposes.
-    pub fn set_local_proposals(&mut self, slots: &[Slot], is_gloas: bool, ticker: &SlotTicker) {
+    pub fn set_local_proposals(
+        &mut self,
+        slots: &[Slot],
+        is_gloas: bool,
+        ticker: &SlotTicker,
+        producers: &mut Producers,
+    ) {
         for &block_slot in slots {
             if !self.targets.has_block_proof(block_slot) {
-                self.outbox.push(PqEvent::BlockDuty { block_slot });
+                producers.produce(PqEvent::BlockDuty { block_slot });
             }
         }
         self.targets.set_local_proposals(slots, is_gloas, ticker);
@@ -383,7 +394,6 @@ impl PqAggregator {
             self.stats.overdue(in_flight.predicted, now.saturating_sub(in_flight.sent));
         }
         self.run_planner(now, ticker, tcache, producers);
-        self.outbox.flush(producers);
     }
 
     fn planner(&self, now: Nanos) -> MergePlanner<'_> {
@@ -458,7 +468,7 @@ impl PqAggregator {
         let predicted = self.stats.cost().predict(shape);
         let sent = ticker.since_genesis();
         let timer_start = Nanos::now();
-        self.outbox.push(PqEvent::MergeSent {
+        producers.produce(PqEvent::MergeSent {
             request_id,
             target: merge.key.pq_target(),
             proofs: shape.proofs as u16,
@@ -467,7 +477,7 @@ impl PqAggregator {
             predicted,
             idle: shape.idle,
         });
-        self.merge.report(request_id, &self.sources, &mut self.outbox);
+        self.merge.report(request_id, &self.sources, producers);
         let in_flight = InFlight { merge, predicted, sent, timer_start };
         self.leanvm = LeanVm::Busy { request_id, in_flight };
         producers.produce(self.merge.request(request_id, body, &self.proofs));
@@ -480,6 +490,7 @@ impl PqAggregator {
         committee_index: u64,
         data_root: B256,
         ticker: &SlotTicker,
+        producers: &mut Producers,
     ) -> Option<ProvedAggregate<'_>> {
         let key = LeafKey { slot, committee_index, data_root };
         self.notify(Trigger::Event);
@@ -487,15 +498,20 @@ impl PqAggregator {
         self.stats.aggregate_proof_read(key.slot, target.due, target.last_position, ticker);
         let claims = target.proof.id.map_or(0, |id| self.proofs.claims(id).len()) as u32;
         let pq_target = PqTarget::Aggregate { slot, committee: committee_index as u16 };
-        self.outbox.push(PqEvent::ProofRead { target: pq_target, claims });
+        producers.produce(PqEvent::ProofRead { target: pq_target, claims });
         target.proof.aggregate(&self.proofs)
     }
 
-    pub fn on_block_proof_read(&mut self, block_slot: Slot, ticker: &SlotTicker) {
+    pub fn on_block_proof_read(
+        &mut self,
+        block_slot: Slot,
+        ticker: &SlotTicker,
+        producers: &mut Producers,
+    ) {
         self.stats.block_proof_read(block_slot, ticker);
         let claims = self.targets.block_claims(block_slot, &self.proofs) as u32;
-        self.outbox
-            .push(PqEvent::ProofRead { target: PqTarget::Block { slot: block_slot }, claims });
+        producers
+            .produce(PqEvent::ProofRead { target: PqTarget::Block { slot: block_slot }, claims });
         self.notify(Trigger::Event);
     }
 
@@ -514,6 +530,7 @@ impl PqAggregator {
         response: Result<ProofBody<'_>, &'static str>,
         refusal: Option<RefusalCode>,
         now: Nanos,
+        producers: &mut Producers,
     ) {
         let InFlight { merge, predicted, sent, .. } = in_flight;
         let shape = *self.merge.shape();
@@ -531,7 +548,7 @@ impl PqAggregator {
         }
         let failure = finished.err().map(|reason| merge_failure(reason, refusal));
         let claims = *finished.as_ref().unwrap_or(&0) as u32;
-        self.outbox.push(PqEvent::MergeSettled { request_id, claims, failure });
+        producers.produce(PqEvent::MergeSettled { request_id, claims, failure });
         let late = finished.is_ok() && now > merge.deadline;
         let round_trip = now.saturating_sub(sent);
         let q = self.stats.cost().margin();

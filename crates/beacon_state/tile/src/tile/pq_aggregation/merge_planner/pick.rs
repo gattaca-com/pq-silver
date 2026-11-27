@@ -1,4 +1,4 @@
-use flux::utils::ArrayVec;
+use flux::{spine::SpineProducers, utils::ArrayVec};
 use silver_beacon_state_data::Slot;
 use silver_common::{
     LeanVmReq, Nanos, PqEvent, PqMergeVotes, TCacheRead,
@@ -14,7 +14,6 @@ use super::{
         bits::Bits,
         claims::MAX_GROUPS,
         cost_model::MergeShape,
-        outbox::Outbox,
         proof_sources::ProofSources,
         proof_store::{ProofId, ProofStore},
         proved::DATA_PER_SLOT,
@@ -25,6 +24,7 @@ use super::{
     MergePlanner, TargetKey,
     queue::{PickQueue, Source, Touched},
 };
+use crate::tile::Producers;
 
 /// The attestation data a proof names. A
 /// block packs no proof that names more than `MAX_ATTESTATIONS_PQ`. A
@@ -224,11 +224,11 @@ impl Merge {
         &self,
         request_id: u64,
         sources: &ProofSources,
-        outbox: &mut Outbox,
+        producers: &mut Producers,
     ) {
         for picked in self.proofs.iter() {
             let group = &picked.aggregate;
-            outbox.push(PqEvent::MergeProof {
+            producers.produce(PqEvent::MergeProof {
                 request_id,
                 slot: AttestationDataView::new(&group.committee.data).slot(),
                 committee: group.committee.index as u16,
@@ -240,7 +240,7 @@ impl Merge {
             let Some(entry) = sources.slot(picked.slot) else { continue };
             let committee = entry.votes.at(picked.index).committee().index as u16;
             let positions = picked.positions.words();
-            outbox.push_votes(PqMergeVotes { request_id, slot: picked.slot, committee, positions });
+            producers.produce(PqMergeVotes { request_id, slot: picked.slot, committee, positions });
         }
     }
 

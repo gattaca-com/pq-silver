@@ -6864,7 +6864,9 @@ fn blinded_block_on_a_bid_matches_the_full_block() {
     let signed_bid =
         signed_builder_bid(&header, frame.commitments, frame.execution_requests, [5; 32]);
     let proposal = fixture_proposal(&tile, &block_ssz);
-    let blinded = tile.produce_on_sidecar_bid(proposal, &signed_bid).expect("built on the bid");
+    let blinded = tile
+        .produce_on_sidecar_bid(proposal, &signed_bid, &mut adapter.producers)
+        .expect("built on the bid");
     assert!(blinded.payload.is_none());
     assert_eq!(blinded.execution_payload_value, [5; 32]);
 
@@ -7766,7 +7768,8 @@ mod pq_aggregator {
         }
 
         fn propose(&mut self, slots: &[Slot]) {
-            self.tile.pq_aggregator.set_local_proposals(slots, false, &self.tile.ticker);
+            let producers = &mut self.adapter.producers;
+            self.tile.pq_aggregator.set_local_proposals(slots, false, &self.tile.ticker, producers);
         }
 
         fn open_vote_gate(&mut self) {
@@ -7840,7 +7843,8 @@ mod pq_aggregator {
                 committee_position: tag as usize,
                 committee_len: COMMITTEE_LEN,
             };
-            self.tile.pq_aggregator.add_vote(&vote, last_position, &self.tile.ticker);
+            let producers = &mut self.adapter.producers;
+            self.tile.pq_aggregator.add_vote(&vote, last_position, &self.tile.ticker, producers);
         }
 
         /// An aggregate of attestation slot `slot`.
@@ -7935,7 +7939,8 @@ mod pq_aggregator {
                 FakeAnswer::NoAnswer => LeanVmResp::NoAnswer { request_id },
             };
             let now = self.tile.ticker.since_genesis();
-            self.tile.pq_aggregator.on_response(resp, now, &mut self.tile.reader);
+            let producers = &mut self.adapter.producers;
+            self.tile.pq_aggregator.on_response(resp, now, &mut self.tile.reader, producers);
         }
 
         fn answer_before_next_slot(&mut self, answer: FakeAnswer<'_>) {
@@ -8123,12 +8128,17 @@ mod pq_aggregator {
             &[earlier, earlier + 1],
             false,
             &rig.tile.ticker,
+            &mut rig.adapter.producers,
         );
         rig.aggregate(SLOT, &[[2; 64]]);
         rig.aggregate(SLOT, &[[2; 64], [3; 64]]);
         assert!(rig.requests().is_empty(), "the block merge is held");
 
-        rig.tile.pq_aggregator.on_block_proof_read(earlier, &rig.tile.ticker);
+        rig.tile.pq_aggregator.on_block_proof_read(
+            earlier,
+            &rig.tile.ticker,
+            &mut rig.adapter.producers,
+        );
         rig.send_next();
         assert!(rig.requests().is_empty(), "the shorter hold is still ahead");
 
@@ -8358,7 +8368,8 @@ mod pq_aggregator {
     fn a_block_proof_takes_the_best_aggregate_when_the_older_gate_opens_during_a_request() {
         let mut rig = Rig::new();
         let block = SLOT + 2;
-        rig.tile.pq_aggregator.set_local_proposals(&[block], false, &rig.tile.ticker);
+        let producers = &mut rig.adapter.producers;
+        rig.tile.pq_aggregator.set_local_proposals(&[block], false, &rig.tile.ticker, producers);
         rig.ready();
         rig.vote(1);
         let in_flight = rig.request();

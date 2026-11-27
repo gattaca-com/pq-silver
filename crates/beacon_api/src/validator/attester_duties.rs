@@ -1,6 +1,7 @@
 use silver_beacon_state_data::{
     Epoch, SLOTS_PER_EPOCH, ShufflingId, Slot, StateReadView, committee_at_position,
 };
+use silver_common::{SlotSubnets, SubnetsBySlot};
 
 use crate::{
     ctx::ApiCtx,
@@ -8,6 +9,7 @@ use crate::{
     validator::{
         duties::{epoch_param, requested_indices},
         shufflings::Shuffling,
+        subnet_subscriptions::submit_committee_subscriptions,
     },
 };
 
@@ -18,9 +20,13 @@ pub(crate) fn post_attester_duties(req: &Request<'_>, ctx: &ApiCtx, resp: &mut R
     let Some(indices) = requested_indices(req, resp) else {
         return;
     };
+    let window = SubnetsBySlot::window(ctx.node_status.wall_slot);
+    let is_pq = ctx.spec.is_pq_at(epoch);
+    let mut by_slot = SubnetsBySlot::default();
     let result = resp.try_json_body(|json| {
         ctx.read_state(|view| {
             json.restart();
+            by_slot = SubnetsBySlot::default();
             let state_epoch = view.slot.current_epoch();
             if epoch < state_epoch || epoch > state_epoch + 1 {
                 return Err((
@@ -37,18 +43,31 @@ pub(crate) fn post_attester_duties(req: &Request<'_>, ctx: &ApiCtx, resp: &mut R
             let Some(shuffling) = ctx.shufflings.get(id) else {
                 return Err((503, "the head state's shuffling for this epoch has not been posted"));
             };
-            json.attester_duties(
-                id.dependent_root,
-                ctx.node_status.execution_optimistic(),
-                indices.iter().filter_map(|&validator_index| {
+            let duties = indices
+                .iter()
+                .filter_map(|&validator_index| {
                     AttesterDuty::read(&view, shuffling, epoch, validator_index)
-                }),
-            );
+                })
+                .inspect(|duty| {
+                    if is_pq &&
+                        window.contains(&duty.slot) &&
+                        let Some(position) = duty.aggregator_position
+                    {
+                        by_slot.insert(SlotSubnets::pq_aggregator(
+                            duty.slot,
+                            duty.committees_at_slot,
+                            duty.committee_index,
+                            position,
+                        ));
+                    }
+                });
+            json.attester_duties(id.dependent_root, ctx.node_status.execution_optimistic(), duties);
             Ok(())
         })
     });
-    if let Err((code, message)) = result {
-        resp.error(code, message);
+    match result {
+        Ok(()) => submit_committee_subscriptions(&by_slot, resp),
+        Err((code, message)) => resp.error(code, message),
     }
 }
 
@@ -102,18 +121,22 @@ impl<'a> AttesterDuty<'a> {
 #[cfg(test)]
 mod tests {
     use silver_beacon_state_data::{
-        BeaconBlockHeader, BeaconState, BeaconStateOwner, EpochStateFinalized, SlotState,
-        SlotStateFinalized, SlotStateGroup, SpecConfig, StateId, ValSeed, committee_range,
-        committees_per_slot,
+        AggregationCommittee, BeaconBlockHeader, BeaconState, BeaconStateOwner,
+        EpochStateFinalized, SlotState, SlotStateFinalized, SlotStateGroup, SpecConfig, StateId,
+        ValSeed, committee_range, committees_per_slot,
     };
-    use silver_common::{SyncUpdate, ssz_view::MAX_COMMITTEES_PER_SLOT};
+    use silver_common::{
+        BeaconApiRequest, ForkName, SyncUpdate, TCacheProducer, compute_subnet_for_attestation,
+        ssz_view::MAX_COMMITTEES_PER_SLOT,
+    };
 
     use super::*;
     use crate::{
         ctx::test_ctx,
+        http::router::Outcome,
         testing::{
-            answer, block_roots_ring, field, indices_body, json, posting, pubkey, ring_root,
-            status_code,
+            answer, block_roots_ring, dispatch_into, field, indices_body, json, posting, pubkey,
+            ring_root, status_code, submissions,
         },
         validator::shufflings::PostedShufflings,
     };
@@ -136,13 +159,14 @@ mod tests {
     /// `ACTIVE` validators plus one the request may name that no committee
     /// holds, with the shufflings of the state's epoch and the next posted.
     fn ctx() -> ApiCtx {
-        ctx_with_owner().0
+        ctx_with_owner(&SpecConfig::mainnet()).0
     }
 
-    fn ctx_with_owner() -> (ApiCtx, BeaconStateOwner, StateId) {
+    fn ctx_with_owner(spec: &SpecConfig) -> (ApiCtx, BeaconStateOwner, StateId) {
         let seeds: Vec<_> =
             (0..=ACTIVE).map(|i| ValSeed { pubkey: pubkey(i), ..ValSeed::default() }).collect();
         let mut state = BeaconState::for_test(EpochStateFinalized::default(), &seeds, STATE_SLOT);
+        state.immutable.pq_fork_epoch = spec.pq_fork_epoch;
         state.slot_states = SlotStateGroup::new(SlotStateFinalized::new(SlotState {
             slot: STATE_SLOT,
             latest_block_header: BeaconBlockHeader { slot: HEAD_SLOT, ..Default::default() },
@@ -153,7 +177,7 @@ mod tests {
         let mut owner = BeaconStateOwner::new(state);
         let anchor = owner.roll_fresh();
         owner.publish_state_id(anchor);
-        let mut ctx = test_ctx(&SpecConfig::mainnet(), owner.reader());
+        let mut ctx = test_ctx(spec, owner.reader());
         ctx.node_status.target = Some(SyncUpdate::Following);
         for epoch in [STATE_EPOCH, STATE_EPOCH + 1] {
             let id = ctx.read_state(|view| ShufflingId::from_state(&view, epoch).unwrap());
@@ -164,6 +188,57 @@ mod tests {
 
     fn post(ctx: &ApiCtx, epoch: &str, body: &str) -> Vec<u8> {
         answer(ctx, &posting(&format!("/eth/v1/validator/duties/attester/{epoch}"), body))
+    }
+
+    #[test]
+    fn serving_pq_aggregator_duties_submits_its_subnet_and_position() {
+        let epoch = STATE_EPOCH + 1;
+        let spec = SpecConfig { pq_fork_epoch: epoch, ..SpecConfig::mainnet() };
+        let (mut ctx, mut owner, anchor) = ctx_with_owner(&spec);
+        let id = ctx.read_state(|view| ShufflingId::from_state(&view, epoch).unwrap());
+        let shuffling = ctx.shufflings.get(id).unwrap();
+        let per_slot = shuffling.committees_per_slot();
+        let slot = epoch * SLOTS_PER_EPOCH + 1;
+        let aggregator = u64::from(shuffling.committee(slot, 0)[1]);
+
+        let mut fork = owner.apply_block_view(anchor);
+        let mut window = fork.epoch.roll_fresh();
+        window.rotate_aggregation_committee_window(per_slot, |offset, index| {
+            let mut committee = AggregationCommittee::default();
+            for &member in &shuffling.committee(offset as Slot, index)[..2] {
+                committee.push(u64::from(member));
+            }
+            committee
+        });
+        fork.epoch_idx = Some(window.commit());
+        let head = fork.commit();
+        owner.publish_state_id(head);
+        ctx.node_status.wall_slot = slot - 1;
+
+        let path = format!("/eth/v1/validator/duties/attester/{epoch}");
+        let body = indices_body(std::iter::once(aggregator));
+        let mut cache = submissions();
+        let (outcome, response) = dispatch_into(&ctx, &posting(&path, &body), &mut cache);
+        let duty = &json(&response)["data"][0];
+        assert_eq!(field(duty, "validator_index"), aggregator);
+        assert_eq!(field(duty, "slot"), slot);
+        assert_eq!(duty["is_aggregator"], true);
+        assert_eq!(field(duty, "aggregator_position"), 1);
+
+        let Outcome::Response(Some(BeaconApiRequest::BeaconCommitteeSubscriptions {
+            subscriptions,
+        })) = outcome
+        else {
+            panic!("{outcome:?}");
+        };
+        let records = cache.read_buffer(subscriptions).unwrap();
+        let subnet = compute_subnet_for_attestation(ForkName::Pq, per_slot as u64, slot, 0);
+        assert!(SlotSubnets::decode_all(records).eq([SlotSubnets {
+            slot,
+            attesting: 1 << subnet,
+            aggregating: 1 << subnet,
+            aggregator_positions: 1 << (subnet * SlotSubnets::POSITIONS_PER_SUBNET + 1),
+        }]));
     }
 
     /// Every posted validator sits in exactly one committee of the epoch, at
@@ -245,7 +320,7 @@ mod tests {
 
     #[test]
     fn duties_wait_for_the_selected_branch_shuffling() {
-        let (mut ctx, mut owner, anchor) = ctx_with_owner();
+        let (mut ctx, mut owner, anchor) = ctx_with_owner(&SpecConfig::mainnet());
         let epoch = STATE_EPOCH.to_string();
         assert_eq!(status_code(&post(&ctx, &epoch, "[\"0\"]")), "200");
 

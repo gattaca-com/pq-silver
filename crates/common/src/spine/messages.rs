@@ -16,6 +16,7 @@ use crate::{
     TCacheProducer, TCacheRead, TProducer,
     block_contents::BLOCK_CONTENTS_FIXED,
     column_util::columns_of,
+    compute_subnet_for_attestation,
     ssz_hash::HashedBody,
     ssz_view::{
         BEACON_BLOCK_FIXED, BLOCKS_BY_RANGE_REQ_SIZE, DC_BY_RANGE_REQ_MAX,
@@ -227,6 +228,22 @@ pub struct SlotSubnets {
 impl SlotSubnets {
     pub const SIZE: usize = 4 * size_of::<u64>();
     pub const POSITIONS_PER_SUBNET: u64 = 4;
+
+    pub fn pq_aggregator(
+        slot: u64,
+        committees_at_slot: u64,
+        committee_index: u64,
+        position: u64,
+    ) -> Self {
+        let subnet =
+            compute_subnet_for_attestation(ForkName::Pq, committees_at_slot, slot, committee_index);
+        Self {
+            slot,
+            attesting: 1 << subnet,
+            aggregating: 1 << subnet,
+            aggregator_positions: Self::position_bit(subnet, position),
+        }
+    }
 
     /// The `aggregator_positions` bit of `position` on `subnet`. Zero when
     /// either is out of range.

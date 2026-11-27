@@ -55,10 +55,10 @@ pub(crate) fn post_prepare_beacon_proposer(
         registered = records.len(),
         "proposer preparations received"
     );
+    resp.ok();
     if records.is_empty() {
-        return resp.ok();
+        return;
     }
-
     resp.submit(
         records.len() * PreparationRecord::SIZE,
         |out| {

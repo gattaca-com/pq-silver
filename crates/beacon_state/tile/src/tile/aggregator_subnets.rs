@@ -10,8 +10,7 @@ struct Aggregating {
     positions: u64,
 }
 
-/// The attestation subnets a local validator aggregates on, per slot, as the
-/// VC's committee subscriptions name them.
+/// The attestation subnets a local validator aggregates on, per slot.
 #[derive(Default)]
 pub(super) struct AggregatorSubnets {
     by_slot: FxHashMap<Slot, Aggregating>,

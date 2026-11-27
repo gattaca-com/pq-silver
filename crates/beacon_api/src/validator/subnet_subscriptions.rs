@@ -1,7 +1,8 @@
 use serde::Deserialize;
 use silver_common::{
     BeaconApiRequest, ForkName, SlotSubnets, SubnetsBySlot, compute_subnet_for_attestation,
-    json_fields::uint64, ssz_view::MAX_COMMITTEES_PER_SLOT,
+    json_fields::uint64,
+    ssz_view::{MAX_COMMITTEES_PER_SLOT, MAX_COMMITTEES_PER_SLOT_PQ},
 };
 
 use crate::{
@@ -17,24 +18,23 @@ pub(crate) fn post_beacon_committee_subscriptions(
     let window = SubnetsBySlot::window(ctx.node_status.wall_slot);
     let mut by_slot = SubnetsBySlot::default();
     let parsed = each_body_entry(req.body, |_, entry: CommitteeSubscription| {
-        let format = ctx.spec.fork_at_slot(entry.slot);
-        if let Some(mut slot_subnets) =
-            entry.slot_subnets(format).filter(|held| window.contains(&held.slot))
+        if window.contains(&entry.slot) &&
+            let Some(slot_subnets) = entry.slot_subnets(ctx)
         {
-            if entry.is_aggregator && format == ForkName::Pq {
-                let subnet = u64::from(slot_subnets.aggregating.trailing_zeros());
-                let position = entry.aggregator_position(ctx);
-                slot_subnets.aggregator_positions = SlotSubnets::position_bit(subnet, position);
-            }
             by_slot.insert(slot_subnets);
         }
     });
     if let Err(message) = parsed {
         return resp.error(400, message);
     }
+    resp.ok();
+    submit_committee_subscriptions(&by_slot, resp);
+}
+
+pub(super) fn submit_committee_subscriptions(by_slot: &SubnetsBySlot, resp: &mut Response<'_>) {
     let held = by_slot.held().count();
     if held == 0 {
-        return resp.ok();
+        return;
     }
 
     resp.submit(
@@ -75,17 +75,26 @@ impl CommitteeSubscription {
         position.map_or(SlotSubnets::POSITIONS_PER_SUBNET - 1, |position| position as u64)
     }
 
-    fn slot_subnets(&self, format: ForkName) -> Option<SlotSubnets> {
+    fn slot_subnets(&self, ctx: &ApiCtx) -> Option<SlotSubnets> {
+        let format = ctx.spec.fork_at_slot(self.slot);
         let committees = self.committees_at_slot;
         if self.committee_index >= committees ||
             committees >
                 (if format == ForkName::Pq {
-                    silver_common::ssz_view::MAX_COMMITTEES_PER_SLOT_PQ
+                    MAX_COMMITTEES_PER_SLOT_PQ
                 } else {
                     MAX_COMMITTEES_PER_SLOT
                 }) as u64
         {
             return None;
+        }
+        if self.is_aggregator && format == ForkName::Pq {
+            return Some(SlotSubnets::pq_aggregator(
+                self.slot,
+                committees,
+                self.committee_index,
+                self.aggregator_position(ctx),
+            ));
         }
         let subnet = 1 <<
             compute_subnet_for_attestation(format, committees, self.slot, self.committee_index);

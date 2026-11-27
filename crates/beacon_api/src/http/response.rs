@@ -162,8 +162,11 @@ impl<'a> Response<'a> {
         request: impl FnOnce(TCacheRead) -> BeaconApiRequest,
     ) {
         match self.submissions.write_with(len, encode) {
-            Some(read) => self.notify(request(read)),
-            None => self.error(500, "api submissions cache full"),
+            Some(read) => self.outcome = Outcome::Response(Some(request(read))),
+            None => {
+                self.out.clear();
+                self.error(500, "api submissions cache full");
+            }
         }
     }
 
@@ -215,15 +218,6 @@ impl<'a> Response<'a> {
             }
             Err(error) => self.error(500, &format!("sidecar unavailable: {error}")),
         }
-    }
-
-    pub(crate) fn notify(&mut self, request: BeaconApiRequest) {
-        self.ok();
-        self.attach_request(request);
-    }
-
-    pub(crate) fn attach_request(&mut self, request: BeaconApiRequest) {
-        self.outcome = Outcome::Response(Some(request));
     }
 
     pub(crate) fn indexed_failures(&mut self, failures: &[SubmissionFailure]) {

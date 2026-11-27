@@ -2612,14 +2612,14 @@ impl BeaconStateTile {
     ) -> Result<u8, Feedback> {
         let target = aggregate.target;
         let view = self.state.read_view(state_id);
-        let position = match view.aggregator_position(
-            target.attestation_slot,
-            aggregate.committee_index as usize,
-            aggregate.aggregator_index as u64,
-        ) {
-            Some(Some(position)) => position as u8,
-            Some(None) => return Err(Feedback::reject("aggregator not selected")),
-            None => return Err(Feedback::Ignore),
+        let committee_index = aggregate.committee_index as usize;
+        let Some(mut aggregators) = view.aggregators(target.attestation_slot, committee_index)
+        else {
+            return Err(Feedback::Ignore);
+        };
+        let aggregator = aggregate.aggregator_index as u64;
+        let Some(position) = aggregators.position(|selected| selected == aggregator) else {
+            return Err(Feedback::reject("aggregator not selected"));
         };
         let Some(pubkey) = view.validator_xmss_pubkey(aggregate.aggregator_index) else {
             return Err(Feedback::Ignore);
@@ -2634,7 +2634,7 @@ impl BeaconStateTile {
         if !SignatureCheck::aggregate_and_proof(signed, pubkey, &domain).verify() {
             return Err(Feedback::reject("aggregate bad signature"));
         }
-        Ok(position)
+        Ok(position as u8)
     }
 
     fn handle_pq_attester_slashing(&mut self, slashing: &[u8]) -> Feedback {

@@ -415,7 +415,8 @@ impl PqAggregate {
         );
         let aggregator = (0..VALIDATORS as u64)
             .find(|&validator| {
-                view.aggregator_position(AGGREGATE_SLOT, 0, validator).flatten().is_some()
+                let mut selected = view.aggregators(AGGREGATE_SLOT, 0).expect("within the window");
+                selected.any(|selected| selected == validator)
             })
             .expect("committee zero has an aggregator");
         let mut indices = Vec::new();

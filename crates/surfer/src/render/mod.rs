@@ -73,8 +73,14 @@ fn draw_footer(f: &mut Frame, area: Rect, app: &App) {
         Span::styled("S-TAB", bold),
         Span::raw(" pane  "),
         Span::styled("↑/↓", bold),
-        Span::raw(" select  "),
     ];
+    if app.pane == Pane::Attestations {
+        spans.push(Span::raw(" select ("));
+        spans.push(Span::styled("S", bold));
+        spans.push(Span::raw(": page)  "));
+    } else {
+        spans.push(Span::raw(" select  "));
+    }
     if app.pane == Pane::Flamegraph {
         for (key, action) in [("p", " pause  "), ("c", " clear  ")] {
             spans.push(Span::styled(key, bold));
@@ -83,7 +89,6 @@ fn draw_footer(f: &mut Frame, area: Rect, app: &App) {
     } else if app.pane == Pane::Attestations {
         let keys = [
             ("←/→", " slot  "),
-            ("S-↑/↓", " page  "),
             ("Enter", " expand·jump  "),
             ("c/v/a", " committees/votes/aggregates  "),
             ("+/-", " zoom  "),

@@ -901,7 +901,7 @@ impl BeaconStateTile {
         for (request_id, proposal) in
             self.block_production.take_pending(build.slot, build.parent_root)
         {
-            let block = self.build_from(proposal, &mut build);
+            let block = self.build_from(proposal, &mut build, producers);
             answer(producers, request_id, block);
         }
         let pending: Vec<_> = self
@@ -924,7 +924,8 @@ impl BeaconStateTile {
                     branch == Ok((context.head_block_hash, context.full_parent))
                 })
             });
-            let block = self.produce_gloas_block(pending.proposal, bids, local.map(TRead::to_read));
+            let local = local.map(TRead::to_read);
+            let block = self.produce_gloas_block(pending.proposal, bids, local, producers);
             answer(producers, pending.request_id, block);
         }
         self.block_production.building = Some(build);
@@ -936,6 +937,7 @@ impl BeaconStateTile {
         &mut self,
         proposal: Proposal,
         build: &mut BlockBuild,
+        producers: &mut Producers,
     ) -> Result<ProducedBlock, ProduceBlockFailure> {
         let local = build.local.as_ref().expect("served once complete");
         let local_terms = local.as_ref().ok().and_then(local_payload);
@@ -945,7 +947,7 @@ impl BeaconStateTile {
         };
         let on_bid = signed_bid
             .filter(|signed_bid| self.sidecar_bid_wins(&proposal, signed_bid, local_terms))
-            .map(|signed_bid| self.produce_on_sidecar_bid(proposal, signed_bid));
+            .map(|signed_bid| self.produce_on_sidecar_bid(proposal, signed_bid, producers));
         let refused = match on_bid {
             Some(Ok(block)) => return Ok(block),
             Some(Err(failure)) => Some(failure),
@@ -960,7 +962,7 @@ impl BeaconStateTile {
         match (local, refused) {
             (Ok(payload), _) => {
                 let mut packed = mem::take(&mut self.block_production.packed);
-                self.pack_operations(&proposal, false, &mut packed);
+                self.pack_operations(&proposal, false, &mut packed, producers);
                 let block = self.block_for(proposal, payload.to_read(), packed.operations());
                 self.block_production.packed = packed;
                 block
@@ -1004,8 +1006,9 @@ impl BeaconStateTile {
         &mut self,
         proposal: Proposal,
         signed_bid: &[u8],
+        producers: &mut Producers,
     ) -> Result<ProducedBlock, ProduceBlockFailure> {
-        self.build_packed(proposal, false, |tile, operations| {
+        self.build_packed(proposal, false, producers, |tile, operations| {
             tile.build_blinded_block(proposal, signed_bid, operations)
         })
     }
@@ -1016,6 +1019,7 @@ impl BeaconStateTile {
         proposal: &Proposal,
         builds_on_full_parent: bool,
         packed: &mut PackedOperations,
+        producers: &mut Producers,
     ) {
         let Ok((parent, _)) = self.proposal_parent(proposal) else {
             return packed.clear();
@@ -1041,7 +1045,7 @@ impl BeaconStateTile {
             packed.clear();
             self.slashing_pool.select(&pre_state, &mut packed.slashings);
             if let Some(rewards) = &rewards {
-                self.pq_aggregator.on_block_proof_read(proposal.slot, &self.ticker);
+                self.pq_aggregator.on_block_proof_read(proposal.slot, &self.ticker, producers);
                 packed.pack_merge(&self.pq_aggregator, rewards, proposal.slot);
             }
             return;
@@ -1162,6 +1166,7 @@ impl BeaconStateTile {
         proposal: Proposal,
         builder_bids: &[u8],
         local: Option<TCacheRead>,
+        producers: &mut Producers,
     ) -> Result<ProducedBlock, ProduceBlockFailure> {
         self.check_slot_proposable(proposal.slot)?;
         if proposal.parent_root != self.head_block_root() {
@@ -1187,7 +1192,7 @@ impl BeaconStateTile {
         let local = local.map(|(bid, _)| bid);
         let candidates = if local_wins { [local, external] } else { [external, local] };
         for commitment in candidates.into_iter().flatten() {
-            match self.build_committed(proposal, &commitment) {
+            match self.build_committed(proposal, &commitment, producers) {
                 Ok(block) => return Ok(block),
                 Err(error) => {
                     silver_log::warn!(
@@ -1200,15 +1205,17 @@ impl BeaconStateTile {
         }
         silver_log::info!(slot = proposal.slot, "no bid or local payload built; returning empty");
         let empty = self.empty_commitment(&proposal, parent)?;
-        self.build_committed(proposal, &empty)
+        self.build_committed(proposal, &empty, producers)
     }
 
     fn build_committed(
         &mut self,
         proposal: Proposal,
         commitment: &BidCommitment,
+        producers: &mut Producers,
     ) -> Result<ProducedBlock, ProduceBlockFailure> {
-        self.build_packed(proposal, commitment.builds_on_full_parent, |tile, operations| {
+        let full_parent = commitment.builds_on_full_parent;
+        self.build_packed(proposal, full_parent, producers, |tile, operations| {
             tile.build_gloas_block(proposal, commitment, operations)
         })
     }
@@ -1235,10 +1242,11 @@ impl BeaconStateTile {
         &mut self,
         proposal: Proposal,
         builds_on_full_parent: bool,
+        producers: &mut Producers,
         build: impl FnMut(&mut Self, Operations<'_>) -> Result<BuiltBlock, ProduceBlockFailure>,
     ) -> Result<ProducedBlock, ProduceBlockFailure> {
         let mut packed = mem::take(&mut self.block_production.packed);
-        self.pack_operations(&proposal, builds_on_full_parent, &mut packed);
+        self.pack_operations(&proposal, builds_on_full_parent, &mut packed, producers);
         let block = self.build_with_fallbacks(proposal, packed.operations(), build);
         self.block_production.packed = packed;
         block

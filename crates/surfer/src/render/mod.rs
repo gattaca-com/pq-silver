@@ -1,4 +1,4 @@
-pub mod attestations_pane;
+pub mod attestations;
 pub mod cluster_pane;
 pub mod counters_pane;
 pub mod events;
@@ -35,7 +35,7 @@ pub fn draw(f: &mut Frame, app: &mut App) {
         Pane::Peers => peers_pane::draw(f, chunks[1], app),
         Pane::Cluster => cluster_pane::draw(f, chunks[1], app),
         Pane::Gossip => gossip_pane::draw(f, chunks[1], app),
-        Pane::Attestations => attestations_pane::draw(f, chunks[1], app),
+        Pane::Attestations => app.attestations.draw(f, chunks[1]),
         Pane::Events => app.events.draw(f, chunks[1]),
         Pane::Flamegraph => flamegraph_pane::draw(f, chunks[1], app),
     }
@@ -73,10 +73,27 @@ fn draw_footer(f: &mut Frame, area: Rect, app: &App) {
         Span::styled("S-TAB", bold),
         Span::raw(" pane  "),
         Span::styled("↑/↓", bold),
-        Span::raw(" select  "),
     ];
+    if app.pane == Pane::Attestations {
+        spans.push(Span::raw(" select ("));
+        spans.push(Span::styled("Shift", bold));
+        spans.push(Span::raw(": page)  "));
+    } else {
+        spans.push(Span::raw(" select  "));
+    }
     if app.pane == Pane::Flamegraph {
         for (key, action) in [("p", " pause  "), ("c", " clear  ")] {
+            spans.push(Span::styled(key, bold));
+            spans.push(Span::raw(action));
+        }
+    } else if app.pane == Pane::Attestations {
+        spans.push(Span::styled("←/→", bold));
+        spans.push(Span::raw(" slot  "));
+        if let Some(enter) = app.attestations.enter_action() {
+            spans.push(Span::styled("Enter", bold));
+            spans.push(Span::raw(format!(" {}  ", enter.label())));
+        }
+        for (key, action) in [("c/v/a", " committees/votes/aggregates  "), ("+/-", " zoom  ")] {
             spans.push(Span::styled(key, bold));
             spans.push(Span::raw(action));
         }

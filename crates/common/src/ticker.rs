@@ -178,7 +178,8 @@ impl SlotTicker {
     /// Before genesis the start of slot 0, which lies in the future.
     pub fn current_slot_start(&self) -> (u64, Instant) {
         let now = Instant::now();
-        let Some(since_genesis) = self.duration_since_genesis(now.duration_since(self.anchor)) else {
+        let Some(since_genesis) = self.duration_since_genesis(now.duration_since(self.anchor))
+        else {
             let until_genesis = Duration::from_millis(self.anchor_genesis_ms.unsigned_abs());
             return (0, self.anchor + until_genesis);
         };

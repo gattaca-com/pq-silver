@@ -86,20 +86,18 @@ impl StateReadView<'_> {
         self.epoch.is_pq(self.imm)
     }
 
-    pub fn is_aggregator(
+    /// `None` outside the aggregation committee window.
+    pub fn aggregators(
         &self,
         slot: Slot,
         committee_index: usize,
-        validator_index: u64,
-    ) -> Option<bool> {
+    ) -> Option<impl Iterator<Item = u64> + '_> {
         let window_epoch = (slot / SLOTS_PER_EPOCH + 1).checked_sub(self.slot.current_epoch())?;
         if window_epoch > MIN_SEED_LOOKAHEAD + 1 {
             return None;
         }
         let window_slot = (window_epoch * SLOTS_PER_EPOCH + slot % SLOTS_PER_EPOCH) as usize;
-        let mut aggregators =
-            self.epoch.aggregation_committee_window().aggregators(window_slot, committee_index);
-        Some(aggregators.any(|aggregator| aggregator == validator_index))
+        Some(self.epoch.aggregation_committee_window().aggregators(window_slot, committee_index))
     }
 
     #[inline]

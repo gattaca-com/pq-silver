@@ -52,10 +52,6 @@ impl EventsPane {
         }
     }
 
-    pub fn clock(&self) -> SlotClock {
-        *self.data.clock()
-    }
-
     pub fn sample(&mut self) {
         self.data.sample();
     }

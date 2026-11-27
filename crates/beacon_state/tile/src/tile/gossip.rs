@@ -744,7 +744,7 @@ impl BeaconStateTile {
                         let p2p_peer = m.stream_id.peer();
                         producers.produce(PeerEvent::LateAttestation { p2p_peer });
                     }
-                    let feedback = self.commit_pq_attestation(p);
+                    let feedback = self.commit_pq_attestation(p, producers);
                     if m.stream_id == LOCAL_GOSSIP_STREAM_ID && feedback == Feedback::Accept {
                         producers.produce(BeaconStateEvent::LocalAttestation {
                             slot: target.attestation_slot,
@@ -803,17 +803,22 @@ impl BeaconStateTile {
     /// A vote waiting for its block or payload is buffered until it arrives.
     /// A local aggregator on the vote's subnet also proves it, and so may a
     /// local block that wants its slot. No subnet is joined for the block.
-    fn commit_pq_attestation(&mut self, p: PreparedPqAttestation) -> Feedback {
+    fn commit_pq_attestation(
+        &mut self,
+        p: PreparedPqAttestation,
+        producers: &mut Producers,
+    ) -> Feedback {
         let checked = p.checked;
         let target = checked.target;
         self.arrival_timers.attestation(target.attestation_slot, &self.ticker);
+        self.pq_aggregator.note_vote(&p.verified_vote(), producers);
         self.seen_attesters.mark(target.target_epoch, checked.attester as usize);
         let proves = self.aggregator_subnets.aggregates(target.attestation_slot, p.subnet) ||
             self.pq_aggregator.block_wants_votes(target.attestation_slot);
         if checked.attested.is_ready() {
             self.record_votes(target, std::slice::from_ref(&checked.attester));
             if proves {
-                self.aggregate_pq_vote(&p);
+                self.aggregate_pq_vote(&p, producers);
             }
             return Feedback::Accept;
         }
@@ -835,11 +840,11 @@ impl BeaconStateTile {
         )
     }
 
-    fn aggregate_pq_vote(&mut self, p: &PreparedPqAttestation) {
+    fn aggregate_pq_vote(&mut self, p: &PreparedPqAttestation, producers: &mut Producers) {
         let slot = p.checked.target.attestation_slot;
         let position = self.aggregator_subnets.last_position(slot, p.subnet);
         if position.is_some() || self.pq_aggregator.block_wants_votes(slot) {
-            self.pq_aggregator.add_vote(&p.verified_vote(), position, &self.ticker);
+            self.pq_aggregator.add_vote(&p.verified_vote(), position, &self.ticker, producers);
         }
     }
 
@@ -884,7 +889,7 @@ impl BeaconStateTile {
                     BeaconStateCounters::UnknownRootVotesPromoted.add(count);
                     self.record_votes(target, &votes.attesters);
                     for vote in &votes.aggregated {
-                        self.aggregate_pq_vote(vote);
+                        self.aggregate_pq_vote(vote, producers);
                     }
                 }
                 Err(_) => BeaconStateCounters::UnknownRootVotesDropped.add(count),
@@ -2446,7 +2451,7 @@ impl BeaconStateTile {
                 BlockSource::Gossip,
                 producers,
             ),
-            GossipTopic::BeaconAggregateAndProof => self.handle_pq_aggregate(data),
+            GossipTopic::BeaconAggregateAndProof => self.handle_pq_aggregate(data, producers),
             GossipTopic::AttesterSlashing => self.handle_pq_attester_slashing(data),
             _ => Feedback::Ignore,
         }
@@ -2488,14 +2493,15 @@ impl BeaconStateTile {
         data.source_epoch() == justified.epoch && *data.source_root() == justified.root
     }
 
-    fn handle_pq_aggregate(&mut self, signed: &[u8]) -> Feedback {
+    fn handle_pq_aggregate(&mut self, signed: &[u8], producers: &mut Producers) -> Feedback {
         let (state_id, votes, coverage) = match self.check_pq_aggregate(signed) {
             Ok(checked) => checked,
             Err(feedback) => return feedback,
         };
-        if let Err(feedback) = self.verify_pq_aggregator(signed, state_id, &votes) {
-            return feedback;
-        }
+        let position = match self.verify_pq_aggregator(signed, state_id, &votes) {
+            Ok(position) => position,
+            Err(feedback) => return feedback,
+        };
         self.arrival_timers.aggregate(votes.target.attestation_slot, &self.ticker);
 
         let merges = self.has_local_proposers();
@@ -2517,7 +2523,7 @@ impl BeaconStateTile {
         if !self.leanvm_verifier.verify(claims, SignedAggregateAndProofPqView::proof(signed)) {
             return Feedback::reject("STARK proof invalid");
         }
-        self.commit_pq_aggregate(signed, votes, coverage, merges)
+        self.commit_pq_aggregate(signed, votes, position, coverage, merges, producers)
     }
 
     fn check_pq_aggregate(
@@ -2603,18 +2609,18 @@ impl BeaconStateTile {
         signed: &[u8],
         state_id: StateId,
         aggregate: &PqAggregateVotes,
-    ) -> Result<(), Feedback> {
+    ) -> Result<u8, Feedback> {
         let target = aggregate.target;
         let view = self.state.read_view(state_id);
-        match view.is_aggregator(
-            target.attestation_slot,
-            aggregate.committee_index as usize,
-            aggregate.aggregator_index as u64,
-        ) {
-            Some(true) => {}
-            Some(false) => return Err(Feedback::reject("aggregator not selected")),
-            None => return Err(Feedback::Ignore),
-        }
+        let committee_index = aggregate.committee_index as usize;
+        let Some(mut aggregators) = view.aggregators(target.attestation_slot, committee_index)
+        else {
+            return Err(Feedback::Ignore);
+        };
+        let aggregator = aggregate.aggregator_index as u64;
+        let Some(position) = aggregators.position(|selected| selected == aggregator) else {
+            return Err(Feedback::reject("aggregator not selected"));
+        };
         let Some(pubkey) = view.validator_xmss_pubkey(aggregate.aggregator_index) else {
             return Err(Feedback::Ignore);
         };
@@ -2628,7 +2634,7 @@ impl BeaconStateTile {
         if !SignatureCheck::aggregate_and_proof(signed, pubkey, &domain).verify() {
             return Err(Feedback::reject("aggregate bad signature"));
         }
-        Ok(())
+        Ok(position as u8)
     }
 
     fn handle_pq_attester_slashing(&mut self, slashing: &[u8]) -> Feedback {
@@ -2658,8 +2664,10 @@ impl BeaconStateTile {
         &mut self,
         signed: &[u8],
         aggregate: PqAggregateVotes,
+        position: u8,
         coverage: Coverage,
         merges: bool,
+        producers: &mut Producers,
     ) -> Feedback {
         let target = aggregate.target;
         let (slot, committee_index) = (target.attestation_slot, aggregate.committee_index);
@@ -2675,16 +2683,28 @@ impl BeaconStateTile {
                 self.ticker.current_slot(),
             );
         }
-        if merges {
-            let attesters = &self.stf_scratch.active;
-            self.pq_aggregator.add_aggregate(
-                SignedAggregateAndProofPqView::aggregate(signed),
-                attesters,
-                self.pq_claims.get(..attesters.len()).unwrap_or_default(),
-                SignedAggregateAndProofPqView::proof(signed),
-                &self.ticker,
-            );
-        }
+        let attesters = &self.stf_scratch.active;
+        let attestation = SignedAggregateAndProofPqView::aggregate(signed);
+        let arrival = merges
+            .then(|| {
+                self.pq_aggregator.add_aggregate(
+                    attestation,
+                    attesters,
+                    self.pq_claims.get(..attesters.len()).unwrap_or_default(),
+                    SignedAggregateAndProofPqView::proof(signed),
+                    &self.ticker,
+                )
+            })
+            .flatten();
+        let aggregator = aggregate.aggregator_index as u32;
+        self.pq_aggregator.note_aggregate(
+            attestation,
+            aggregator,
+            position,
+            attesters.len(),
+            arrival,
+            producers,
+        );
         Feedback::Accept
     }
 

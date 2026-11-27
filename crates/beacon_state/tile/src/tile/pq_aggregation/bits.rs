@@ -38,6 +38,10 @@ impl Bits {
         outside.map(|word| word.count_ones() as usize).sum()
     }
 
+    pub fn words(&self) -> [u64; MAX_VALIDATORS_PER_COMMITTEE / 64] {
+        self.0
+    }
+
     pub fn count(&self) -> usize {
         self.0.iter().map(|word| word.count_ones() as usize).sum()
     }

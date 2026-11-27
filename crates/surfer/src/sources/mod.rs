@@ -1,7 +1,7 @@
-pub mod attestations;
 pub mod cluster;
 pub mod counters;
 pub mod events;
 pub mod peers;
+pub mod pq;
 pub mod tilemetrics;
 pub mod timings;

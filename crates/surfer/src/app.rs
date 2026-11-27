@@ -1,16 +1,16 @@
 use std::collections::HashSet;
 
+use flux::timing::Nanos;
 use ratatui::widgets::TableState;
 use silver_common::{GossipTopic, PeerId};
 use silver_observe::{DiscoveredSources, sort_key};
 
 use crate::{
     flamegraph::Flamegraph,
-    render::events::EventsPane,
+    render::{attestations::AttestationsPane, events::EventsPane},
     search::Search,
     sources::{
-        attestations::AttestationArrivals, counters::CounterSet, peers::Peers,
-        tilemetrics::TileMetricsSet, timings::TimingSet,
+        counters::CounterSet, peers::Peers, tilemetrics::TileMetricsSet, timings::TimingSet,
     },
 };
 
@@ -111,11 +111,7 @@ pub struct App {
     /// Topic selection by identity, mirroring the peers pane.
     pub gossip_selected: Option<GossipTopic>,
     pub gossip_display_order: Vec<GossipTopic>,
-    pub attestations: AttestationArrivals,
-    /// By slot, so the highlight stays on it as new slots arrive. `None` is
-    /// the row of every slot together.
-    pub attestations_selected: Option<u64>,
-    pub attestations_display_order: Vec<Option<u64>>,
+    pub attestations: AttestationsPane,
     pub events: EventsPane,
     /// When true, the active pane renders only the plot for the
     /// selected row, full-area. Toggled by Enter; Esc exits.
@@ -135,7 +131,6 @@ pub struct App {
     pub tiles_table_state: TableState,
     pub peers_table_state: TableState,
     pub gossip_table_state: TableState,
-    pub attestations_table_state: TableState,
     pub flamegraph: Flamegraph,
     pub build_info: Option<String>,
     pub search: Search,
@@ -148,6 +143,7 @@ const SPLIT_MAX: u16 = 80;
 const SPLIT_STEP: i32 = 5;
 
 impl App {
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         counters: Vec<CounterSet>,
         tcaches: Vec<CounterSet>,
@@ -155,6 +151,7 @@ impl App {
         tilemetrics: Vec<TileMetricsSet>,
         peers: Peers,
         events: EventsPane,
+        attestations: AttestationsPane,
         flamegraph: Flamegraph,
     ) -> Self {
         Self {
@@ -174,9 +171,7 @@ impl App {
             peers_sort_desc: true,
             gossip_selected: None,
             gossip_display_order: Vec::new(),
-            attestations: AttestationArrivals::new(events.clock()),
-            attestations_selected: None,
-            attestations_display_order: Vec::new(),
+            attestations,
             events,
             drilled_in: false,
             split_pct: SPLIT_DEFAULT,
@@ -186,7 +181,6 @@ impl App {
             tiles_table_state: TableState::default(),
             peers_table_state: TableState::default(),
             gossip_table_state: TableState::default(),
-            attestations_table_state: TableState::default(),
             flamegraph,
             build_info: None,
             search: Search::default(),
@@ -222,7 +216,6 @@ impl App {
     /// rings. Selections are restored by name across the sort so a
     /// newly-inserted source doesn't shift the user's highlight.
     pub fn merge_new_sources(&mut self, sources: DiscoveredSources) {
-        self.attestations.attach(&sources.timings);
         if sources.build_info.is_some() {
             self.build_info = sources.build_info;
         }
@@ -339,7 +332,7 @@ impl App {
         for t in &mut self.tilemetrics {
             t.drain();
         }
-        self.attestations.drain();
+        self.attestations.sample(Nanos::now());
         self.peers.sample();
         self.events.sample();
     }
@@ -374,7 +367,7 @@ impl App {
             Pane::Tiles => self.move_tile_selection(dir),
             Pane::Peers => self.move_peer_selection(dir),
             Pane::Gossip => self.move_gossip_selection(dir),
-            Pane::Attestations => self.move_attestation_selection(dir),
+            Pane::Attestations => {}
             Pane::Cluster => {}
             Pane::Events => self.events.move_selection(dir),
             Pane::Flamegraph => self.flamegraph.scroll_by(dir),
@@ -411,11 +404,7 @@ impl App {
                 .map(|id| self.peers.get(id).map_or_else(String::new, |row| row.search_text(id)))
                 .collect(),
             Pane::Gossip => self.gossip_display_order.iter().map(ToString::to_string).collect(),
-            Pane::Attestations => self
-                .attestations_display_order
-                .iter()
-                .map(|row| row.map_or_else(|| "all".to_string(), |slot| slot.to_string()))
-                .collect(),
+            Pane::Attestations => Vec::new(),
             Pane::Cluster => Vec::new(),
             Pane::Events => self.events.rows_text(),
             Pane::Flamegraph => self.flamegraph.tree().lines().map(str::to_string).collect(),
@@ -444,11 +433,7 @@ impl App {
                 .gossip_selected
                 .and_then(|t| self.gossip_display_order.iter().position(|x| *x == t))
                 .unwrap_or(0),
-            Pane::Attestations => self
-                .attestations_display_order
-                .iter()
-                .position(|&row| row == self.attestations_selected)
-                .unwrap_or(0),
+            Pane::Attestations => 0,
             Pane::Cluster => 0,
             Pane::Events => self.events.selected_row(),
             Pane::Flamegraph => self.flamegraph.scroll() as usize,
@@ -463,7 +448,7 @@ impl App {
             Pane::Tiles => self.tiles_selection = pos,
             Pane::Peers => self.peers_selected = Some(self.peers_display_order[pos]),
             Pane::Gossip => self.gossip_selected = Some(self.gossip_display_order[pos]),
-            Pane::Attestations => self.attestations_selected = self.attestations_display_order[pos],
+            Pane::Attestations => {}
             Pane::Cluster => {}
             Pane::Events => self.events.select_row(pos),
             Pane::Flamegraph => self.flamegraph.scroll_to(pos),
@@ -502,16 +487,6 @@ impl App {
             .unwrap_or(0);
         let new = pos.saturating_add_signed(dir as isize).min(self.gossip_display_order.len() - 1);
         self.gossip_selected = Some(self.gossip_display_order[new]);
-    }
-
-    fn move_attestation_selection(&mut self, dir: i32) {
-        let order = &self.attestations_display_order;
-        if order.is_empty() {
-            return;
-        }
-        let pos = order.iter().position(|&row| row == self.attestations_selected).unwrap_or(0);
-        self.attestations_selected =
-            order[pos.saturating_add_signed(dir as isize).min(order.len() - 1)];
     }
 
     /// Peers pane: jump selection to the first row of the current sort.

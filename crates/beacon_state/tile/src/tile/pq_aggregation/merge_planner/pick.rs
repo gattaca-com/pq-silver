@@ -1,7 +1,7 @@
-use flux::utils::ArrayVec;
+use flux::{spine::SpineProducers, utils::ArrayVec};
 use silver_beacon_state_data::Slot;
 use silver_common::{
-    LeanVmReq, Nanos, TCacheRead,
+    LeanVmReq, Nanos, PqEvent, PqMergeVotes, TCacheRead,
     leanvm::{
         MAX_PROOF_CLAIMS, MAX_PROOFS, MAX_REQUEST_LEN, MAX_SIGNATURES, ProofLen, RequestBody,
         SIGNED_CLAIM_SIZE,
@@ -24,6 +24,7 @@ use super::{
     MergePlanner, TargetKey,
     queue::{PickQueue, Source, Touched},
 };
+use crate::tile::Producers;
 
 /// The attestation data a proof names. A
 /// block packs no proof that names more than `MAX_ATTESTATIONS_PQ`. A
@@ -66,6 +67,7 @@ impl NamedData {
 #[derive(Clone, Copy)]
 struct ProofPick {
     id: ProofId,
+    arrival: u64,
     aggregate: ProvedGroup,
     new_positions: Bits,
 }
@@ -87,7 +89,7 @@ impl VotePick {
 }
 
 #[derive(Default)]
-pub(in crate::tile::pq_aggregation) struct Merge {
+pub struct Merge {
     running: Option<ProofId>,
     proofs: ArrayVec<ProofPick, MAX_PROOFS>,
     votes: ArrayVec<VotePick, MAX_GROUPS>,
@@ -200,7 +202,7 @@ impl Merge {
         self.proofs.len() + self.shape.signatures
     }
 
-    pub(in crate::tile::pq_aggregation) fn shape(&self) -> &MergeShape {
+    pub fn shape(&self) -> &MergeShape {
         &self.shape
     }
 
@@ -217,11 +219,26 @@ impl Merge {
         self.claims
     }
 
-    pub(in crate::tile::pq_aggregation) fn running_id(&self) -> Option<ProofId> {
+    /// Tells surfer what the merge takes: each picked aggregate, and each
+    /// committee's picked votes.
+    pub fn report(&self, request_id: u64, sources: &ProofSources, producers: &mut Producers) {
+        for picked in self.proofs.iter() {
+            let (arrival, new_votes) = (picked.arrival, picked.new_positions.count() as u16);
+            producers.produce(PqEvent::MergeProof { request_id, arrival, new_votes });
+        }
+        for picked in self.votes.iter() {
+            let Some(entry) = sources.slot(picked.slot) else { continue };
+            let committee = entry.votes.at(picked.index).committee().index as u16;
+            let positions = picked.positions.words();
+            producers.produce(PqMergeVotes { request_id, slot: picked.slot, committee, positions });
+        }
+    }
+
+    pub fn running_id(&self) -> Option<ProofId> {
         self.running
     }
 
-    pub(in crate::tile::pq_aggregation) fn visit_members(
+    pub fn visit_members(
         &self,
         proofs: &ProofStore,
         sources: &ProofSources,
@@ -252,18 +269,11 @@ impl Merge {
         true
     }
 
-    pub(in crate::tile::pq_aggregation) fn proof_ids(
-        &self,
-    ) -> impl Iterator<Item = ProofId> + use<'_> {
+    pub fn proof_ids(&self) -> impl Iterator<Item = ProofId> + use<'_> {
         self.running.into_iter().chain(self.proofs.iter().map(|picked| picked.id))
     }
 
-    pub(in crate::tile::pq_aggregation) fn write(
-        &self,
-        out: &mut [u8],
-        proofs: &ProofStore,
-        sources: &ProofSources,
-    ) {
+    pub fn write(&self, out: &mut [u8], proofs: &ProofStore, sources: &ProofSources) {
         let proofs = self.proof_ids().map(|id| proofs.bytes(id));
         let votes = self.votes.iter().flat_map(|picked| {
             let group = sources.slot(picked.slot).unwrap().votes.at(picked.index);
@@ -272,12 +282,7 @@ impl Merge {
         RequestBody::write(out, votes, proofs);
     }
 
-    pub(in crate::tile::pq_aggregation) fn request(
-        &self,
-        request_id: u64,
-        body: TCacheRead,
-        proofs: &ProofStore,
-    ) -> LeanVmReq {
+    pub fn request(&self, request_id: u64, body: TCacheRead, proofs: &ProofStore) -> LeanVmReq {
         let mut children = [ProofLen::default(); MAX_PROOFS];
         for (child, id) in children.iter_mut().zip(self.proof_ids()) {
             *child = proofs.len(id);
@@ -327,7 +332,8 @@ impl Merge {
         }
         let new_positions = stored.group.positions.outside(covered);
         self.commit(shape, touched, &new_positions, claims, gain);
-        self.proofs.push(ProofPick { id: stored.proof, aggregate: stored.group, new_positions });
+        let (id, arrival, aggregate) = (stored.proof, stored.arrival, stored.group);
+        self.proofs.push(ProofPick { id, arrival, aggregate, new_positions });
     }
 
     /// Takes the longest prefix of the waiting votes that every check allows.

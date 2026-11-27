@@ -728,8 +728,13 @@ impl BeaconStateTile {
     ) {
         let events = &mut self.events_producer;
         let written = if self.spec.is_pq_at_slot(slot) {
-            let aggregate =
-                self.pq_aggregator.aggregate(slot, committee_index, data_root, &self.ticker);
+            let aggregate = self.pq_aggregator.aggregate(
+                slot,
+                committee_index,
+                data_root,
+                &self.ticker,
+                producers,
+            );
             aggregate.map(|aggregate| {
                 events.write_with(aggregate.ssz_len(), |buffer| aggregate.write_ssz(buffer))
             })
@@ -924,7 +929,7 @@ impl BeaconStateTile {
 
     /// Proposers are read off the head, so a new head may change them. A
     /// syncing head may not reach the coming slots.
-    fn set_pq_local_proposals(&mut self) {
+    fn set_pq_local_proposals(&mut self, producers: &mut Producers) {
         if self.sync_target.is_syncing() || !self.has_local_proposers() {
             return;
         }
@@ -932,7 +937,7 @@ impl BeaconStateTile {
         let window = PqAggregator::proposal_window(wall_slot);
         let slots: Vec<_> = window.filter(|&slot| self.proposes_locally(slot)).collect();
         let is_gloas = self.spec.is_gloas_at_slot(wall_slot);
-        self.pq_aggregator.set_local_proposals(&slots, is_gloas, &self.ticker);
+        self.pq_aggregator.set_local_proposals(&slots, is_gloas, &self.ticker, producers);
     }
 
     fn on_fc_lookahead(&mut self, _slot: Slot) {
@@ -967,7 +972,7 @@ impl BeaconStateTile {
         self.seen_aggregates.prune_before(floor);
         self.attestation_root_memo.prune_before(floor);
         self.pq_aggregator.prune_before(floor);
-        self.set_pq_local_proposals();
+        self.set_pq_local_proposals(producers);
         self.payload_bids_pool.on_slot(slot);
         self.seen_proposer_preferences.on_slot(slot);
         self.envelope_arrivals.on_slot(slot);
@@ -1202,8 +1207,9 @@ impl BeaconStateTile {
         });
 
         adapter.consume(|_: LeanVmReady, _| self.pq_aggregator.on_prover_ready());
-        adapter.consume(|resp: LeanVmResp, _| {
-            self.pq_aggregator.on_response(resp, self.ticker.since_genesis(), &mut self.reader);
+        adapter.consume(|resp: LeanVmResp, producers| {
+            let now = self.ticker.since_genesis();
+            self.pq_aggregator.on_response(resp, now, &mut self.reader, producers);
         });
 
         adapter.consume(|answer: SidecarBidResponse, producers| {
@@ -1587,7 +1593,7 @@ impl Tile<SilverSpine> for BeaconStateTile {
         }
         if self.fork_choice.take_head_moved() {
             self.announce_head_change(&mut adapter.producers);
-            self.set_pq_local_proposals();
+            self.set_pq_local_proposals(&mut adapter.producers);
         }
 
         // After every event, so a request goes out in the iteration that unlocked it.

@@ -414,7 +414,10 @@ impl PqAggregate {
             VALIDATORS,
         );
         let aggregator = (0..VALIDATORS as u64)
-            .find(|&validator| view.is_aggregator(AGGREGATE_SLOT, 0, validator) == Some(true))
+            .find(|&validator| {
+                let mut selected = view.aggregators(AGGREGATE_SLOT, 0).expect("within the window");
+                selected.any(|selected| selected == validator)
+            })
             .expect("committee zero has an aggregator");
         let mut indices = Vec::new();
         let epoch = AGGREGATE_SLOT / SLOTS_PER_EPOCH;
@@ -480,10 +483,15 @@ fn a_proven_aggregate_serves_a_local_proposal() {
             ProposerPreparation { validator_index: proposer, fee_recipient: [1; 20] }
                 .encode(&mut preparation);
             tile.proposer_preparations.record(&preparation, 2);
-            tile.set_pq_local_proposals();
+            tile.set_pq_local_proposals(&mut adapter.producers);
         } else {
             // The target exists, so only the claims not kept leave it empty.
-            tile.pq_aggregator.set_local_proposals(&[block], false, &tile.ticker);
+            tile.pq_aggregator.set_local_proposals(
+                &[block],
+                false,
+                &tile.ticker,
+                &mut adapter.producers,
+            );
         }
 
         assert_eq!(tile.proposes_locally(block), local);
@@ -627,7 +635,12 @@ impl GapVote {
         ProposerPreparation { validator_index: 0, fee_recipient: [1; 20] }.encode(&mut preparation);
         tile.proposer_preparations.record(&preparation, 2);
         if let Some(block) = block {
-            tile.pq_aggregator.set_local_proposals(&[block], false, &tile.ticker);
+            tile.pq_aggregator.set_local_proposals(
+                &[block],
+                false,
+                &tile.ticker,
+                &mut adapter.producers,
+            );
         }
 
         let validator = (0..VALIDATORS as u32)

@@ -156,7 +156,9 @@ impl AggregateFixture {
         sources: &mut ProofSources,
         proofs: &mut ProofStore,
     ) -> Result<(), AggregateRefused> {
-        sources.add_aggregate(&self.attestation, &self.attesters, &self.claims, &self.proof, proofs)
+        sources
+            .add_aggregate(&self.attestation, &self.attesters, &self.claims, &self.proof, proofs)
+            .map(drop)
     }
 
     pub(super) fn group(&self) -> Group {
